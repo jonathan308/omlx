@@ -1887,7 +1887,10 @@ class EnginePool:
         for _ in range(5):
             await asyncio.sleep(0)
 
-        # Clear engine reference before settle barrier
+        # Clear engine reference before settle barrier. Capture the observed
+        # load-time footprint first: the barrier target must not exceed what
+        # the load actually allocated.
+        observed_actual_size = entry.actual_size
         entry.engine = None
         entry.last_access = 0.0
         entry.actual_size = None
@@ -1930,8 +1933,17 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
-        min_expected_freed = max(0, resident_size - settle_tolerance)
+        # Base the target on the observed load-time footprint when it is
+        # smaller than the estimate: a model whose actual size undershoots
+        # the estimate by more than the tolerance (e.g. DeepSeek-V4-Flash
+        # MXFP4: actual 148.9 GB vs estimated 163.4 GB) can never free the
+        # estimated amount, making the barrier unsatisfiable and burning
+        # all 10 rounds on every unload.
+        settle_basis = entry.estimated_size
+        if observed_actual_size and 0 < observed_actual_size < settle_basis:
+            settle_basis = observed_actual_size
+        settle_tolerance = max(2 * 1024**3, int(settle_basis * 0.05))
+        min_expected_freed = max(0, settle_basis - settle_tolerance)
         settled = False
         settle_indeterminate = False
         for _settle_round in range(10):
