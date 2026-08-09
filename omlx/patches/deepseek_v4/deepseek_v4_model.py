@@ -17,6 +17,7 @@ from .hyper_connection import HyperConnection, HyperHead, hc_expand
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
@@ -644,6 +645,20 @@ def _sparse_pooled_attention(
         and pooled.shape[-1] == D
         and topk.ndim == 3
     ):
+        if B == 1 and q.dtype == mx.bfloat16 and topk.shape[1] == L:
+            out = wsdpa_topk_prefill(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                sinks,
+                scale,
+                int(q_offset),
+                int(local_window),
+                int(compress_ratio),
+            )
+            if out is not None:
+                return out
         try:
             from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
@@ -1482,15 +1497,28 @@ class LocalAttention(nn.Module):
         if self.dspark and B == 1 and L == 1:
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
-            out = scaled_dot_product_attention(
-                q,
-                kv,
-                kv,
-                cache=cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
+            out = None
+            if B == 1 and L > 1:
+                out = wsdpa_prefill(
+                    q,
+                    kv,
+                    None,
+                    sinks,
+                    self.scale,
+                    offset,
+                    self.config.sliding_window,
+                    1,
+                )
+            if out is None:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
         out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
@@ -1598,21 +1626,36 @@ class CompressedAttention(nn.Module):
             pooled_mask = (
                 pool_cache.make_mask(L, offset) if pool_cache is not None else None
             )
-        if pooled.shape[1] > 0:
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
         if self.dspark and B == 1 and L == 1:
+            if pooled.shape[1] > 0:
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
-            out = scaled_dot_product_attention(
-                q,
-                kv,
-                kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
+            out = None
+            if B == 1 and L > 1:
+                out = wsdpa_prefill(
+                    q,
+                    kv,
+                    pooled if pooled.shape[1] > 0 else None,
+                    sinks,
+                    self.scale,
+                    offset,
+                    self.config.sliding_window,
+                    self.compress_ratio,
+                )
+            if out is None:
+                if pooled.shape[1] > 0:
+                    kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
         out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
@@ -1819,30 +1862,57 @@ class SparseCompressedAttention(nn.Module):
             if self.dspark and B == 1 and L == 1:
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
-                out = scaled_dot_product_attention(
-                    q,
-                    kv,
-                    kv,
-                    cache=local_cache,
-                    scale=self.scale,
-                    mask=mask,
-                    sinks=sinks,
-                )
+                out = None
+                if B == 1 and L > 1:
+                    out = wsdpa_prefill(
+                        q,
+                        kv,
+                        None,
+                        sinks,
+                        self.scale,
+                        offset,
+                        self.config.sliding_window,
+                        self.compress_ratio,
+                    )
+                if out is None:
+                    out = scaled_dot_product_attention(
+                        q,
+                        kv,
+                        kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pmask, full_kv.shape[2])
             if self.dspark and B == 1 and L == 1:
+                full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
-                out = scaled_dot_product_attention(
-                    q,
-                    full_kv,
-                    full_kv,
-                    cache=local_cache,
-                    scale=self.scale,
-                    mask=mask,
-                    sinks=sinks,
-                )
+                out = None
+                if B == 1 and L > 1:
+                    out = wsdpa_prefill(
+                        q,
+                        kv,
+                        pooled,
+                        sinks,
+                        self.scale,
+                        offset,
+                        self.config.sliding_window,
+                        self.compress_ratio,
+                    )
+                if out is None:
+                    full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                    mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                    out = scaled_dot_product_attention(
+                        q,
+                        full_kv,
+                        full_kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
         else:
             out = _sparse_pooled_attention(
                 q,
