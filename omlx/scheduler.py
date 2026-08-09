@@ -2369,17 +2369,21 @@ class Scheduler:
 
         return window_sizes
 
-    # Target range for RotatingKVCache block size alignment.
-    # Using a multiple of window_size within this range reduces SSD I/O
-    # overhead (fewer, larger block files) while keeping cache restore
-    # reprocessing reasonable.
-    _ROTATING_BLOCK_SIZE_MIN = 512
-    _ROTATING_BLOCK_SIZE_MAX = 1024
+    # Target range for RotatingKVCache block size alignment.  A larger block
+    # amortizes boundary-cache snapshots and stream synchronization while
+    # preserving the exact rotating-cache contents and positions.  Keep the
+    # values configurable for lower-memory deployments.
+    _ROTATING_BLOCK_SIZE_MIN = int(
+        os.environ.get("OMLX_ROTATING_BLOCK_SIZE_MIN", "2048")
+    )
+    _ROTATING_BLOCK_SIZE_MAX = int(
+        os.environ.get("OMLX_ROTATING_BLOCK_SIZE_MAX", "2048")
+    )
 
     def _align_block_size_with_rotating_window(self) -> None:
         """
         Align paged cache block size to a multiple of RotatingKVCache
-        window size, targeting 512-1024 tokens per block.
+        window size, targeting 2048 tokens per block by default.
 
         Block size must be a multiple of window_size so that block
         boundaries align with rotation boundaries. When window_size is
