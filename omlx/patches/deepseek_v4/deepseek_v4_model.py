@@ -1241,13 +1241,31 @@ class Indexer(nn.Module):
                         if projected_weights is None
                         else projected_weights
                     ).astype(q.dtype) * ((self.n_heads**-0.5) * self.scale)
+                    # Fused pooled-ratio causal mask (lossless): the kernel
+                    # epilogue writes the finfo(bf16).min sentinel itself
+                    # when the mask is the plain 2-D PoolingCache ratio mask,
+                    # bit-identical to the mx.where pass it replaces.
+                    # Batched 3-D masks keep the where pass; pmask is None
+                    # stays unmasked as before.
+                    _mask_ratio = 0
+                    _mask_q_offset = 0
+                    if (
+                        pmask is not None
+                        and pmask.ndim == 2
+                        and isinstance(offset, int)
+                        and type(pool_cache).__name__ == "PoolingCache"
+                    ):
+                        _mask_ratio = int(pool_cache.ratio)
+                        _mask_q_offset = int(offset)
                     scores4 = glm_fast.dsa_indexer_scores(
                         q,
                         pooled[:, None],
                         weights,
                         causal=False,
+                        mask_ratio=_mask_ratio,
+                        mask_q_offset=_mask_q_offset,
                     )
-                    if pmask is not None:
+                    if _mask_ratio == 0 and pmask is not None:
                         scores4 = mx.where(
                             (pmask[:, None] if pmask.ndim == 3 else pmask[None, None]),
                             scores4,
