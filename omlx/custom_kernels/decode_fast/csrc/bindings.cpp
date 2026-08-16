@@ -4,6 +4,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "decode_fast.h"
+#include "rope_append.h"
 #include "sdpa_decode.h"
 
 namespace nb = nanobind;
@@ -55,5 +56,31 @@ NB_MODULE(_ext, m) {
       "causal"_a,
       "mask"_a = nb::none(),
       "sinks"_a = nb::none(),
+      "stream"_a = nb::none());
+
+  m.def(
+      "rope_kv_append_supported",
+      &omlx::decode_fast_kernels::rope_kv_append_supported,
+      "keys"_a,
+      "values"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "offset"_a,
+      "dims"_a,
+      "stream"_a = nb::none());
+
+  m.def(
+      "rope_kv_append",
+      &omlx::decode_fast_kernels::rope_kv_append,
+      "keys"_a,
+      "values"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "offset"_a,
+      "dims"_a,
+      "traditional"_a,
+      "base"_a = nb::none(),
+      "scale"_a = 1.0f,
+      "freqs"_a = nb::none(),
       "stream"_a = nb::none());
 }

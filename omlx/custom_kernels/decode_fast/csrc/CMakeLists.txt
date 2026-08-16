@@ -29,7 +29,8 @@ target_sources(
   omlx_decode_fast_kernel_ops
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/decode_fast.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/sdpa_decode.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/sdpa_decode.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/rope_append.cpp)
 target_include_directories(
   omlx_decode_fast_kernel_ops
   PUBLIC ${CMAKE_CURRENT_LIST_DIR})
@@ -38,7 +39,8 @@ target_link_libraries(omlx_decode_fast_kernel_ops PUBLIC mlx)
 if(MLX_BUILD_METAL)
   set(OMLX_DECODE_FAST_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/rms_residual.metal
-      ${CMAKE_CURRENT_LIST_DIR}/sdpa_decode.metal)
+      ${CMAKE_CURRENT_LIST_DIR}/sdpa_decode.metal
+      ${CMAKE_CURRENT_LIST_DIR}/rope_append.metal)
   file(GLOB_RECURSE OMLX_DECODE_FAST_METAL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/*.h)
   set(OMLX_DECODE_FAST_METAL_FLAGS
