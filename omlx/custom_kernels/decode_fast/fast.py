@@ -98,4 +98,35 @@ def rms_norm_residual(
     return _composed_rms_norm_residual(x, weight, residual, eps)
 
 
-__all__ = ["NATIVE_AVAILABLE", "rms_norm_residual"]
+def sdpa_decode(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    scale: float,
+    causal: bool = False,
+    mask: Optional[mx.array] = None,
+    sinks: Optional[mx.array] = None,
+    *,
+    stream: Optional[mx.Stream] = None,
+    force_fallback: bool = False,
+) -> mx.array:
+    """Decode-mode SDPA (query length <= 8) with the ported #4294 kernels.
+
+    Falls back to mx.fast.scaled_dot_product_attention when the native
+    extension is unavailable or the shapes/dtypes are unsupported. As with
+    rms_norm_residual, realized layouts must satisfy the vectorized-load
+    stride predicates (always true for omlx KV caches); exotic views should
+    use force_fallback=True.
+    """
+    if (
+        not force_fallback
+        and _ext is not None
+        and _ext.sdpa_decode_supported(q, k, v, stream)
+    ):
+        return _ext.sdpa_decode(q, k, v, scale, causal, mask, sinks, stream)
+    return mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=scale, mask=mask, sinks=sinks
+    )
+
+
+__all__ = ["NATIVE_AVAILABLE", "rms_norm_residual", "sdpa_decode"]

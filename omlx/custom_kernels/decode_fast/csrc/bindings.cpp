@@ -1,8 +1,10 @@
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include "decode_fast.h"
+#include "sdpa_decode.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -33,5 +35,25 @@ NB_MODULE(_ext, m) {
       "weight"_a,
       "residual"_a,
       "eps"_a,
+      "stream"_a = nb::none());
+
+  m.def(
+      "sdpa_decode_supported",
+      &omlx::decode_fast_kernels::sdpa_decode_supported,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "stream"_a = nb::none());
+
+  m.def(
+      "sdpa_decode",
+      &omlx::decode_fast_kernels::sdpa_decode,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "causal"_a,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none());
 }
