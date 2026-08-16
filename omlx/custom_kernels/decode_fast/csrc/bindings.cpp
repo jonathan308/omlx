@@ -6,6 +6,7 @@
 #include "decode_fast.h"
 #include "rope_append.h"
 #include "sdpa_decode.h"
+#include "sparse_attn_decode.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -82,5 +83,23 @@ NB_MODULE(_ext, m) {
       "base"_a = nb::none(),
       "scale"_a = 1.0f,
       "freqs"_a = nb::none(),
+      "stream"_a = nb::none());
+
+  m.def(
+      "sparse_attn_decode_supported",
+      &omlx::decode_fast_kernels::sparse_attn_decode_supported,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "sinks"_a,
+      "stream"_a = nb::none());
+
+  m.def(
+      "sparse_attn_decode",
+      &omlx::decode_fast_kernels::sparse_attn_decode,
+      "q"_a,
+      "local_kv"_a,
+      "pooled"_a,
+      "sinks"_a,
       "stream"_a = nb::none());
 }

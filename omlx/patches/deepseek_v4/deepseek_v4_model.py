@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,6 +39,16 @@ from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
+# Fused sparse decode attention (decode_fast.sparse_attn_decode) replaces the
+# composed rowwise-GEMM + logsumexp glue of _dspark_sparse_exact_attention
+# with one Metal dispatch. The kernel is batch-row invariant by construction
+# (independent per-row reduction), preserving the DSpark decode==verify
+# contract. OMLX_DSV4_FUSED_SPARSE=0 forces the composed path.
+_DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED = (
+    os.environ.get("OMLX_DSV4_FUSED_SPARSE", "1").strip().lower()
+    in ("0", "false", "off")
+)
+_DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = False
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -505,6 +516,39 @@ def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     return weights_a, weights_b
 
 
+def _fused_sparse_decode_attention(
+    q_scaled: mx.array,
+    local_kv: mx.array,
+    pooled_sq: mx.array,
+    sinks: mx.array,
+) -> Optional[mx.array]:
+    """Single-dispatch fused sparse decode attention; None when unavailable.
+
+    decode_fast.sparse_attn_decode computes the same composition as
+    _dspark_sparse_exact_attention in one Metal kernel with an independent
+    per-(batch, head) reduction order, so decode (B=1) and verify (B=block)
+    stay bitwise row-consistent. Any failure latches the composed path for
+    the rest of the process.
+    """
+    global _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED
+    if _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED:
+        return None
+    try:
+        from omlx.custom_kernels.decode_fast import fast as decode_fast
+
+        return decode_fast.sparse_attn_decode(
+            q_scaled, local_kv, pooled_sq, sinks
+        )
+    except Exception as exc:
+        _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 fused sparse decode attention failed; composed path for "
+            "the rest of this process: %s",
+            exc,
+        )
+        return None
+
+
 @mx.compile
 def _dspark_sparse_exact_attention(
     q_scaled: mx.array,
@@ -727,6 +771,12 @@ def _sparse_pooled_attention(
     exact_local = decode_consistent and L == 1 and 1 <= B <= 6
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
+        if not _DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED:
+            fused = _fused_sparse_decode_attention(
+                q_scaled, local_kv, pooled_sq, sinks
+            )
+            if fused is not None:
+                return fused
         return _dspark_sparse_exact_attention(
             q_scaled,
             local_kv,

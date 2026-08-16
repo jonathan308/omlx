@@ -180,4 +180,40 @@ def rope_kv_append(
     return key_cache, value_cache
 
 
-__all__ = ["NATIVE_AVAILABLE", "rms_norm_residual", "sdpa_decode", "rope_kv_append"]
+def sparse_attn_decode(
+    q: mx.array,
+    local_kv: mx.array,
+    pooled: mx.array,
+    sinks: mx.array,
+    *,
+    stream: Optional[mx.Stream] = None,
+) -> Optional[mx.array]:
+    """Fused DeepSeek-V4 sparse decode attention; None when not applicable.
+
+    Computes, in one Metal dispatch, the exact composition of
+    ``_dspark_sparse_exact_attention``: scores over the concatenated
+    [local window | selected pooled] KV rows, a logaddexp(logsumexp, sink)
+    normalizer, and the weighted value sum. Requires q [B,H,1,512],
+    local_kv [B,1,W,512], pooled [B,1,P,512], sinks float32 [H], W+P <= 1024,
+    B <= 8, and row-contiguous realized inputs (always true for omlx caches).
+
+    Each (batch, head) pair is an independent threadgroup with a fixed
+    sequential reduction order, so decode (B=1) and DSpark verify (B=block)
+    rows produce bitwise-identical per-row results. Returns None when the
+    native extension is missing or the shapes/dtypes are unsupported —
+    callers keep their composed fallback for that case.
+    """
+    if _ext is None:
+        return None
+    if not _ext.sparse_attn_decode_supported(q, local_kv, pooled, sinks, stream):
+        return None
+    return _ext.sparse_attn_decode(q, local_kv, pooled, sinks, stream)
+
+
+__all__ = [
+    "NATIVE_AVAILABLE",
+    "rms_norm_residual",
+    "sdpa_decode",
+    "rope_kv_append",
+    "sparse_attn_decode",
+]
