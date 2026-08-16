@@ -129,4 +129,55 @@ def sdpa_decode(
     )
 
 
-__all__ = ["NATIVE_AVAILABLE", "rms_norm_residual", "sdpa_decode"]
+def rope_kv_append(
+    keys: mx.array,
+    values: mx.array,
+    key_cache: mx.array,
+    value_cache: mx.array,
+    offset: int,
+    dims: int,
+    traditional: bool = False,
+    base: Optional[float] = None,
+    scale: float = 1.0,
+    freqs: Optional[mx.array] = None,
+    *,
+    stream: Optional[mx.Stream] = None,
+    force_fallback: bool = False,
+) -> Tuple[mx.array, mx.array]:
+    """Fused RoPE(K) + KV cache append for single-token decode (#4297 port).
+
+    Returns (key_cache, value_cache) with the rotated K written directly
+    into the donated K-cache buffer (no rope-temp round-trip) and V appended
+    via slice update. Falls back to composed rope + slice assignment.
+    """
+    if (
+        not force_fallback
+        and _ext is not None
+        and _ext.rope_kv_append_supported(
+            keys, values, key_cache, value_cache, offset, dims, stream
+        )
+    ):
+        kc, vc = _ext.rope_kv_append(
+            keys,
+            values,
+            key_cache,
+            value_cache,
+            offset,
+            dims,
+            traditional,
+            base,
+            scale,
+            freqs,
+            stream,
+        )
+        return kc, vc
+    k_rot = mx.fast.rope(
+        keys, dims, traditional=traditional, base=base, scale=scale, offset=offset, freqs=freqs
+    )
+    # In-place slice assignment mirrors the native update semantics.
+    key_cache[:, :, offset : offset + keys.shape[-2], :] = k_rot
+    value_cache[:, :, offset : offset + values.shape[-2], :] = values
+    return key_cache, value_cache
+
+
+__all__ = ["NATIVE_AVAILABLE", "rms_norm_residual", "sdpa_decode", "rope_kv_append"]
