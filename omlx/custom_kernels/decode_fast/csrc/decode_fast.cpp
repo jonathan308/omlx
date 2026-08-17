@@ -133,12 +133,12 @@ class RmsNormResidualPrimitive : public Primitive {
     const int looped_limit = 4096; // RMS_LOOPED_LIMIT
     int n_reads = 4; // RMS_N_READS
     std::string op_name = "omlx_rms_residual";
-    if (axis_size <= 3072) {
-      // More reads per thread keep the threadgroup small which leaves room
-      // for more resident threadgroups per SM at small axis sizes.
-      op_name += "16";
-      n_reads = 16;
-    }
+    // NOTE: upstream #4295 used a 16-read variant for axis_size <= 3072, but
+    // stock (non-residual) rms_norm always uses N_READS=4 there. The 16-read
+    // tiling changes the fp32 sum-of-squares accumulation order, which breaks
+    // bit-exactness with the composed add -> rms_norm path (observed: greedy
+    // decode divergence on Qwen3-30B-A3B at hidden=2048). omlx always uses
+    // N_READS=4 so fused output is bit-identical to the composed path.
     if (axis_size > looped_limit) {
       op_name += "_looped";
     }
