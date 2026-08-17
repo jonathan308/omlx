@@ -405,6 +405,25 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
 
+_FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
+
+
+def _fixed_depth_override(max_depth: int) -> Optional[int]:
+    """Diagnostic: pin the adaptive controller to one fixed draft depth.
+
+    ``OMLX_MTP_FIXED_DEPTH=N`` (clamped to 1..max_depth) disables the
+    _DepthController so every cycle drafts exactly N tokens. Used to
+    measure true per-depth economics (acceptance and cycle cost) without
+    the controller's hysteresis/probing masking them. Unset = adaptive.
+    """
+    raw = os.environ.get(_FIXED_DEPTH_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        return max(1, min(max_depth, int(raw)))
+    except ValueError:
+        return None
+
 
 def _rowwise_batch_mtp_enabled() -> bool:
     """Opt-in for row-wise MTP on multi-row batches (default off).
@@ -2363,13 +2382,17 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.depth = depth
         state.head_clone = head_clone
         if depth > 1:
-            state.controller = _DepthController(
-                depth,
-                marginal_ms=getattr(
-                    gen_batch.model, "_omlx_mtp_marginal_ms", None
-                ),
-                exit_margin=_effective_loop_tax(gen_batch.model),
-            )
+            fixed = _fixed_depth_override(depth)
+            if fixed is not None:
+                state.depth = fixed
+            else:
+                state.controller = _DepthController(
+                    depth,
+                    marginal_ms=getattr(
+                        gen_batch.model, "_omlx_mtp_marginal_ms", None
+                    ),
+                    exit_margin=_effective_loop_tax(gen_batch.model),
+                )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
         )
