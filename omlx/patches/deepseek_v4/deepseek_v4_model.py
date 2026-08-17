@@ -49,6 +49,13 @@ _DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED = (
     in ("0", "false", "off")
 )
 _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = False
+# OMLX_DSV4_RING=0 disables the dspark_ring_gemm verify fast path, forcing
+# the per-row _sparse_pooled_attention route (fused or composed). Diagnostic
+# escape hatch for A/B benchmarking.
+_DEEPSEEK_V4_RING_VERIFY_DISABLED = (
+    os.environ.get("OMLX_DSV4_RING", "1").strip().lower()
+    in ("0", "false", "off")
+)
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -1946,7 +1953,8 @@ class SparseCompressedAttention(nn.Module):
                 )
                 topk_batch = mx.concatenate(topk_rows, axis=0)
                 use_ring_kernel = bool(
-                    ring_view is not None
+                    not _DEEPSEEK_V4_RING_VERIFY_DISABLED
+                    and ring_view is not None
                     and ring_view.source.ndim == 2
                     and ring_view.source.shape[1] == 512
                     and ring_view.indices.ndim == 2
