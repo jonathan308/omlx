@@ -926,6 +926,9 @@ class DistributedBatchedEngine(BatchedEngine):
         except httpx.ReadTimeout as exc:
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            # abort_request() closed this response; surface the abort, not a
+            # spurious transport failure.
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
@@ -1183,6 +1186,9 @@ class DistributedBatchedEngine(BatchedEngine):
         except httpx.ReadTimeout as exc:
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            # abort_request() closed this response; surface the abort, not a
+            # spurious transport failure.
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
