@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import signal
 import sys
@@ -40,6 +41,8 @@ from .runtime_optimizations import install_runtime_optimizations
 from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
+
+logger = logging.getLogger(__name__)
 
 
 def _emit_event(payload: dict[str, Any]) -> None:
@@ -291,15 +294,58 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, interrupt)
 
 
+def _write_cancel_request(
+    state_dir: str,
+    deployment_id: str,
+    reason: str,
+    *,
+    plan_hash: str | None = None,
+) -> None:
+    """Ask this rank's telemetry to force-cancel in-flight requests.
+
+    Best effort and silent on failure: the file is consumed by the rank's
+    telemetry heartbeat, which cancels through ``BatchGenerator.remove`` at
+    a batch step boundary shared with peer ranks. Writing it before a
+    watchdog exit lets in-flight work unwind instead of being severed
+    mid-collective.
+    """
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "deployment_id": deployment_id,
+        "epoch": int(time.time() * 1000),
+        "scope": "all",
+        "reason": reason,
+    }
+    if plan_hash:
+        payload["plan_hash"] = plan_hash
+    try:
+        root = Path(state_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{deployment_id}-cancel.json"
+        temporary = path.with_name(path.name + ".tmp")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("Could not write the rank cancel request: %s", exc)
+
+
 def _watch_launcher_parent(
     parent_pid: int,
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
+    watched_marker_path: Any = None,
+    marker_stale_after: float = 45.0,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
     exit_process: Any = os._exit,
     emit_event: Any = _emit_event,
+    on_abort: Any = None,
 ) -> None:
     """Fail fast if MLX's launcher exits without reaping this rank.
 
@@ -307,22 +353,50 @@ def _watch_launcher_parent(
     after its main thread handles SIGTERM. The launcher is the lifetime owner
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
+
+    Two conditions are watched: the parent pid changing (the original check),
+    and — when ``watched_marker_path`` is configured — a launcher- or
+    coordinator-maintained lease file going stale for ``marker_stale_after``
+    seconds, which catches a launcher that is alive but wedged (its ranks
+    would otherwise wait in a collective forever). ``os._exit`` stays the
+    last resort: ``on_abort`` fires first so in-flight requests can be
+    cancelled at a step boundary before the process disappears.
     """
 
+    watched = Path(watched_marker_path) if watched_marker_path else None
     while True:
         wait(poll_interval)
-        if get_parent_pid() == parent_pid:
+        reason = None
+        if get_parent_pid() != parent_pid:
+            current_parent = get_parent_pid()
+            reason = (
+                f"rank launcher parent changed from {parent_pid} to "
+                f"{current_parent}; the rank cannot safely continue"
+            )
+        elif watched is not None and marker_stale_after > 0:
+            try:
+                age = time.time() - watched.stat().st_mtime
+            except OSError:
+                age = None
+            # A lease that never appeared yet is not stale; the launcher may
+            # still be starting. Once it exists, it must stay fresh.
+            if age is not None and age > marker_stale_after:
+                reason = (
+                    f"launcher lease {watched} is stale ({age:.1f}s > "
+                    f"{marker_stale_after:.1f}s); the launcher is wedged"
+                )
+        if reason is None:
             continue
-        current_parent = get_parent_pid()
-        reason = (
-            f"rank launcher parent changed from {parent_pid} to "
-            f"{current_parent}; the rank cannot safely continue"
-        )
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
         # failure to "heartbeat missing" with no explanation.
         marker.update("launcher_lost", error=reason)
+        if on_abort is not None:
+            try:
+                on_abort(reason)
+            except Exception:
+                logger.warning("Launcher watchdog abort stage failed", exc_info=True)
         emit_event({"type": "launcher_lost", "reason": reason})
         exit_process(1)
         return
@@ -396,11 +470,27 @@ def _start_peer_watchdog(
         _emit_event({"type": "peer_lost", "reason": reason})
         os._exit(1)
 
+    def on_abort(reason: str) -> None:
+        # The cancel file is consumed by this rank's telemetry heartbeat,
+        # which cancels in-flight requests through BatchGenerator.remove at
+        # a batch step boundary shared with every rank — never mid-collective.
+        _write_cancel_request(
+            state_dir,
+            deployment_id,
+            f"peer watchdog aborting before teardown: {reason}",
+            plan_hash=marker.payload.get("plan_hash"),
+        )
+
+    abort_grace = float(
+        os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0
+    )
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
+        on_abort=on_abort,
+        abort_grace=abort_grace,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -409,10 +499,35 @@ def _start_peer_watchdog(
     return watchdog
 
 
-def _start_launcher_watchdog(marker: RuntimeMarker, parent_pid: int) -> None:
+def _start_launcher_watchdog(
+    marker: RuntimeMarker,
+    parent_pid: int,
+    *,
+    state_dir: str | None = None,
+) -> None:
+    # Optional coordinator/launcher lease file: when configured (and once
+    # it exists), the watchdog also fires if it goes stale — covering a
+    # launcher that is alive but wedged, which the parent-pid check alone
+    # cannot see. Off by default, preserving the original PPID-only watch.
+    lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
+    deployment_id = str(marker.payload.get("deployment_id") or "")
+
+    def on_abort(reason: str) -> None:
+        if state_dir and deployment_id:
+            _write_cancel_request(
+                state_dir,
+                deployment_id,
+                reason,
+                plan_hash=marker.payload.get("plan_hash"),
+            )
+
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
+        kwargs={
+            "watched_marker_path": lease or None,
+            "on_abort": on_abort,
+        },
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -789,7 +904,7 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     marker.start_heartbeat()
     _install_signal_handlers()
-    _start_launcher_watchdog(marker, launcher_parent_pid)
+    _start_launcher_watchdog(marker, launcher_parent_pid, state_dir=args.state_dir)
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
