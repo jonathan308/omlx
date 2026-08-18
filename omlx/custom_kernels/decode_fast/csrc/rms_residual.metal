@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // omlx fused residual-add + RMS norm kernels (decode fast path).
 //
 // Ported from the mlx core PR ml-explore/mlx#4295 (closed unmerged upstream)

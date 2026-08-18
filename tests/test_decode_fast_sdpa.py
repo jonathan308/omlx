@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 """Decode SDPA (decode_fast) matches mx.fast.scaled_dot_product_attention."""
 
 import pytest

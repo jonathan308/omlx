@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Copyright © 2024 Apple Inc.
 
 #include <metal_simdgroup>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused sparse decode attention for DeepSeek-V4-style MQA layers.
 //
 // One decode step attends a sliding-window KV segment plus a selected pooled

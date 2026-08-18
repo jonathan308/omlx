@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused sparse decode attention (windowed local KV + selected pooled KV +
 // attention sinks) for DeepSeek-V4-style single-KV-head MLA layers. Replaces
 // the composed rowwise-GEMM + logsumexp glue of

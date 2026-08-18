@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // omlx fused RoPE(K) + key-cache append kernels — port of
 // ml-explore/mlx#4297 (closed unmerged upstream). Writes the rotated key
 // pair directly into the (donated) K-cache buffer at `offset`, eliminating

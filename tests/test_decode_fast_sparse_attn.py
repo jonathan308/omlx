@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 """Fused sparse decode attention (decode_fast) vs the composed reference.
 
 The reference mirrors

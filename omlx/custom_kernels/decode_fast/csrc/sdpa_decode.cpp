@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Decode-mode SDPA (query length <= 8) using the omlx_sdpa_decode kernels:
 // a port of ml-explore/mlx#4294 (closed unmerged upstream) — tiled online
 // softmax, vectorized KV loads, context-scaled 2-pass split on 'd'-class

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused RoPE(K) + key-cache append (single-token decode) — host side of the
 // ml-explore/mlx#4297 port. Single-output primitive so the K-cache buffer
 // can be donated and updated in place; the V cache is appended with a plain

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // omlx decode SDPA (vector) kernels — port of ml-explore/mlx#4295's sibling
 // PR #4294 (closed unmerged upstream): tiled online softmax, vectorized KV
 // loads, context-scaled 2-pass split for 'd'-class GPUs, fp32 partials.
