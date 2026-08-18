@@ -431,7 +431,11 @@ async def test_stream_records_real_prefill_and_decode_for_automatic_choice(
         )
     )
     store = configure_strategy_benchmark_store(tmp_path)
-    ticks = iter((10.0, 12.0, 16.0))
+    # Monotonic call order in stream_generate: request_started_at(10.0),
+    # _enter_request state timestamp (11.0, unused for rates), first-chunk
+    # now/first_token_at(12.0), _mark_backend_finished (15.0, unused),
+    # finished_at(16.0). Rates: prefill 32/(12-10)=16, decode (2-1)/(16-12)=0.25.
+    ticks = iter((10.0, 11.0, 12.0, 15.0, 16.0))
     monkeypatch.setattr(
         distributed,
         "time",
@@ -480,7 +484,9 @@ async def test_strategy_benchmark_buckets_total_context_but_rates_uncached_prefi
         )
     )
     store = configure_strategy_benchmark_store(tmp_path)
-    ticks = iter((10.0, 12.0, 16.0))
+    # Same monotonic call order as the automatic-choice test above; only the
+    # started/first-token/finished values feed the rates.
+    ticks = iter((10.0, 11.0, 12.0, 15.0, 16.0))
     monkeypatch.setattr(
         distributed,
         "time",
@@ -727,6 +733,9 @@ async def test_aborted_stream_raises_at_the_next_yield_boundary(tmp_path):
 async def test_abort_all_writes_cancel_file_and_swaps_client(tmp_path):
     engine = _ready_engine(lambda request: httpx.Response(200, json={}))
     engine._supervisor.state_dir = str(tmp_path)
+    # The client swap needs a supervisor endpoint; the test double never
+    # launches, so set the port a real launch would have allocated.
+    engine._supervisor.port = 18010
     old_client = engine._client
 
     count = await engine.abort_all_requests(reason="unload requested")
@@ -767,6 +776,7 @@ async def test_backend_drain_waits_for_rank_side_evidence(tmp_path):
 async def test_abort_all_reports_rank_side_survivors(tmp_path):
     engine = _ready_engine(lambda request: httpx.Response(200, json={}))
     engine._supervisor.state_dir = str(tmp_path)
+    engine._supervisor.port = 18010  # endpoint needed for the post-abort client swap
     engine._abort_drain_timeout = 0.2
     (tmp_path / "engine-test-rank-0.json").write_text(
         json.dumps(_rank_zero_marker(1)), encoding="utf-8"

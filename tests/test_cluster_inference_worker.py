@@ -598,7 +598,7 @@ def _run_rank(
     )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(
-        inference_worker, "_start_launcher_watchdog", lambda _m, _pid: None
+        inference_worker, "_start_launcher_watchdog", lambda _m, _pid, **_kw: None
     )
 
     def fake_wired(desired):
