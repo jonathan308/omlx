@@ -31,9 +31,15 @@ from typing import Any
 from omlx.utils import hardware
 
 from .deployment import ClusterDeployment, validate_ssh_target
-from .liveness import _LOOPBACK_TARGETS, read_marker, read_remote_marker
+from .liveness import (
+    _LOOPBACK_TARGETS,
+    marker_owner_is_live,
+    read_marker,
+    read_remote_marker,
+)
 from .models import CLUSTER_PROTOCOL_VERSION
 from .performance import performance_profiles_from_records
+from .runtime import read_runtime_markers
 from .ssh_policy import cluster_ssh_options
 from .staging import home_relative_model_path, validate_staged_model
 
@@ -49,6 +55,19 @@ _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
 
 class DistributedLaunchError(RuntimeError):
     """Raised when a distributed job cannot become or remain ready."""
+
+
+class DistributedTeardownError(DistributedLaunchError):
+    """Raised when a distributed job survives a verified teardown attempt.
+
+    A rank that survives SIGKILL (unkillable Metal/JACCL kernel wait,
+    D-state, or a ``PermissionError`` that ``_process_group_alive``
+    deliberately reads as alive) keeps its unified-memory allocation
+    resident. Reporting success anyway was the orphaned-GPU-memory hole:
+    the engine pool released the model's memory budget while the weights
+    were still wired. Callers must treat this as "teardown NOT complete"
+    and keep enough state to retry.
+    """
 
 
 @dataclass(frozen=True)
@@ -121,6 +140,333 @@ def _wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
             return False
         time.sleep(min(0.05, remaining))
     return True
+
+
+def _pid_alive(pid: int) -> bool:
+    """Local mirror of ``liveness._pid_is_live`` for reaper bookkeeping."""
+
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError):
+        return True
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+_LAUNCH_MANIFEST_PREFIX = "launch-"
+_LOOPBACK_SSH_TARGETS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
+    return (
+        Path(state_dir).expanduser()
+        / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
+    )
+
+
+def _write_launch_manifest(
+    state_dir: str | Path,
+    deployment: ClusterDeployment,
+    *,
+    launcher_pid: int,
+    api_port: int | None,
+) -> Path:
+    """Persist launch identity so a *new* coordinator can reap leftovers.
+
+    Every teardown path lives in the coordinator process, so a SIGKILL or
+    panic of omlx-server strands the launcher and every rank with no owner
+    (G8). The manifest records the process group and the marker directory
+    of the job; ``reap_orphaned_launches`` consumes it at the next server
+    start. It is removed only after verified process-group exit.
+    """
+
+    root = Path(state_dir).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "plan_hash": deployment.plan_hash,
+        # start_new_session=True makes the launcher its own group leader.
+        "launcher_pid": int(launcher_pid),
+        "process_group": int(launcher_pid),
+        "coordinator_pid": os.getpid(),
+        "api_port": api_port,
+        "started_at": time.time(),
+        "hosts": [
+            {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+            for rank, host in enumerate(deployment.hosts)
+        ],
+    }
+    path = _launch_manifest_path(state_dir, deployment.deployment_id)
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+    return path
+
+
+def _read_launch_manifest(path: Path) -> dict[str, Any] | None:
+    """Read one manifest; anything malformed is ignored, never reaped."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    deployment_id = payload.get("deployment_id")
+    launcher_pid = payload.get("launcher_pid")
+    coordinator_pid = payload.get("coordinator_pid")
+    hosts = payload.get("hosts")
+    if not isinstance(deployment_id, str) or not deployment_id:
+        return None
+    if not all(
+        isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+        for pid in (launcher_pid, coordinator_pid)
+    ):
+        return None
+    if not isinstance(hosts, list):
+        return None
+    return payload
+
+
+def _kill_local_pid(pid: int, *, grace: float) -> bool:
+    """SIGTERM, brief grace, then SIGKILL; True once the pid is gone."""
+
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, grace)
+    while _pid_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    if not _pid_alive(pid):
+        return True
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while _pid_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    return not _pid_alive(pid)
+
+
+def _kill_remote_pid(
+    ssh_target: str,
+    pid: int,
+    *,
+    grace: float,
+    runner: SSHRunner = subprocess.run,
+) -> bool:
+    """Best-effort remote TERM->grace->KILL of one rank pid over SSH.
+
+    killpg only reaches the *local* process group (G2): a remote rank whose
+    launcher-parent watchdog never fired keeps its shard resident. The rank
+    pid recorded in its runtime marker gives the coordinator a direct kill
+    path that does not depend on the SSH session teardown chain.
+    """
+
+    command = (
+        f"kill -TERM {pid} 2>/dev/null; sleep {max(0.0, grace):.1f}; "
+        f"kill -KILL {pid} 2>/dev/null; sleep 0.5; "
+        f"if kill -0 {pid} 2>/dev/null; then echo alive; else echo gone; fi"
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=max(5.0, grace) + 15.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        logger.warning("Remote rank kill via %s failed: %s", ssh_target, exc)
+        return False
+    return "gone" in completed.stdout and "alive" not in completed.stdout
+
+
+def _rank_marker_matches(
+    marker: dict[str, Any] | None,
+    *,
+    deployment_id: str,
+    plan_hash: str | None,
+    rank: int,
+) -> bool:
+    if not isinstance(marker, dict):
+        return False
+    if marker.get("deployment_id") != deployment_id or marker.get("rank") != rank:
+        return False
+    recorded = marker.get("plan_hash")
+    if plan_hash is not None and recorded is not None and recorded != plan_hash:
+        return False
+    return True
+
+
+def _sweep_rank_processes(
+    deployment_id: str,
+    hosts: list[dict[str, Any]],
+    *,
+    state_dir: str | Path,
+    plan_hash: str | None = None,
+    kill_grace: float = 3.0,
+    runner: SSHRunner = subprocess.run,
+) -> list[str]:
+    """Kill rank processes recorded in runtime markers that are still live.
+
+    Returns a bounded list of human-readable failures; empty means no rank
+    of this job remains resident anywhere the sweep could reach.
+    """
+
+    failures: list[str] = []
+    local_root = Path(state_dir).expanduser()
+    remote_root = str(state_dir).rstrip("/") or "."
+    local_markers: dict[int, dict[str, Any]] = {}
+    try:
+        for job in read_runtime_markers(local_root).get("jobs", []):
+            if job.get("deployment_id") == deployment_id:
+                local_markers[job["rank"]] = job
+    except (OSError, KeyError, TypeError) as exc:
+        failures.append(f"could not read local runtime markers: {exc}")
+
+    for host in hosts:
+        rank = host.get("rank")
+        ssh_target = host.get("ssh")
+        node_id = host.get("node_id", "?")
+        if not isinstance(rank, int) or not isinstance(ssh_target, str):
+            continue
+        filename = f"{deployment_id}-rank-{rank}.json"
+        if ssh_target in _LOOPBACK_SSH_TARGETS:
+            marker = local_markers.get(rank)
+            if marker is None:
+                marker = read_marker(local_root / filename)
+            if not _rank_marker_matches(
+                marker,
+                deployment_id=deployment_id,
+                plan_hash=plan_hash,
+                rank=rank,
+            ):
+                continue
+            if not marker_owner_is_live(marker):
+                continue
+            pid = marker.get("pid")
+            if _kill_local_pid(pid, grace=kill_grace):
+                logger.warning(
+                    "Reaped leftover rank %d (%s) pid %d of deployment %s",
+                    rank,
+                    node_id,
+                    pid,
+                    deployment_id,
+                )
+            else:
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} survived SIGKILL"
+                )
+            continue
+        # Remote rank: its marker lives on the peer.
+        marker, process_live, _, error = read_remote_marker(
+            ssh_target,
+            f"{remote_root}/{filename}",
+        )
+        if error:
+            failures.append(f"rank {rank} ({node_id}) marker unreadable: {error}")
+            continue
+        if not _rank_marker_matches(
+            marker,
+            deployment_id=deployment_id,
+            plan_hash=plan_hash,
+            rank=rank,
+        ):
+            continue
+        if process_live is not True:
+            continue
+        pid = marker.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            continue
+        if _kill_remote_pid(ssh_target, pid, grace=kill_grace, runner=runner):
+            logger.warning(
+                "Reaped leftover remote rank %d (%s) pid %d of deployment %s",
+                rank,
+                node_id,
+                pid,
+                deployment_id,
+            )
+        else:
+            failures.append(
+                f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
+            )
+    return failures
+
+
+def reap_orphaned_launches(
+    state_dir: str | Path = "~/.omlx/cluster/runtime",
+    *,
+    kill_grace: float = 5.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Reap jobs whose coordinator died without tearing them down (G8).
+
+    Every launch writes a manifest next to the runtime markers. A manifest
+    whose coordinator *and* launcher group are both gone belongs to a
+    crashed predecessor: any rank processes its markers still name are
+    orphans holding unified memory, so kill them and retire the manifest.
+    A manifest with a live coordinator is an active job and is left alone.
+
+    Returns ``{"reaped": [...], "failures": [...], "active": [...]}``.
+    """
+
+    report: dict[str, Any] = {"reaped": [], "failures": [], "active": []}
+    root = Path(state_dir).expanduser()
+    if not root.exists():
+        return report
+    try:
+        manifests = sorted(root.glob(f"{_LAUNCH_MANIFEST_PREFIX}*.json"))
+    except OSError as exc:
+        report["failures"].append(f"runtime state unavailable: {exc}")
+        return report
+
+    for path in manifests:
+        manifest = _read_launch_manifest(path)
+        if manifest is None:
+            continue
+        deployment_id = manifest["deployment_id"]
+        coordinator_pid = manifest["coordinator_pid"]
+        launcher_pid = manifest["launcher_pid"]
+        if _pid_alive(coordinator_pid):
+            report["active"].append(deployment_id)
+            continue
+        # The coordinator is gone. Kill the launcher group if it somehow
+        # survived, then sweep rank processes by their marker pids.
+        if _process_group_alive(launcher_pid):
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(launcher_pid, signal.SIGKILL)
+        failures = _sweep_rank_processes(
+            deployment_id,
+            manifest.get("hosts", []),
+            state_dir=state_dir,
+            plan_hash=manifest.get("plan_hash"),
+            kill_grace=kill_grace,
+            runner=runner,
+        )
+        if failures:
+            report["failures"].extend(
+                f"{deployment_id}: {failure}" for failure in failures
+            )
+            continue
+        report["reaped"].append(deployment_id)
+        with suppress(OSError):
+            path.unlink()
+    return report
 
 
 def _available_launch_ports(
@@ -1761,6 +2107,17 @@ class DistributedJobSupervisor:
     def start(self) -> dict[str, Any]:
         if self.process is not None:
             raise RuntimeError("distributed job is already started")
+        # A previous coordinator may have died mid-job (G8); reap its
+        # leftover ranks before admitting a new launch against the memory
+        # ceiling. Best effort: reaping must never block a launch.
+        try:
+            orphan_report = reap_orphaned_launches(self.state_dir)
+            if orphan_report["reaped"] or orphan_report["failures"]:
+                logger.warning(
+                    "Reaped orphaned distributed launches: %s", orphan_report
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Orphaned-launch reaper failed: %s", exc)
         self._phase = "preflight"
         if self.preflight:
             preflight_remote_hosts(
@@ -1807,6 +2164,7 @@ class DistributedJobSupervisor:
                 env=environment,
                 start_new_session=True,
             )
+            self._write_launch_manifest()
             self._start_readers()
             event = self._wait_for_ready()
             self._wait_for_listener()
@@ -1814,7 +2172,16 @@ class DistributedJobSupervisor:
             self.ready_event = event
             return event
         except Exception:
-            self._terminate()
+            # A failed start still owns a spawned group; tear it down, but
+            # never mask the launch error with a teardown error.
+            try:
+                self._terminate()
+            except Exception:
+                logger.error(
+                    "Teardown after failed distributed start also failed; "
+                    "the launch manifest lets a later sweep reap the job",
+                    exc_info=True,
+                )
             raise
 
     def _start_readers(self) -> None:
@@ -1933,7 +2300,66 @@ class DistributedJobSupervisor:
     def stop(self) -> None:
         self._terminate()
 
+    def _write_launch_manifest(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        try:
+            _write_launch_manifest(
+                self.state_dir,
+                self.deployment,
+                launcher_pid=process.pid,
+                api_port=self.port,
+            )
+        except OSError as exc:
+            # The manifest is the crashed-coordinator recovery path; losing
+            # it must not fail an otherwise healthy launch.
+            logger.warning("Could not write the launch manifest: %s", exc)
+
+    def _remove_launch_manifest(self) -> None:
+        with suppress(OSError):
+            _launch_manifest_path(
+                self.state_dir,
+                self.deployment.deployment_id,
+            ).unlink(missing_ok=True)
+
+    def _sweep_rank_leftovers(self, *, kill_grace: float = 3.0) -> list[str]:
+        """Kill rank processes that outlived the launcher group.
+
+        Returns failure descriptions; empty means nothing resident remains.
+        """
+
+        return _sweep_rank_processes(
+            self.deployment.deployment_id,
+            [
+                {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+                for rank, host in enumerate(self.deployment.hosts)
+            ],
+            state_dir=self.state_dir,
+            plan_hash=self.deployment.plan_hash,
+            kill_grace=kill_grace,
+        )
+
     def _terminate(self) -> None:
+        """Tear the job down and *prove* the teardown worked.
+
+        ``stop()`` used to report success after a best-effort SIGKILL: the
+        ``_wait_for_process_group_exit`` result was ignored, so a rank that
+        survived (unkillable Metal/JACCL kernel wait, D-state, or a
+        ``PermissionError`` that ``_process_group_alive`` deliberately reads
+        as alive) kept its unified-memory allocation resident while the
+        engine pool had already released the model's memory budget (G1).
+
+        Teardown now verifies the final SIGKILL, retries once, then sweeps
+        leftover rank processes by their runtime-marker pids — including
+        remote ranks, which killpg can never reach (G2). If anything still
+        survives, ``DistributedTeardownError`` is raised and the process
+        reference is kept so a later ``stop()`` retries the kill instead of
+        dropping all state. The launch manifest is removed only after
+        verified exit, so a crashed coordinator leaves ``reap_orphaned_
+        launches`` enough evidence to finish the job (G8).
+        """
+
         process = self.process
         if process is not None:
             process_group = process.pid
@@ -1951,10 +2377,38 @@ class DistributedJobSupervisor:
             # resident. Stop is complete only when the entire launch process
             # group has disappeared.
             remaining = max(0.0, deadline - time.monotonic())
-            if not _wait_for_process_group_exit(process_group, remaining):
+            group_gone = _wait_for_process_group_exit(process_group, remaining)
+            for attempt in (1, 2):
+                if group_gone:
+                    break
+                logger.error(
+                    "Distributed process group %d survived SIGKILL "
+                    "(attempt %d/2); %s",
+                    process_group,
+                    attempt,
+                    "retrying" if attempt == 1 else "sweeping rank markers",
+                )
                 with suppress(ProcessLookupError):
                     os.killpg(process_group, signal.SIGKILL)
-                _wait_for_process_group_exit(process_group, 2.0)
+                group_gone = _wait_for_process_group_exit(process_group, 2.0)
+
+            # A rank that escaped the group (reparented before the kill)
+            # survives a verified group exit; sweep it by its marker pid.
+            leftovers = self._sweep_rank_leftovers()
+            if not group_gone and not _process_group_alive(process_group):
+                group_gone = True
+            if not group_gone or leftovers:
+                problems = []
+                if not group_gone:
+                    problems.append(
+                        f"process group {process_group} survived SIGKILL twice"
+                    )
+                problems.extend(leftovers)
+                raise DistributedTeardownError(
+                    f"distributed teardown of "
+                    f"{self.deployment.deployment_id} could not be verified: "
+                    + "; ".join(problems)
+                )
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=2.0)
@@ -1973,6 +2427,7 @@ class DistributedJobSupervisor:
         self.rank_ready_events.clear()
         self.failure_event = None
         self._phase = "stopped"
+        self._remove_launch_manifest()
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None
