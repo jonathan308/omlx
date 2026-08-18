@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -16,6 +17,7 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.liveness import read_marker
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -24,6 +26,32 @@ logger = logging.getLogger(__name__)
 
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
+
+
+class DistributedRequestAborted(DistributedInferenceError):
+    """Raised into a proxied request the coordinator has aborted."""
+
+
+class _DistributedRequestState:
+    """Coordinator-side tracking for one proxied request.
+
+    The local engine path has per-request abort and an orphan-collector
+    reaper through AsyncEngineCore; the distributed path had neither (G3/G4).
+    This record is the handle ``abort_request`` acts on and the evidence the
+    orphan reaper sweeps: ``finished_at`` stamps the moment the *backend*
+    finished, so a consumer that abandoned the generator instead of closing
+    it can be reaped after a grace period — pop-only, mirroring
+    ``AsyncEngineCore._reap_orphaned_collectors``.
+    """
+
+    __slots__ = ("request_id", "started_at", "finished_at", "response", "aborted")
+
+    def __init__(self, request_id: str, started_at: float) -> None:
+        self.request_id = request_id
+        self.started_at = started_at
+        self.finished_at: float | None = None
+        self.response: Any | None = None
+        self.aborted = False
 
 
 class DistributedBatchedEngine(BatchedEngine):
@@ -46,9 +74,13 @@ class DistributedBatchedEngine(BatchedEngine):
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
         request_read_timeout: float = 300.0,
+        abort_drain_timeout: float = 15.0,
+        orphan_reap_grace: float = 5.0,
     ) -> None:
         if request_read_timeout <= 0:
             raise ValueError("distributed request read timeout must be positive")
+        if abort_drain_timeout < 0 or orphan_reap_grace < 0:
+            raise ValueError("distributed abort timeouts must be non-negative")
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -72,6 +104,10 @@ class DistributedBatchedEngine(BatchedEngine):
         self._model_type: str | None = None
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
+        self._abort_drain_timeout = float(abort_drain_timeout)
+        self._orphan_reap_grace = float(orphan_reap_grace)
+        self._request_states: dict[str, _DistributedRequestState] = {}
+        self._next_request_seq = 0
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -484,13 +520,197 @@ class DistributedBatchedEngine(BatchedEngine):
             return f"<think>{reasoning_text}</think>{content_text}"
         return content_text
 
-    async def _enter_request(self) -> None:
+    async def _enter_request(self) -> str:
         async with self._active_lock:
             self._active_requests += 1
+            self._next_request_seq += 1
+            request_id = (
+                f"{self.deployment.deployment_id}-{self._next_request_seq}"
+            )
+            self._request_states[request_id] = _DistributedRequestState(
+                request_id,
+                time.monotonic(),
+            )
+            return request_id
 
-    async def _leave_request(self) -> None:
+    async def _leave_request(self, request_id: str | None = None) -> None:
         async with self._active_lock:
             self._active_requests = max(0, self._active_requests - 1)
+            if request_id is not None:
+                self._request_states.pop(request_id, None)
+
+    def _request_state(self, request_id: str) -> _DistributedRequestState | None:
+        return self._request_states.get(request_id)
+
+    def _raise_if_aborted(self, request_id: str) -> None:
+        state = self._request_states.get(request_id)
+        if state is not None and state.aborted:
+            raise DistributedRequestAborted(
+                f"distributed request {request_id} aborted by the coordinator"
+            )
+
+    def _mark_backend_finished(self, request_id: str) -> None:
+        """Stamp backend completion so the orphan reaper can sweep strays."""
+
+        state = self._request_states.get(request_id)
+        if state is not None and state.finished_at is None:
+            state.finished_at = time.monotonic()
+
+    def reap_orphaned_generators(
+        self,
+        *,
+        now: float | None = None,
+        grace: float | None = None,
+    ) -> int:
+        """Drop requests whose backend finished but whose consumer vanished.
+
+        Parallel to ``AsyncEngineCore._reap_orphaned_collectors``: when the
+        SSE generator chain is abandoned rather than closed, the ``finally``
+        that calls ``_leave_request`` only runs at GC time, so
+        ``_active_requests`` leaks and quiescence-gated unload blocks (G4) —
+        or worse, unblocks spuriously. Pop-only: any request whose backend
+        finished more than ``grace`` ago but is still tracked is reaped. A
+        live consumer drains in the same event-loop turn the backend
+        finishes, so the grace period cannot race it.
+        """
+
+        if not self._request_states:
+            return 0
+        current = time.monotonic() if now is None else now
+        limit = self._orphan_reap_grace if grace is None else grace
+        stale = [
+            request_id
+            for request_id, state in self._request_states.items()
+            if state.finished_at is not None
+            and current - state.finished_at >= limit
+        ]
+        for request_id in stale:
+            self._request_states.pop(request_id, None)
+            self._active_requests = max(0, self._active_requests - 1)
+        if stale:
+            logger.warning(
+                "Reaped %d orphaned distributed request(s) after consumer "
+                "abandonment: %s",
+                len(stale),
+                stale,
+            )
+        return len(stale)
+
+    def rank_side_active_requests(self) -> int | None:
+        """Active requests as rank zero's telemetry reports them, if known.
+
+        The coordinator's own counter only proves the httpx side closed;
+        the rank-0 marker's ``metrics.active_requests`` is the rank-side
+        quiescence evidence an abort or unload should wait for (G5).
+        """
+
+        marker = read_marker(
+            Path(self._supervisor.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-rank-0.json"
+        )
+        if not isinstance(marker, dict):
+            return None
+        metrics = marker.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        active = metrics.get("active_requests")
+        if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
+            return active
+        return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one proxied request and close only its backend connection.
+
+        The abort flag ends the local generator at the next yield boundary;
+        closing the request's own connection makes the rank-0 handler reach
+        its ``finally`` and cancel the generation context through MLX-LM's
+        batch-loop removal — a step boundary every rank reaches, never a
+        mid-collective sever. Other in-flight requests keep their
+        connections (the old whole-client close in abort_all_requests is
+        retained there only as the nuclear option).
+        """
+
+        state = self._request_states.get(request_id)
+        if state is None:
+            return False
+        state.aborted = True
+        response = state.response
+        if response is not None:
+            with suppress(Exception):
+                await response.aclose()
+        logger.info(
+            "Aborted distributed request %s (%s)",
+            request_id,
+            reason or error_code or "no reason given",
+        )
+        return True
+
+    def _write_rank_cancel_request(self, *, reason: str | None) -> Path | None:
+        """Ask rank zero to force-cancel every active request at a step boundary.
+
+        The rank's telemetry heartbeat consumes this file and cancels through
+        ``BatchGenerator.remove`` — MLX-LM's own cancel path, which the batch
+        loop applies at a step boundary and shares with peer ranks. This is
+        the backstop for a handler wedged in a collective that never reaches
+        its disconnect ``finally`` (G3).
+        """
+
+        root = Path(self._supervisor.state_dir).expanduser()
+        path = root / f"{self.deployment.deployment_id}-cancel.json"
+        payload = {
+            "schema_version": 1,
+            "deployment_id": self.deployment.deployment_id,
+            "plan_hash": self.deployment.plan_hash,
+            "epoch": int(time.time() * 1000),
+            "scope": "all",
+            "reason": reason or "coordinator abort_all_requests",
+        }
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True)
+            os.replace(temporary, path)
+        except OSError as exc:
+            logger.warning("Could not write the rank cancel request: %s", exc)
+            return None
+        return path
+
+    async def _wait_for_backend_drain(self, *, timeout: float) -> bool:
+        """Wait for local generators AND rank-side telemetry to reach zero.
+
+        Client close alone never proved the ranks stopped generating (G5).
+        Drain is confirmed only when the coordinator counter is zero and the
+        rank-0 marker reports no active requests.
+        """
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            self.reap_orphaned_generators()
+            local_active = self._active_requests
+            rank_active = self.rank_side_active_requests()
+            if local_active == 0 and rank_active == 0:
+                return True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Distributed backend drain unconfirmed after %.1fs "
+                    "(local active=%d, rank-zero active=%s)",
+                    timeout,
+                    local_active,
+                    "unknown" if rank_active is None else rank_active,
+                )
+                return False
+            await asyncio.sleep(0.1)
+
 
     async def chat(
         self,
@@ -539,13 +759,15 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        await self._enter_request()
+        request_id = await self._enter_request()
         started_at = time.monotonic()
         try:
             response = await client.post("/v1/chat/completions", json=payload)
             self._raise_for_backend(response)
+            self._raise_if_aborted(request_id)
             body = response.json()
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
             raise await self._transport_failure_error(
@@ -557,7 +779,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend returned invalid chat JSON"
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         try:
             choice = body["choices"][0]
@@ -646,15 +869,19 @@ class DistributedBatchedEngine(BatchedEngine):
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
 
-        await self._enter_request()
+        request_id = await self._enter_request()
         try:
             async with client.stream(
                 "POST", "/v1/chat/completions", json=payload
             ) as response:
+                state = self._request_state(request_id)
+                if state is not None:
+                    state.response = response
                 if response.status_code >= 400:
                     await response.aread()
                 self._raise_for_backend(response)
                 async for line in response.aiter_lines():
+                    self._raise_if_aborted(request_id)
                     if not line.startswith("data:"):
                         continue
                     data = line.removeprefix("data:").strip()
@@ -775,6 +1002,7 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend emitted invalid chat token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
             raise await self._transport_failure_error(
@@ -782,7 +1010,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 stream=True,
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         pending_final_text = ""
         if reasoning_open:
@@ -843,13 +1072,15 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        await self._enter_request()
+        request_id = await self._enter_request()
         started_at = time.monotonic()
         try:
             response = await client.post("/v1/completions", json=payload)
             self._raise_for_backend(response)
+            self._raise_if_aborted(request_id)
             body = response.json()
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
             raise await self._transport_failure_error(
@@ -861,7 +1092,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend returned invalid completion JSON"
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         try:
             choice = body["choices"][0]
@@ -921,15 +1153,19 @@ class DistributedBatchedEngine(BatchedEngine):
         first_token_at: float | None = None
         request_started_at = time.monotonic()
 
-        await self._enter_request()
+        request_id = await self._enter_request()
         try:
             async with client.stream(
                 "POST", "/v1/completions", json=payload
             ) as response:
+                state = self._request_state(request_id)
+                if state is not None:
+                    state.response = response
                 if response.status_code >= 400:
                     await response.aread()
                 self._raise_for_backend(response)
                 async for line in response.aiter_lines():
+                    self._raise_if_aborted(request_id)
                     if not line.startswith("data:"):
                         continue
                     data = line.removeprefix("data:").strip()
@@ -1006,6 +1242,7 @@ class DistributedBatchedEngine(BatchedEngine):
                 "rank-zero backend emitted invalid token counts"
             ) from exc
         except httpx.ReadTimeout as exc:
+            self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
             raise await self._transport_failure_error(
@@ -1013,7 +1250,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 stream=True,
             ) from exc
         finally:
-            await self._leave_request()
+            self._mark_backend_finished(request_id)
+            await self._leave_request(request_id)
 
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
@@ -1116,7 +1354,27 @@ class DistributedBatchedEngine(BatchedEngine):
         return None
 
     def has_active_requests(self) -> bool:
+        # Sweep finished-but-abandoned requests first so a leaked generator
+        # cannot hold quiescence-gated unload open forever (G4).
+        self.reap_orphaned_generators()
         return self._active_requests > 0
+
+    def _cancel_backend_after_timeout(self, request_id: str) -> None:
+        """Follow a read timeout with a rank-side cancel (G5).
+
+        httpx closing its side never proved the rank stopped generating; a
+        stalled rank keeps the request alive (KV growth, prompt-cache churn)
+        with nobody reading. A 300 s inactivity bound means the rank is
+        stalled, not merely slow — keepalive frames rule that out — so the
+        coordinator-level cancel file is the proportionate follow-up.
+        """
+
+        state = self._request_states.get(request_id)
+        if state is not None:
+            state.aborted = True
+        self._write_rank_cancel_request(
+            reason=f"read timeout on {request_id}; possible rank stall"
+        )
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -1137,13 +1395,30 @@ class DistributedBatchedEngine(BatchedEngine):
         reason: str | None = None,
         error_code: str | None = None,
     ) -> int:
-        # Closing the private client disconnects all rank-zero handlers. The
-        # MLX-LM handler cancels their generation contexts in ``finally``.
+        """Abort everything in flight and confirm the backend drained.
+
+        Three layers, in order: (1) flag every tracked request so its local
+        generator stops at the next yield boundary; (2) drop the rank-side
+        cancel file so rank 0 force-cancels through ``BatchGenerator.remove``
+        at a batch step boundary even if a handler is wedged in a collective
+        and never reaches its disconnect ``finally``; (3) close the shared
+        client, disconnecting every rank-zero handler. Then wait — bounded —
+        for both the coordinator counter and rank-side telemetry to report
+        zero active requests instead of trusting the client close (G5).
+        """
+
+        self.reap_orphaned_generators()
         active = self._active_requests
+        for state in self._request_states.values():
+            state.aborted = True
+        self._write_rank_cancel_request(reason=reason or error_code)
         client, self._client = self._client, None
         if client is not None:
             await client.aclose()
             endpoint = self._supervisor.endpoint
             if endpoint is not None and self._loaded:
                 self._client = self._new_client(endpoint)
+        rank_active = self.rank_side_active_requests()
+        if active or (rank_active or 0) > 0:
+            await self._wait_for_backend_drain(timeout=self._abort_drain_timeout)
         return active
