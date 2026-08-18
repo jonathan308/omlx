@@ -3,7 +3,9 @@
 
 import contextlib
 import json
+import os
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +21,7 @@ from omlx.cluster.inference_worker import (
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
     _watch_launcher_parent,
+    _write_cancel_request,
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
@@ -1110,3 +1113,109 @@ def test_the_marker_is_removed_when_the_rank_exits_cleanly(monkeypatch, tmp_path
     _run_rank(monkeypatch, tmp_path, rank=0)
 
     assert list(tmp_path.glob("*.json")) == []
+
+
+def test_launcher_watchdog_fires_on_a_stale_launcher_lease(tmp_path):
+    updates: list[tuple[str, dict]] = []
+    events: list[dict] = []
+    exit_codes: list[int] = []
+    aborts: list[str] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    stale = time.time() - 120.0
+    os.utime(lease, (stale, stale))
+
+    _watch_launcher_parent(
+        42,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=lambda _seconds: None,
+        exit_process=exit_codes.append,
+        emit_event=events.append,
+        on_abort=aborts.append,
+    )
+
+    assert updates[0][0] == "launcher_lost"
+    assert "stale" in updates[0][1]["error"]
+    # The abort stage ran before the exit stage.
+    assert len(aborts) == 1
+    assert events[0]["type"] == "launcher_lost"
+    assert exit_codes == [1]
+
+
+def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+
+    polls = [0]
+
+    class StopLoop(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=lease,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
+    exit_codes: list[int] = []
+    marker = SimpleNamespace(update=lambda phase, **extra: None)
+    missing = tmp_path / "not-yet-created-lease.json"
+
+    polls = [0]
+
+    class StopLoop(Exception):
+        pass
+
+    def wait(_seconds):
+        polls[0] += 1
+        if polls[0] >= 3:
+            raise StopLoop
+
+    with pytest.raises(StopLoop):
+        _watch_launcher_parent(
+            42,
+            marker,
+            watched_marker_path=missing,
+            marker_stale_after=45.0,
+            get_parent_pid=lambda: 42,
+            wait=wait,
+            exit_process=exit_codes.append,
+            emit_event=lambda _event: None,
+        )
+
+    assert exit_codes == []
+
+
+def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
+    _write_cancel_request(str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64)
+
+    payload = json.loads((tmp_path / "dep-9-cancel.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["deployment_id"] == "dep-9"
+    assert payload["plan_hash"] == "e" * 64
+    assert payload["scope"] == "all"
+    assert isinstance(payload["epoch"], int) and payload["epoch"] > 0
+    assert payload["reason"] == "peer watchdog test"
