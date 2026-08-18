@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import tempfile
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -145,6 +147,9 @@ def _stalled_engine():
         raise httpx.ReadTimeout("collective stalled", request=request)
 
     engine = _ready_engine(handler)
+    # Read timeouts now drop a rank-side cancel file; keep it out of the
+    # real runtime state dir.
+    engine._supervisor.state_dir = tempfile.mkdtemp(prefix="omlx-test-runtime-")
     status_calls = []
 
     def status():
