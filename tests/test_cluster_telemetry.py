@@ -554,3 +554,130 @@ def test_serving_starts_the_heartbeat_without_the_caller_asking(monkeypatch):
     settled = marker.count()
     time.sleep(0.1)
     assert marker.count() == settled, "the heartbeat outlived the serving block"
+
+
+class _BatchGenerator:
+    def __init__(self) -> None:
+        self.removed = []
+
+    def remove(self, uids):
+        self.removed.append(list(uids))
+
+
+def _cancel_telemetry(tmp_path, clock=None):
+    marker = _Marker()
+    telemetry = RuntimeTelemetry(
+        marker,
+        clock=clock or _Clock(),
+        publish_interval=0,
+        cancel_path=tmp_path / "dep-1-cancel.json",
+        cancel_deployment_id="dep-1",
+    )
+    return telemetry
+
+
+def test_force_cancel_all_removes_active_uids_through_the_batch_loop(tmp_path):
+    telemetry = _cancel_telemetry(tmp_path)
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((73,))
+
+    cancelled = telemetry.force_cancel_all(reason="test")
+
+    assert cancelled == 1
+    assert generator.removed == [[73]]
+    # remove() routes back through cancel_uids in production; here the
+    # fake does not, so the request is still tracked until it does.
+    telemetry.cancel_uids([73])
+    assert telemetry._requests == {}
+    assert telemetry._requests_cancelled == 1
+
+
+def test_force_cancel_all_without_generator_or_uids_is_a_noop(tmp_path):
+    telemetry = _cancel_telemetry(tmp_path)
+
+    assert telemetry.force_cancel_all(reason="test") == 0
+
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    assert telemetry.force_cancel_all(reason="test") == 0
+    assert generator.removed == []
+
+
+def test_force_cancel_all_survives_a_failing_batch_loop(tmp_path):
+    telemetry = _cancel_telemetry(tmp_path)
+
+    class BrokenGenerator:
+        def remove(self, uids):
+            raise RuntimeError("wedged")
+
+    telemetry.register_batch_generator(BrokenGenerator())
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((5,))
+
+    assert telemetry.force_cancel_all(reason="test") == 0
+    # The request stays tracked; the coordinator's process teardown is the
+    # fallback for this failure mode.
+    assert request_id in telemetry._requests
+
+
+def test_cancel_file_is_consumed_once_and_acked(tmp_path):
+    import json
+
+    telemetry = _cancel_telemetry(tmp_path)
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((9,))
+
+    cancel_path = tmp_path / "dep-1-cancel.json"
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "epoch": 42,
+                "scope": "all",
+                "reason": "memory pressure",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert generator.removed == [[9]]
+    ack = json.loads(
+        (tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8")
+    )
+    assert ack["epoch"] == 42
+    assert ack["cancelled"] == 1
+
+    # Same epoch is not consumed twice.
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+    assert generator.removed == [[9]]
+
+
+def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
+    import json
+
+    telemetry = _cancel_telemetry(tmp_path)
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    (tmp_path / "dep-1-cancel.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "somebody-else",
+                "epoch": 7,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+    assert generator.removed == []

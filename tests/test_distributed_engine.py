@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import tempfile
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -102,6 +104,9 @@ def _stalled_engine():
         raise httpx.ReadTimeout("collective stalled", request=request)
 
     engine = _ready_engine(handler)
+    # Read timeouts now drop a rank-side cancel file; keep it out of the
+    # real runtime state dir.
+    engine._supervisor.state_dir = tempfile.mkdtemp(prefix="omlx-test-runtime-")
     status_calls = []
 
     def status():
@@ -641,3 +646,179 @@ async def test_distributed_preflight_rejects_features_before_stream_starts():
             )
     finally:
         await engine._client.aclose()
+
+
+def _rank_zero_marker(active_requests: int) -> dict:
+    return {
+        "schema_version": 1,
+        "deployment_id": "engine-test",
+        "pid": 424242,
+        "rank": 0,
+        "world_size": 2,
+        "model": "org/model",
+        "backend": "ring",
+        "plan_hash": "d" * 64,
+        "phase": "ready",
+        "updated_at": "2026-08-17T00:00:00+00:00",
+        "metrics": {"active_requests": active_requests},
+    }
+
+
+@pytest.mark.asyncio
+async def test_abort_request_flags_and_closes_only_that_request(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    first = await engine._enter_request()
+    second = await engine._enter_request()
+    closed = []
+
+    class FakeResponse:
+        async def aclose(self):
+            closed.append(True)
+
+    engine._request_states[first].response = FakeResponse()
+
+    assert await engine.abort_request(first, reason="test") is True
+    assert engine._request_states[first].aborted is True
+    assert engine._request_states[second].aborted is False
+    assert closed == [True]
+    assert await engine.abort_request("engine-test-999") is False
+
+    await engine._leave_request(first)
+    await engine._leave_request(second)
+    await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_aborted_stream_raises_at_the_next_yield_boundary(tmp_path):
+    events = [
+        {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": " world"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "!"}, "finish_reason": "stop"}]},
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    engine = _ready_engine(handler)
+    engine._supervisor.state_dir = str(tmp_path)
+    try:
+        stream = engine.stream_chat([{"role": "user", "content": "hi"}])
+        first = await stream.__anext__()
+        assert first.new_text == "hello"
+        request_id = next(iter(engine._request_states))
+        assert await engine.abort_request(request_id, reason="operator") is True
+        with pytest.raises(distributed.DistributedRequestAborted):
+            await stream.__anext__()
+        # The abort unwound the generator's finally: the counter drained.
+        assert engine._active_requests == 0
+        assert engine.has_active_requests() is False
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_abort_all_writes_cancel_file_and_swaps_client(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    old_client = engine._client
+
+    count = await engine.abort_all_requests(reason="unload requested")
+
+    assert count == 0
+    assert engine._client is not old_client
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["deployment_id"] == "engine-test"
+    assert payload["scope"] == "all"
+    assert payload["reason"] == "unload requested"
+    assert payload["epoch"] > 0
+    await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_backend_drain_waits_for_rank_side_evidence(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    (tmp_path / "engine-test-rank-0.json").write_text(
+        json.dumps(_rank_zero_marker(0)), encoding="utf-8"
+    )
+    try:
+        assert await engine._wait_for_backend_drain(timeout=1.0) is True
+
+        (tmp_path / "engine-test-rank-0.json").write_text(
+            json.dumps(_rank_zero_marker(2)), encoding="utf-8"
+        )
+        started = time.monotonic()
+        assert await engine._wait_for_backend_drain(timeout=0.3) is False
+        assert time.monotonic() - started >= 0.3
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_abort_all_reports_rank_side_survivors(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    engine._abort_drain_timeout = 0.2
+    (tmp_path / "engine-test-rank-0.json").write_text(
+        json.dumps(_rank_zero_marker(1)), encoding="utf-8"
+    )
+    try:
+        # No local requests, but the rank still reports one: the drain wait
+        # must engage and expire unconfirmed rather than trust client close.
+        count = await engine.abort_all_requests(reason="memory pressure")
+        assert count == 0
+    finally:
+        await engine._client.aclose()
+
+
+def test_orphan_reaper_drops_finished_but_abandoned_requests():
+    engine = DistributedBatchedEngine(_deployment())
+    abandoned = distributed._DistributedRequestState("a", 100.0)
+    abandoned.finished_at = 100.0
+    live = distributed._DistributedRequestState("b", 100.0)
+    fresh = distributed._DistributedRequestState("c", 100.0)
+    fresh.finished_at = 199.0
+    engine._request_states.update({"a": abandoned, "b": live, "c": fresh})
+    engine._active_requests = 3
+
+    reaped = engine.reap_orphaned_generators(now=200.0, grace=5.0)
+
+    assert reaped == 1
+    assert set(engine._request_states) == {"b", "c"}
+    assert engine._active_requests == 2
+
+
+def test_orphan_reaper_runs_from_has_active_requests():
+    engine = DistributedBatchedEngine(_deployment())
+    stale = distributed._DistributedRequestState("a", 0.0)
+    stale.finished_at = 0.0
+    engine._request_states["a"] = stale
+    engine._active_requests = 1
+
+    assert engine.has_active_requests() is False
+    assert engine._request_states == {}
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_drops_rank_side_cancel_file(tmp_path):
+    engine, _ = _stalled_engine()
+    engine._supervisor.state_dir = str(tmp_path)
+    try:
+        with pytest.raises(DistributedInferenceError):
+            await engine.generate("hello")
+    finally:
+        await engine._client.aclose()
+
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+    assert payload["scope"] == "all"
+    assert "read timeout" in payload["reason"]
