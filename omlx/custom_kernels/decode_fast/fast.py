@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Decode fast-path kernels (fused residual+RMS norm, ...) with fallback.
 
 Ports of the user's closed-unmerged mlx core PRs so omlx ships the fusion

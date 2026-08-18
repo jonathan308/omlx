@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.27)
 
 project(omlx_decode_fast_kernels LANGUAGES CXX)
