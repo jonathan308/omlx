@@ -11,12 +11,19 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
+
+import json
+import os
 
 from .performance import ExecutionSettings
 from .planner import PipelineAssignment
 
 logger = logging.getLogger(__name__)
+
+# Bounded read for the coordinator's cancel-request file.
+_MAX_CANCEL_FILE_BYTES = 64 * 1024
 
 # How often a rank refreshes its marker with nothing to report.
 #
@@ -70,6 +77,8 @@ class RuntimeTelemetry:
         execution: ExecutionSettings | None = None,
         assignment: PipelineAssignment | None = None,
         heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
+        cancel_path: Path | None = None,
+        cancel_deployment_id: str = "",
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -108,6 +117,17 @@ class RuntimeTelemetry:
         self._cache_tokens_reused = 0
         self._cache_entries = 0
         self._cache_bytes = 0
+        # Rank-side force-cancel surface. The coordinator drops a cancel file
+        # next to the runtime markers; the heartbeat picks it up and removes
+        # every active uid through BatchGenerator.remove — MLX-LM's own
+        # cancel path, which lands at a batch step boundary and is shared
+        # with peer ranks, so cancellation never severs a collective
+        # mid-request.
+        self._batch_generator: Any | None = None
+        self._cancel_path = cancel_path
+        self._cancel_deployment_id = cancel_deployment_id
+        self._last_cancel_epoch = 0
+        self._last_cancel_poll_at = float("-inf")
 
     def heartbeat(self) -> None:
         """Refresh the marker with nothing new to say.
@@ -118,6 +138,9 @@ class RuntimeTelemetry:
         """
 
         now = float(self._clock())
+        # A coordinator cancel request is picked up here even when no
+        # request event is driving publishes (e.g. a wedged handler).
+        self.poll_cancel_requests(min_interval=0.0)
         with self._lock:
             self._publish_locked(now, force=True)
 
@@ -320,6 +343,120 @@ class RuntimeTelemetry:
             if changed:
                 self._publish_locked(now, force=True)
 
+    def register_batch_generator(self, generator: Any) -> None:
+        """Remember the live BatchGenerator so force-cancel can reach it."""
+
+        with self._lock:
+            self._batch_generator = generator
+
+    def force_cancel_all(self, *, reason: str = "coordinator cancel") -> int:
+        """Remove every active uid through MLX-LM's own cancel path.
+
+        ``BatchGenerator.remove`` is the same call MLX-LM handlers make on
+        client disconnect: it is processed by the batch loop at a step
+        boundary and shared with peer ranks, so both sides of the pipeline
+        abandon the request together and no collective is severed
+        mid-request. Returns the number of uids handed to the batch loop.
+        """
+
+        with self._lock:
+            generator = self._batch_generator
+            uids = [
+                uid
+                for request_id, uid in self._request_to_uid.items()
+                if request_id in self._requests
+            ]
+        if generator is None or not uids:
+            return 0
+        try:
+            generator.remove(list(uids))
+        except Exception as exc:
+            # A cancel that failed must be loud but must not kill the rank;
+            # the coordinator falls back to process teardown.
+            logger.warning("Rank-side force-cancel failed: %s", exc)
+            return 0
+        logger.warning(
+            "Force-cancelled %d active rank-side request(s): %s",
+            len(uids),
+            reason,
+        )
+        return len(uids)
+
+    def _read_cancel_request(self) -> dict[str, Any] | None:
+        path = self._cancel_path
+        if path is None:
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if len(raw.encode()) > _MAX_CANCEL_FILE_BYTES:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return None
+        if (
+            self._cancel_deployment_id
+            and payload.get("deployment_id") != self._cancel_deployment_id
+        ):
+            return None
+        epoch = payload.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            return None
+        return payload
+
+    def _write_cancel_ack(self, *, epoch: int, cancelled: int) -> None:
+        path = self._cancel_path
+        if path is None:
+            return
+        ack = path.with_name(path.stem + "-ack.json")
+        payload = {
+            "schema_version": 1,
+            "deployment_id": self._cancel_deployment_id,
+            "epoch": epoch,
+            "cancelled": cancelled,
+            "at": time.time(),
+        }
+        try:
+            temporary = ack.with_name(ack.name + ".tmp")
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True)
+            os.replace(temporary, ack)
+        except OSError:
+            # The ack is advisory; the marker's active_requests count is the
+            # authoritative drain evidence.
+            return
+
+    def poll_cancel_requests(self, *, min_interval: float = 1.0) -> int:
+        """Consume the coordinator's cancel file, at most one read a second.
+
+        Each epoch is consumed once. The ack file lets the coordinator
+        confirm the cancel reached the rank without guessing.
+        """
+
+        now = float(self._clock())
+        if now - self._last_cancel_poll_at < max(0.0, min_interval):
+            return 0
+        self._last_cancel_poll_at = now
+        payload = self._read_cancel_request()
+        if payload is None:
+            return 0
+        epoch = payload["epoch"]
+        if epoch <= self._last_cancel_epoch:
+            return 0
+        self._last_cancel_epoch = epoch
+        cancelled = self.force_cancel_all(
+            reason=str(payload.get("reason") or "coordinator cancel")
+        )
+        self._write_cancel_ack(epoch=epoch, cancelled=cancelled)
+        return cancelled
+
     def observe_batch_step(
         self,
         *,
@@ -329,6 +466,9 @@ class RuntimeTelemetry:
     ) -> None:
         """Record one coalesced MLX-LM continuous-batching step."""
 
+        # Throttled to one read a second; gives a coordinator cancel ~1 s
+        # latency while the batch loop is actively stepping.
+        self.poll_cancel_requests()
         now = float(self._clock())
         elapsed = max(0.0, float(elapsed_seconds))
         with self._lock:
@@ -659,11 +799,24 @@ def install_server_telemetry(
     original_prompt_cache = mlx_server.LRUPromptCache
     original_generation_context = mlx_server.GenerationContext
     cancellation_state = threading.local()
+    marker_path = getattr(marker, "path", None)
+    marker_payload = getattr(marker, "payload", None)
+    marker_deployment_id = (
+        str(marker_payload.get("deployment_id") or "")
+        if isinstance(marker_payload, dict)
+        else ""
+    )
     telemetry = RuntimeTelemetry(
         marker,
         execution=execution,
         assignment=assignment,
         heartbeat_interval=heartbeat_interval,
+        cancel_path=(
+            Path(marker_path).parent / f"{marker_deployment_id}-cancel.json"
+            if marker_path is not None and marker_deployment_id
+            else None
+        ),
+        cancel_deployment_id=marker_deployment_id,
     )
 
     snapshot_ctx = threading.local()
@@ -731,6 +884,7 @@ def install_server_telemetry(
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
+            telemetry.register_batch_generator(self)
 
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
