@@ -12,6 +12,8 @@ cluster surface.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import threading
 import time
 from typing import Any
@@ -20,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .._version import __version__
 from ..admin.auth import require_admin
+from .discovery import local_addr_dicts
 from .identity import get_node_identity
 from .registry import get_device_registry
 
@@ -135,6 +138,87 @@ async def cluster_discovery_health(is_admin: bool = Depends(require_admin)):
     }
 
 
+@discovery_router.get("/discovery/health/detail")
+async def cluster_discovery_health_detail(
+    is_admin: bool = Depends(require_admin),
+):
+    """Extended discovery self-diagnostics (loop liveness, TX health).
+
+    Separate route so the pinned wizard fixture shape on
+    ``/discovery/health`` stays untouched. This is how "no peers nearby" is
+    distinguished from "discovery loop dead / socket wedged / interface
+    renumbered underneath us" in the field.
+    """
+
+    service = discovery_service_or_none()
+    if service is None:
+        raise HTTPException(status_code=503, detail="discovery is disabled")
+    return service.health()
+
+
+@discovery_router.post("/devices/manual")
+async def cluster_add_manual_peer(
+    request: Request, is_admin: bool = Depends(require_admin)
+):
+    """Manually add a peer by IP — the deterministic path over Thunderbolt.
+
+    Multicast is best-effort on macOS (Local Network permission, interface
+    renumbering, routers that filter v6 multicast). When two machines share
+    a direct Thunderbolt link, pointing each node at the other's link
+    address (typically the 10.0.0.x pair) skips all of that. The candidate
+    is verified through the same HTTP probe path as multicast-discovered
+    peers before it is returned as verified.
+    """
+
+    service = discovery_service_or_none()
+    if service is None:
+        raise HTTPException(status_code=503, detail="discovery is disabled")
+    client = request.client.host if request.client else "unknown"
+    if not probe_rate_limiter.allow(client):
+        raise HTTPException(
+            status_code=429,
+            detail="probe rate limit exceeded",
+            headers={"Retry-After": "1"},
+        )
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    raw_ip = body.get("ip")
+    try:
+        ip = str(ipaddress.ip_address(str(raw_ip)))
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"invalid IP address: {raw_ip!r}"
+        )
+    port = body.get("port", 8000)
+    if not isinstance(port, int) or isinstance(port, bool) or not (
+        1 <= port <= 65535
+    ):
+        raise HTTPException(status_code=400, detail="invalid port")
+    service.add_manual(ip, port)
+    # Probe synchronously (bounded by the configured probe timeout) so the
+    # caller learns immediately whether the address answers as an oMLX node.
+    await asyncio.to_thread(service.probe_now)
+    peer = next(
+        (
+            p
+            for p in service.peers()
+            if any(a["ip"] == ip for a in p.addrs)
+        ),
+        None,
+    )
+    return {
+        "ok": True,
+        "ip": ip,
+        "port": port,
+        "verified": peer is not None,
+        "peer": peer.to_dict() if peer is not None else None,
+    }
+
+
 @discovery_router.get("/devices")
 async def cluster_devices(is_admin: bool = Depends(require_admin)):
     """Cluster device inventory for the wizard UI.
@@ -193,7 +277,7 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
         "version": __version__,
         "cluster_name": _cluster_name(),
         "caps": service.config.caps.to_dict() if service is not None else {},
-        "addrs": [],
+        "addrs": local_addr_dicts(),
         "http_port": service.config.http_port if service is not None else 0,
         "paired": True,
         "last_seen": time.time(),

@@ -5,13 +5,19 @@ No real multicast, mDNS, or HTTP happens here: sockets, the probe function,
 the clock, interface listing, and tailscale status are all injected.
 """
 
+import errno
 import json
+import logging
 import socket
 import struct
+import time
 
 import pytest
 
 from omlx.cluster.discovery import (
+    MULTICAST_GROUP,
+    MULTICAST_PORT,
+    _TX_FAIL_RESET_ROUNDS,
     DiscoveryConfig,
     DiscoveryService,
     PeerCaps,
@@ -652,3 +658,197 @@ def test_mdns_start_failure_disables_mdns_without_killing_service():
     service._socket_factory = FakeSocket
     service.start()  # must not raise
     service.stop()
+
+
+# -- resilience: scoped sends, stale joins, supervision, self-heal ------------
+
+
+def test_send_hello_uses_scoped_4tuple_per_interface():
+    sock = FakeSocket()
+    service, _ = _service(socket_factory=lambda: sock)
+    service._joined = {"en5": 20, "en1": 26}
+
+    service._send_hello(sock)
+
+    targets = [addr for _, addr in sock.sent]
+    assert (MULTICAST_GROUP, MULTICAST_PORT, 0, 20) in targets
+    assert (MULTICAST_GROUP, MULTICAST_PORT, 0, 26) in targets
+    # The shared socket's IPV6_MULTICAST_IF must not be mutated per round;
+    # the scope id in the destination carries the egress interface instead.
+    assert not any(
+        len(opt) == 3 and opt[1] == socket.IPV6_MULTICAST_IF
+        for opt in sock.opts
+    )
+
+
+def test_send_hello_without_joins_uses_default_route_2tuple():
+    sock = FakeSocket()
+    service, _ = _service(socket_factory=lambda: sock)
+
+    service._send_hello(sock)
+
+    assert sock.sent[0][1] == (MULTICAST_GROUP, MULTICAST_PORT)
+
+
+def test_wassup_reply_preserves_link_local_scope_id():
+    sock = FakeSocket()
+    service, _ = _service(socket_factory=lambda: sock)
+
+    service._handle_hello(
+        42, service._cluster_hash, ("fe80::99", 53413, 0, 20), sock
+    )
+
+    assert len(sock.sent) == 1
+    assert sock.sent[0][1] == ("fe80::99", 53413, 0, 20)
+
+
+def test_sync_interfaces_rejoins_after_renumber(monkeypatch):
+    sock = FakeSocket()
+    service, _ = _service(interface_lister=lambda: ["en5"])
+    state = {"idx": 20}
+    monkeypatch.setattr(
+        socket, "if_nametoindex", lambda name: state["idx"]
+    )
+
+    service._sync_interfaces(sock)
+    assert service._joined == {"en5": 20}
+    assert len(sock.joined) == 1
+
+    state["idx"] = 21  # Thunderbolt hotplug renumbered the interface
+    service._sync_interfaces(sock)
+    assert service._joined == {"en5": 21}
+    assert len(sock.joined) == 2  # re-joined under the new index
+
+
+def test_sync_interfaces_drops_vanished_interfaces(monkeypatch):
+    sock = FakeSocket()
+    names = ["en5", "en1"]
+    service, _ = _service(interface_lister=lambda: names)
+    index_of = {"en5": 20, "en1": 26}
+    monkeypatch.setattr(
+        socket,
+        "if_nametoindex",
+        lambda name: index_of.get(name) or (_ for _ in ()).throw(OSError()),
+    )
+
+    service._sync_interfaces(sock)
+    assert set(service._joined) == {"en5", "en1"}
+
+    names.remove("en5")  # cable pulled / bridge torn down
+    service._sync_interfaces(sock)
+    assert set(service._joined) == {"en1"}
+
+
+class _FailingSocket(FakeSocket):
+    """Every send fails the way macOS reports a dead interface."""
+
+    def sendto(self, data, addr):
+        raise OSError(errno.EHOSTUNREACH, "No route to host")
+
+
+def test_send_failures_are_rate_limited(caplog):
+    sock = _FailingSocket()
+    service, clock = _service(socket_factory=lambda: sock)
+    service._joined = {"en0": 10}
+
+    with caplog.at_level(logging.DEBUG, logger="omlx.cluster.discovery"):
+        service._send_hello(sock)
+        clock.advance(5)
+        service._send_hello(sock)  # inside the 60s window: silent
+        assert (
+            sum("HELLO send on if" in r.getMessage() for r in caplog.records)
+            == 1
+        )
+        clock.advance(61)
+        service._send_hello(sock)
+        assert (
+            sum("HELLO send on if" in r.getMessage() for r in caplog.records)
+            == 2
+        )
+
+
+def test_consecutive_failed_rounds_request_socket_reset():
+    sock = _FailingSocket()
+    service, clock = _service(socket_factory=lambda: sock)
+    service._joined = {"en0": 10}
+
+    for _ in range(_TX_FAIL_RESET_ROUNDS):
+        service._send_hello(sock)
+        clock.advance(1)
+
+    assert service._needs_socket_reset is True
+    assert service._consecutive_tx_fail_rounds >= _TX_FAIL_RESET_ROUNDS
+    assert service._last_tx_error
+
+
+def test_successful_send_clears_fail_state():
+    sock = FakeSocket()
+    service, _ = _service(socket_factory=lambda: sock)
+    service._joined = {"en0": 10}
+    service._consecutive_tx_fail_rounds = 5
+    service._last_tx_error = "if 10: boom"
+
+    service._send_hello(sock)
+
+    assert service._consecutive_tx_fail_rounds == 0
+    assert service._last_tx_error is None
+    assert service._last_tx_ok_wall is not None
+
+
+def test_multicast_loop_rebuilds_wedged_socket():
+    socks = [FakeSocket(), FakeSocket()]
+    service, clock = _service(socket_factory=lambda: socks.pop(0))
+    service._needs_socket_reset = True
+    service.config.iface_poll_interval = 0.0
+    service.config.hello_interval = 0.0
+
+    service.start()
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if (
+                not service._needs_socket_reset
+                and service._socket is not None
+                and service._joined
+            ):
+                break
+            time.sleep(0.02)
+        assert service._needs_socket_reset is False
+        assert service._socket is not None
+        assert service._joined  # re-joined after the rebuild
+        health = service.health()
+        assert health["multicast_loop_alive"] is True
+        assert health["socket_open"] is True
+    finally:
+        service.stop()
+
+
+def test_spawned_thread_restarts_after_crash():
+    service, _ = _service()
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        service._stop.set()
+
+    service._spawn(flaky, "test-flaky")
+    deadline = time.time() + 8
+    while len(calls) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+    service.stop()
+
+    assert len(calls) == 2  # crashed once, supervised restart ran it again
+
+
+def test_health_reports_dead_loops_before_start():
+    service, _ = _service()
+
+    health = service.health()
+
+    assert health["multicast_loop_alive"] is False
+    assert health["maintenance_loop_alive"] is False
+    assert health["socket_open"] is False
+    assert health["joined_interfaces"] == []
+    assert health["consecutive_tx_fail_rounds"] == 0
