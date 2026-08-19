@@ -241,6 +241,12 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # the test suite calls them (production swaps via configure_*).
         ("identity.py", "reset_configured_identity"),
         ("registry.py", "reset_configured_device_registry"),
+        ("pairing.py", "reset_pairing_manager"),
+        # Test hook injecting a PairingManager double into the route module.
+        ("pairing_routes.py", "set_pairing_manager_getter"),
+        # Settings write path for cluster.json; the admin settings endpoint
+        # that calls it lands with the cluster settings UI.
+        ("discovery.py", "save_cluster_name"),
     }
 
     sources = {
