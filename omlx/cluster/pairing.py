@@ -408,9 +408,15 @@ class DeviceRegistryBridge:
     Each operation feature-detects the documented candidates in order and
     raises a clear error if none exist, so an API drift fails loudly at
     integration time rather than silently dropping peers.
+
+    Integration note: the real ``DeviceRegistry.mark_paired`` takes keyword
+    fields, not a record dict, and its ``merge`` only persists *already
+    paired* devices — routing a pairing approval through ``merge`` would
+    leave the new peer memory-only. ``mark_paired`` is therefore detected
+    first and called with the record's fields.
     """
 
-    _PUT = ("upsert", "merge", "put", "add", "set_paired", "mark_paired")
+    _PUT = ("upsert", "merge", "put", "add", "set_paired")
     _REMOVE = ("remove", "delete", "unpair", "drop")
     _GET = ("get", "device", "find")
     _LIST = ("list_paired", "paired", "list", "devices")
@@ -430,6 +436,16 @@ class DeviceRegistryBridge:
         )
 
     def put_paired(self, record: dict[str, Any]) -> None:
+        mark_paired = getattr(self._registry, "mark_paired", None)
+        if callable(mark_paired):
+            mark_paired(
+                record["node_id"],
+                friendly_name=record.get("friendly_name") or None,
+                caps=record.get("caps") or None,
+                addrs=record.get("last_addrs") or None,
+                paired_at=record.get("paired_at"),
+            )
+            return
         self._call(self._PUT, record)
 
     def get(self, node_id: str) -> dict[str, Any] | None:
@@ -512,13 +528,13 @@ def _fallback_identity(base_path: Path) -> dict[str, Any]:
 
 
 def load_node_identity(base_path: Path) -> dict[str, Any]:
-    """Prefer Module A's ``NodeIdentity.load_or_create``; fall back locally."""
+    """Prefer Module A's ``identity.load_or_create``; fall back locally."""
 
     try:
-        from .identity import NodeIdentity  # type: ignore[import-not-found]
+        from .identity import load_or_create as _load_or_create  # type: ignore[import-not-found]
     except ImportError:
         return _fallback_identity(base_path)
-    identity = NodeIdentity.load_or_create()
+    identity = _load_or_create(base_path / "cluster" / "identity.json")
     return {
         "node_id": identity.node_id,
         "friendly_name": identity.friendly_name,
