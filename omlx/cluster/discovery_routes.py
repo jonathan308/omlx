@@ -107,6 +107,33 @@ async def cluster_node_id_probe(request: Request):
     }
 
 
+@discovery_router.get("/discovery/health")
+async def cluster_discovery_health(is_admin: bool = Depends(require_admin)):
+    """Local-network self-test for the wizard's checks row.
+
+    ``multicast_rx_within_5s`` is False when no foreign HELLO arrived in the
+    last five seconds — on macOS that is how a denied Local Network
+    permission presents, so the UI pairs it with actionable guidance instead
+    of a silently empty device list. Shape is pinned by the wizard fixture
+    (tests/ui/fixtures/cluster_v2/discovery_health_ok.json).
+    """
+
+    service = discovery_service_or_none()
+    if service is None:
+        return {
+            "multicast_rx_within_5s": False,
+            "last_multicast_rx_at": None,
+            "mdns_active": False,
+            "transport": "disabled",
+        }
+    return {
+        "multicast_rx_within_5s": bool(service.multicast_ok),
+        "last_multicast_rx_at": service.last_multicast_rx_at,
+        "mdns_active": bool(service.mdns_active),
+        "transport": service.transport_summary(),
+    }
+
+
 @discovery_router.get("/devices")
 async def cluster_devices(is_admin: bool = Depends(require_admin)):
     """Cluster device inventory for the wizard UI.

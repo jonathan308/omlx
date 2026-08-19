@@ -840,6 +840,7 @@ class DiscoveryService:
         self._callbacks: list[Callable[[PeerRecord], None]] = []
         self._hash_mismatch_logged = False
         self._last_hello_at: float | None = None
+        self._last_hello_wall: float | None = None
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -867,6 +868,28 @@ class DiscoveryService:
         return last is not None and (
             self._clock() - last
         ) < self.config.multicast_window
+
+    @property
+    def last_multicast_rx_at(self) -> float | None:
+        """Wall-clock time of the last foreign HELLO, or None if never."""
+
+        return self._last_hello_wall
+
+    @property
+    def mdns_active(self) -> bool:
+        """True when our mDNS service announcement is actually registered."""
+
+        return self._zc_info is not None
+
+    def transport_summary(self) -> str:
+        """Active discovery transports, e.g. ``"mdns+multicast"``."""
+
+        parts: list[str] = []
+        if self.mdns_active:
+            parts.append("mdns")
+        if self.config.enable_multicast:
+            parts.append("multicast")
+        return "+".join(parts) if parts else "none"
 
     def peers(self) -> list[PeerRecord]:
         with self._lock:
@@ -1058,6 +1081,7 @@ class DiscoveryService:
             if nonce in self._nonces:
                 return  # nonce-echo self-drop: our own HELLO came back
         self._last_hello_at = self._clock()
+        self._last_hello_wall = time.time()
         peer_ip = addr[0] if isinstance(addr, tuple) else str(addr)
         # Answer unicast so the sender learns our node_id + http_port.
         reply = encode_wassup(
