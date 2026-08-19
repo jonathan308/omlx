@@ -212,6 +212,11 @@ def _model_identity_digest(model_path: str | Path) -> str:
     return hasher.hexdigest()
 
 
+# Public name for the digest; the manifest endpoint and peer comparison in
+# ``modelsync.py`` share this exact identity definition with staging.
+model_identity_digest = _model_identity_digest
+
+
 def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     """Read the full shard map from the index even on a partially staged rank."""
 
@@ -913,13 +918,18 @@ def stage_files_from_source(
     transfer: Any = scp_copy,
     progress: Callable[[str, str, int], None] | None = None,
     clock: Any = None,
+    destination_path: str | Path | None = None,
 ) -> StagingResult:
     """Stage one rank from a local or peer model holder and verify every file."""
 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
-    destination_dir = str(Path(model_path).expanduser())
+    destination_dir = str(
+        Path(destination_path).expanduser()
+        if destination_path is not None
+        else Path(model_path).expanduser()
+    )
     expected = dict(expected_sizes)
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
@@ -943,6 +953,7 @@ def stage_files_from_source(
             parallel=parallel,
             progress=progress,
             clock=clock,
+            destination_path=destination_path,
         )
 
     present = (
@@ -1124,19 +1135,28 @@ def stage_remote_files(
     present_reader: Callable[[str, str], dict[str, int]] = remote_file_sizes,
     progress: Callable[[str, str, int], None] | None = None,
     clock: Any = None,
+    destination_path: str | Path | None = None,
 ) -> StagingResult:
     """Push and verify every file one remote rank needs.
 
     The coordinator owns the source model and the job state. That makes the
     direction unambiguous (local source → explicit destination), supports any
     number of nodes, and lets the GUI show file-level progress.
+
+    ``destination_path`` overrides where files land on the peer (cluster v2
+    per-node model paths); when omitted, files land at the same absolute path
+    as the source, which is the legacy behavior.
     """
 
     import time
     from concurrent.futures import ThreadPoolExecutor
 
     source = Path(model_path).expanduser()
-    destination_dir = str(source)
+    destination_dir = (
+        str(Path(destination_path).expanduser())
+        if destination_path is not None
+        else str(source)
+    )
     expected = {
         path.name: path.stat().st_size
         for path in source.iterdir()
