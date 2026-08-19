@@ -73,7 +73,14 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     both worth knowing about.
     """
 
-    allowed_without_caller: set[str] = set()
+    allowed_without_caller: set[str] = {
+        # Cluster v2 runtime endpoints (Module E). Their callers ship with
+        # the wizard UI (Module C): /replan is the one-action
+        # deactivate→re-plan→reload the wizard's plan view drives, and
+        # /backend-selection renders the jaccl-vs-ring decision beside it.
+        "/admin/api/cluster/replan",
+        "/admin/api/cluster/backend-selection",
+    }
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "

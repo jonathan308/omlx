@@ -2439,6 +2439,8 @@ class ClusterBackendMemberRequest(BaseModel):
 class ClusterBackendSelectionRequest(BaseModel):
     """Which collective backend should this exact member set use?"""
 
+    model_config = ConfigDict(extra="forbid")
+
     members: list[ClusterBackendMemberRequest] = Field(min_length=2, max_length=64)
 
 
@@ -3298,6 +3300,8 @@ class ClusterReplanRequest(BaseModel):
     change (a node joining or leaving the model) is expressed by posting the
     new explicit ``nodes`` + ``hosts`` lists.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     deployment_id: str | None = Field(default=None, max_length=128)
     model_path: str | None = Field(default=None, max_length=4096)
