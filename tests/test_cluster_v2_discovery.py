@@ -587,3 +587,68 @@ def test_peer_record_to_dict_shape():
     assert payload["link"] == "tb"
     assert payload["state"] == "discovered"
     json.dumps(payload)  # must be JSON-serializable for the API
+
+
+# -- mDNS announce path with a fake zeroconf module -----------------------------
+
+
+class _FakeZeroconfModule:
+    class ServiceInfo:
+        def __init__(self, type_, name, addresses, port, properties):
+            self.type = type_
+            self.name = name
+            self.addresses = addresses
+            self.port = port
+            self.properties = properties
+
+    class ServiceBrowser:
+        def __init__(self, zc, type_, listener):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Zeroconf:
+        def __init__(self):
+            self.registered = []
+            self.closed = False
+
+        def register_service(self, info):
+            self.registered.append(info)
+
+        def unregister_service(self, info):
+            self.registered.remove(info)
+
+        def close(self):
+            self.closed = True
+
+
+def test_mdns_announce_publishes_spec_txt_record():
+    service, _ = _service("aaaa-node", zeroconf_module=_FakeZeroconfModule)
+    service.identity.friendly_name = "studio-a"
+
+    service._start_mdns()
+
+    info = service._zc_instance.registered[0]
+    assert info.type == "_omlx._tcp.local."
+    assert info.name.startswith("studio-a._omlx._tcp.local.")
+    assert info.port == 8000
+    assert info.properties["id"] == "aaaa-node"
+    assert info.properties["name"] == "studio-a"
+    assert info.properties["cl"] == "omlx"
+    assert info.properties["ver"]
+    caps = json.loads(info.properties["caps"])
+    assert set(caps) == {"chip", "ram_gb", "backends", "thunderbolt", "jaccl"}
+    service.stop()
+
+
+def test_mdns_start_failure_disables_mdns_without_killing_service():
+    class BoomZeroconf(_FakeZeroconfModule):
+        class Zeroconf:
+            def __init__(self):
+                raise RuntimeError("Local Network permission denied")
+
+    service, _ = _service("aaaa-node", zeroconf_module=BoomZeroconf)
+    service._socket_factory = FakeSocket
+    service.start()  # must not raise
+    service.stop()
