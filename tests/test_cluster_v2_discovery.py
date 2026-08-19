@@ -852,3 +852,20 @@ def test_health_reports_dead_loops_before_start():
     assert health["socket_open"] is False
     assert health["joined_interfaces"] == []
     assert health["consecutive_tx_fail_rounds"] == 0
+
+
+def test_blocked_suspicion_flag_lifecycle():
+    sock = FakeSocket()
+    service, _ = _service(socket_factory=lambda: sock)
+    service._joined = {"en0": 10}
+    service._local_network_blocked_suspected = True
+    service._consecutive_socket_resets = 6
+
+    service._send_hello(sock)  # a successful round ends the suspicion
+
+    assert service._local_network_blocked_suspected is False
+    assert service._consecutive_socket_resets == 0
+
+    service._local_network_blocked_suspected = True
+    service._handle_hello(7, service._cluster_hash, ("fe80::99", 53413), sock)
+    assert service._local_network_blocked_suspected is False
