@@ -1440,3 +1440,25 @@ class _MdnsListener:
     # older zeroconf style
     def update_service_callback(self, *args: Any, **kwargs: Any) -> None:
         pass
+
+
+_discovery_service_lock = threading.Lock()
+_configured_discovery_service: DiscoveryService | None = None
+
+
+def configure_discovery_service(
+    service: DiscoveryService | None,
+) -> DiscoveryService | None:
+    """Set (or clear) the process-wide discovery service for the endpoints."""
+
+    global _configured_discovery_service
+    with _discovery_service_lock:
+        _configured_discovery_service = service
+        return _configured_discovery_service
+
+
+def get_discovery_service() -> DiscoveryService:
+    with _discovery_service_lock:
+        if _configured_discovery_service is None:
+            raise RuntimeError("cluster discovery service is not configured")
+        return _configured_discovery_service
