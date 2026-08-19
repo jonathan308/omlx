@@ -748,6 +748,24 @@ def _register_cluster_routes() -> None:
         discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
+    # Cluster v2 pairing (Module B): the joiner's pair/request + pair/status
+    # are public but carry only blake2s(code + node_id) and a code-encrypted
+    # cluster key — the admin's approve step is the trust decision. Approve,
+    # deny, and unpair are admin-only like every other cluster mutation.
+    from .cluster.pairing_routes import pair_admin_router, pair_router
+
+    app.include_router(
+        pair_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    app.include_router(
+        pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+
     _cluster_routes_registered = True
 
 
@@ -2001,13 +2019,20 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
-    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
+    from .cluster.pairing import configure_pairing_manager
     from .cluster.registry import configure_cluster_registry
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_strategy_benchmark_store(base_path)
+    # Cluster v2 pairing manager. Module A's DeviceRegistry is passed here once
+    # its branch lands; until then the schema-compatible fallback store is used.
+    configure_pairing_manager(
+        base_path,
+        enrollment_store=get_cluster_enrollment(),
+    )
 
     # Cluster v2: stable node identity + trusted device inventory. Best
     # effort — a failure here must never block local inference.
