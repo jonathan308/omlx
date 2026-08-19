@@ -37,6 +37,11 @@ from .autoconfigure import (
     preflight_issues,
     tp_groups_spanning_slow_links,
 )
+from .backends import (
+    MemberFabric,
+    members_from_host_records,
+    select_cluster_backend,
+)
 from .catalogue import ModelFit, assess_model, catalogue_for_cluster
 from .collective import (
     CollectiveSmokeError,
@@ -2423,6 +2428,47 @@ async def cluster_plan(request: ClusterPlanRequest):
     return _plan_with_signature(plan.to_dict())
 
 
+class ClusterBackendMemberRequest(BaseModel):
+    """One member's observed RDMA capability, from local or peer probes."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+    rdma_ctl_enabled: bool = False
+    rdma_devices: list[str] = Field(default_factory=list, max_length=16)
+
+
+class ClusterBackendSelectionRequest(BaseModel):
+    """Which collective backend should this exact member set use?"""
+
+    members: list[ClusterBackendMemberRequest] = Field(min_length=2, max_length=64)
+
+
+@router.post("/backend-selection")
+async def cluster_backend_selection(
+    request: ClusterBackendSelectionRequest,
+) -> dict[str, Any]:
+    """jaccl when rdma_ctl is enabled on ALL members, else the TCP ring.
+
+    The plan view renders this decision (including which members block JACCL)
+    before anyone approves a placement; the replan endpoint makes the same
+    call when asked for ``backend="auto"``.
+    """
+
+    try:
+        selection = select_cluster_backend(
+            tuple(
+                MemberFabric(
+                    node_id=member.node_id.strip(),
+                    rdma_ctl_enabled=member.rdma_ctl_enabled,
+                    rdma_devices=tuple(member.rdma_devices),
+                )
+                for member in request.members
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return selection.to_dict()
+
+
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model_path.name).strip("-._")
     return f"{slug or 'model'}-{plan_hash[:12]}"
@@ -3257,7 +3303,7 @@ class ClusterReplanRequest(BaseModel):
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
     model_source_python: str | None = Field(default=None, max_length=4096)
-    backend: Literal["ring", "jaccl", "jaccl-ring"] | None = None
+    backend: Literal["auto", "ring", "jaccl", "jaccl-ring"] | None = None
     nodes: list[ClusterPlanNodeRequest] | None = Field(
         default=None, min_length=2, max_length=64
     )
@@ -3351,6 +3397,25 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             raise HTTPException(status_code=400, detail="backend is required")
         backend = current.backend
         derived["backend"] = True
+    if backend == "auto":
+        # rdma_ctl on every member → jaccl; any member without it pulls the
+        # whole cluster onto the TCP ring. Derived from the posted host
+        # records; launch preflight re-verifies the live state.
+        try:
+            selection = select_cluster_backend(members_from_host_records(hosts))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        backend_decision: dict[str, Any] = selection.to_dict()
+        backend = selection.backend
+    else:
+        backend_decision = {
+            "backend": backend,
+            "reason": "operator-selected backend",
+            "blockers": [],
+            "members": [
+                member.to_dict() for member in members_from_host_records(hosts)
+            ],
+        }
     try:
         _validate_cluster_hosts(hosts)
         effective = ClusterDeploymentRequest(
@@ -3402,6 +3467,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             "changes": changes,
             "deployment_id": deployment.deployment_id,
             "backend": deployment.backend,
+            "backend_decision": backend_decision,
             "plan": signed_plan,
         }
 
@@ -3422,6 +3488,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
         "replan": {
             "steps": list(_REPLAN_STEPS),
             "derived": derived,
+            "backend_decision": backend_decision,
             "previous": (
                 summarize_deployment(current) if current is not None else None
             ),
