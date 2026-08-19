@@ -43,7 +43,12 @@ from .collective import (
     run_local_collective_smoke,
     run_local_pipeline_smoke,
 )
-from .deployment import ClusterDeployment, ClusterHost, validate_ssh_target
+from .deployment import (
+    ClusterDeployment,
+    ClusterHost,
+    validate_model_path_map,
+    validate_ssh_target,
+)
 from .discovery import (
     discover_all_peers,
     record_peer_transports,
@@ -424,6 +429,9 @@ class ClusterPlanRequest(BaseModel):
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # Cluster v2: optional node_id → absolute model path on that node. Empty
+    # keeps the legacy same-absolute-path-on-every-node behavior.
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
 
 
 class ClusterHostRequest(BaseModel):
@@ -479,6 +487,9 @@ class ClusterDeploymentRequest(BaseModel):
     # one dropped the role and the split cap without saying so. Activation is a
     # GUI workflow: callers must preview and name the placement they approve.
     approved_placement: str = Field(min_length=16, max_length=64)
+    # Cluster v2: node_id → absolute model path on that node. Nodes not listed
+    # load ``model_path`` — the pre-v2 shared-path behavior.
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
 
 
 class ClusterPeerProbeRequest(BaseModel):
@@ -699,7 +710,14 @@ def _placement_rows(plan: dict[str, Any]) -> list[dict[str, Any]]:
 def _placement_signature(plan: dict[str, Any]) -> str:
     """Identity of the plan a user approves, stable across cosmetic re-planning."""
 
-    payload = json.dumps(_placement_rows(plan), sort_keys=True, separators=(",", ":"))
+    rows: Any = _placement_rows(plan)
+    # A per-node path override changes what actually runs, so it is part of
+    # what the user approves. Folded in only when present, keeping signatures
+    # byte-identical to the legacy format for shared-path deployments.
+    path_map = plan.get("path_map")
+    if path_map:
+        rows = {"rows": rows, "path_map": path_map}
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -800,9 +818,13 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 f"across {len(nodes)} Macs."
             )
         raise PlanningError(detail)
+    path_map = validate_model_path_map(
+        request.path_map,
+        tuple(node.node_id.strip() for node in request.nodes),
+    )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
-        return plan_hybrid(
+        plan = plan_hybrid(
             model,
             nodes,
             tensor_parallel_size=request.tensor_parallel_size,
@@ -812,15 +834,19 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
         )
-    return plan_unequal_pipeline(
-        model,
-        nodes,
-        workload_profile=request.execution_profile,
-        microbatch_size=(
-            request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
-        ),
-        context_tokens=request.target_context_tokens,
-    )
+    else:
+        plan = plan_unequal_pipeline(
+            model,
+            nodes,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    if path_map:
+        plan = replace(plan, path_map=path_map)
+    return plan
 
 
 class ClusterAutoconfigureRequest(BaseModel):
@@ -1585,19 +1611,26 @@ def _run_staging_job(
         portable_model_path = home_relative_model_path(deployment.model)
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
+            # Cluster v2: files land at the node's path_map entry when one
+            # exists. Otherwise preserve the cross-account behavior by
+            # resolving the portable model path in the remote Mac's home.
+            explicit_destination = deployment.path_map.get(host.node_id)
             if _local_ssh_target(host.ssh):
-                destination_dir = str(model_path)
+                destination_dir = explicit_destination or str(model_path)
+                destination_path = Path(destination_dir)
                 present = (
-                    {
-                        path.name: path.stat().st_size
-                        for path in model_path.iterdir()
-                        if path.is_file()
-                    }
-                    if model_path.is_dir()
+                {
+                    path.name: path.stat().st_size
+                    for path in destination_path.iterdir()
+                    if path.is_file()
+                }
+                    if destination_path.is_dir()
                     else {}
                 )
             else:
-                destination_dir = remote_model_dir(host.ssh, portable_model_path)
+                destination_dir = explicit_destination or remote_model_dir(
+                    host.ssh, portable_model_path
+                )
                 present = remote_file_sizes(host.ssh, destination_dir)
             plan = plan_staging(
                 model_path,
@@ -2648,6 +2681,7 @@ def _create_deployment(
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        path_map=request.path_map,
     )
     plan = _create_cluster_plan(plan_request)
     execution = _execution_for_request(
@@ -2691,6 +2725,7 @@ def _create_deployment(
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
     )
     return deployment, plan.to_dict()
 

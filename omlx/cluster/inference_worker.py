@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract
+from .deployment import decode_worker_contract, decode_worker_path_map
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -969,6 +969,15 @@ def run_worker(args: argparse.Namespace) -> int:
         )
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
+
+    # Cluster v2: a deployment may give each node its own absolute model path.
+    # The rank's path comes from the signed contract's path_map; nodes without
+    # an entry keep the shared --model argument, the pre-v2 behavior.
+    path_map = decode_worker_path_map(args.plan)
+    if path_map:
+        rank_model_path = path_map.get(assignments[rank].node_id)
+        if rank_model_path and rank_model_path != args.model:
+            args.model = rank_model_path
 
     marker = RuntimeMarker(
         state_dir=args.state_dir,

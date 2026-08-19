@@ -11,7 +11,7 @@ import subprocess
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -426,6 +426,11 @@ class ShardPlan:
     # case the per-rank byte reservation is zero, but the operator's requested
     # runtime limit must still be visible and part of the plan identity.
     target_context_tokens: int = _DEFAULT_CONTEXT_TOKENS
+    # node_id → absolute model path on that node (cluster v2). Display and
+    # staging metadata only: the layer split is path-independent, so the map
+    # is deliberately excluded from ``plan_hash``. Empty means every node
+    # loads the shared coordinator path — the legacy behavior.
+    path_map: dict[str, str] = field(default_factory=dict)
 
     @property
     def max_context_tokens(self) -> int:
@@ -458,7 +463,7 @@ class ShardPlan:
         return sum(item.planned_weight_bytes for item in self.assignments)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "plan_version": 1,
             "plan_hash": self.plan_hash,
             "strategy": (
@@ -484,6 +489,9 @@ class ShardPlan:
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_stages": self.pipeline_stages,
         }
+        if self.path_map:
+            result["path_map"] = dict(sorted(self.path_map.items()))
+        return result
 
 
 def synthetic_model_layout(*, total_weight_bytes: int, layer_count: int) -> ModelLayout:
