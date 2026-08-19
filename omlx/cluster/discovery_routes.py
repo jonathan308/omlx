@@ -169,6 +169,23 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
                 continue
             discovered_records[peer.node_id] = peer.to_dict()
 
+    # Seam with Module B: a posted pair/request must surface in the device
+    # list as an awaiting_approval row so the wizard renders code entry +
+    # approve/deny (fixture: tests/ui/.../devices_pending_approval.json).
+    # Pending state wins over a plain discovered record for the same node.
+    try:
+        from .pairing import get_pairing_manager
+
+        pairing_manager = get_pairing_manager()
+    except RuntimeError:
+        pairing_manager = None
+    if pairing_manager is not None:
+        for pending in pairing_manager.pending_requests():
+            row = dict(discovered_records.get(pending["node_id"], {}))
+            row.update(pending)
+            row["state"] = "awaiting_approval"
+            discovered_records[pending["node_id"]] = row
+
     self_record: dict[str, Any] = {
         "node_id": identity.node_id,
         "friendly_name": identity.friendly_name,
