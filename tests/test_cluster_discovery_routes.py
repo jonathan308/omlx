@@ -283,3 +283,127 @@ def test_node_id_probe_503_without_identity():
         assert response.status_code == 503
     finally:
         pass  # fixture resets on next test
+
+
+# -- manual peer add + health detail ------------------------------------------
+
+
+def _live_service(registry, prober=None):
+    service = DiscoveryService(
+        NodeIdentity(node_id="self-node", friendly_name="self", created_at=1.0),
+        registry,
+        DiscoveryConfig(cluster_name="omlx", http_port=8000),
+        prober=prober or (lambda ip, port, timeout: None),
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    configure_discovery_service(service)
+    return service
+
+
+def test_manual_peer_add_verifies_and_returns_peer(_configured_stores):
+    _, registry, client = _configured_stores
+
+    def prober(ip, port, timeout):
+        if ip == "10.0.0.2":
+            return {"node_id": "tb-peer", "friendly_name": "m5-max"}
+        return None
+
+    service = _live_service(registry, prober)
+
+    response = client.post(
+        "/api/cluster/devices/manual", json={"ip": "10.0.0.2"}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["verified"] is True
+    assert payload["peer"]["node_id"] == "tb-peer"
+    assert payload["peer"]["friendly_name"] == "m5-max"
+    assert payload["peer"]["addrs"] == [
+        {"ip": "10.0.0.2", "if_type": "manual"}
+    ]
+    service.stop()
+
+
+def test_manual_peer_add_unverified_when_address_silent(_configured_stores):
+    _, registry, client = _configured_stores
+    service = _live_service(registry)  # prober answers None for everything
+
+    response = client.post(
+        "/api/cluster/devices/manual", json={"ip": "10.0.0.99", "port": 8000}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["verified"] is False
+    assert payload["peer"] is None
+    service.stop()
+
+
+def test_manual_peer_add_rejects_bad_input(_configured_stores):
+    _, registry, client = _configured_stores
+    _live_service(registry)
+
+    assert (
+        client.post(
+            "/api/cluster/devices/manual", json={"ip": "not-an-ip"}
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/api/cluster/devices/manual",
+            json={"ip": "10.0.0.2", "port": 70000},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post("/api/cluster/devices/manual", json={}).status_code
+        == 400
+    )
+
+
+def test_manual_peer_add_503_when_discovery_disabled(_configured_stores):
+    _, _, client = _configured_stores  # fixture leaves service unset
+
+    response = client.post(
+        "/api/cluster/devices/manual", json={"ip": "10.0.0.2"}
+    )
+
+    assert response.status_code == 503
+
+
+def test_health_detail_reports_loop_state(_configured_stores):
+    _, registry, client = _configured_stores
+    service = _live_service(registry)
+
+    response = client.get("/api/cluster/discovery/health/detail")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["multicast_loop_alive"] is False  # never started
+    assert payload["maintenance_loop_alive"] is False
+    assert payload["socket_open"] is False
+    assert payload["joined_interfaces"] == []
+    assert payload["peers"] == 0
+
+
+def test_health_detail_503_when_discovery_disabled(_configured_stores):
+    _, _, client = _configured_stores
+
+    assert client.get("/api/cluster/discovery/health/detail").status_code == 503
+
+
+def test_devices_self_row_lists_local_addresses(_configured_stores):
+    _, _, client = _configured_stores
+
+    response = client.get("/api/cluster/devices")
+
+    assert response.status_code == 200
+    addrs = response.json()["self"]["addrs"]
+    assert isinstance(addrs, list)
+    for entry in addrs:
+        assert set(entry) == {"ip", "if_type"}

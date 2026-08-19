@@ -547,6 +547,16 @@ _JOIN_IGNORED_ERRNOS = {
     errno.EINVAL,
 }
 
+# HELLO-send and WASSUP-reply failure logs are rate-limited per interface /
+# peer (a down Thunderbolt bridge otherwise spams one line per second per
+# interface forever — 7k lines in nine minutes observed in the field).
+_TX_FAIL_LOG_INTERVAL = 60.0
+# After this many consecutive HELLO rounds in which every send failed, the
+# multicast socket is discarded and rebuilt. macOS gotcha #6: Thunderbolt
+# hotplug renumbers interfaces, which wedges a bound socket's per-interface
+# multicast state; rebuilding is the only reliable escape.
+_TX_FAIL_RESET_ROUNDS = 3
+
 
 def cluster_hash_u64(cluster_name: str) -> int:
     """blake2s(cluster_name)[:8] as a big-endian u64."""
@@ -800,6 +810,58 @@ def _default_interface_lister() -> list[str]:
     return [n for n in names if not n.startswith("lo")]
 
 
+def local_addr_dicts() -> list[dict[str, str]]:
+    """Addresses this node considers its own, for the devices ``self`` row.
+
+    Best-effort and never raises. Thunderbolt bridge addresses (typically
+    the self-assigned 10.0.0.0/24 pair on a direct link) are included so the
+    UI can show the direct-link path next to LAN and Tailscale ones.
+    """
+
+    addrs: list[dict[str, str]] = []
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(  # noqa: S603 - fixed system executable
+                ["/sbin/ifconfig", "-a"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            current: str | None = None
+            for line in result.stdout.splitlines():
+                header = re.match(r"^([a-z0-9]+): ", line)
+                if header:
+                    current = header.group(1)
+                    continue
+                if current is None or current.startswith(
+                    ("lo", "awdl", "llw", "anpi", "ap", "gif", "stf")
+                ):
+                    continue
+                match = re.match(r"^\s+inet6?\s+(\S+)", line)
+                if match is None:
+                    continue
+                ip = match.group(1)
+                if_type = "vpn" if current.startswith("utun") else "lan"
+                if ip.startswith("100."):
+                    if_type = "tailscale"
+                addrs.append({"ip": ip, "if_type": if_type})
+            return addrs[:16]
+    # Portable fallback: primary IPv4 via the routing table (no traffic is
+    # actually sent to TEST-NET-1).
+    with suppress(OSError):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("192.0.2.1", 80))
+            addrs.append({"ip": sock.getsockname()[0], "if_type": "lan"})
+        finally:
+            sock.close()
+    return addrs
+
+
 def _http_probe_node_id(
     ip: str, port: int, timeout: float
 ) -> dict[str, Any] | None:
@@ -899,6 +961,12 @@ class DiscoveryService:
         self._threads: list[threading.Thread] = []
         self._socket: Any | None = None
         self._joined: dict[str, int] = {}  # ifname -> ifindex
+        self._tx_fail_logged_at: dict[int, float] = {}  # ifindex -> monotonic
+        self._reply_fail_logged_at: dict[str, float] = {}  # peer_ip -> monotonic
+        self._consecutive_tx_fail_rounds = 0
+        self._last_tx_ok_wall: float | None = None
+        self._last_tx_error: str | None = None
+        self._needs_socket_reset = False
         self._zc_instance: Any | None = None
         self._zc_browser: Any | None = None
         self._zc_info: Any | None = None
@@ -949,6 +1017,32 @@ class DiscoveryService:
             return [
                 self._peers[key] for key in sorted(self._peers)
             ]
+
+    def health(self) -> dict[str, Any]:
+        """Extended self-diagnostics for the discovery health detail route.
+
+        The base health endpoint only reports inbound multicast state; when
+        discovery silently dies (a crashed loop thread, a wedged socket,
+        interfaces renumbered by Thunderbolt hotplug) these fields are how
+        the UI and field debugging tell those apart from "no peers nearby".
+        """
+
+        with self._lock:
+            threads = {t.name: t.is_alive() for t in self._threads}
+            joined = sorted(self._joined)
+        return {
+            "multicast_loop_alive": threads.get("omlx-discovery-mcast", False),
+            "maintenance_loop_alive": threads.get(
+                "omlx-discovery-maint", False
+            ),
+            "socket_open": self._socket is not None,
+            "joined_interfaces": joined,
+            "last_hello_tx_ok_at": self._last_tx_ok_wall,
+            "last_hello_tx_error": self._last_tx_error,
+            "consecutive_tx_fail_rounds": self._consecutive_tx_fail_rounds,
+            "candidates": len(self._candidates),
+            "peers": len(self._peers),
+        }
 
     def on_change(self, callback: Callable[[PeerRecord], None]) -> None:
         with self._lock:
@@ -1006,7 +1100,34 @@ class DiscoveryService:
     # -- internals -----------------------------------------------------------
 
     def _spawn(self, target: Callable[[], None], name: str) -> None:
-        thread = threading.Thread(target=target, name=name, daemon=True)
+        def _supervised() -> None:
+            while not self._stop.is_set():
+                try:
+                    target()
+                except BaseException:
+                    if self._stop.is_set():
+                        return
+                    # A daemon thread dying silently is how discovery goes
+                    # dark without a trace; log loudly and restart instead.
+                    logger.critical(
+                        "discovery thread %s crashed; restarting in 2s",
+                        name,
+                        exc_info=True,
+                    )
+                    self._stop.wait(2.0)
+                    continue
+                if self._stop.is_set():
+                    return
+                # Clean return without a stop request is also a bug —
+                # discovery is always-on. Restart rather than going dark.
+                logger.warning(
+                    "discovery thread %s exited unexpectedly; "
+                    "restarting in 2s",
+                    name,
+                )
+                self._stop.wait(2.0)
+
+        thread = threading.Thread(target=_supervised, name=name, daemon=True)
         self._threads.append(thread)
         thread.start()
 
@@ -1030,13 +1151,37 @@ class DiscoveryService:
         """Join the multicast group on every multicast-capable interface.
 
         Thunderbolt bridges appear/disappear with cable state (macOS gotcha
-        #4), so this is re-run whenever the interface set changes.
+        #4), so this is re-run periodically. macOS also *renumbers*
+        interfaces on Thunderbolt hotplug (gotcha #5): a cached ifindex then
+        silently points at the wrong interface and every send fails with
+        EHOSTUNREACH, so stale or renumbered entries are dropped here and
+        re-joined below.
         """
 
         try:
             names = self._interface_lister()
         except Exception:
             return
+        current = set(names)
+        for name, ifindex in list(self._joined.items()):
+            if name not in current:
+                # Interface vanished; its group membership dies with it.
+                self._joined.pop(name, None)
+                continue
+            try:
+                now_index = socket.if_nametoindex(name)
+            except OSError:
+                self._joined.pop(name, None)
+                continue
+            if now_index != ifindex:
+                logger.info(
+                    "interface %s renumbered (%d -> %d); "
+                    "re-joining multicast group",
+                    name,
+                    ifindex,
+                    now_index,
+                )
+                self._joined.pop(name, None)
         for name in names:
             if name in self._joined:
                 continue
@@ -1066,8 +1211,31 @@ class DiscoveryService:
         self._socket = sock
         last_hello = 0.0
         last_ifaces = 0.0
+        last_reset_warn = 0.0
         try:
             while not self._stop.is_set():
+                if self._needs_socket_reset:
+                    self._needs_socket_reset = False
+                    with suppress(Exception):
+                        sock.close()
+                    with self._lock:
+                        self._joined.clear()
+                    try:
+                        sock = self._socket_factory()
+                    except OSError as exc:
+                        now_wall = time.monotonic()
+                        if now_wall - last_reset_warn >= 60.0:
+                            last_reset_warn = now_wall
+                            logger.warning(
+                                "multicast socket rebuild failed: %s; "
+                                "retrying",
+                                exc,
+                            )
+                        self._needs_socket_reset = True
+                        self._stop.wait(1.0)
+                        continue
+                    self._socket = sock
+                    last_ifaces = 0.0  # force an immediate re-join pass
                 now = self._clock()
                 if now - last_ifaces >= self.config.iface_poll_interval:
                     self._sync_interfaces(sock)
@@ -1083,30 +1251,71 @@ class DiscoveryService:
                     if self._stop.is_set():
                         break
                     continue
-                self._handle_datagram(data, addr, sock)
+                try:
+                    self._handle_datagram(data, addr, sock)
+                except Exception:
+                    # A malformed datagram or a handler bug must never kill
+                    # the loop (and with it, all discovery).
+                    logger.exception("discovery datagram handler failed")
         finally:
             with suppress(Exception):
                 sock.close()
+            if self._socket is sock:
+                self._socket = None
+            with self._lock:
+                self._joined.clear()
 
     def _send_hello(self, sock: Any) -> None:
         nonce = secrets.randbits(64)
         with self._lock:
             self._nonces.append(nonce)
         payload = encode_hello(nonce, self._cluster_hash)
-        target = (MULTICAST_GROUP, MULTICAST_PORT)
-        joined = list(self._joined.values()) or [0]
+        with self._lock:
+            joined = list(self._joined.values()) or [0]
+        any_ok = False
+        last_error: str | None = None
+        now = self._clock()
         for ifindex in joined:
+            # Link-scope multicast needs the egress interface in the
+            # destination's scope id. (The previous design set
+            # IPV6_MULTICAST_IF on the shared socket per round instead; that
+            # state goes stale when macOS renumbers interfaces on
+            # Thunderbolt hotplug and every send then fails EHOSTUNREACH.)
+            target = (
+                (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
+                if ifindex
+                else (MULTICAST_GROUP, MULTICAST_PORT)
+            )
             try:
-                if ifindex:
-                    sock.setsockopt(
-                        socket.IPPROTO_IPV6,
-                        socket.IPV6_MULTICAST_IF,
-                        struct.pack("@I", ifindex),
-                    )
                 sock.sendto(payload, target)
+                any_ok = True
             except OSError as exc:
-                if exc.errno not in _JOIN_IGNORED_ERRNOS:
-                    logger.debug("HELLO send on if %d failed: %s", ifindex, exc)
+                last_error = f"if {ifindex}: {exc}"
+                if exc.errno not in _JOIN_IGNORED_ERRNOS and (
+                    now - self._tx_fail_logged_at.get(ifindex, 0.0)
+                    >= _TX_FAIL_LOG_INTERVAL
+                ):
+                    self._tx_fail_logged_at[ifindex] = now
+                    logger.debug(
+                        "HELLO send on if %d failed: %s", ifindex, exc
+                    )
+        if any_ok:
+            self._consecutive_tx_fail_rounds = 0
+            self._last_tx_ok_wall = time.time()
+            self._last_tx_error = None
+        else:
+            self._consecutive_tx_fail_rounds += 1
+            self._last_tx_error = last_error
+            if (
+                self._consecutive_tx_fail_rounds >= _TX_FAIL_RESET_ROUNDS
+                and any(joined)
+            ):
+                logger.warning(
+                    "HELLO sends failed on every joined interface for %d "
+                    "rounds; rebuilding multicast socket",
+                    self._consecutive_tx_fail_rounds,
+                )
+                self._needs_socket_reset = True
 
     def _handle_datagram(self, data: bytes, addr: Any, sock: Any = None) -> None:
         hello = decode_hello(data)
@@ -1135,18 +1344,38 @@ class DiscoveryService:
                 return  # nonce-echo self-drop: our own HELLO came back
         self._last_hello_at = self._clock()
         self._last_hello_wall = time.time()
-        peer_ip = addr[0] if isinstance(addr, tuple) else str(addr)
-        # Answer unicast so the sender learns our node_id + http_port.
+        if isinstance(addr, tuple):
+            peer_ip = addr[0]
+            peer_port = addr[1]
+            scope_id = addr[3] if len(addr) > 3 else 0
+        else:
+            peer_ip, peer_port, scope_id = str(addr), MULTICAST_PORT, 0
+        # Answer unicast so the sender learns our node_id + http_port. A
+        # link-local HELLO source requires the ingress interface as scope id
+        # in the reply destination; without it the kernel has no route and
+        # the handshake silently never completes.
         reply = encode_wassup(
             nonce, self.identity.node_id, self.config.http_port
         )
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
+            target = (
+                (peer_ip, peer_port, 0, scope_id)
+                if scope_id
+                else (peer_ip, peer_port)
+            )
             try:
-                port = addr[1] if isinstance(addr, tuple) else MULTICAST_PORT
-                target_sock.sendto(reply, (peer_ip, port))
-            except OSError:
-                pass
+                target_sock.sendto(reply, target)
+            except OSError as exc:
+                now = self._clock()
+                if (
+                    now - self._reply_fail_logged_at.get(peer_ip, 0.0)
+                    >= _TX_FAIL_LOG_INTERVAL
+                ):
+                    self._reply_fail_logged_at[peer_ip] = now
+                    logger.debug(
+                        "WASSUP reply to %s failed: %s", peer_ip, exc
+                    )
 
     def _handle_wassup(self, payload: dict[str, Any], addr: Any) -> None:
         with self._lock:
