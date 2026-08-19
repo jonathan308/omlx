@@ -973,6 +973,9 @@ class DiscoveryService:
         self._last_tx_ok_wall: float | None = None
         self._last_tx_error: str | None = None
         self._needs_socket_reset = False
+        self._consecutive_socket_resets = 0
+        self._last_socket_reset_at = 0.0
+        self._local_network_blocked_suspected = False
         self._zc_instance: Any | None = None
         self._zc_browser: Any | None = None
         self._zc_info: Any | None = None
@@ -1046,6 +1049,10 @@ class DiscoveryService:
             "last_hello_tx_ok_at": self._last_tx_ok_wall,
             "last_hello_tx_error": self._last_tx_error,
             "consecutive_tx_fail_rounds": self._consecutive_tx_fail_rounds,
+            "socket_resets": self._consecutive_socket_resets,
+            "local_network_blocked_suspected": (
+                self._local_network_blocked_suspected
+            ),
             "candidates": len(self._candidates),
             "peers": len(self._peers),
         }
@@ -1221,7 +1228,21 @@ class DiscoveryService:
         try:
             while not self._stop.is_set():
                 if self._needs_socket_reset:
+                    # Exponential backoff: a process-level wedge (e.g. a
+                    # denied macOS Local Network permission) survives socket
+                    # rebuilds, so rebuilding every second just spams the
+                    # log and burns CPU. Back off to at most one rebuild
+                    # per 60s; the first success resets the schedule.
+                    now_mono = time.monotonic()
+                    backoff = min(
+                        2.0 ** self._consecutive_socket_resets, 60.0
+                    )
+                    if now_mono - self._last_socket_reset_at < backoff:
+                        self._stop.wait(1.0)
+                        continue
                     self._needs_socket_reset = False
+                    self._last_socket_reset_at = now_mono
+                    self._consecutive_socket_resets += 1
                     with suppress(Exception):
                         sock.close()
                     with self._lock:
@@ -1242,6 +1263,18 @@ class DiscoveryService:
                         continue
                     self._socket = sock
                     last_ifaces = 0.0  # force an immediate re-join pass
+                    if self._consecutive_socket_resets == 6:
+                        self._local_network_blocked_suspected = True
+                        logger.critical(
+                            "cluster multicast still dead after %d socket "
+                            "rebuilds — on macOS this is usually a denied "
+                            "Local Network permission (System Settings → "
+                            "Privacy & Security → Local Network) or a wedged "
+                            "process (a server restart clears it); peers can "
+                            "always be added manually via POST "
+                            "/api/cluster/devices/manual",
+                            self._consecutive_socket_resets,
+                        )
                 now = self._clock()
                 if now - last_ifaces >= self.config.iface_poll_interval:
                     self._sync_interfaces(sock)
@@ -1307,6 +1340,8 @@ class DiscoveryService:
                     )
         if any_ok:
             self._consecutive_tx_fail_rounds = 0
+            self._consecutive_socket_resets = 0
+            self._local_network_blocked_suspected = False
             self._last_tx_ok_wall = time.time()
             self._last_tx_error = None
         else:
@@ -1316,11 +1351,14 @@ class DiscoveryService:
                 self._consecutive_tx_fail_rounds >= _TX_FAIL_RESET_ROUNDS
                 and any(joined)
             ):
-                logger.warning(
-                    "HELLO sends failed on every joined interface for %d "
-                    "rounds; rebuilding multicast socket",
-                    self._consecutive_tx_fail_rounds,
-                )
+                if self._consecutive_tx_fail_rounds == _TX_FAIL_RESET_ROUNDS:
+                    # Log once per failure streak; the loop's backoff
+                    # schedule paces the actual rebuilds from here.
+                    logger.warning(
+                        "HELLO sends failed on every joined interface for "
+                        "%d rounds; scheduling multicast socket rebuild",
+                        self._consecutive_tx_fail_rounds,
+                    )
                 self._needs_socket_reset = True
 
     def _handle_datagram(self, data: bytes, addr: Any, sock: Any = None) -> None:
@@ -1350,6 +1388,9 @@ class DiscoveryService:
                 return  # nonce-echo self-drop: our own HELLO came back
         self._last_hello_at = self._clock()
         self._last_hello_wall = time.time()
+        # Inbound multicast works, so any Local Network permission wedge is
+        # definitively over.
+        self._local_network_blocked_suspected = False
         if isinstance(addr, tuple):
             peer_ip = addr[0]
             peer_port = addr[1]
