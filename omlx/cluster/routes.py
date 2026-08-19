@@ -89,6 +89,7 @@ from .planner import (
     ShardPlan,
     complete_model_layout,
     plan_hybrid,
+    plan_proportional_pipeline,
     plan_unequal_pipeline,
     remote_model_layout,
     synthetic_model_layout,
@@ -426,6 +427,9 @@ class ClusterPlanRequest(BaseModel):
     layer_count: int = Field(default=80, gt=0, le=2048)
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=1, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    # "balanced" runs the bottleneck-minimizing DP planner; "proportional"
+    # splits layers ∝ usable RAM with largest-remainder rounding (exo-style).
+    allocation: Literal["balanced", "proportional"] = "balanced"
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
@@ -472,6 +476,7 @@ class ClusterDeploymentRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
     preflight: Literal[True] = True
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    allocation: Literal["balanced", "proportional"] = "balanced"
     auto_tune: bool = True
     sampling_rank_only: bool = True
     async_overlap: bool = True
@@ -2678,6 +2683,7 @@ def _create_deployment(
         model_source_python=request.model_source_python,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        allocation=request.allocation,
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
