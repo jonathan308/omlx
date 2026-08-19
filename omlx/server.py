@@ -2046,30 +2046,40 @@ def init_server(
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
-    from .cluster.registry import configure_cluster_registry
+    from .cluster.registry import (
+        configure_cluster_registry,
+        configure_device_registry,
+        get_device_registry,
+    )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
-    # Cluster v2 pairing manager. Module A's DeviceRegistry is passed here once
-    # its branch lands; until then the schema-compatible fallback store is used.
-    configure_pairing_manager(
-        base_path,
-        enrollment_store=get_cluster_enrollment(),
-    )
-
     # Cluster v2: stable node identity + trusted device inventory. Best
-    # effort — a failure here must never block local inference.
+    # effort — a failure here must never block local inference. Configured
+    # before the pairing manager so pairing approvals persist into the real
+    # device registry instead of the schema-compatible fallback store.
     try:
         from .cluster.identity import configure_node_identity
-        from .cluster.registry import configure_device_registry
 
         configure_node_identity(base_path)
         configure_device_registry(base_path / "cluster" / "devices.json")
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+    try:
+        device_registry = get_device_registry()
+    except RuntimeError:
+        device_registry = None
+    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # available (DeviceRegistryBridge adapts the API and fails loudly on
+    # drift); otherwise the schema-compatible fallback store is used.
+    configure_pairing_manager(
+        base_path,
+        registry=device_registry,
+        enrollment_store=get_cluster_enrollment(),
+    )
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager

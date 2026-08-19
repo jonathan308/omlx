@@ -562,6 +562,40 @@ def test_registry_bridge_reports_api_drift_loudly():
         bridge.put_paired({"node_id": "n"})
 
 
+def test_registry_bridge_against_real_module_a_registry(tmp_path):
+    """Integration lock: the bridge drives Module A's real DeviceRegistry.
+
+    mark_paired (not merge) must persist the peer as paired — merge would
+    leave a newly approved device memory-only.
+    """
+
+    from omlx.cluster.registry import DeviceRegistry
+
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    bridge = DeviceRegistryBridge(registry)
+    bridge.put_paired(
+        {
+            "node_id": "peer-real",
+            "friendly_name": "studio",
+            "caps": {"chip": "M3"},
+            "paired_at": 42.0,
+            "last_addrs": ["192.168.5.2"],
+            "state": "paired",
+        }
+    )
+
+    assert registry.is_paired("peer-real")
+    stored = bridge.get("peer-real")
+    assert stored["friendly_name"] == "studio"
+    assert stored["paired_at"] == 42.0
+    assert [d["node_id"] for d in bridge.list_paired()] == ["peer-real"]
+    # Persisted to disk, not memory-only.
+    reloaded = DeviceRegistry(tmp_path / "devices.json")
+    assert reloaded.is_paired("peer-real")
+    assert bridge.remove("peer-real") is True
+    assert not registry.is_paired("peer-real")
+
+
 # --- HTTP endpoints -----------------------------------------------------------------
 
 
