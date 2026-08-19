@@ -150,6 +150,42 @@ def test_devices_excludes_paired_peers_from_discovered(
     configure_discovery_service(None)
 
 
+def test_discovery_health_without_service(_configured_stores):
+    _, _, client = _configured_stores
+
+    payload = client.get("/api/cluster/discovery/health").json()
+
+    assert payload == {
+        "multicast_rx_within_5s": False,
+        "last_multicast_rx_at": None,
+        "mdns_active": False,
+        "transport": "disabled",
+    }
+
+
+def test_discovery_health_reflects_live_service(_configured_stores):
+    identity, registry, client = _configured_stores
+    service = DiscoveryService(
+        identity,
+        registry,
+        DiscoveryConfig(cluster_name="home", http_port=8000),
+        prober=lambda ip, port, timeout: None,
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    configure_discovery_service(service)
+    service._last_hello_at = service._clock()
+    service._last_hello_wall = 1782000002.5
+
+    payload = client.get("/api/cluster/discovery/health").json()
+
+    assert payload["multicast_rx_within_5s"] is True
+    assert payload["last_multicast_rx_at"] == 1782000002.5
+    assert payload["mdns_active"] is False  # zeroconf disabled in tests
+    assert payload["transport"] == "multicast"
+    configure_discovery_service(None)
+
+
 def test_devices_requires_admin_auth(tmp_path):
     # Without the dependency override, an unauthenticated call is rejected.
     reset_configured_identity()
