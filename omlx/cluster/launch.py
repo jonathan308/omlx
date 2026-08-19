@@ -1754,7 +1754,10 @@ def preflight_remote_hosts(
     script = _PREFLIGHT_SCRIPT
     local_python_version = platform.python_version()
     results: list[dict[str, Any]] = []
-    local_model_exists = Path(deployment.model).is_dir()
+    # Cluster v2: each rank validates against its own path_map entry; nodes
+    # without an entry share the coordinator path, as before v2.
+    local_model_path = deployment.model_path_for(deployment.hosts[0].node_id)
+    local_model_exists = Path(local_model_path).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
     if len(assignments) != len(deployment.hosts):
         raise DistributedLaunchError(
@@ -1762,7 +1765,7 @@ def preflight_remote_hosts(
         )
     local_validation = (
         validate_staged_model(
-            deployment.model,
+            local_model_path,
             assignments[0].start_layer,
             assignments[0].end_layer,
         )
@@ -1809,12 +1812,13 @@ def preflight_remote_hosts(
             )
             continue
         remote_python = host.python_executable or python_executable
+        remote_model_path = deployment.model_path_for(host.node_id)
         remote_command = shlex.join(
             [
                 remote_python,
                 "-c",
                 script,
-                deployment.model,
+                remote_model_path,
                 str(assignment.start_layer),
                 str(assignment.end_layer),
                 assignment.memory_guard_tier,
@@ -1866,7 +1870,7 @@ def preflight_remote_hosts(
         runtime_warnings = [warning] if warning is not None else []
         if versions.get("model-exists") is not True:
             mismatches.append(
-                f"model directory is missing on remote host: {deployment.model}"
+                f"model directory is missing on remote host: {remote_model_path}"
             )
         if local_identity is not None and versions.get("model_identity") != local_identity:
             mismatches.append(

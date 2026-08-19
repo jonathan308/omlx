@@ -13,6 +13,11 @@ from typing import Any
 
 from .deployment import ClusterDeployment
 
+# Version 2 persists per-node model paths (``path_map`` on each deployment).
+# Version 1 files are migrated in memory on load and rewritten atomically.
+REGISTRY_SCHEMA_VERSION = 2
+_SUPPORTED_REGISTRY_SCHEMAS = (1, REGISTRY_SCHEMA_VERSION)
+
 
 def _model_key(model: str) -> str:
     path = Path(model).expanduser()
@@ -30,6 +35,8 @@ class ClusterRegistry:
         self._lock = threading.RLock()
         self._deployments: dict[str, ClusterDeployment] = {}
         self.load_error: str | None = None
+        #: Set when an on-disk legacy schema was upgraded on load.
+        self.migrated_from: int | None = None
         try:
             self._load()
         except ValueError as exc:
@@ -49,7 +56,9 @@ class ClusterRegistry:
                 raise ValueError(
                     f"could not read cluster deployment registry: {exc}"
                 ) from exc
-            if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            if not isinstance(payload, dict) or payload.get("schema_version") not in (
+                _SUPPORTED_REGISTRY_SCHEMAS
+            ):
                 raise ValueError("unsupported cluster deployment registry schema")
             raw_deployments = payload.get("deployments")
             if not isinstance(raw_deployments, list):
@@ -63,11 +72,21 @@ class ClusterRegistry:
             }
             if len(self._deployments) != len(deployments):
                 raise ValueError("cluster deployment registry has duplicate models")
+            if payload.get("schema_version") != REGISTRY_SCHEMA_VERSION:
+                # Legacy files hold no per-node paths; every deployment decoded
+                # above with an empty path_map, which is the exact behavior the
+                # file described. Persist the upgrade so the migration happens
+                # once, but never let an unwritable file block server startup.
+                self.migrated_from = int(payload.get("schema_version", 1))
+                try:
+                    self._save()
+                except OSError:
+                    pass
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 1,
+            "schema_version": REGISTRY_SCHEMA_VERSION,
             "deployments": [
                 deployment.to_dict()
                 for _, deployment in sorted(self._deployments.items())
@@ -154,9 +173,10 @@ class ClusterRegistry:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": REGISTRY_SCHEMA_VERSION,
             "deployments": [deployment.to_dict() for deployment in self.list()],
             "load_error": self.load_error,
+            "migrated_from": self.migrated_from,
         }
 
 
