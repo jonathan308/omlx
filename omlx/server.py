@@ -465,6 +465,41 @@ async def lifespan(app: FastAPI):
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
+    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # manual + Tailscale). Best-effort: discovery failures must never block
+    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    discovery_service = None
+    if (
+        distributed_inference_enabled()
+        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        try:
+            from .cluster.discovery import (
+                DiscoveryConfig,
+                DiscoveryService,
+                configure_discovery_service,
+            )
+            from .cluster.identity import get_node_identity
+            from .cluster.registry import get_device_registry
+
+            discovery_service = DiscoveryService(
+                get_node_identity(),
+                get_device_registry(),
+                DiscoveryConfig(
+                    http_port=(
+                        _server_state.global_settings.server.port
+                        if _server_state.global_settings is not None
+                        else 8000
+                    )
+                ),
+            )
+            configure_discovery_service(discovery_service)
+            await asyncio.to_thread(discovery_service.start)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to start: %s", exc)
+            discovery_service = None
+
     # Start process memory enforcer if configured
     if (
         _server_state.global_settings is not None
@@ -566,6 +601,14 @@ async def lifespan(app: FastAPI):
             await bonjour_task
     if bonjour_publisher is not None:
         bonjour_publisher.stop()
+    if discovery_service is not None:
+        try:
+            from .cluster.discovery import configure_discovery_service
+
+            await asyncio.to_thread(discovery_service.stop)
+            configure_discovery_service(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to stop: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -677,6 +720,15 @@ def _register_cluster_routes() -> None:
     # credentials, not the browser's admin cookie.
     app.include_router(
         cluster_join_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # rate-limited probe peers use to verify announced addresses before any
+    # pairing trust exists; /api/cluster/devices requires admin per-route.
+    from .cluster.discovery_routes import discovery_router
+
+    app.include_router(
+        discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
     _cluster_routes_registered = True
@@ -1983,6 +2035,17 @@ def init_server(
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+
+    # Cluster v2: stable node identity + trusted device inventory. Best
+    # effort — a failure here must never block local inference.
+    try:
+        from .cluster.identity import configure_node_identity
+        from .cluster.registry import configure_device_registry
+
+        configure_node_identity(base_path)
+        configure_device_registry(base_path / "cluster" / "devices.json")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
