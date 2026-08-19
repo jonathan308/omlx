@@ -37,6 +37,11 @@ from .autoconfigure import (
     preflight_issues,
     tp_groups_spanning_slow_links,
 )
+from .backends import (
+    MemberFabric,
+    members_from_host_records,
+    select_cluster_backend,
+)
 from .catalogue import ModelFit, assess_model, catalogue_for_cluster
 from .collective import (
     CollectiveSmokeError,
@@ -88,12 +93,19 @@ from .planner import (
     ShardPlan,
     complete_model_layout,
     plan_hybrid,
+    plan_proportional_pipeline,
     plan_unequal_pipeline,
     remote_model_layout,
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status
 from .registry import get_cluster_registry
+from .replan import (
+    hosts_from_deployment,
+    nodes_from_deployment,
+    placement_view,
+    summarize_deployment,
+)
 from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
@@ -387,6 +399,9 @@ class ClusterPlanRequest(BaseModel):
     layer_count: int = Field(default=80, gt=0, le=2048)
     nodes: list[ClusterPlanNodeRequest] = Field(min_length=1, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    # "balanced" runs the bottleneck-minimizing DP planner; "proportional"
+    # splits layers ∝ usable RAM with largest-remainder rounding (exo-style).
+    allocation: Literal["balanced", "proportional"] = "balanced"
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
@@ -433,6 +448,7 @@ class ClusterDeploymentRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
     preflight: Literal[True] = True
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
+    allocation: Literal["balanced", "proportional"] = "balanced"
     auto_tune: bool = True
     sampling_rank_only: bool = True
     async_overlap: bool = True
@@ -779,10 +795,25 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
+        if request.allocation != "balanced":
+            raise PlanningError(
+                "RAM-proportional allocation is a pipeline-only rule; tensor "
+                "parallelism uses the hybrid planner (allocation='balanced')"
+            )
         plan = plan_hybrid(
             model,
             nodes,
             tensor_parallel_size=request.tensor_parallel_size,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    elif request.allocation == "proportional":
+        plan = plan_proportional_pipeline(
+            model,
+            nodes,
             workload_profile=request.execution_profile,
             microbatch_size=(
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
@@ -2453,6 +2484,49 @@ async def cluster_plan(request: ClusterPlanRequest):
     return _plan_with_signature(plan.to_dict())
 
 
+class ClusterBackendMemberRequest(BaseModel):
+    """One member's observed RDMA capability, from local or peer probes."""
+
+    node_id: str = Field(min_length=1, max_length=128)
+    rdma_ctl_enabled: bool = False
+    rdma_devices: list[str] = Field(default_factory=list, max_length=16)
+
+
+class ClusterBackendSelectionRequest(BaseModel):
+    """Which collective backend should this exact member set use?"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    members: list[ClusterBackendMemberRequest] = Field(min_length=2, max_length=64)
+
+
+@router.post("/backend-selection")
+async def cluster_backend_selection(
+    request: ClusterBackendSelectionRequest,
+) -> dict[str, Any]:
+    """jaccl when rdma_ctl is enabled on ALL members, else the TCP ring.
+
+    The plan view renders this decision (including which members block JACCL)
+    before anyone approves a placement; the replan endpoint makes the same
+    call when asked for ``backend="auto"``.
+    """
+
+    try:
+        selection = select_cluster_backend(
+            tuple(
+                MemberFabric(
+                    node_id=member.node_id.strip(),
+                    rdma_ctl_enabled=member.rdma_ctl_enabled,
+                    rdma_devices=tuple(member.rdma_devices),
+                )
+                for member in request.members
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return selection.to_dict()
+
+
 def _deployment_id(model_path: Path, plan_hash: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model_path.name).strip("-._")
     return f"{slug or 'model'}-{plan_hash[:12]}"
@@ -2532,6 +2606,7 @@ def _create_deployment(
         model_source_python=request.model_source_python,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        allocation=request.allocation,
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
@@ -3014,9 +3089,20 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/deployments")
-async def activate_cluster_deployment(request: ClusterDeploymentRequest):
-    """Recompute, preflight, eagerly load, and prove one distributed model."""
+async def _activate_and_report(
+    request: ClusterDeploymentRequest,
+) -> dict[str, Any]:
+    """Recompute, preflight, eagerly load, and prove one distributed model.
+
+    This is the single activation pipeline behind both ``POST /deployments``
+    (explicit approval of a previewed plan) and the approve phase of
+    ``POST /replan`` (one-action deactivate → re-plan → reload). The
+    deactivate half of a replan is exactly what this pipeline already does:
+    ``pool.prepare_cluster_reload`` unloads the resident engine under the
+    pool lock — quiescence-gated, and for distributed engines the supervisor's
+    *verified* teardown is the memory barrier — before the registry swap and
+    the eager reload below.
+    """
 
     plan_changes: dict[str, Any] = {
         "changed": False,
@@ -3249,6 +3335,226 @@ async def activate_cluster_deployment(request: ClusterDeploymentRequest):
             "model": model_id,
             "chat_completions": "/v1/chat/completions",
             "responses": "/v1/responses",
+        },
+    }
+
+
+@router.post("/deployments")
+async def activate_cluster_deployment(request: ClusterDeploymentRequest):
+    """Recompute, preflight, eagerly load, and prove one distributed model."""
+
+    return await _activate_and_report(request)
+
+
+class ClusterReplanRequest(BaseModel):
+    """One-action deactivate → re-plan → reload for a clustered model.
+
+    With no ``approved_placement`` this is a dry run: it renders the plan the
+    one-action call would launch, signed, with a diff against the running
+    placement. Posting that signature back performs the whole dance at once.
+
+    ``nodes``/``hosts``/``backend`` default to the current deployment's, so a
+    budget-only or context-only change needs no host details; a membership
+    change (a node joining or leaving the model) is expressed by posting the
+    new explicit ``nodes`` + ``hosts`` lists.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: str | None = Field(default=None, max_length=128)
+    model_path: str | None = Field(default=None, max_length=4096)
+    model_source: str | None = Field(default=None, max_length=255)
+    model_source_python: str | None = Field(default=None, max_length=4096)
+    backend: Literal["auto", "ring", "jaccl", "jaccl-ring"] | None = None
+    nodes: list[ClusterPlanNodeRequest] | None = Field(
+        default=None, min_length=2, max_length=64
+    )
+    hosts: list[ClusterHostRequest] | None = Field(
+        default=None, min_length=2, max_length=64
+    )
+    execution_profile: Literal["interactive", "balanced", "throughput"] = (
+        "balanced"
+    )
+    allocation: Literal["balanced", "proportional"] = "balanced"
+    auto_tune: bool = False
+    sampling_rank_only: bool = True
+    async_overlap: bool = True
+    cache_affinity: bool = True
+    max_kv_size: int | None = Field(default=None, gt=0)
+    ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
+    tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
+
+
+_REPLAN_STEPS = (
+    "deactivate (quiescence-gated unload with verified teardown)",
+    "re-plan (recomputed server-side and pinned by signature)",
+    "reload (eager distributed load with readiness canary)",
+)
+
+
+@router.post("/replan")
+async def replan_cluster_deployment(request: ClusterReplanRequest):
+    """Collapse deactivate → re-plan → reload into one action.
+
+    The engine-pool quiescence gate (``prepare_cluster_reload``) refuses to
+    interrupt in-flight requests, and the distributed supervisor's verified
+    teardown is the memory barrier between the old world and the new one: if
+    teardown cannot be proven, the old registry record stays and the error
+    says what survived.
+    """
+
+    try:
+        registry = get_cluster_registry()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    current: ClusterDeployment | None = None
+    if request.deployment_id:
+        current = await asyncio.to_thread(registry.get, request.deployment_id)
+        if current is None:
+            raise HTTPException(
+                status_code=404, detail="cluster deployment not found"
+            )
+    elif request.model_path:
+        current = await asyncio.to_thread(
+            registry.get_for_model, request.model_path
+        )
+
+    if current is None and not (
+        request.model_path and request.nodes and request.hosts
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "replan needs an existing deployment (deployment_id or a "
+                "model_path with a registered deployment) or an explicit "
+                "model_path together with nodes and hosts"
+            ),
+        )
+
+    derived: dict[str, bool] = {"nodes": False, "hosts": False, "backend": False}
+    nodes = request.nodes
+    if nodes is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="nodes are required")
+        nodes = [
+            ClusterPlanNodeRequest(**payload)
+            for payload in nodes_from_deployment(current)
+        ]
+        derived["nodes"] = True
+    hosts = request.hosts
+    if hosts is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="hosts are required")
+        hosts = [
+            ClusterHostRequest(**payload)
+            for payload in hosts_from_deployment(current)
+        ]
+        derived["hosts"] = True
+    backend = request.backend
+    if backend is None:
+        if current is None:
+            raise HTTPException(status_code=400, detail="backend is required")
+        backend = current.backend
+        derived["backend"] = True
+    if backend == "auto":
+        # rdma_ctl on every member → jaccl; any member without it pulls the
+        # whole cluster onto the TCP ring. Derived from the posted host
+        # records; launch preflight re-verifies the live state.
+        try:
+            selection = select_cluster_backend(members_from_host_records(hosts))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        backend_decision: dict[str, Any] = selection.to_dict()
+        backend = selection.backend
+    else:
+        backend_decision = {
+            "backend": backend,
+            "reason": "operator-selected backend",
+            "blockers": [],
+            "members": [
+                member.to_dict() for member in members_from_host_records(hosts)
+            ],
+        }
+    try:
+        _validate_cluster_hosts(hosts)
+        effective = ClusterDeploymentRequest(
+            deployment_id=request.deployment_id,
+            model_path=(request.model_path or (current.model if current else "")),
+            model_source=request.model_source,
+            model_source_python=request.model_source_python,
+            backend=backend,
+            nodes=nodes,
+            hosts=hosts,
+            execution_profile=request.execution_profile,
+            allocation=request.allocation,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            async_overlap=request.async_overlap,
+            cache_affinity=request.cache_affinity,
+            max_kv_size=request.max_kv_size,
+            ring_connections_per_ip=request.ring_connections_per_ip,
+            tensor_parallel_size=request.tensor_parallel_size,
+            target_context_tokens=request.target_context_tokens,
+            # Not consulted by planning; activation re-checks the real one
+            # below. Preview callers do not have a signature yet.
+            approved_placement=request.approved_placement or ("0" * 16),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        deployment, plan = await asyncio.to_thread(_create_deployment, effective)
+    except (OSError, PlanningError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    signed_plan = _plan_with_signature(plan)
+    changes = (
+        _plan_changes(placement_view(current), plan)
+        if current is not None
+        else None
+    )
+
+    if request.approved_placement is None:
+        return {
+            "ok": True,
+            "mode": "preview",
+            "steps": list(_REPLAN_STEPS),
+            "derived": derived,
+            "current": (
+                summarize_deployment(current) if current is not None else None
+            ),
+            "changes": changes,
+            "deployment_id": deployment.deployment_id,
+            "backend": deployment.backend,
+            "backend_decision": backend_decision,
+            "plan": signed_plan,
+        }
+
+    if request.approved_placement.strip() != signed_plan["placement_signature"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This is not the plan the replan preview showed — the budgets, "
+                "roles or layer split changed in between. Preview again and "
+                f"approve what it shows. As posted, this request would place: "
+                f"{_describe_placement(plan)}."
+            ),
+        )
+
+    result = await _activate_and_report(effective)
+    return result | {
+        "mode": "applied",
+        "replan": {
+            "steps": list(_REPLAN_STEPS),
+            "derived": derived,
+            "backend_decision": backend_decision,
+            "previous": (
+                summarize_deployment(current) if current is not None else None
+            ),
+            "changes": changes,
         },
     }
 
