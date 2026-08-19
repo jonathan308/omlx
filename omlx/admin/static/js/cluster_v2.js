@@ -543,10 +543,12 @@ function clusterV2Wizard() {
         },
 
         sshTargetFor(device) {
+            // Pairing enrollment records the SSH target; the devices payload
+            // surfaces it as ssh_target on paired rows. Fall back to the
+            // first verified probe address when no enrollment exists yet.
+            if (device?.ssh_target) return String(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
             const first = addrs.find((addr) => addr && addr.ip);
-            // Pairing enrollment records the SSH target; until the registry
-            // surfaces it, the first verified probe address is the target.
             return first ? String(first.ip) : this.deviceName(device);
         },
 
