@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator
@@ -73,12 +74,26 @@ class DistributedBatchedEngine(BatchedEngine):
         python_executable: str | None = None,
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
-        request_read_timeout: float = 300.0,
+        request_read_timeout: float | None = None,
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
     ) -> None:
-        if request_read_timeout <= 0:
-            raise ValueError("distributed request read timeout must be positive")
+        # Upstream 0.6.2 (#2714) structure: env-var-configurable read timeout.
+        if request_read_timeout is None:
+            raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
+            try:
+                request_read_timeout = float(raw)
+            except ValueError:
+                raise ValueError(
+                    "OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT must be a number, "
+                    f"got {raw!r}"
+                ) from None
+        if not math.isfinite(request_read_timeout) or request_read_timeout <= 0:
+            raise ValueError(
+                "distributed request read timeout must be a finite positive "
+                f"number, got {request_read_timeout!r}"
+            )
+        # Our G3/G4 abort-drain / orphan-reap semantics kept on top.
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
         super().__init__(
@@ -207,7 +222,6 @@ class DistributedBatchedEngine(BatchedEngine):
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
-                "thinking_budget_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -321,10 +335,6 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if kwargs.get("logit_bias"):
             raise ValueError("logit_bias is not yet supported by distributed inference")
-        if kwargs.get("thinking_budget") is not None:
-            raise ValueError(
-                "thinking budgets are not yet supported by distributed inference"
-            )
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
 
@@ -371,6 +381,14 @@ class DistributedBatchedEngine(BatchedEngine):
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
+        chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        # MLX-LM's private server reads thinking budgets from chat_template_kwargs
+        # on the request body, not from a top-level field. Fold it in so the rank
+        # sees it and can build its budget processor per request.
+        if kwargs.get("thinking_budget") is not None:
+            chat_template_kwargs["thinking_budget"] = kwargs["thinking_budget"]
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
         if stream:
             payload["stream_options"] = {"include_usage": True}
         return payload
@@ -431,7 +449,12 @@ class DistributedBatchedEngine(BatchedEngine):
             payload["stop"] = stop
         if kwargs.get("seed") is not None:
             payload["seed"] = kwargs["seed"]
-        chat_template_kwargs = kwargs.get("chat_template_kwargs")
+        chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        # MLX-LM's private server reads thinking budgets from chat_template_kwargs
+        # on the request body, not from a top-level field. Fold it in so the rank
+        # sees it and can build its budget processor per request.
+        if kwargs.get("thinking_budget") is not None:
+            chat_template_kwargs["thinking_budget"] = kwargs["thinking_budget"]
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
         if stream:
