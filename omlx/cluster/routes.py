@@ -3356,7 +3356,9 @@ class ClusterReplanRequest(BaseModel):
     ``nodes``/``hosts``/``backend`` default to the current deployment's, so a
     budget-only or context-only change needs no host details; a membership
     change (a node joining or leaving the model) is expressed by posting the
-    new explicit ``nodes`` + ``hosts`` lists.
+    new explicit ``nodes`` + ``hosts`` lists. ``path_map`` likewise defaults
+    to the current deployment's per-node paths so a replan does not silently
+    revert a heterogeneous-path cluster to same-path resolution.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -3384,6 +3386,7 @@ class ClusterReplanRequest(BaseModel):
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
 
@@ -3434,7 +3437,12 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             ),
         )
 
-    derived: dict[str, bool] = {"nodes": False, "hosts": False, "backend": False}
+    derived: dict[str, bool] = {
+        "nodes": False,
+        "hosts": False,
+        "backend": False,
+        "path_map": False,
+    }
     nodes = request.nodes
     if nodes is None:
         if current is None:
@@ -3459,6 +3467,13 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             raise HTTPException(status_code=400, detail="backend is required")
         backend = current.backend
         derived["backend"] = True
+    path_map = request.path_map
+    if path_map is None and current is not None and current.path_map:
+        # Per-node paths are part of the deployment contract: a replan that
+        # dropped them would silently revert workers to the coordinator's
+        # shared path. Carry them forward unless the caller overrides.
+        path_map = dict(current.path_map)
+        derived["path_map"] = True
     if backend == "auto":
         # rdma_ctl on every member → jaccl; any member without it pulls the
         # whole cluster onto the TCP ring. Derived from the posted host
@@ -3498,6 +3513,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             ring_connections_per_ip=request.ring_connections_per_ip,
             tensor_parallel_size=request.tensor_parallel_size,
             target_context_tokens=request.target_context_tokens,
+            path_map=path_map,
             # Not consulted by planning; activation re-checks the real one
             # below. Preview callers do not have a signature yet.
             approved_placement=request.approved_placement or ("0" * 16),
