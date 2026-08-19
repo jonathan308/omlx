@@ -1410,15 +1410,13 @@ def _predict_stage_seconds(
     return compute_seconds, send_seconds, compute_seconds + send_seconds
 
 
-def plan_unequal_pipeline(
+def _validate_pipeline_request(
     model: ModelLayout,
     nodes: Sequence[NodeBudget],
-    *,
-    workload_profile: ExecutionProfileName = "balanced",
-    microbatch_size: int = 1,
-    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
-) -> ShardPlan:
-    """Assign contiguous layers in MLX pipeline order across unequal nodes."""
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+) -> None:
+    """The input contract every pipeline planner enforces identically."""
 
     if not nodes:
         raise ValueError("at least one node is required")
@@ -1441,6 +1439,19 @@ def plan_unequal_pipeline(
             raise PlanningError(
                 f"replicated fixed weights do not fit node {node.node_id}"
             )
+
+
+def plan_unequal_pipeline(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    *,
+    workload_profile: ExecutionProfileName = "balanced",
+    microbatch_size: int = 1,
+    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> ShardPlan:
+    """Assign contiguous layers in MLX pipeline order across unequal nodes."""
+
+    _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
 
     # MLX-LM sends activations from the highest rank (early layers) down to
     # rank zero (late layers / HTTP coordinator), so partition in reverse rank.
@@ -1467,6 +1478,133 @@ def plan_unequal_pipeline(
                 f"fit the supplied per-node budgets: {exc}"
             ) from exc
         raise
+    return _finish_pipeline_plan(
+        model,
+        nodes,
+        pipeline_nodes,
+        ranges,
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
+        optimization="performance" if performance_aware else "memory",
+    )
+
+
+def allocate_layers_proportional(
+    layer_count: int,
+    shares: Sequence[int],
+) -> tuple[int, ...]:
+    """Split ``layer_count`` across nodes proportionally to ``shares``.
+
+    Largest-remainder rounding with a one-layer minimum per node — the
+    allocation rule exo's placement uses, so a 256 GB + 128 GB pair splits
+    roughly ⅔–⅓. Fractions are exact (no float drift) and ties break toward
+    the larger share, then the earlier pipeline position, so the result is
+    deterministic and reproducible across machines.
+    """
+
+    if not isinstance(layer_count, int) or layer_count <= 0:
+        raise ValueError("layer_count must be a positive integer")
+    if not shares:
+        raise ValueError("at least one share is required")
+    for share in shares:
+        if not isinstance(share, int) or isinstance(share, bool) or share <= 0:
+            raise ValueError("shares must be positive integers")
+    node_count = len(shares)
+    if node_count > layer_count:
+        raise PlanningError(
+            f"{node_count} nodes cannot each receive a layer from "
+            f"{layer_count} layers"
+        )
+    total = sum(shares)
+    exact = [Fraction(layer_count * share, total) for share in shares]
+    counts = [max(1, value.numerator // value.denominator) for value in exact]
+    remainder = layer_count - sum(counts)
+    # Σfloor(exact) ≤ layer_count and the one-layer floor adds at most one per
+    # node that floored to zero, so ``remainder`` is never negative.
+    assert remainder >= 0
+    order = sorted(
+        range(node_count),
+        key=lambda index: (
+            -(exact[index] - counts[index]),
+            -shares[index],
+            index,
+        ),
+    )
+    for index in order[:remainder]:
+        counts[index] += 1
+    return tuple(counts)
+
+
+def plan_proportional_pipeline(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    *,
+    workload_profile: ExecutionProfileName = "balanced",
+    microbatch_size: int = 1,
+    context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+) -> ShardPlan:
+    """RAM-proportional N-node pipeline plan (largest-remainder, exo-style).
+
+    Layer counts are proportional to each node's usable memory
+    (``capacity − reserve``), rounded by largest remainder. Unlike the
+    balanced planner this does not optimize for the bottleneck stage or honor
+    soft weight targets — it is the predictable "split by RAM" rule operators
+    expect when generalizing beyond two nodes. Per-node weight ceilings (the
+    split control) and KV reservations are still enforced: a node whose
+    proportional share does not fit fails the plan with its name, rather than
+    being silently rebalanced.
+    """
+
+    _validate_pipeline_request(model, nodes, workload_profile, microbatch_size)
+
+    pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
+    counts = allocate_layers_proportional(
+        len(model.layer_weight_bytes),
+        [node.usable_bytes for node in pipeline_nodes],
+    )
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    for count in counts:
+        ranges.append((start, start + count))
+        start += count
+    for node, (range_start, range_end) in zip(pipeline_nodes, ranges):
+        layer_weight = sum(model.layer_weight_bytes[range_start:range_end])
+        if model.fixed_weight_bytes + layer_weight > node.weight_ceiling_bytes:
+            raise PlanningError(
+                f"the RAM-proportional split gives node {node.node_id} "
+                f"{range_end - range_start} layers "
+                f"({model.fixed_weight_bytes + layer_weight} bytes with fixed "
+                f"weights) above its weight ceiling of "
+                f"{node.weight_ceiling_bytes}; raise that node's split cap or "
+                "plan with the balanced allocator"
+            )
+    return _finish_pipeline_plan(
+        model,
+        nodes,
+        pipeline_nodes,
+        tuple(ranges),
+        workload_profile=workload_profile,
+        microbatch_size=microbatch_size,
+        context_tokens=context_tokens,
+        optimization="ram-proportional",
+    )
+
+
+def _finish_pipeline_plan(
+    model: ModelLayout,
+    nodes: Sequence[NodeBudget],
+    pipeline_nodes: Sequence[NodeBudget],
+    ranges: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    *,
+    workload_profile: ExecutionProfileName,
+    microbatch_size: int,
+    context_tokens: int,
+    optimization: str,
+) -> ShardPlan:
+    """Assignments, per-node fit checks, and the signed hash for a partition."""
+
+    performance_aware = all(node.performance is not None for node in pipeline_nodes)
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
@@ -1519,7 +1657,7 @@ def plan_unequal_pipeline(
     hash_payload = {
         "model": model.to_dict(),
         "context_tokens": context_tokens,
-        "optimization": "performance" if performance_aware else "memory",
+        "optimization": optimization,
         "workload_profile": workload_profile,
         "microbatch_size": microbatch_size,
         "performance_profiles": [
@@ -1560,7 +1698,7 @@ def plan_unequal_pipeline(
         model=model,
         assignments=tuple(assignments),
         plan_hash=plan_hash,
-        optimization="performance" if performance_aware else "memory",
+        optimization=optimization,
         workload_profile=workload_profile,
         performance_profiles=tuple(
             node.performance
