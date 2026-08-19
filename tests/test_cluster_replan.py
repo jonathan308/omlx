@@ -217,13 +217,64 @@ def test_replan_preview_derives_current_cluster(active_deployment):
     assert response.status_code == 200, response.json()
     payload = response.json()
     assert payload["mode"] == "preview"
-    assert payload["derived"] == {"nodes": True, "hosts": True, "backend": True}
+    assert payload["derived"] == {
+        "nodes": True,
+        "hosts": True,
+        "backend": True,
+        "path_map": False,
+    }
     assert payload["current"]["world_size"] == 2
     assert payload["changes"]["changed"] is False
     assert len(payload["steps"]) == 3
     assert payload["plan"]["placement_signature"]
     # A preview must not touch the pool at all.
     assert active_deployment.pool.reloads == 1  # only the initial activation
+
+
+def test_replan_carries_path_map_forward(tmp_path, monkeypatch):
+    """A replan of a per-node-path deployment must not revert to same-path."""
+
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    pool = _RecordingPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+
+    path_map = {
+        "large": str(model_path),
+        "small": "/Volumes/shared/nemotron",
+    }
+    body = _deployment_payload(model_path)
+    body["path_map"] = path_map
+    plan = routes._create_cluster_plan(
+        routes.ClusterPlanRequest(
+            model_path=body["model_path"],
+            nodes=body["nodes"],
+            path_map=path_map,
+        )
+    )
+    body["approved_placement"] = routes._placement_signature(plan.to_dict())
+    response = _client().post("/admin/api/cluster/deployments", json=body)
+    assert response.status_code == 200, response.json()
+    deployment_id = response.json()["deployment"]["deployment_id"]
+    assert response.json()["deployment"]["path_map"] == path_map
+
+    preview = _client().post(
+        "/admin/api/cluster/replan", json={"deployment_id": deployment_id}
+    )
+    assert preview.status_code == 200, preview.json()
+    payload = preview.json()
+    assert payload["derived"]["path_map"] is True
+    assert payload["plan"]["path_map"] == path_map
+
+    # An explicit override wins over the carried-forward map.
+    override = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "path_map": {}},
+    )
+    assert override.status_code == 200, override.json()
+    assert override.json()["derived"]["path_map"] is False
 
 
 def test_replan_preview_detects_changed_split(active_deployment):
