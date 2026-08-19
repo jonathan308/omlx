@@ -186,6 +186,45 @@ def test_discovery_health_reflects_live_service(_configured_stores):
     configure_discovery_service(None)
 
 
+def test_devices_merges_pending_pairing_requests(
+    _configured_stores, monkeypatch
+):
+    identity, registry, client = _configured_stores
+
+    class _FakePairingManager:
+        def pending_requests(self):
+            return [
+                {
+                    "node_id": "peer-pending",
+                    "friendly_name": "studio-2",
+                    "caps": {"chip": "M3"},
+                    "addrs": ["192.168.1.11"],
+                    "http_port": 8000,
+                    "state": "awaiting_approval",
+                    "created_at": 100.0,
+                    "expires_at": 700.0,
+                    "attempts": 0,
+                    "locked": False,
+                    "locked_until": None,
+                }
+            ]
+
+    from omlx.cluster import pairing
+
+    monkeypatch.setattr(
+        pairing, "get_pairing_manager", lambda: _FakePairingManager()
+    )
+
+    payload = client.get("/api/cluster/devices").json()
+
+    pending = [
+        d for d in payload["discovered"] if d["node_id"] == "peer-pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["state"] == "awaiting_approval"
+    assert pending[0]["friendly_name"] == "studio-2"
+
+
 def test_devices_requires_admin_auth(tmp_path):
     # Without the dependency override, an unauthenticated call is rejected.
     reset_configured_identity()
