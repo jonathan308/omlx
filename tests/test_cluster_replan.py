@@ -313,12 +313,17 @@ def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
     pool.busy = True
 
     preview = _client().post(
-        "/admin/api/cluster/replan", json={"deployment_id": deployment_id}
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "target_context_tokens": 16384,
+        },
     ).json()
     response = _client().post(
         "/admin/api/cluster/replan",
         json={
             "deployment_id": deployment_id,
+            "target_context_tokens": 16384,
             "approved_placement": preview["plan"]["placement_signature"],
         },
     )
