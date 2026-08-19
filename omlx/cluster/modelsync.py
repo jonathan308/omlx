@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -33,6 +34,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 
 from ..exceptions import ModelNotFoundError
+from .ssh_policy import cluster_ssh_options
 from .staging import (
     index_shards,
     model_identity_digest,
@@ -300,12 +302,14 @@ def build_rsync_argv(
 
     ``--partial --append-verify`` resumes interrupted transfers and verifies
     the appended bytes, the functional equivalent of ``-P --append-verify``
-    without the interactive progress format.
+    without the interactive progress format. The SSH transport uses the one
+    shared non-interactive cluster policy (managed identity, accept-new
+    host keys, BatchMode) — never a hand-rolled option set.
     """
 
-    ssh_command = ["ssh", "-o", "BatchMode=yes"]
+    ssh_argv = ["ssh", *cluster_ssh_options()]
     if ssh_identity is not None:
-        ssh_command.extend(["-i", str(ssh_identity)])
+        ssh_argv.extend(["-i", str(ssh_identity)])
     source = str(Path(source_dir).expanduser()).rstrip("/") + "/"
     destination = f"{ssh_target}:{destination_dir}"
     return [
@@ -315,7 +319,7 @@ def build_rsync_argv(
         "--append-verify",
         "--info=progress2",
         "-e",
-        " ".join(ssh_command),
+        shlex.join(ssh_argv),
         source,
         destination,
     ]
