@@ -230,6 +230,10 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Peer import preflight, exposed ahead of the /autoconfigure handler
         # that will call it alongside preflight_issues.
         ("autoconfigure.py", "peer_import_issues"),
+        # Test hooks that drop process-wide v2 singletons between cases; only
+        # the test suite calls them (production swaps via configure_*).
+        ("identity.py", "reset_configured_identity"),
+        ("registry.py", "reset_configured_device_registry"),
     }
 
     sources = {
