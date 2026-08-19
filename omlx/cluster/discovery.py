@@ -492,3 +492,951 @@ def _enrich_peer_transports(
         peer["transport"] = known["transport"] if known else "detecting"
         peer["link_speed_gbps"] = known["link_speed_gbps"] if known else None
         peer["rdma_available"] = known["rdma_available"] if known else False
+
+
+# ---------------------------------------------------------------------------
+# Cluster v2: PeerRecord + DiscoveryService
+#
+# Layered peer discovery (see ops/notes/cluster_discovery_onboarding_comparison.md):
+#   1. mDNS (_omlx._tcp.local.) via python-zeroconf — optional; absence or any
+#      mDNS failure disables only mDNS, never the process.
+#   2. IPv6 link-local multicast fallback (exo-style): HELLO/WASSUP on
+#      ff12::6f6d:6c78 udp/53413 with per-interface joins and nonce self-drop.
+#   3. Manual peer add (add_manual) for multicast-filtered networks.
+#   4. Tailscale opportunistic candidates when the tailscale CLI exists.
+# Every announced address is verified against GET /api/cluster/node_id before
+# it is trusted; peers never graduate from "discovered" without that probe.
+# ---------------------------------------------------------------------------
+
+import errno  # noqa: E402
+import hashlib  # noqa: E402
+import ipaddress  # noqa: E402
+import logging  # noqa: E402
+import os  # noqa: E402
+import platform  # noqa: E402
+import struct  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import urllib.request  # noqa: E402
+from collections import deque  # noqa: E402
+from contextlib import suppress  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+
+from .._version import __version__ as _OMLX_VERSION  # noqa: E402
+
+logger = logging.getLogger(__name__)  # noqa: E402
+
+MDNS_SERVICE_TYPE = "_omlx._tcp.local."
+MULTICAST_GROUP = "ff12::6f6d:6c78"
+MULTICAST_PORT = 53413
+_HELLO_MAGIC = b"OMLX"
+_WASSUP_MAGIC = b"OMLXW"
+_HELLO_STRUCT = struct.Struct(">4sQQ")  # magic, nonce, cluster_hash
+_MAX_DATAGRAM = 2048
+_RECENT_NONCES = 64
+_MAX_CANDIDATES = 256
+
+# Multicast-join failures we tolerate per-interface (macOS gotcha #3: skip
+# interfaces that do not support multicast instead of dying).
+_JOIN_IGNORED_ERRNOS = {
+    errno.EAFNOSUPPORT,
+    errno.EADDRNOTAVAIL,
+    errno.ENODEV,
+    errno.ENXIO,
+    errno.EINVAL,
+}
+
+
+def cluster_hash_u64(cluster_name: str) -> int:
+    """blake2s(cluster_name)[:8] as a big-endian u64."""
+
+    digest = hashlib.blake2s(str(cluster_name).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def encode_hello(nonce: int, cluster_hash: int) -> bytes:
+    return _HELLO_STRUCT.pack(_HELLO_MAGIC, nonce & 0xFFFFFFFFFFFFFFFF, cluster_hash)
+
+
+def decode_hello(data: bytes) -> tuple[int, int] | None:
+    """Decode a HELLO datagram to (nonce, cluster_hash); ``None`` if invalid."""
+
+    if len(data) != _HELLO_STRUCT.size:
+        return None
+    magic, nonce, cluster_hash = _HELLO_STRUCT.unpack(data)
+    if magic != _HELLO_MAGIC:
+        return None
+    return nonce, cluster_hash
+
+
+def encode_wassup(nonce: int, node_id: str, http_port: int) -> bytes:
+    payload = json.dumps(
+        {"nonce": nonce, "node_id": node_id, "http_port": int(http_port)},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _WASSUP_MAGIC + payload
+
+
+def decode_wassup(data: bytes) -> dict[str, Any] | None:
+    """Decode a WASSUP datagram; ``None`` if invalid."""
+
+    if not data.startswith(_WASSUP_MAGIC):
+        return None
+    try:
+        payload = json.loads(data[len(_WASSUP_MAGIC):].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nonce = payload.get("nonce")
+    node_id = payload.get("node_id")
+    http_port = payload.get("http_port")
+    if not isinstance(nonce, int) or not 0 <= nonce < 1 << 64:
+        return None
+    if not isinstance(node_id, str) or not node_id or len(node_id) > 255:
+        return None
+    if not isinstance(http_port, int) or not 1 <= http_port <= 65535:
+        return None
+    return {"nonce": nonce, "node_id": node_id, "http_port": http_port}
+
+
+@dataclass
+class PeerCaps:
+    chip: str = ""
+    ram_gb: float = 0.0
+    backends: list[str] = field(default_factory=list)
+    thunderbolt: bool = False
+    jaccl: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chip": self.chip,
+            "ram_gb": self.ram_gb,
+            "backends": list(self.backends),
+            "thunderbolt": self.thunderbolt,
+            "jaccl": self.jaccl,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> PeerCaps:
+        if not isinstance(payload, dict):
+            return cls()
+        backends = payload.get("backends")
+        return cls(
+            chip=str(payload.get("chip") or "")[:128],
+            ram_gb=float(payload.get("ram_gb") or 0.0),
+            backends=[str(b) for b in backends][:8]
+            if isinstance(backends, list)
+            else [],
+            thunderbolt=bool(payload.get("thunderbolt")),
+            jaccl=bool(payload.get("jaccl")),
+        )
+
+
+def local_caps() -> PeerCaps:
+    """Best-effort local capability snapshot; never raises."""
+
+    caps = PeerCaps()
+    try:
+        if sys.platform == "darwin":
+            chip = subprocess.run(  # noqa: S603 - fixed system executable
+                ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if chip.returncode == 0:
+                caps.chip = chip.stdout.strip()[:128]
+            mem = subprocess.run(  # noqa: S603 - fixed system executable
+                ["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if mem.returncode == 0:
+                caps.ram_gb = round(int(mem.stdout.strip()) / (1 << 30), 1)
+        else:
+            caps.chip = platform.machine()
+            with suppress(OSError, ValueError):
+                caps.ram_gb = round(
+                    os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                    / (1 << 30),
+                    1,
+                )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return caps
+
+
+PeerLink = str  # "tb" | "ethernet" | "wifi" | "tailscale" | "unknown"
+PeerState = str  # "discovered" | "suspect" | "dead"
+
+
+@dataclass
+class PeerRecord:
+    node_id: str
+    friendly_name: str = ""
+    version: str = ""
+    cluster_name: str = ""
+    caps: PeerCaps = field(default_factory=PeerCaps)
+    addrs: list[dict[str, str]] = field(default_factory=list)
+    http_port: int = 0
+    paired: bool = False
+    last_seen: float = 0.0
+    link: PeerLink = "unknown"
+    state: PeerState = "discovered"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "friendly_name": self.friendly_name,
+            "version": self.version,
+            "cluster_name": self.cluster_name,
+            "caps": self.caps.to_dict(),
+            "addrs": [dict(a) for a in self.addrs],
+            "http_port": self.http_port,
+            "paired": self.paired,
+            "last_seen": self.last_seen,
+            "link": self.link,
+            "state": self.state,
+        }
+
+
+@dataclass
+class DiscoveryConfig:
+    cluster_name: str = "omlx"
+    http_port: int = 8000
+    version: str = _OMLX_VERSION
+    caps: PeerCaps = field(default_factory=local_caps)
+    hello_interval: float = 1.0
+    heartbeat_interval: float = 2.0
+    probe_interval: float = 10.0
+    probe_timeout: float = 3.0
+    suspect_after: float = 6.0
+    dead_after: float = 30.0
+    multicast_window: float = 5.0
+    iface_poll_interval: float = 5.0
+    tailscale_interval: float = 30.0
+    enable_mdns: bool = True
+    enable_multicast: bool = True
+    enable_tailscale: bool = True
+
+
+def _default_interface_lister() -> list[str]:
+    """Names of multicast-capable candidate interfaces (never raises)."""
+
+    names: list[str] = []
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(  # noqa: S603 - fixed system executable
+                ["/sbin/ifconfig", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                names = result.stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            names = []
+    if not names:
+        with suppress(OSError):
+            names = [name for _, name in socket.if_nameindex()]
+    return [n for n in names if not n.startswith("lo")]
+
+
+def _http_probe_node_id(
+    ip: str, port: int, timeout: float
+) -> dict[str, Any] | None:
+    """GET http://ip:port/api/cluster/node_id; ``None`` on any failure."""
+
+    host = f"[{ip}]" if ":" in ip else ip
+    url = f"http://{host}:{port}/api/cluster/node_id"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - cluster LAN probe of an announced address
+            payload = json.loads(response.read(65536).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("node_id"), str
+    ):
+        return None
+    return payload
+
+
+def _classify_link(ip: str, if_type: str, rtt: float | None) -> PeerLink:
+    """Best-effort link classification.
+
+    Tailscale is certain (100.64.0.0/10); Thunderbolt vs ethernet vs wifi is
+    an RTT heuristic over the verified address until interface metadata says
+    otherwise.
+    """
+
+    if if_type == "tailscale":
+        return "tailscale"
+    with suppress(ValueError):
+        if ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10"):
+            return "tailscale"
+    if rtt is None:
+        return "unknown"
+    if rtt < 0.001:
+        return "tb"
+    if rtt < 0.010:
+        return "ethernet"
+    return "wifi"
+
+
+def _load_zeroconf() -> Any | None:
+    """Import python-zeroconf if installed; ``None`` disables only mDNS."""
+
+    try:
+        import zeroconf
+    except ImportError:
+        return None
+    return zeroconf
+
+
+class DiscoveryService:
+    """Always-on peer discovery for cluster v2.
+
+    All network-touching seams are injectable (``socket_factory``,
+    ``prober``, ``interface_lister``, ``tailscale_status``,
+    ``zeroconf_module``) so unit tests run fully offline.
+    """
+
+    def __init__(
+        self,
+        identity: Any,
+        registry: Any,
+        config: DiscoveryConfig | None = None,
+        *,
+        socket_factory: Callable[[], Any] | None = None,
+        prober: Callable[[str, int, float], dict[str, Any] | None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        interface_lister: Callable[[], list[str]] = _default_interface_lister,
+        tailscale_status: Callable[[], dict[str, Any] | None] | None = None,
+        zeroconf_module: Any = "auto",
+    ) -> None:
+        self.identity = identity
+        self.registry = registry
+        self.config = config or DiscoveryConfig()
+        self._clock = clock
+        self._prober = prober or _http_probe_node_id
+        self._socket_factory = socket_factory or self._open_multicast_socket
+        self._interface_lister = interface_lister
+        self._tailscale_status = tailscale_status or self._read_tailscale_status
+        if zeroconf_module == "auto":
+            self._zc = _load_zeroconf() if self.config.enable_mdns else None
+        else:
+            self._zc = zeroconf_module or None
+
+        self._cluster_hash = cluster_hash_u64(self.config.cluster_name)
+        self._peers: dict[str, PeerRecord] = {}
+        # (ip, port) -> {node_id hint, if_type, last_probe, rtt, verified}
+        self._candidates: dict[tuple[str, int], dict[str, Any]] = {}
+        self._nonces: deque[int] = deque(maxlen=_RECENT_NONCES)
+        self._callbacks: list[Callable[[PeerRecord], None]] = []
+        self._hash_mismatch_logged = False
+        self._last_hello_at: float | None = None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._socket: Any | None = None
+        self._joined: dict[str, int] = {}  # ifname -> ifindex
+        self._zc_instance: Any | None = None
+        self._zc_browser: Any | None = None
+        self._zc_info: Any | None = None
+
+    # -- public API ----------------------------------------------------------
+
+    @property
+    def mdns_available(self) -> bool:
+        return self._zc is not None
+
+    @property
+    def multicast_ok(self) -> bool:
+        """True when a foreign HELLO arrived within the multicast window.
+
+        The UI uses this to warn about macOS Local Network permission
+        denial: discovery silently finds nothing when the OS blocks us.
+        """
+
+        last = self._last_hello_at
+        return last is not None and (
+            self._clock() - last
+        ) < self.config.multicast_window
+
+    def peers(self) -> list[PeerRecord]:
+        with self._lock:
+            return [
+                self._peers[key] for key in sorted(self._peers)
+            ]
+
+    def on_change(self, callback: Callable[[PeerRecord], None]) -> None:
+        with self._lock:
+            self._callbacks.append(callback)
+
+    def add_manual(self, ip: str, port: int) -> None:
+        """Manually added peer candidate; verified via the same probe path."""
+
+        self._add_candidate(str(ip), int(port), node_id=None, if_type="manual")
+        # Probe on the next maintenance tick; tests may call probe_now().
+
+    def start(self) -> None:
+        with self._lock:
+            if self._threads:
+                return
+            self._stop.clear()
+            if self.config.enable_multicast:
+                self._spawn(self._multicast_loop, "omlx-discovery-mcast")
+            self._spawn(self._maintenance_loop, "omlx-discovery-maint")
+            if self._zc is not None:
+                try:
+                    self._start_mdns()
+                except Exception as exc:  # mDNS must never kill the process
+                    logger.warning("mDNS announce/browse disabled: %s", exc)
+                    self._zc_instance = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        for thread in list(self._threads):
+            thread.join(timeout=2.0)
+        self._threads = []
+        with suppress(Exception):
+            if self._socket is not None:
+                self._socket.close()
+        self._socket = None
+        with suppress(Exception):
+            if self._zc_instance is not None:
+                if self._zc_info is not None:
+                    self._zc_instance.unregister_service(self._zc_info)
+                if self._zc_browser is not None:
+                    self._zc_browser.cancel()
+                self._zc_instance.close()
+        self._zc_instance = self._zc_browser = self._zc_info = None
+
+    def probe_now(self) -> None:
+        """Run one probe sweep synchronously (maintenance loop does this)."""
+
+        self._probe_sweep()
+
+    def tick_liveness(self) -> None:
+        """Evaluate suspect/dead transitions synchronously (loop does this)."""
+
+        self._liveness_sweep()
+
+    # -- internals -----------------------------------------------------------
+
+    def _spawn(self, target: Callable[[], None], name: str) -> None:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        self._threads.append(thread)
+        thread.start()
+
+    def _fire_change(self, peer: PeerRecord) -> None:
+        with self._lock:
+            callbacks = list(self._callbacks)
+        for callback in callbacks:
+            try:
+                callback(peer)
+            except Exception:  # a UI callback must never kill discovery
+                logger.exception("discovery on_change callback failed")
+
+    def _open_multicast_socket(self) -> Any:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("::", MULTICAST_PORT))
+        sock.settimeout(0.25)
+        return sock
+
+    def _sync_interfaces(self, sock: Any) -> None:
+        """Join the multicast group on every multicast-capable interface.
+
+        Thunderbolt bridges appear/disappear with cable state (macOS gotcha
+        #4), so this is re-run whenever the interface set changes.
+        """
+
+        try:
+            names = self._interface_lister()
+        except Exception:
+            return
+        for name in names:
+            if name in self._joined:
+                continue
+            try:
+                ifindex = socket.if_nametoindex(name)
+            except OSError:
+                continue
+            membership = socket.inet_pton(
+                socket.AF_INET6, MULTICAST_GROUP
+            ) + struct.pack("@I", ifindex)
+            try:
+                sock.setsockopt(
+                    socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, membership
+                )
+            except OSError as exc:
+                if exc.errno not in _JOIN_IGNORED_ERRNOS:
+                    logger.debug("multicast join on %s failed: %s", name, exc)
+                continue
+            self._joined[name] = ifindex
+
+    def _multicast_loop(self) -> None:
+        try:
+            sock = self._socket_factory()
+        except OSError as exc:
+            logger.warning("cluster multicast discovery unavailable: %s", exc)
+            return
+        self._socket = sock
+        last_hello = 0.0
+        last_ifaces = 0.0
+        try:
+            while not self._stop.is_set():
+                now = self._clock()
+                if now - last_ifaces >= self.config.iface_poll_interval:
+                    self._sync_interfaces(sock)
+                    last_ifaces = now
+                if now - last_hello >= self.config.hello_interval:
+                    self._send_hello(sock)
+                    last_hello = now
+                try:
+                    data, addr = sock.recvfrom(_MAX_DATAGRAM)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                    continue
+                self._handle_datagram(data, addr, sock)
+        finally:
+            with suppress(Exception):
+                sock.close()
+
+    def _send_hello(self, sock: Any) -> None:
+        nonce = secrets.randbits(64)
+        with self._lock:
+            self._nonces.append(nonce)
+        payload = encode_hello(nonce, self._cluster_hash)
+        target = (MULTICAST_GROUP, MULTICAST_PORT)
+        joined = list(self._joined.values()) or [0]
+        for ifindex in joined:
+            try:
+                if ifindex:
+                    sock.setsockopt(
+                        socket.IPPROTO_IPV6,
+                        socket.IPV6_MULTICAST_IF,
+                        struct.pack("@I", ifindex),
+                    )
+                sock.sendto(payload, target)
+            except OSError as exc:
+                if exc.errno not in _JOIN_IGNORED_ERRNOS:
+                    logger.debug("HELLO send on if %d failed: %s", ifindex, exc)
+
+    def _handle_datagram(self, data: bytes, addr: Any, sock: Any = None) -> None:
+        hello = decode_hello(data)
+        if hello is not None:
+            self._handle_hello(hello[0], hello[1], addr, sock)
+            return
+        wassup = decode_wassup(data)
+        if wassup is not None:
+            self._handle_wassup(wassup, addr)
+
+    def _handle_hello(
+        self, nonce: int, cluster_hash: int, addr: Any, sock: Any = None
+    ) -> None:
+        if cluster_hash != self._cluster_hash:
+            # A foreign oMLX cluster shares the LAN; ignore silently for
+            # discovery but make the situation diagnosable (once).
+            if not self._hash_mismatch_logged:
+                self._hash_mismatch_logged = True
+                logger.info(
+                    "Ignoring cluster HELLO with a non-matching cluster hash "
+                    "(another oMLX cluster on this LAN?)"
+                )
+            return
+        with self._lock:
+            if nonce in self._nonces:
+                return  # nonce-echo self-drop: our own HELLO came back
+        self._last_hello_at = self._clock()
+        peer_ip = addr[0] if isinstance(addr, tuple) else str(addr)
+        # Answer unicast so the sender learns our node_id + http_port.
+        reply = encode_wassup(
+            nonce, self.identity.node_id, self.config.http_port
+        )
+        target_sock = sock if sock is not None else self._socket
+        if target_sock is not None:
+            try:
+                port = addr[1] if isinstance(addr, tuple) else MULTICAST_PORT
+                target_sock.sendto(reply, (peer_ip, port))
+            except OSError:
+                pass
+
+    def _handle_wassup(self, payload: dict[str, Any], addr: Any) -> None:
+        with self._lock:
+            if payload["nonce"] not in self._nonces:
+                return  # not an echo of a nonce we issued
+        node_id = payload["node_id"]
+        if node_id == self.identity.node_id:
+            return
+        peer_ip = addr[0] if isinstance(addr, tuple) else str(addr)
+        if "%" in peer_ip:
+            peer_ip = peer_ip.split("%", 1)[0]
+        now = self._clock()
+        with self._lock:
+            peer = self._peers.get(node_id)
+            is_new = peer is None
+            if peer is None:
+                peer = PeerRecord(node_id=node_id)
+                self._peers[node_id] = peer
+            peer.http_port = payload["http_port"]
+            peer.last_seen = now
+            if peer.state == "dead":
+                peer.state = "discovered"
+            if not any(a["ip"] == peer_ip for a in peer.addrs):
+                peer.addrs.append({"ip": peer_ip, "if_type": "unknown"})
+                peer.addrs = peer.addrs[-8:]
+        self._merge_registry(peer)
+        self._add_candidate(
+            peer_ip, payload["http_port"], node_id=node_id, if_type="unknown"
+        )
+        if is_new:
+            self._fire_change(peer)
+        # Higher node_id (string compare) initiates contact: the higher node
+        # probes immediately; the lower node's next periodic probe sweep
+        # verifies its own candidate entry.
+        if self.identity.node_id > node_id:
+            self._probe_candidate(peer_ip, payload["http_port"])
+
+    def _add_candidate(
+        self, ip: str, port: int, *, node_id: str | None, if_type: str
+    ) -> None:
+        with self._lock:
+            if len(self._candidates) >= _MAX_CANDIDATES:
+                return
+            key = (ip, port)
+            candidate = self._candidates.get(key)
+            if candidate is None:
+                candidate = {
+                    "node_id": node_id,
+                    "if_type": if_type,
+                    "last_probe": 0.0,
+                    "rtt": None,
+                    "verified": False,
+                }
+                self._candidates[key] = candidate
+            else:
+                if node_id:
+                    candidate["node_id"] = node_id
+                if if_type != "unknown":
+                    candidate["if_type"] = if_type
+
+    def _probe_sweep(self) -> None:
+        now = self._clock()
+        with self._lock:
+            due = [
+                (ip, port)
+                for (ip, port), candidate in self._candidates.items()
+                if now - candidate["last_probe"] >= self.config.probe_interval
+            ]
+        for ip, port in due:
+            self._probe_candidate(ip, port)
+
+    def _probe_candidate(self, ip: str, port: int) -> None:
+        with self._lock:
+            candidate = self._candidates.get((ip, port))
+            if candidate is None:
+                return
+            candidate["last_probe"] = self._clock()
+            hint = candidate["node_id"]
+            if_type = candidate["if_type"]
+        started = self._clock()
+        try:
+            result = self._prober(ip, port, self.config.probe_timeout)
+        except Exception:
+            result = None
+        rtt = self._clock() - started
+        if result is None:
+            return
+        node_id = result.get("node_id")
+        if hint is not None and node_id != hint:
+            # Announced address does not answer with the announced node_id —
+            # drop it (stale DHCP lease, spoofed announcement, etc.).
+            with self._lock:
+                self._candidates.pop((ip, port), None)
+                peer = self._peers.get(hint)
+                if peer is not None:
+                    peer.addrs = [a for a in peer.addrs if a["ip"] != ip]
+            return
+        now = self._clock()
+        with self._lock:
+            candidate = self._candidates.get((ip, port))
+            if candidate is not None:
+                candidate["verified"] = True
+                candidate["rtt"] = rtt
+                candidate["node_id"] = node_id
+            peer = self._peers.get(node_id)
+            is_new = peer is None
+            if peer is None:
+                peer = PeerRecord(node_id=node_id)
+                self._peers[node_id] = peer
+            peer.version = str(result.get("version") or peer.version)
+            peer.cluster_name = str(
+                result.get("cluster_name") or peer.cluster_name
+            )
+            if result.get("friendly_name"):
+                peer.friendly_name = str(result["friendly_name"])
+            peer.http_port = port
+            peer.last_seen = now
+            if not any(a["ip"] == ip for a in peer.addrs):
+                peer.addrs.append({"ip": ip, "if_type": if_type})
+                peer.addrs = peer.addrs[-8:]
+            peer.link = _classify_link(ip, if_type, rtt)
+        self._merge_registry(peer)
+        if is_new:
+            self._fire_change(peer)
+
+    def _merge_registry(self, peer: PeerRecord) -> None:
+        if self.registry is None:
+            return
+        try:
+            self.registry.merge(
+                {
+                    "node_id": peer.node_id,
+                    "friendly_name": peer.friendly_name,
+                    "caps": peer.caps.to_dict(),
+                    "addrs": peer.addrs,
+                }
+            )
+            with self._lock:
+                peer.paired = bool(self.registry.is_paired(peer.node_id))
+        except Exception:
+            logger.debug("device registry merge failed", exc_info=True)
+
+    def _liveness_sweep(self) -> None:
+        now = self._clock()
+        transitions: list[PeerRecord] = []
+        with self._lock:
+            for peer in self._peers.values():
+                silence = now - peer.last_seen
+                if silence >= self.config.dead_after:
+                    target = "dead"
+                elif silence >= self.config.suspect_after:
+                    target = "suspect"
+                else:
+                    target = "discovered"
+                if peer.state != target:
+                    peer.state = target
+                    transitions.append(peer)
+        for peer in transitions:
+            self._fire_change(peer)
+
+    def _maintenance_loop(self) -> None:
+        last_probe = 0.0
+        last_tailscale = 0.0
+        while not self._stop.is_set():
+            now = self._clock()
+            if now - last_probe >= self.config.probe_interval:
+                self._probe_sweep()
+                last_probe = now
+            self._liveness_sweep()
+            if (
+                self.config.enable_tailscale
+                and now - last_tailscale >= self.config.tailscale_interval
+            ):
+                self._tailscale_sweep()
+                last_tailscale = now
+            self._stop.wait(0.5)
+
+    # -- Tailscale (opportunistic, never required) ---------------------------
+
+    @staticmethod
+    def _read_tailscale_status() -> dict[str, Any] | None:
+        if shutil.which("tailscale") is None:
+            return None
+        try:
+            result = subprocess.run(  # noqa: S603 - tailscale CLI lookup
+                ["tailscale", "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _tailscale_sweep(self) -> None:
+        try:
+            status = self._tailscale_status()
+        except Exception:
+            return
+        if not status:
+            return
+        peers = status.get("Peer")
+        if not isinstance(peers, dict):
+            return
+        for entry in peers.values():
+            if not isinstance(entry, dict):
+                continue
+            ips = entry.get("TailscaleIPs")
+            if not isinstance(ips, list):
+                continue
+            for ip in ips:
+                if isinstance(ip, str) and ip.startswith("100."):
+                    # Peer's oMLX port is unknown; our own configured port is
+                    # the best heuristic (documented — Tailscale is
+                    # opportunistic, never required).
+                    self._add_candidate(
+                        ip,
+                        self.config.http_port,
+                        node_id=None,
+                        if_type="tailscale",
+                    )
+
+    # -- mDNS (python-zeroconf, optional) ------------------------------------
+
+    def _start_mdns(self) -> None:
+        zc = self._zc
+        addresses = self._local_addresses()
+        caps_json = json.dumps(
+            self.config.caps.to_dict(), separators=(",", ":")
+        )
+        properties = {
+            "id": self.identity.node_id,
+            "name": self.identity.friendly_name,
+            "ver": self.config.version,
+            "cl": self.config.cluster_name,
+            "caps": caps_json,
+            "port": str(self.config.http_port),
+        }
+        instance = f"{self.identity.friendly_name}.{MDNS_SERVICE_TYPE}"[:255]
+        info = zc.ServiceInfo(
+            MDNS_SERVICE_TYPE,
+            instance,
+            addresses=addresses,
+            port=self.config.http_port,
+            properties=properties,
+        )
+        self._zc_instance = zc.Zeroconf()
+        self._zc_info = info
+        listener = _MdnsListener(self)
+        self._zc_browser = zc.ServiceBrowser(
+            self._zc_instance, MDNS_SERVICE_TYPE, listener
+        )
+        self._zc_instance.register_service(info)
+
+    @staticmethod
+    def _local_addresses() -> list[bytes]:
+        packed: list[bytes] = []
+        with suppress(OSError):
+            hostname = socket.gethostname()
+            for family, _, _, _, sockaddr in socket.getaddrinfo(
+                hostname, None
+            ):
+                if family == socket.AF_INET:
+                    packed.append(socket.inet_pton(family, sockaddr[0]))
+                elif family == socket.AF_INET6 and not sockaddr[0].startswith(
+                    "fe80::1"  # skip loopback-ish
+                ):
+                    packed.append(
+                        socket.inet_pton(family, sockaddr[0].split("%", 1)[0])
+                    )
+        return packed[:8]
+
+    def _handle_mdns_service(self, info: Any) -> None:
+        """Process one resolved _omlx._tcp service (zeroconf callback path)."""
+
+        try:
+            props = {
+                (k.decode("utf-8", "replace") if isinstance(k, bytes) else k):
+                (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
+                for k, v in (info.properties or {}).items()
+            }
+            node_id = str(props.get("id") or "")
+            if not node_id or node_id == self.identity.node_id:
+                return
+            cluster = str(props.get("cl") or "")
+            if cluster != self.config.cluster_name:
+                if not self._hash_mismatch_logged:
+                    self._hash_mismatch_logged = True
+                    logger.info(
+                        "Ignoring mDNS service for a different oMLX cluster "
+                        "(%r != %r)",
+                        cluster,
+                        self.config.cluster_name,
+                    )
+                return
+            try:
+                caps = PeerCaps.from_dict(json.loads(props.get("caps") or "{}"))
+            except json.JSONDecodeError:
+                caps = PeerCaps()
+            port = int(getattr(info, "port", 0) or 0)
+            addresses: list[str] = []
+            parsed = getattr(info, "parsed_addresses", None)
+            if callable(parsed):
+                addresses = [a for a in parsed() if isinstance(a, str)]
+            now = self._clock()
+            with self._lock:
+                peer = self._peers.get(node_id)
+                is_new = peer is None
+                if peer is None:
+                    peer = PeerRecord(node_id=node_id)
+                    self._peers[node_id] = peer
+                peer.friendly_name = str(props.get("name") or peer.friendly_name)
+                peer.version = str(props.get("ver") or peer.version)
+                peer.cluster_name = cluster
+                peer.caps = caps
+                if port:
+                    peer.http_port = port
+                peer.last_seen = now
+                for ip in addresses:
+                    if not any(a["ip"] == ip for a in peer.addrs):
+                        peer.addrs.append({"ip": ip, "if_type": "mdns"})
+                peer.addrs = peer.addrs[-8:]
+            self._merge_registry(peer)
+            if port:
+                for ip in addresses:
+                    self._add_candidate(
+                        ip, port, node_id=node_id, if_type="mdns"
+                    )
+            if is_new:
+                self._fire_change(peer)
+        except Exception:
+            # mDNS callbacks run on zeroconf threads; nothing here may kill
+            # the process (macOS gotcha #3).
+            logger.exception("failed to process mDNS service")
+
+
+class _MdnsListener:
+    """zeroconf ServiceListener adapter; every callback is exception-safe."""
+
+    def __init__(self, service: DiscoveryService) -> None:
+        self._service = service
+
+    def _resolve(self, zc: Any, type_: str, name: str) -> None:
+        try:
+            info = zc.get_service_info(type_, name, timeout=3000)
+        except Exception:
+            return
+        if info is not None:
+            self._service._handle_mdns_service(info)
+
+    # zeroconf >= 0.28 style
+    def add_service(self, zc: Any, type_: str, name: str) -> None:
+        self._resolve(zc, type_, name)
+
+    def update_service(self, zc: Any, type_: str, name: str) -> None:
+        self._resolve(zc, type_, name)
+
+    def remove_service(self, zc: Any, type_: str, name: str) -> None:
+        pass
+
+    # older zeroconf style
+    def update_service_callback(self, *args: Any, **kwargs: Any) -> None:
+        pass
