@@ -247,6 +247,17 @@ def test_devices_paired_rows_carry_enrolled_ssh_target(
     assert payload["paired"][0]["ssh_target"] == "omlx@studio-b.local"
 
 
+def test_cluster_name_persisted_config(tmp_path, monkeypatch):
+    from omlx.cluster.discovery import load_cluster_name, save_cluster_name
+
+    assert load_cluster_name(tmp_path) == "omlx"  # no file yet
+    save_cluster_name("studio-lan", tmp_path)
+    assert load_cluster_name(tmp_path) == "studio-lan"
+    # Malformed JSON falls back to the default instead of raising.
+    (tmp_path / "cluster" / "cluster.json").write_text("{not json")
+    assert load_cluster_name(tmp_path) == "omlx"
+
+
 def test_devices_requires_admin_auth(tmp_path):
     # Without the dependency override, an unauthenticated call is rejected.
     reset_configured_identity()

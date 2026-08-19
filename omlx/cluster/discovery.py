@@ -521,6 +521,7 @@ import urllib.request  # noqa: E402
 from collections import deque  # noqa: E402
 from contextlib import suppress  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 from .._version import __version__ as _OMLX_VERSION  # noqa: E402
 
@@ -722,6 +723,58 @@ class DiscoveryConfig:
     enable_mdns: bool = True
     enable_multicast: bool = True
     enable_tailscale: bool = True
+
+
+def default_cluster_config_path(base_path: Path | str | None = None) -> Path:
+    """On-disk location of the persisted cluster config (cluster.json)."""
+
+    if base_path is not None:
+        base = Path(base_path)
+    else:
+        env_value = os.environ.get("OMLX_BASE_PATH")
+        base = Path(env_value).expanduser() if env_value else Path.home() / ".omlx"
+    return base / "cluster" / "cluster.json"
+
+
+def load_cluster_name(base_path: Path | str | None = None) -> str:
+    """Persisted settings-level cluster name, defaulting to ``"omlx"``.
+
+    Read from ``<base>/cluster/cluster.json`` (``{"cluster_name": ...}``).
+    A missing or malformed file never fails startup — the default keeps the
+    pre-config behavior, and nodes only discover each other when the names
+    (and therefore the cluster hashes) match.
+    """
+
+    try:
+        payload = json.loads(
+            default_cluster_config_path(base_path).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return DiscoveryConfig.cluster_name
+    if not isinstance(payload, dict):
+        return DiscoveryConfig.cluster_name
+    name = payload.get("cluster_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return DiscoveryConfig.cluster_name
+
+
+def save_cluster_name(
+    cluster_name: str, base_path: Path | str | None = None
+) -> Path:
+    """Persist the cluster name atomically with owner-only permissions."""
+
+    name = str(cluster_name).strip()
+    if not name:
+        raise ValueError("cluster_name cannot be empty")
+    path = default_cluster_config_path(base_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema_version": 1, "cluster_name": name}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
 
 
 def _default_interface_lister() -> list[str]:

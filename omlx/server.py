@@ -496,14 +496,21 @@ async def lifespan(app: FastAPI):
                 DiscoveryConfig,
                 DiscoveryService,
                 configure_discovery_service,
+                load_cluster_name,
             )
             from .cluster.identity import get_node_identity
             from .cluster.registry import get_device_registry
 
+            cluster_base = (
+                Path(_server_state.global_settings.base_path)
+                if _server_state.global_settings is not None
+                else Path.home() / ".omlx"
+            )
             discovery_service = DiscoveryService(
                 get_node_identity(),
                 get_device_registry(),
                 DiscoveryConfig(
+                    cluster_name=load_cluster_name(cluster_base),
                     http_port=(
                         _server_state.global_settings.server.port
                         if _server_state.global_settings is not None

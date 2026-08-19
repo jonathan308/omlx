@@ -25,8 +25,6 @@ from .registry import get_device_registry
 
 discovery_router = APIRouter(prefix="/api/cluster", tags=["cluster-discovery"])
 
-DEFAULT_CLUSTER_NAME = "omlx"
-
 
 class ProbeRateLimiter:
     """Token-bucket rate limiter for the unauthenticated probe endpoint."""
@@ -74,7 +72,10 @@ def _cluster_name() -> str:
     service = discovery_service_or_none()
     if service is not None:
         return service.config.cluster_name
-    return DEFAULT_CLUSTER_NAME
+    # Discovery disabled still reports the persisted settings-level name.
+    from .discovery import load_cluster_name
+
+    return load_cluster_name()
 
 
 @discovery_router.get("/node_id")
