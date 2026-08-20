@@ -797,7 +797,12 @@ function clusterV2Wizard() {
             // first verified probe address when no enrollment exists yet.
             if (device?.ssh_target) return String(device.ssh_target);
             const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
-            const first = addrs.find((addr) => addr && addr.ip);
+            // A bare fe80:: link-local address has no scope id here, so SSH
+            // to it has no route — prefer any routable address first.
+            const usable = addrs.filter(
+                (addr) => addr && addr.ip && !String(addr.ip).startsWith('fe80::'),
+            );
+            const first = usable[0] || addrs.find((addr) => addr && addr.ip);
             return first ? String(first.ip) : this.deviceName(device);
         },
 
