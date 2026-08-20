@@ -595,6 +595,67 @@ def test_peer_record_to_dict_shape():
     json.dumps(payload)  # must be JSON-serializable for the API
 
 
+def test_mark_paired_flips_in_memory_peer_flag():
+    service, _ = _service()
+    service._peers["peer-1"] = PeerRecord(node_id="peer-1")
+
+    service.mark_paired("peer-1")
+
+    assert service._peers["peer-1"].paired is True
+    # Unknown node_ids are a no-op; the flag is advisory, not authoritative.
+    service.mark_paired("unknown-node")
+
+
+# -- announced caps provider (pairing payload seam) ------------------------------
+
+
+def test_announced_caps_reflects_configured_service():
+    from omlx.cluster.discovery import announced_caps, configure_discovery_service
+
+    caps = PeerCaps(
+        chip="M3 Max", ram_gb=96.0, backends=["jaccl"], thunderbolt=True, jaccl=True
+    )
+    service, _ = _service(config=DiscoveryConfig(caps=caps))
+    configure_discovery_service(service)
+    try:
+        assert announced_caps() == caps.to_dict()
+    finally:
+        configure_discovery_service(None)
+
+
+def test_announced_caps_falls_back_to_local_snapshot_without_service(monkeypatch):
+    from omlx.cluster import discovery
+
+    discovery.configure_discovery_service(None)
+    monkeypatch.setattr(
+        discovery, "local_caps", lambda: PeerCaps(chip="M-test", ram_gb=32.0)
+    )
+    assert discovery.announced_caps() == PeerCaps(
+        chip="M-test", ram_gb=32.0
+    ).to_dict()
+
+
+def test_announced_caps_degrades_to_empty_dict_on_failure(monkeypatch):
+    from omlx.cluster import discovery
+
+    class _BrokenCaps:
+        def to_dict(self):
+            raise RuntimeError("boom")
+
+    service, _ = _service()
+    service.config.caps = _BrokenCaps()
+    discovery.configure_discovery_service(service)
+
+    def _boom():
+        raise OSError("no sysctl")
+
+    monkeypatch.setattr(discovery, "local_caps", _boom)
+    try:
+        assert discovery.announced_caps() == {}
+    finally:
+        discovery.configure_discovery_service(None)
+
+
 # -- mDNS announce path with a fake zeroconf module -----------------------------
 
 

@@ -2096,11 +2096,16 @@ def init_server(
         device_registry = None
     # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
     # available (DeviceRegistryBridge adapts the API and fails loudly on
-    # drift); otherwise the schema-compatible fallback store is used.
+    # drift); otherwise the schema-compatible fallback store is used. The
+    # caps provider resolves at call time — discovery is configured later in
+    # startup — so join requests carry the same caps discovery announces.
+    from .cluster.discovery import announced_caps
+
     configure_pairing_manager(
         base_path,
         registry=device_registry,
         enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
     )
 
     # Discover models (use pinned models from settings file)

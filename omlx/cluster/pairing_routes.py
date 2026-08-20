@@ -134,9 +134,18 @@ async def cluster_pair_approve(body: PairApproveBody):
 
     manager = _manager()
     try:
-        return await asyncio.to_thread(manager.approve, body.node_id, body.code)
+        result = await asyncio.to_thread(manager.approve, body.node_id, body.code)
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
+    # Flip the in-memory discovery record so the freshly paired peer stops
+    # showing as discovered before its next announcement refresh.
+    try:
+        from .discovery import get_discovery_service
+
+        get_discovery_service().mark_paired(body.node_id)
+    except Exception:  # discovery disabled or not configured — harmless
+        pass
+    return result
 
 
 @pair_admin_router.post("/pair/deny")

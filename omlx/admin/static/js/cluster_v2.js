@@ -729,7 +729,7 @@ function clusterV2Wizard() {
             const raw = (this.manualAddr || '').trim();
             const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
             if (!match) {
-                this.manualError = 'Enter an IPv4 address like 10.0.0.2 or 10.0.0.2:8000.';
+                this.manualError = 'Enter an IPv4 address like 192.168.1.50 or 192.168.1.50:8000.';
                 return;
             }
             const ip = match[1];

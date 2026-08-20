@@ -219,6 +219,55 @@ async def cluster_add_manual_peer(
     }
 
 
+def _enrich_paired_row(
+    row: dict[str, Any], record: dict[str, Any] | None
+) -> None:
+    """Fill gaps on a paired row from the matching discovery record.
+
+    Pairings completed before capabilities were exchanged persisted empty
+    ``caps``; the matching registry/service record carries the announced
+    values. Only fields actually known are merged — nothing is fabricated —
+    and the persisted row is untouched (the route returns copies). The row
+    also gains a normalized ``addrs`` list of ``{"ip", "if_type"}`` dicts,
+    sourced from ``last_addrs`` plus the discovered record, so the UI's
+    address pickers read paired rows the same way as discovered rows.
+    """
+
+    addrs: list[dict[str, str]] = []
+    for ip in row.get("last_addrs") or []:
+        if isinstance(ip, str) and ip and all(a["ip"] != ip for a in addrs):
+            addrs.append({"ip": ip, "if_type": "paired"})
+    if record is not None:
+        for addr in record.get("addrs") or []:
+            if not isinstance(addr, dict) or not addr.get("ip"):
+                continue
+            existing = next(
+                (a for a in addrs if a["ip"] == addr["ip"]), None
+            )
+            if existing is not None:
+                # The discovered entry knows the real interface type.
+                existing["if_type"] = addr.get("if_type") or existing["if_type"]
+            elif len(addrs) < 16:
+                addrs.append(
+                    {
+                        "ip": addr["ip"],
+                        "if_type": addr.get("if_type") or "discovered",
+                    }
+                )
+    if addrs:
+        row["addrs"] = addrs
+    if record is None:
+        return
+    caps = row.get("caps") or {}
+    if not caps.get("ram_gb") or not caps.get("chip"):
+        known_caps = record.get("caps") or {}
+        if known_caps.get("ram_gb") or known_caps.get("chip"):
+            row["caps"] = dict(known_caps)
+    for key in ("version", "friendly_name", "link"):
+        if not row.get(key) and record.get(key):
+            row[key] = record[key]
+
+
 @discovery_router.get("/devices")
 async def cluster_devices(is_admin: bool = Depends(require_admin)):
     """Cluster device inventory for the wizard UI.
@@ -244,6 +293,7 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     service = discovery_service_or_none()
 
     paired: list[dict[str, Any]] = registry.paired() if registry else []
+    paired_ids = {row["node_id"] for row in paired}
 
     # Seam with Module B's enrollment: a paired device that completed SSH
     # TOFU enrollment carries its enrolled ssh_target, so the UI probes and
@@ -269,6 +319,19 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
             if peer.paired:
                 continue
             discovered_records[peer.node_id] = peer.to_dict()
+
+    # Devices paired before caps were exchanged carry empty caps on disk;
+    # enrich them from what discovery has actually seen before suppressing
+    # their node_ids from the discovered list below.
+    for row in paired:
+        _enrich_paired_row(row, discovered_records.get(row.get("node_id")))
+
+    # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
+    # the moment pairing completes, so a stale (possibly dead) record for a
+    # now-paired node_id would otherwise render a zombie "Pair" card next
+    # to the paired row. Paired node_ids never appear as discovered.
+    for node_id in paired_ids:
+        discovered_records.pop(node_id, None)
 
     # Seam with Module B: a posted pair/request must surface in the device
     # list as an awaiting_approval row so the wizard renders code entry +

@@ -1021,6 +1021,20 @@ class DiscoveryService:
                 self._peers[key] for key in sorted(self._peers)
             ]
 
+    def mark_paired(self, node_id: str) -> None:
+        """Flip the in-memory paired flag when pairing completes out-of-band.
+
+        ``_merge_registry`` refreshes ``peer.paired`` on every observed
+        announcement; this covers the window — and dead peers — between the
+        pairing approval and the peer's next announcement, so the device
+        inventory stops listing a freshly paired node as discovered.
+        """
+
+        with self._lock:
+            peer = self._peers.get(node_id)
+            if peer is not None:
+                peer.paired = True
+
     def health(self) -> dict[str, Any]:
         """Extended self-diagnostics for the discovery health detail route.
 
@@ -1809,3 +1823,31 @@ def get_discovery_service() -> DiscoveryService:
         if _configured_discovery_service is None:
             raise RuntimeError("cluster discovery service is not configured")
         return _configured_discovery_service
+
+
+def announced_caps() -> dict[str, Any]:
+    """Capability dict for pairing payloads; never raises.
+
+    The pairing manager is configured before the discovery service starts,
+    so the service is resolved at call time: when it is up this returns
+    exactly the caps the service announces (``DiscoveryConfig.caps``); when
+    discovery is disabled (or not configured yet) a fresh local snapshot is
+    taken, which is what the service would announce anyway. Any failure
+    degrades to ``{}`` rather than breaking a pairing.
+    """
+
+    try:
+        service = get_discovery_service()
+    except RuntimeError:
+        service = None
+    if service is not None:
+        try:
+            caps = service.config.caps.to_dict()
+        except Exception:  # pragma: no cover - defensive
+            caps = {}
+        if caps:
+            return caps
+    try:
+        return local_caps().to_dict()
+    except Exception:  # pragma: no cover - defensive
+        return {}

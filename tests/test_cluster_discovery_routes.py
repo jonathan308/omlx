@@ -9,6 +9,7 @@ from omlx.cluster import discovery_routes
 from omlx.cluster.discovery import (
     DiscoveryConfig,
     DiscoveryService,
+    PeerCaps,
     PeerRecord,
     configure_discovery_service,
 )
@@ -407,3 +408,185 @@ def test_devices_self_row_lists_local_addresses(_configured_stores):
     assert isinstance(addrs, list)
     for entry in addrs:
         assert set(entry) == {"ip", "if_type"}
+
+
+# -- paired suppression + paired-row enrichment ---------------------------------
+
+
+def test_devices_suppresses_paired_node_with_stale_dead_peer(
+    _configured_stores,
+):
+    identity, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="studio-b")
+
+    service = DiscoveryService(
+        identity,
+        registry,
+        DiscoveryConfig(),
+        prober=lambda ip, port, timeout: None,
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    configure_discovery_service(service)
+    # Stale in-memory record: the peer went silent before pairing completed,
+    # so nothing ever flipped PeerRecord.paired on this dead row.
+    service._peers["peer-1"] = PeerRecord(
+        node_id="peer-1", friendly_name="studio-b", state="dead"
+    )
+
+    payload = client.get("/api/cluster/devices").json()
+
+    assert payload["discovered"] == []
+    assert [row["node_id"] for row in payload["paired"]] == ["peer-1"]
+    configure_discovery_service(None)
+
+
+def test_devices_pending_request_wins_over_stale_discovered_record(
+    _configured_stores, monkeypatch
+):
+    identity, registry, client = _configured_stores
+
+    service = DiscoveryService(
+        identity,
+        registry,
+        DiscoveryConfig(),
+        prober=lambda ip, port, timeout: None,
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    configure_discovery_service(service)
+    service._peers["peer-pending"] = PeerRecord(
+        node_id="peer-pending", friendly_name="stale-name", state="dead"
+    )
+
+    class _FakePairingManager:
+        def pending_requests(self):
+            return [
+                {
+                    "node_id": "peer-pending",
+                    "friendly_name": "studio-2",
+                    "caps": {"chip": "M3"},
+                    "addrs": ["192.168.1.11"],
+                    "http_port": 8000,
+                    "state": "awaiting_approval",
+                    "created_at": 100.0,
+                    "expires_at": 700.0,
+                    "attempts": 0,
+                    "locked": False,
+                    "locked_until": None,
+                }
+            ]
+
+    from omlx.cluster import pairing
+
+    monkeypatch.setattr(
+        pairing, "get_pairing_manager", lambda: _FakePairingManager()
+    )
+
+    payload = client.get("/api/cluster/devices").json()
+
+    pending = [
+        d for d in payload["discovered"] if d["node_id"] == "peer-pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0]["state"] == "awaiting_approval"
+    assert pending[0]["friendly_name"] == "studio-2"
+    configure_discovery_service(None)
+
+
+def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
+    identity, registry, client = _configured_stores
+    # Paired before caps were exchanged: empty caps persisted on disk.
+    registry.mark_paired(
+        "peer-1",
+        friendly_name="studio-b",
+        caps={},
+        addrs=["192.168.1.20"],
+        paired_at=10.0,
+    )
+
+    service = DiscoveryService(
+        identity,
+        registry,
+        DiscoveryConfig(),
+        prober=lambda ip, port, timeout: None,
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    configure_discovery_service(service)
+    peer = PeerRecord(
+        node_id="peer-1",
+        friendly_name="studio-b",
+        version="1.2.3",
+        caps=PeerCaps(
+            chip="M3 Max",
+            ram_gb=96.0,
+            backends=["jaccl"],
+            thunderbolt=True,
+            jaccl=True,
+        ),
+        addrs=[
+            {"ip": "192.168.1.20", "if_type": "lan"},
+            {"ip": "192.168.1.21", "if_type": "tb"},
+        ],
+        http_port=8000,
+        state="dead",
+    )
+    peer.link = "tb"
+    service._peers["peer-1"] = peer
+
+    payload = client.get("/api/cluster/devices").json()
+
+    assert payload["discovered"] == []  # suppressed, but still enriches
+    row = payload["paired"][0]
+    assert row["caps"] == {
+        "chip": "M3 Max",
+        "ram_gb": 96.0,
+        "backends": ["jaccl"],
+        "thunderbolt": True,
+        "jaccl": True,
+    }
+    assert row["version"] == "1.2.3"
+    assert row["link"] == "tb"
+    # Normalized addrs: last_addrs entries come first with the "paired"
+    # marker; the discovered record upgrades if_type where the IP matches
+    # and appends addresses the pairing flow never saw.
+    assert row["addrs"] == [
+        {"ip": "192.168.1.20", "if_type": "lan"},
+        {"ip": "192.168.1.21", "if_type": "tb"},
+    ]
+    configure_discovery_service(None)
+
+
+def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
+    _configured_stores, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from omlx.cluster import enrollment
+
+    _, registry, client = _configured_stores
+    registry.mark_paired(
+        "peer-1",
+        friendly_name="studio-b",
+        caps={"chip": "M4", "ram_gb": 64},
+        addrs=["192.168.1.20", "192.168.1.21"],
+    )
+    enrolled = SimpleNamespace(node_id="peer-1", ssh="omlx@studio-b.local")
+    fake_store = SimpleNamespace(list_nodes=lambda: (enrolled,))
+    monkeypatch.setattr(
+        enrollment, "get_cluster_enrollment", lambda: fake_store
+    )
+
+    payload = client.get("/api/cluster/devices").json()
+
+    row = payload["paired"][0]
+    # No discovery record: caps stay as persisted and nothing is invented.
+    assert row["caps"] == {"chip": "M4", "ram_gb": 64}
+    assert row["addrs"] == [
+        {"ip": "192.168.1.20", "if_type": "paired"},
+        {"ip": "192.168.1.21", "if_type": "paired"},
+    ]
+    assert "version" not in row
+    # The enrollment seam still applies on top of the normalization.
+    assert row["ssh_target"] == "omlx@studio-b.local"
