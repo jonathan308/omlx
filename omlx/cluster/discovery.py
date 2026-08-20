@@ -677,8 +677,14 @@ def _rdma_fabric_caps(caps: "PeerCaps", runner: Callable[..., Any] = subprocess.
         devices = runner(  # noqa: S603 - fixed system executable
             [ibv_devices], capture_output=True, text=True, timeout=5.0, check=False
         )
+        # Same shape as probe.py's _RDMA_DEVICE_RE: device lines are
+        # whitespace-indented under a two-row header.
         rdma_devs = (
-            [line.split()[0] for line in devices.stdout.splitlines() if line.startswith("rdma_")]
+            [
+                stripped.split()[0]
+                for line in devices.stdout.splitlines()
+                if (stripped := line.strip()).startswith("rdma_")
+            ]
             if devices.returncode == 0
             else []
         )
