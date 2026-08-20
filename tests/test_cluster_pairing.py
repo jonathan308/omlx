@@ -33,6 +33,7 @@ from omlx.cluster.pairing import (
     PairingRequestError,
     PairingStateError,
     generate_pairing_code,
+    normalize_coordinator_addr,
     pairing_code_hash,
     unwrap_cluster_key,
     wrap_cluster_key,
@@ -357,6 +358,180 @@ def test_deny_removes_pending_and_is_audited(tmp_path):
     with pytest.raises(PairingStateError, match="denied"):
         coordinator.approve("join-node", "123456")
     assert "join_request_denied" in coordinator._audit.names()
+
+
+# --- Joiner-side UI session (begin/poll/cancel) -------------------------------
+
+
+def test_normalize_coordinator_addr():
+    assert normalize_coordinator_addr("10.0.0.1") == "10.0.0.1:8000"
+    assert normalize_coordinator_addr("10.0.0.1:9000") == "10.0.0.1:9000"
+    assert normalize_coordinator_addr("http://10.0.0.1:9000/") == "10.0.0.1:9000"
+    assert normalize_coordinator_addr("https://studio.local") == "studio.local:8000"
+    # Bracketed IPv6 strips brackets; a bare v6 literal keeps the default port.
+    assert normalize_coordinator_addr("[fe80::1]:9000") == "fe80::1:9000"
+    assert normalize_coordinator_addr("fe80::1") == "fe80::1:8000"
+    for bad in ("", "http://", "10.0.0.1:notaport", "10.0.0.1:70000", "[fe80::1"):
+        with pytest.raises(PairingRequestError):
+            normalize_coordinator_addr(bad)
+
+
+def test_begin_join_success_returns_code_and_remembers_coordinator(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+
+    snapshot = joiner.begin_join("coordinator.local")  # default port 8000
+    assert snapshot["state"] == "awaiting_approval"
+    assert snapshot["coordinator_addr"] == "coordinator.local:8000"
+    assert snapshot["code"].isdigit() and len(snapshot["code"]) == 6
+    assert snapshot["expires_at"] - joiner._clock() == CODE_TTL_SECONDS
+    assert [p["node_id"] for p in coordinator.pending_requests()] == ["join-node"]
+    assert "join_requested" in joiner._audit.names()
+
+    state = joiner.local_join_state()
+    assert state["state"] == "awaiting_approval"
+    assert state["code"] == snapshot["code"]
+    assert state["coordinator_addr"] == "coordinator.local:8000"
+    assert 0 < state["seconds_remaining"] <= CODE_TTL_SECONDS
+    assert state["error"] is None
+    # The plaintext code only ever leaves the manager through this snapshot —
+    # never the audit trail.
+    assert snapshot["code"] not in json.dumps(joiner._audit.events)
+
+
+def test_begin_join_transport_failure_clears_state(tmp_path):
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+
+    def boom(url, payload, timeout):
+        raise OSError("connection refused")
+
+    joiner._http_post = boom
+    with pytest.raises(PairingRequestError, match="unreachable or refused"):
+        joiner.begin_join("10.9.9.9:8000")
+    assert joiner.local_join_state()["state"] == "idle"
+    assert joiner._local_code is None
+    assert "join_request_failed" in joiner._audit.names()
+
+    # A later attempt against a reachable coordinator works normally.
+    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
+    joiner._http_post = (
+        lambda url, payload, timeout: coordinator.handle_join_request(payload)
+    )
+    snapshot = joiner.begin_join("10.0.0.5")
+    assert snapshot["state"] == "awaiting_approval"
+    assert [p["node_id"] for p in coordinator.pending_requests()] == ["join-node"]
+
+
+def test_begin_join_refuses_a_second_join_while_awaiting(tmp_path):
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.begin_join("coordinator.local:8080")
+    with pytest.raises(PairingStateError, match="already awaiting"):
+        joiner.begin_join("coordinator.local:8080")
+
+
+def test_local_join_state_idle_without_join(tmp_path):
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    state = joiner.local_join_state()
+    assert state["state"] == "idle"
+    assert state["code"] is None
+    assert state["coordinator_addr"] is None
+    # Polling with no join in progress never touches the transport.
+    joiner._http_get = lambda url, timeout: (_ for _ in ()).throw(AssertionError)
+    assert joiner.poll_join_once()["state"] == "idle"
+
+
+def test_local_join_state_expired_code_becomes_error(tmp_path):
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.begin_join("coordinator.local:8080")
+    joiner._clock.now += CODE_TTL_SECONDS + 1
+
+    state = joiner.local_join_state()
+    assert state["state"] == "error"
+    assert state["code"] is None  # an expired code is never shown again
+    assert "expired" in state["error"]
+    # The address survives so the UI can offer "start again" against it.
+    assert state["coordinator_addr"] == "coordinator.local:8080"
+
+
+def test_poll_join_once_approved_completes_and_persists(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.begin_join("coordinator.local:8080")
+    coordinator.approve("join-node", shown["code"])
+
+    snapshot = joiner.poll_join_once()
+    assert snapshot["state"] == "approved"
+    assert snapshot["code"] is None  # the pairing is done — the code is gone
+    assert snapshot["coordinator_addr"] == "coordinator.local:8080"
+    assert snapshot["coordinator_name"] == "Coordinator"
+    assert joiner._local_code is None
+    assert "join_completed" in joiner._audit.names()
+
+    # The coordinator landed in the device store on disk, not just memory.
+    assert [d["node_id"] for d in joiner.paired_devices()] == ["coord-node"]
+    reloaded = JsonDeviceStore(tmp_path / "join-node")
+    assert reloaded.get("coord-node")["state"] == "paired"
+
+    # Approved is reported exactly once; the next poll is back to idle.
+    assert joiner.poll_join_once()["state"] == "idle"
+
+
+def test_poll_join_once_denied_is_terminal_until_rejoin(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.begin_join("coordinator.local:8080")
+    coordinator.deny("join-node")
+
+    assert joiner.poll_join_once()["state"] == "denied"
+    # Terminal: no further transport calls, state sticks until cancel/rejoin.
+    joiner._http_get = lambda url, timeout: (_ for _ in ()).throw(AssertionError)
+    assert joiner.poll_join_once()["state"] == "denied"
+
+    assert joiner.cancel_join() == {"state": "idle"}
+    fresh = joiner.begin_join("coordinator.local:8080")
+    coordinator.approve("join-node", fresh["code"])
+    joiner._http_get = (
+        lambda url, timeout: coordinator.join_status(url.rsplit("/", 1)[1])
+    )
+    assert joiner.poll_join_once()["state"] == "approved"
+
+
+def test_poll_join_once_transient_error_keeps_awaiting(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.begin_join("coordinator.local:8080")
+    original_get = joiner._http_get
+
+    def flaky(url, timeout):
+        raise OSError("timed out")
+
+    joiner._http_get = flaky
+    snapshot = joiner.poll_join_once()
+    assert snapshot["state"] == "awaiting_approval"
+    assert "timed out" in snapshot["error"]
+    assert snapshot["code"] is not None
+
+    # The next successful poll clears the recorded error.
+    joiner._http_get = original_get
+    snapshot = joiner.poll_join_once()
+    assert snapshot["state"] == "awaiting_approval"
+    assert snapshot["error"] is None
+
+
+def test_cancel_join_is_idempotent_and_rejoinable(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+
+    # Nothing in progress: still idle, nothing audited.
+    assert joiner.cancel_join() == {"state": "idle"}
+    assert "join_cancelled" not in joiner._audit.names()
+
+    joiner.begin_join("coordinator.local:8080")
+    assert joiner.cancel_join() == {"state": "idle"}
+    assert joiner.cancel_join() == {"state": "idle"}
+    assert joiner._audit.names().count("join_cancelled") == 1
+    assert joiner.local_join_state()["state"] == "idle"
+    assert joiner._local_code is None
+
+    # Re-join after cancel starts a fresh attempt against the coordinator.
+    snapshot = joiner.begin_join("coordinator.local:8080")
+    assert snapshot["state"] == "awaiting_approval"
+    assert [p["node_id"] for p in coordinator.pending_requests()] == ["join-node"]
 
 
 # --- Unpair revocation ------------------------------------------------------------
@@ -723,6 +898,108 @@ def test_request_validation_rejects_bad_payloads(tmp_path):
     )
 
 
+# --- Joiner-side endpoints (/pair/join) ------------------------------------------
+
+
+def _joiner_client(tmp_path):
+    """Routers mounted over a JOINER manager looping back to a coordinator."""
+
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
+
+    def http_post(url, payload, timeout):
+        assert url.endswith("/api/cluster/pair/request")
+        return coordinator.handle_join_request(payload)
+
+    def http_get(url, timeout):
+        return coordinator.join_status(url.rsplit("/", 1)[1])
+
+    joiner._http_post = http_post
+    joiner._http_get = http_get
+    pairing_routes.set_pairing_manager_getter(lambda: joiner)
+    app = FastAPI()
+    app.include_router(pairing_routes.pair_admin_router)
+    return TestClient(app), joiner, coordinator
+
+
+def test_join_endpoints_full_joiner_flow(tmp_path):
+    client, joiner, coordinator = _joiner_client(tmp_path)
+
+    # Idle until a join begins; the cancel endpoint is idempotent.
+    assert client.get("/api/cluster/pair/join").json()["state"] == "idle"
+    assert client.post("/api/cluster/pair/join/cancel").json() == {"state": "idle"}
+
+    response = client.post("/api/cluster/pair/join", json={"coordinator_addr": "10.0.0.5"})
+    assert response.status_code == 200
+    snapshot = response.json()
+    assert snapshot["state"] == "awaiting_approval"
+    assert snapshot["coordinator_addr"] == "10.0.0.5:8000"  # default port
+    code = snapshot["code"]
+    assert code.isdigit() and len(code) == 6
+
+    # The 1 Hz UI poll keeps reporting awaiting_approval (and drives completion).
+    waiting = client.get("/api/cluster/pair/join").json()
+    assert waiting["state"] == "awaiting_approval"
+    assert waiting["code"] == code
+
+    coordinator.approve("join-node", code)
+    approved = client.get("/api/cluster/pair/join").json()
+    assert approved["state"] == "approved"
+    assert approved["code"] is None
+    assert approved["coordinator_name"] == "Coordinator"
+    assert [d["node_id"] for d in joiner.paired_devices()] == ["coord-node"]
+    # Approval is reported exactly once, then the snapshot is idle again.
+    assert client.get("/api/cluster/pair/join").json()["state"] == "idle"
+
+
+def test_join_endpoint_reports_denial(tmp_path):
+    client, _, coordinator = _joiner_client(tmp_path)
+    client.post("/api/cluster/pair/join", json={"coordinator_addr": "10.0.0.5"})
+
+    coordinator.deny("join-node")
+    assert client.get("/api/cluster/pair/join").json()["state"] == "denied"
+
+    # Cancel clears back to idle so the UI panel closes.
+    assert client.post("/api/cluster/pair/join/cancel").json() == {"state": "idle"}
+    assert client.get("/api/cluster/pair/join").json()["state"] == "idle"
+
+
+def test_join_endpoint_transport_failure_maps_to_400(tmp_path):
+    client, joiner, _ = _joiner_client(tmp_path)
+
+    def boom(url, payload, timeout):
+        raise OSError("connection refused")
+
+    joiner._http_post = boom
+    response = client.post("/api/cluster/pair/join", json={"coordinator_addr": "10.9.9.9"})
+    assert response.status_code == 400
+    assert "unreachable or refused" in response.json()["detail"]
+    # The failed attempt left no local join state behind.
+    assert client.get("/api/cluster/pair/join").json()["state"] == "idle"
+
+
+def test_join_endpoints_validate_payloads(tmp_path):
+    client, _, _ = _joiner_client(tmp_path)
+
+    assert client.post("/api/cluster/pair/join", json={}).status_code == 422
+    assert (
+        client.post("/api/cluster/pair/join", json={"coordinator_addr": ""}).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/cluster/pair/join",
+            json={"coordinator_addr": "10.0.0.1", "extra": 1},
+        ).status_code
+        == 422
+    )
+    # Well-formed body, malformed address → PairingRequestError → 400.
+    assert (
+        client.post("/api/cluster/pair/join", json={"coordinator_addr": "http://"}).status_code
+        == 400
+    )
+
+
 def test_unconfigured_manager_returns_503(tmp_path):
     pairing_routes.set_pairing_manager_getter(
         lambda: (_ for _ in ()).throw(RuntimeError("cluster pairing is not configured"))
@@ -733,6 +1010,14 @@ def test_unconfigured_manager_returns_503(tmp_path):
     client = TestClient(app)
     assert client.get("/api/cluster/pair/status/x").status_code == 503
     assert client.delete("/api/cluster/devices/x").status_code == 503
+    assert (
+        client.post(
+            "/api/cluster/pair/join", json={"coordinator_addr": "10.0.0.5"}
+        ).status_code
+        == 503
+    )
+    assert client.get("/api/cluster/pair/join").status_code == 503
+    assert client.post("/api/cluster/pair/join/cancel").status_code == 503
 
 
 # --- Legacy non-regression ----------------------------------------------------------

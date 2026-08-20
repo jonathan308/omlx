@@ -662,6 +662,46 @@ def default_revocation_driver(revocation: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def normalize_coordinator_addr(addr: str, *, default_port: int = 8000) -> str:
+    """Normalize a coordinator address to ``host:port`` for the joiner.
+
+    Accepts ``"ip"``, ``"ip:port"``, or ``"http://ip:port"`` (any scheme),
+    strips a path suffix, defaults the port to 8000, and strips the brackets
+    off bracketed IPv6 literals (``"[fe80::1]:8000"`` → ``"fe80::1:8000"``).
+    A bare multi-colon IPv6 literal keeps the default port.
+    """
+
+    text = str(addr or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0].strip()
+    if not text:
+        raise PairingRequestError("coordinator address is empty")
+    host = text
+    port = default_port
+    if text.startswith("["):
+        closing = text.find("]")
+        if closing == -1:
+            raise PairingRequestError(f"malformed coordinator address: {addr!r}")
+        host = text[1:closing]
+        rest = text[closing + 1 :]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                raise PairingRequestError(f"malformed coordinator address: {addr!r}")
+            port = int(rest[1:])
+    elif text.count(":") == 1:
+        host_part, _, port_part = text.partition(":")
+        host = host_part
+        if not port_part.isdigit():
+            raise PairingRequestError(f"malformed coordinator address: {addr!r}")
+        port = int(port_part)
+    if not host:
+        raise PairingRequestError("coordinator address is missing a host")
+    if not 1 <= port <= 65535:
+        raise PairingRequestError(f"coordinator port out of range: {port}")
+    return f"{host}:{port}"
+
+
 def _default_http_post(url: str, payload: dict[str, Any], timeout: float) -> Any:
     request = urllib.request.Request(
         url,
@@ -757,6 +797,10 @@ class PairingManager:
         self._pending: dict[str, _PendingRequest] = {}
         self._denied: dict[str, float] = {}
         self._local_code: dict[str, Any] | None = None
+        # Joiner-side session for the wizard UI: set by begin_join, consumed
+        # by local_join_state/poll_join_once/cancel_join. Memory-only like
+        # _local_code — a restart invalidates a half-finished join.
+        self._local_join: dict[str, Any] | None = None
 
     # -- helpers ------------------------------------------------------------
 
@@ -896,6 +940,167 @@ class PairingManager:
         self._local_code = None
         self._record_audit("join_completed", node_id=coordinator_id)
         return record
+
+    # -- joiner-side UI session (begin/poll/cancel, no background thread) -----
+
+    def begin_join(self, coordinator_addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        """Mint the 6-digit code and POST the join request to the coordinator.
+
+        This is the one-call joiner entry point the admin UI uses: it
+        normalizes the address (``ip`` / ``ip:port`` / ``http://ip:port``),
+        starts the code, and sends the request. On a transport failure the
+        local join state is cleared and a :class:`PairingRequestError`
+        explains the coordinator was unreachable or refused.
+        """
+
+        normalized = normalize_coordinator_addr(coordinator_addr)
+        with self._lock:
+            if self._local_join is not None and self._local_join.get("state") == "awaiting_approval":
+                raise PairingStateError(
+                    "a join is already awaiting approval; cancel it before starting another"
+                )
+        shown = self.start_join()
+        try:
+            self.request_join(normalized, timeout=timeout)
+        except PairingError:
+            self._clear_local_join()
+            raise
+        except Exception as exc:
+            self._clear_local_join()
+            self._record_audit(
+                "join_request_failed",
+                node_id=self.node_id,
+                detail={"coordinator": normalized, "error": str(exc)},
+            )
+            raise PairingRequestError(
+                f"coordinator at {normalized} is unreachable or refused the join: {exc}"
+            ) from exc
+        with self._lock:
+            self._local_join = {
+                "state": "awaiting_approval",
+                "coordinator_addr": normalized,
+                "error": None,
+            }
+        return {
+            "state": "awaiting_approval",
+            "code": shown["code"],
+            "expires_at": shown["expires_at"],
+            "coordinator_addr": normalized,
+        }
+
+    def _clear_local_join(self) -> None:
+        with self._lock:
+            self._local_join = None
+            self._local_code = None
+
+    def local_join_state(self) -> dict[str, Any]:
+        """Snapshot of this node's own join attempt for the admin UI.
+
+        ``state`` is ``idle`` (nothing in progress), ``awaiting_approval``,
+        ``approved`` (reported once by :meth:`poll_join_once`), ``denied``
+        (terminal until a new :meth:`begin_join`), or ``error`` (the code
+        expired — start again). The code is included only while unexpired;
+        it is never logged or persisted.
+        """
+
+        with self._lock:
+            join = dict(self._local_join) if self._local_join is not None else None
+            local_code = (
+                dict(self._local_code) if self._local_code is not None else None
+            )
+        now = self._clock()
+        snapshot: dict[str, Any] = {
+            "state": "idle",
+            "code": None,
+            "expires_at": None,
+            "coordinator_addr": None,
+            "error": None,
+            "seconds_remaining": 0,
+        }
+        code_live = local_code is not None and local_code["expires_at"] >= now
+        if code_live:
+            snapshot["code"] = local_code["code"]
+            snapshot["expires_at"] = local_code["expires_at"]
+            snapshot["seconds_remaining"] = max(
+                0, int(local_code["expires_at"] - now)
+            )
+        if join is None:
+            return snapshot
+        snapshot["coordinator_addr"] = join.get("coordinator_addr")
+        snapshot["error"] = join.get("error")
+        state = str(join.get("state") or "awaiting_approval")
+        if state == "awaiting_approval" and not code_live:
+            # The code outlived its TTL while waiting: terminal for this
+            # attempt — the UI offers "start again" against the same address.
+            state = "error"
+            snapshot["error"] = snapshot["error"] or (
+                "the pairing code expired — start again"
+            )
+        snapshot["state"] = state
+        return snapshot
+
+    def poll_join_once(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Drive the join forward one step; called by the UI's 1 Hz poll.
+
+        Lazy poll-and-complete instead of a background thread: if a join is
+        awaiting approval, ask the coordinator once. ``approved`` unwraps and
+        persists via :meth:`complete_join` and is reported exactly once (the
+        next call is back to ``idle``); ``denied`` is terminal until a new
+        :meth:`begin_join`; transient transport errors keep
+        ``awaiting_approval`` with the error string recorded in the snapshot.
+        """
+
+        with self._lock:
+            join = dict(self._local_join) if self._local_join is not None else None
+        if join is None or join.get("state") != "awaiting_approval":
+            return self.local_join_state()
+        coordinator_addr = str(join["coordinator_addr"])
+        try:
+            status = self.poll_join(coordinator_addr, timeout=timeout)
+        except Exception as exc:
+            with self._lock:
+                if self._local_join is not None:
+                    self._local_join["error"] = str(exc)
+            return self.local_join_state()
+        state = status.get("state")
+        if state == "approved":
+            with self._lock:
+                already_completed = self._local_code is None
+            # complete_join audits join_completed and clears the code.
+            record = None if already_completed else self.complete_join(status)
+            with self._lock:
+                self._local_join = None
+            snapshot = self.local_join_state()
+            snapshot["state"] = "approved"
+            snapshot["coordinator_addr"] = coordinator_addr
+            coordinator = status.get("coordinator") or {}
+            snapshot["coordinator_name"] = (
+                (record or {}).get("friendly_name")
+                or coordinator.get("friendly_name")
+                or ""
+            )
+            return snapshot
+        if state == "denied":
+            with self._lock:
+                if self._local_join is not None:
+                    self._local_join["state"] = "denied"
+                    self._local_join["error"] = None
+            return self.local_join_state()
+        # pending/unknown: keep waiting; a fresh error string clears.
+        with self._lock:
+            if self._local_join is not None:
+                self._local_join["error"] = None
+        return self.local_join_state()
+
+    def cancel_join(self) -> dict[str, Any]:
+        """Abandon a join in progress. Idempotent: always returns ``idle``."""
+
+        with self._lock:
+            had_join = self._local_join is not None or self._local_code is not None
+        if had_join:
+            self._record_audit("join_cancelled", node_id=self.node_id)
+        self._clear_local_join()
+        return {"state": "idle"}
 
     # -- coordinator side -----------------------------------------------------
 

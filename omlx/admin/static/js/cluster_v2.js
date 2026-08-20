@@ -8,6 +8,10 @@
 //     GET    /api/cluster/devices               — {paired, discovered, self}, polled at 1 Hz
 //     POST   /api/cluster/pair/approve          — {node_id, code}
 //     POST   /api/cluster/pair/deny             — {node_id}
+//     POST   /api/cluster/pair/join             — {coordinator_addr} — joiner: mint + show the code
+//     GET    /api/cluster/pair/join             — local join snapshot, polled at 1 Hz (drives approval)
+//     POST   /api/cluster/pair/join/cancel      — abandon the join in progress
+//     POST   /api/cluster/devices/manual        — {ip, port} seed + probe a peer by address
 //     DELETE /api/cluster/devices/{node_id}     — unpair
 //   STUB (defined by Module C, to be implemented in Module A's probe path):
 //     GET    /api/cluster/discovery/health      — {multicast_rx_within_5s: bool,
@@ -38,6 +42,9 @@ function clusterV2Wizard() {
         discoveryHealth: '/api/cluster/discovery/health',
         pairApprove: '/api/cluster/pair/approve',
         pairDeny: '/api/cluster/pair/deny',
+        pairJoin: '/api/cluster/pair/join',
+        pairJoinCancel: '/api/cluster/pair/join/cancel',
+        manualDevice: '/api/cluster/devices/manual',
         unpair: (nodeId) =>
             `/api/cluster/devices/${encodeURIComponent(nodeId)}`,
         models: '/admin/api/cluster/models',
@@ -82,6 +89,28 @@ function clusterV2Wizard() {
         // Null = derive from the snapshot. Explicit values: 'checks', 'plan'.
         stage: null,
         pairing: { target: null, code: '', busy: false, error: '' },
+
+        // ---- joiner side (this Mac shows the code, the other Mac approves) ---
+        // Server-driven snapshot from GET /api/cluster/pair/join; polled in
+        // tick() so the panel survives reloads and approval completes by
+        // itself. target_name is client-local context for friendly toasts.
+        join: {
+            state: 'idle',
+            code: null,
+            expires_at: null,
+            coordinator_addr: null,
+            seconds_remaining: 0,
+            error: null,
+            busy: false,
+            target_name: '',
+        },
+        joinApprovedNotified: false,
+        joinDeniedNotified: false,
+
+        // ---- add by IP (when multicast discovery is unavailable) -------------
+        manualAddr: '',
+        manualBusy: false,
+        manualError: '',
         checks: {
             started: false,
             running: false,
@@ -133,6 +162,7 @@ function clusterV2Wizard() {
         async tick() {
             if (!this.wizardVisible()) return;
             await this.refreshDevices();
+            await this.refreshJoinState();
             this.tickCount += 1;
             if (
                 !this.deploymentsLoaded ||
@@ -232,6 +262,52 @@ function clusterV2Wizard() {
             }
         },
 
+        // The joiner snapshot is server-owned, so a page reload mid-join
+        // restores the panel and the coordinator's approval completes on the
+        // next tick without any user action.
+        async refreshJoinState() {
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin);
+                if (!snapshot) return;
+                const previous = this.join.state;
+                this.join = { ...this.join, ...snapshot, busy: false };
+                if (
+                    snapshot.state === 'approved' &&
+                    !this.joinApprovedNotified
+                ) {
+                    this.joinApprovedNotified = true;
+                    this.notify(
+                        'success',
+                        `This Mac joined ${this.joinTargetName()}'s cluster.`,
+                    );
+                    await this.refreshDevices();
+                    this.startChecks();
+                } else if (
+                    snapshot.state === 'denied' &&
+                    previous !== 'denied' &&
+                    !this.joinDeniedNotified
+                ) {
+                    this.joinDeniedNotified = true;
+                    this.notify(
+                        'error',
+                        `${this.joinTargetName()} denied the join request.`,
+                    );
+                    // Denied is terminal server-side; reset locally so the
+                    // panel clears instead of sticking on the refusal.
+                    await this.cancelJoin({ silent: true });
+                }
+            } catch (error) {
+                // A 404 means this backend predates the joiner endpoints —
+                // stay idle rather than tearing down the rest of the wizard.
+                if (error?.status !== 404) {
+                    this.join = {
+                        ...this.join,
+                        error: error?.message || 'Join status unavailable',
+                    };
+                }
+            }
+        },
+
         // =====================================================================
         // Snapshot selectors
         // =====================================================================
@@ -291,7 +367,11 @@ function clusterV2Wizard() {
             if (this.stage === 'checks' && this.pairedDevices().length) {
                 return 'checks';
             }
-            if (this.pairing.target || this.pendingApprovals().length) {
+            if (
+                this.pairing.target ||
+                this.pendingApprovals().length ||
+                this.joinActive()
+            ) {
                 return 'pairing';
             }
             if (
@@ -515,6 +595,175 @@ function clusterV2Wizard() {
                     'error',
                     error?.message || 'Could not unpair this device',
                 );
+            }
+        },
+
+        // =====================================================================
+        // Joiner side — THIS Mac shows the code; the other Mac approves it.
+        // =====================================================================
+        joinActive() {
+            // Anything but idle keeps the joiner panel up; approved/denied
+            // clear themselves through refreshJoinState().
+            return !!this.join.state && this.join.state !== 'idle';
+        },
+
+        joinTargetName() {
+            return (
+                this.join.target_name ||
+                this.join.coordinator_name ||
+                this.join.coordinator_addr ||
+                'the other Mac'
+            );
+        },
+
+        joinCountdownLabel() {
+            const total = Math.max(0, Math.round(this.join.seconds_remaining || 0));
+            const minutes = Math.floor(total / 60);
+            const seconds = String(total % 60).padStart(2, '0');
+            return `${minutes}:${seconds}`;
+        },
+
+        // exo-style address choice: prefer a routable IPv4 on a direct or
+        // known interface; a bare link-local fe80:: (no scope zone) can never
+        // be dialed, so it ranks below everything.
+        bestDeviceAddr(device) {
+            const addrs = Array.isArray(device?.addrs) ? device.addrs : [];
+            const preferred = ['manual', 'tb', 'thunderbolt', 'ethernet', 'tailscale'];
+            const scored = addrs
+                .filter((addr) => addr && addr.ip)
+                .map((addr) => {
+                    const ip = String(addr.ip);
+                    let score = 0;
+                    const rank = preferred.indexOf(String(addr.if_type || ''));
+                    if (rank >= 0) score += 100 - rank;
+                    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) score += 50;
+                    if (ip.toLowerCase().startsWith('fe80:')) score -= 1000;
+                    return { addr, score };
+                })
+                .sort((a, b) => b.score - a.score);
+            return scored.length ? scored[0].addr : null;
+        },
+
+        coordinatorAddrFor(device) {
+            const addr = this.bestDeviceAddr(device);
+            if (!addr) return null;
+            return `${addr.ip}:${device.http_port || 8000}`;
+        },
+
+        async beginJoinAsJoiner(device) {
+            const target = this.coordinatorAddrFor(device);
+            if (!target) {
+                this.notify(
+                    'error',
+                    `No usable address for ${this.deviceName(device)} yet — try Add by IP.`,
+                );
+                return;
+            }
+            await this.beginJoinAddr(target, this.deviceName(device));
+        },
+
+        async beginJoinAddr(coordinatorAddr, targetName) {
+            if (this.join.busy) return;
+            this.join.busy = true;
+            try {
+                const snapshot = await this.apiFetch(CLUSTER_V2_API.pairJoin, {
+                    method: 'POST',
+                    body: JSON.stringify({ coordinator_addr: coordinatorAddr }),
+                });
+                this.join = {
+                    ...this.join,
+                    ...snapshot,
+                    busy: false,
+                    target_name: targetName || coordinatorAddr,
+                };
+                this.joinApprovedNotified = false;
+                this.joinDeniedNotified = false;
+                this.cancelPairing();
+            } catch (error) {
+                this.join.busy = false;
+                this.notify(
+                    'error',
+                    error?.message || 'Could not reach that Mac',
+                );
+            }
+        },
+
+        async restartJoin() {
+            // "Code expired — start again": same coordinator, fresh code.
+            const addr = this.join.coordinator_addr;
+            if (!addr) return;
+            await this.beginJoinAddr(addr, this.join.target_name);
+        },
+
+        async cancelJoin(options = {}) {
+            try {
+                const snapshot = await this.apiFetch(
+                    CLUSTER_V2_API.pairJoinCancel,
+                    { method: 'POST' },
+                );
+                this.join = {
+                    ...this.join,
+                    ...(snapshot || { state: 'idle' }),
+                    busy: false,
+                    target_name: '',
+                };
+                if (!options.silent) {
+                    this.notify('info', 'Join cancelled.');
+                }
+            } catch (error) {
+                if (!options.silent) {
+                    this.notify(
+                        'error',
+                        error?.message || 'Could not cancel the join',
+                    );
+                }
+            }
+        },
+
+        // =====================================================================
+        // Add by IP — the deterministic path when multicast can't reach the
+        // other Mac (Thunderbolt pairs, filtered routers, Local Network off).
+        // =====================================================================
+        async submitManualPeer() {
+            if (this.manualBusy) return;
+            const raw = (this.manualAddr || '').trim();
+            const match = raw.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
+            if (!match) {
+                this.manualError = 'Enter an IPv4 address like 10.0.0.2 or 10.0.0.2:8000.';
+                return;
+            }
+            const ip = match[1];
+            const port = match[2] ? parseInt(match[2], 10) : 8000;
+            const octetsOk = ip.split('.').every((part) => Number(part) <= 255);
+            if (!octetsOk || !(port >= 1 && port <= 65535)) {
+                this.manualError = 'That address or port is out of range.';
+                return;
+            }
+            this.manualBusy = true;
+            this.manualError = '';
+            try {
+                const result = await this.apiFetch(CLUSTER_V2_API.manualDevice, {
+                    method: 'POST',
+                    body: JSON.stringify({ ip, port }),
+                });
+                await this.refreshDevices();
+                if (result && result.verified) {
+                    const name = result.peer?.friendly_name || ip;
+                    this.notify('success', `Found ${name} at ${ip}.`);
+                    // One click: this Mac shows the code, the other approves.
+                    await this.beginJoinAddr(`${ip}:${port}`, name);
+                } else {
+                    this.notify(
+                        'warning',
+                        'No oMLX node answered at that address yet — it stays on the list while we keep trying.',
+                    );
+                }
+                this.manualAddr = '';
+            } catch (error) {
+                this.manualError =
+                    error?.message || 'Could not add that address';
+            } finally {
+                this.manualBusy = false;
             }
         },
 

@@ -10,8 +10,10 @@ copy-paste endpoints stay untouched under ``/admin/api/cluster`` as
   ``blake2s(code + node_id)``, and the served cluster key is encrypted under
   a PBKDF2 key derived from the code, so the admin's approve step remains
   the sole trust decision.
-* ``pair_admin_router`` — admin-facing approve/deny/unpair.  Mounted with
-  ``Depends(require_admin)`` exactly like the existing cluster router.
+* ``pair_admin_router`` — admin-facing approve/deny/unpair plus the joiner
+  side of the flow (``/pair/join`` begin/poll/cancel), which mutates this
+  node's own local join state.  Mounted with ``Depends(require_admin)``
+  exactly like the existing cluster router.
 
 Both are wired in ``omlx/server.py:_register_cluster_routes``.
 """
@@ -82,6 +84,12 @@ class PairDenyBody(BaseModel):
     node_id: str = Field(min_length=1, max_length=255)
 
 
+class PairJoinBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    coordinator_addr: str = Field(min_length=1, max_length=255)
+
+
 def _pairing_http_error(exc: PairingError) -> HTTPException:
     if isinstance(exc, PairingLockoutError):
         return HTTPException(status_code=423, detail=str(exc))
@@ -143,6 +151,37 @@ async def cluster_pair_deny(body: PairDenyBody):
     if not denied:
         raise HTTPException(status_code=404, detail="no pending join request")
     return {"ok": True, "node_id": body.node_id, "state": "denied"}
+
+
+@pair_admin_router.post("/pair/join")
+async def cluster_pair_join(body: PairJoinBody):
+    """Joiner side: show a 6-digit code here, the other Mac approves it.
+
+    Mints the code, POSTs the pair/request to ``coordinator_addr``, and
+    returns the local join snapshot; the UI then polls ``GET /pair/join``.
+    """
+
+    manager = _manager()
+    try:
+        return await asyncio.to_thread(manager.begin_join, body.coordinator_addr)
+    except PairingError as exc:
+        raise _pairing_http_error(exc) from exc
+
+
+@pair_admin_router.get("/pair/join")
+async def cluster_pair_join_state():
+    """Local join snapshot for the wizard; polling drives approval completion."""
+
+    manager = _manager()
+    return await asyncio.to_thread(manager.poll_join_once)
+
+
+@pair_admin_router.post("/pair/join/cancel")
+async def cluster_pair_join_cancel():
+    """Abandon this node's join in progress (idempotent)."""
+
+    manager = _manager()
+    return await asyncio.to_thread(manager.cancel_join)
 
 
 @pair_admin_router.delete("/devices/{node_id}")

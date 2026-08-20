@@ -62,6 +62,9 @@ ALLOWED_ENDPOINTS = {
     "/api/cluster/discovery/health",  # Module C stub, pending Module A impl
     "/api/cluster/pair/approve",
     "/api/cluster/pair/deny",
+    "/api/cluster/pair/join",
+    "/api/cluster/pair/join/cancel",
+    "/api/cluster/devices/manual",
     "/admin/api/cluster/models",
     "/admin/api/cluster/catalogue",
     "/admin/api/cluster/peer-probe",
@@ -168,6 +171,7 @@ def test_wizard_consumes_only_contract_endpoints():
         "/api/cluster/devices",
         "/api/cluster/pair/approve",
         "/api/cluster/pair/deny",
+        "/api/cluster/pair/join",
         "/admin/api/cluster/plan",
         "/admin/api/cluster/deployments",
     ):
@@ -320,3 +324,93 @@ def test_fixtures_are_valid_json_with_state_annotations(fixture_name):
     assert payload, fixture_name
     if fixture_name.startswith("devices_"):
         assert "_state" in payload or "_variant" in payload
+
+
+# --- Joiner side: this Mac shows the code, the other Mac approves ---------------
+
+
+def test_joiner_panel_renders_the_six_digit_code():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-joining" in template
+    assert "data-cluster-v2-join-code" in template
+    assert "data-cluster-v2-join-countdown" in template
+    assert "data-cluster-v2-join-cancel" in template
+    assert "joinActive()" in javascript
+    assert "joinCountdownLabel()" in javascript
+    # An active local join lands in the pairing wizard state, alongside (never
+    # instead of) a pending approval arriving from the other Mac.
+    state_body = javascript.split("wizardState() {", 1)[1].split("wizardSteps()", 1)[0]
+    assert "this.joinActive()" in state_body
+    assert "this.pendingApprovals().length" in state_body
+
+    fixture = _fixtures()["pair_join_state.json"]
+    assert fixture["state"] == "awaiting_approval"
+    assert re.fullmatch(r"\d{6}", fixture["code"])
+    assert fixture["coordinator_addr"]
+    assert fixture["seconds_remaining"] > 0
+    assert fixture["error"] is None
+
+
+def test_joiner_poll_drives_approval_and_survives_reloads():
+    javascript = _read(JAVASCRIPT)
+
+    # The 1 Hz tick polls the server-owned join snapshot, so a page reload
+    # mid-join restores the panel and the coordinator's approval completes
+    # by itself — no background thread on either side.
+    tick_body = javascript.split("async tick() {", 1)[1].split("},", 1)[0]
+    assert "this.refreshJoinState()" in tick_body
+    assert "refreshJoinState" in javascript
+
+    approved = javascript.split("snapshot.state === 'approved'", 1)[1]
+    assert "joined" in approved
+    assert "this.refreshDevices()" in approved
+    denied = javascript.split("snapshot.state === 'denied'", 1)[1]
+    assert "denied the join request" in denied
+    # Denied is terminal server-side; the UI clears it via the cancel endpoint.
+    assert "/api/cluster/pair/join/cancel" in javascript
+
+
+def test_show_code_instead_posts_the_best_reachable_address():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-show-code" in template
+    assert "beginJoinAsJoiner" in javascript
+    assert "bestDeviceAddr" in javascript
+    # Manual/Thunderbolt/ethernet/tailscale IPv4 win; a bare link-local fe80::
+    # (no scope zone) is never dialed.
+    assert "'manual', 'tb', 'thunderbolt', 'ethernet', 'tailscale'" in javascript
+    assert "fe80:" in javascript
+    assert "device.http_port || 8000" in javascript
+    # The join POST carries exactly the coordinator address.
+    assert re.search(
+        r"JSON\.stringify\(\{ coordinator_addr: coordinatorAddr \}\)", javascript
+    )
+
+
+def test_expired_join_offers_start_again_not_a_dead_end():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-join-restart" in template
+    assert "restartJoin" in javascript
+    # Restart reuses the remembered coordinator address with a fresh code.
+    assert "this.join.coordinator_addr" in javascript
+
+
+def test_add_by_ip_validates_then_offers_the_join_flow():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-manual-add" in template
+    assert "data-cluster-v2-manual-input" in template
+    assert "data-cluster-v2-manual-submit" in template
+    assert "submitManualPeer" in javascript
+    assert "/api/cluster/devices/manual" in javascript
+    # Client-side validation before any request leaves: IPv4 + optional port.
+    assert re.search(r"\^\(\\d\{1,3\}\(\?:\\\.\\d\{1,3\}\)\{3\}", javascript)
+    assert "port >= 1 && port <= 65535" in javascript
+    # A verified address flows straight into the joiner code panel (one click).
+    assert "beginJoinAddr(`${ip}:${port}`" in javascript
