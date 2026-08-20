@@ -769,3 +769,21 @@ def test_legacy_pairing_token_flow_still_works():
     token = generate_pairing_token(shared_secret=secret)
     assert verify_pairing_token(token, shared_secret=secret) is True
     assert verify_pairing_token(token, shared_secret="y" * 32) is False
+
+
+def test_join_status_carries_coordinator_caps_and_key(tmp_path):
+    """The poll path is the only one the UI drives: complete_join persists
+    whatever join_status returns, so the coordinator block must carry the
+    same caps/ssh key that approve() returns synchronously."""
+
+    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    joiner.begin_join("coord:8000")
+    coordinator.approve("join-node", joiner._local_code["code"])
+
+    status = coordinator.join_status("join-node")
+    assert status["state"] == "approved"
+    assert status["coordinator"]["caps"] == {"chip": "M4 Max", "ram_gb": 128}
+    assert status["coordinator"]["ssh_public_key"] == "ssh-ed25519 AAAA-coord-node"
+
+    record = joiner.complete_join(status)
+    assert record["caps"] == {"chip": "M4 Max", "ram_gb": 128}
