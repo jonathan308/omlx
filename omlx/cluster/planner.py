@@ -18,7 +18,7 @@ from typing import Any
 
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
-from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
+from .staging import is_local_host, run_remote_python
 from .tensor_strategies import (
     native_shard_is_layer_local,
     supports_model_type,
@@ -1150,7 +1150,7 @@ def remote_model_layout(
     ssh_target: str,
     model_dir: str,
     *,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> ModelLayout:
     """Measure a model that lives on a peer, on the peer.
@@ -1197,7 +1197,7 @@ def locate_model_layout(
     model_path: str | Path,
     hosts: Sequence[str] = (),
     *,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> ModelHolder:
     """Read a model's layout from whichever node holds all of it.

@@ -32,10 +32,6 @@ _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-# Where a peer's oMLX checkout keeps its interpreter. Unquoted on the remote
-# command line so the peer's shell expands ``~`` to its own home.
-DEFAULT_REMOTE_PYTHON = "~/omlx-distributed/.venv/bin/python"
-
 
 def is_local_host(host: str) -> bool:
     """Whether this address names this machine, so ssh would be a detour."""
@@ -370,7 +366,7 @@ def remote_model_staging_inventory(
     ssh_target: str,
     model_path: str,
     *,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> tuple[tuple[ShardInfo, ...], dict[str, int]]:
     """Read a complete source model's shard map on the Mac that owns it."""
@@ -489,7 +485,7 @@ def stage_manifest(
     hosts_by_node: dict[str, str],
     *,
     source_host: str = "127.0.0.1",
-    source_python_executable: str = DEFAULT_REMOTE_PYTHON,
+    source_python_executable: str | None = None,
 ) -> dict[str, Any]:
     """What must move before this plan can run, per node.
 
@@ -1066,7 +1062,7 @@ def run_remote_python(
     argument: str,
     *,
     description: str,
-    python_executable: str = DEFAULT_REMOTE_PYTHON,
+    python_executable: str | None = None,
     timeout: float = 600.0,
 ) -> Any:
     """Run one line of oMLX on a peer and return the JSON it printed.
@@ -1077,19 +1073,22 @@ def run_remote_python(
     reaches here from an API request, and an unquoted one is a command the
     peer's shell would happily run. Paths keep their ``~`` because the oMLX
     side expands it in Python.
+
+    With no ``python_executable``, the peer's own interpreter is discovered
+    over SSH (see ``launch.resolve_remote_python``) rather than assumed —
+    there is no install layout every peer shares.
     """
 
-    executable = str(python_executable).strip()
-    if executable == DEFAULT_REMOTE_PYTHON:
-        # This one fixed internal default intentionally keeps ``~`` for the
-        # peer shell. All discovered/user-carried paths must be absolute and
-        # are quoted as a single word below.
-        executable_word = executable
-    else:
-        path = Path(executable)
-        if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
-            raise ValueError("remote Python executable must be an absolute path")
-        executable_word = shlex.quote(executable)
+    executable = str(python_executable or "").strip()
+    if not executable:
+        # Late import: launch.py already imports this module.
+        from .launch import resolve_remote_python
+
+        executable = resolve_remote_python(ssh_target)
+    path = Path(executable)
+    if not path.is_absolute() or "\x00" in executable or len(executable) > 4096:
+        raise ValueError("remote Python executable must be an absolute path")
+    executable_word = shlex.quote(executable)
     result = subprocess.run(
         [
             "ssh",

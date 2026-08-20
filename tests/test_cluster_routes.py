@@ -547,6 +547,86 @@ def test_cluster_node_budgets_reject_ssh_options_before_probing(monkeypatch):
     assert called == []
 
 
+def test_cluster_node_roles_expose_the_reserve_rules_clients_mirrored():
+    """The wizard renders usable budgets client-side; reserve_bytes and
+    reserve_fraction are what keep that math identical to node_role.py."""
+
+    from omlx.cluster.node_role import DEFAULT_ROLE, ROLES
+
+    response = _client().get("/admin/api/cluster/node-roles")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["default"] == DEFAULT_ROLE
+    by_key = {role["key"]: role for role in payload["roles"]}
+    assert set(by_key) == set(ROLES)
+    for key, role in ROLES.items():
+        assert by_key[key]["label"] == role.label
+        assert by_key[key]["reserve_bytes"] == role.reserve_bytes
+        assert by_key[key]["reserve_fraction"] == role.reserve_fraction
+
+
+def test_cluster_node_budgets_report_an_unmeasurable_node_in_place(monkeypatch):
+    """A legacy enrolled Mac that no longer runs oMLX must not 503 the whole
+    request — the other nodes still measure, and the dead one is named."""
+
+    from omlx.cluster.launch import DistributedLaunchError
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        "omlx.cluster.node_role._enforcer_ceiling_bytes",
+        lambda: 100 * gib,
+    )
+
+    def fake_probe(ssh, *, python_executable):
+        raise DistributedLaunchError(
+            f"memory ceiling probe failed for {ssh}; "
+            "no interpreter that can import oMLX was found"
+        )
+
+    monkeypatch.setattr(routes, "probe_remote_admission_ceiling", fake_probe)
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={
+            "hosts": [
+                {"node_id": "node-a", "ssh": "127.0.0.1"},
+                {"node_id": "node-b", "ssh": "node-b.local"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    node_a, node_b = response.json()["nodes"]
+    assert node_a["capacity_bytes"] == 100 * gib
+    assert "unusable" not in node_a
+    assert node_b["unusable"] is True
+    assert node_b["capacity_bytes"] == 0
+    assert node_b["usable_bytes"] == 0
+    assert "no interpreter that can import oMLX" in node_b["error"]
+
+
+def test_cluster_node_budgets_503_contract_is_gone_for_probe_failures(monkeypatch):
+    """The whole-request 503 made the legacy dashboard retry every poll."""
+
+    from omlx.cluster.launch import DistributedLaunchError
+
+    def fake_probe(ssh, *, python_executable):
+        raise DistributedLaunchError(f"memory ceiling probe failed for {ssh}")
+
+    monkeypatch.setattr(routes, "probe_remote_admission_ceiling", fake_probe)
+
+    response = _client().post(
+        "/admin/api/cluster/node-budgets",
+        json={"hosts": [{"node_id": "node-b", "ssh": "node-b.local"}]},
+    )
+
+    assert response.status_code == 200
+    (node,) = response.json()["nodes"]
+    assert node["unusable"] is True
+    assert "memory ceiling probe failed" in node["error"]
+
+
 def test_cluster_plan_route_builds_unequal_pipeline():
     gib = 1024**3
 

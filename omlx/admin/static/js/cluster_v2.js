@@ -52,6 +52,7 @@ function clusterV2Wizard() {
         peerProbe: '/admin/api/cluster/peer-probe',
         autoconfigure: '/admin/api/cluster/autoconfigure',
         plan: '/admin/api/cluster/plan',
+        nodeRoles: '/admin/api/cluster/node-roles',
         deployments: '/admin/api/cluster/deployments',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
@@ -71,6 +72,27 @@ function clusterV2Wizard() {
         wifi: { label: 'Wi-Fi', icon: 'wifi' },
         tailscale: { label: 'Tailscale', icon: 'globe' },
         unknown: { label: 'Network', icon: 'help-circle' },
+    };
+
+    // Offline mirror of omlx/cluster/node_role.py (NodeRole.reserve_for):
+    // a workstation keeps max(32 GiB, 50%) of its Mac, a headless node keeps
+    // 10%. The wizard prefers GET /admin/api/cluster/node-roles, which exposes
+    // these same numbers from the server; this mirror exists only so the
+    // usable-budget labels still render when that endpoint is unreachable.
+    // If node_role.py changes, this mirror must change with it.
+    const CLUSTER_V2_ROLE_FALLBACK = {
+        workstation: {
+            key: 'workstation',
+            label: 'Workstation',
+            reserve_bytes: 32 * 1024 ** 3,
+            reserve_fraction: 0.5,
+        },
+        headless: {
+            key: 'headless',
+            label: 'Headless',
+            reserve_bytes: 0,
+            reserve_fraction: 0.1,
+        },
     };
 
     return {
@@ -129,6 +151,13 @@ function clusterV2Wizard() {
         plan: null,
         planLoading: false,
         planError: '',
+        // Explicit per-node role picks (node_id → 'workstation' | 'headless').
+        // Nodes without an entry keep the long-standing default: this Mac is
+        // a workstation, every peer is headless.
+        nodeRoles: {},
+        roleOptions: [],
+        // Parsed from a /plan 400: { shortfallBytes, canFixWithHeadless }.
+        planFitFailure: null,
         activateBusy: false,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
@@ -1062,9 +1091,129 @@ function clusterV2Wizard() {
         // =====================================================================
         enterPlan() {
             this.stage = 'plan';
+            this.loadNodeRoles();
             if (!this.modelOptions.length && !this.modelsLoading) {
                 this.loadModels();
             }
+        },
+
+        // =====================================================================
+        // Per-node roles — how much of each Mac the cluster may take
+        // =====================================================================
+        async loadNodeRoles() {
+            if (this.roleOptions.length) return;
+            try {
+                const payload = await this.apiFetch(CLUSTER_V2_API.nodeRoles);
+                this.roleOptions = payload?.roles || [];
+            } catch (error) {
+                // The mirrored fallback constants keep the budget labels
+                // rendering; planning itself re-derives roles server-side.
+            }
+        },
+
+        roleSpecFor(key) {
+            return (
+                this.roleOptions.find((role) => role.key === key) ||
+                CLUSTER_V2_ROLE_FALLBACK[key] ||
+                CLUSTER_V2_ROLE_FALLBACK.headless
+            );
+        },
+
+        roleLabel(key) {
+            return this.roleSpecFor(key).label || key;
+        },
+
+        nodeRole(nodeId, isSelf) {
+            // The default is unchanged: the Mac whose display is in front of
+            // the user keeps a workstation reserve; everything else is
+            // headless (also the server default).
+            return this.nodeRoles[nodeId] || (isSelf ? 'workstation' : 'headless');
+        },
+
+        setNodeRole(device, role) {
+            if (!device || this.planLoading) return;
+            if (this.nodeRole(device.node_id, !!device.is_self) === role) return;
+            this.nodeRoles = { ...this.nodeRoles, [device.node_id]: role };
+            this.planFitFailure = null;
+            if (this.selectedModelPath) this.runPlan();
+        },
+
+        // The paired Macs that will receive layers (this Mac included).
+        planRoleDevices() {
+            return this.allDevices().filter(
+                (device) => device.paired && this.deviceRamGb(device),
+            );
+        },
+
+        reserveBytesFor(roleKey, capacityBytes) {
+            // Mirrors NodeRole.reserve_for in omlx/cluster/node_role.py using
+            // the server-provided reserve_bytes/reserve_fraction pair (or the
+            // synced fallback mirror above): max(absolute floor, fractional
+            // headroom), always leaving the model at least 1 GiB.
+            const spec = this.roleSpecFor(roleKey);
+            const gib = 1024 ** 3;
+            const reserve = Math.max(
+                Number(spec.reserve_bytes || 0),
+                Math.floor(capacityBytes * Number(spec.reserve_fraction || 0)),
+            );
+            return Math.min(reserve, Math.max(0, capacityBytes - gib));
+        },
+
+        usableGbLabel(device) {
+            const capacity = (this.deviceRamGb(device) || 0) * 1024 ** 3;
+            if (!capacity) return '';
+            const role = this.nodeRole(device.node_id, !!device.is_self);
+            const usable = Math.max(
+                0,
+                capacity - this.reserveBytesFor(role, capacity),
+            );
+            return `${Math.round(usable / 1024 ** 3)} GB usable as ${this.roleLabel(role)}`;
+        },
+
+        // What flipping every workstation node to headless would free up.
+        headlessGainBytes() {
+            return this.planRoleDevices().reduce((gain, device) => {
+                const capacity = (this.deviceRamGb(device) || 0) * 1024 ** 3;
+                const role = this.nodeRole(device.node_id, !!device.is_self);
+                if (role !== 'workstation') return gain;
+                return (
+                    gain +
+                    this.reserveBytesFor('workstation', capacity) -
+                    this.reserveBytesFor('headless', capacity)
+                );
+            }, 0);
+        },
+
+        // /plan 400s with "model does not fit the supplied per-node budgets
+        // (at least N additional bytes required)" — turn the number into
+        // guidance instead of a dead end.
+        parseFitFailure(message) {
+            if (!/per-node budgets/.test(message || '')) return null;
+            const match = /at least (\d+) additional bytes/.exec(message || '');
+            if (!match) return null;
+            const shortfallBytes = Number(match[1]);
+            return {
+                shortfallBytes,
+                canFixWithHeadless:
+                    shortfallBytes > 0 &&
+                    this.headlessGainBytes() >= shortfallBytes,
+            };
+        },
+
+        fitShortfallLabel() {
+            const bytes = this.planFitFailure?.shortfallBytes;
+            return bytes ? `${(bytes / 1024 ** 3).toFixed(1)} GiB` : '';
+        },
+
+        // One explicit click: roles never flip on their own.
+        async switchAllToHeadless() {
+            const flipped = { ...this.nodeRoles };
+            for (const device of this.planRoleDevices()) {
+                flipped[device.node_id] = 'headless';
+            }
+            this.nodeRoles = flipped;
+            this.planFitFailure = null;
+            await this.runPlan();
         },
 
         inventoryHosts() {
@@ -1149,8 +1298,8 @@ function clusterV2Wizard() {
                     capacity_bytes:
                         (this.deviceRamGb(self) || 0) * 1024 ** 3,
                     // The Mac whose display is in front of the user keeps a
-                    // workstation reserve; everything else is headless.
-                    role: 'workstation',
+                    // workstation reserve unless the plan step says otherwise.
+                    role: this.nodeRole(self.node_id, true),
                     memory_guard_tier: 'balanced',
                     accelerator: 'metal',
                 });
@@ -1160,7 +1309,7 @@ function clusterV2Wizard() {
                     node_id: peer.node_id,
                     capacity_bytes:
                         (this.deviceRamGb(peer) || 0) * 1024 ** 3,
-                    role: 'headless',
+                    role: this.nodeRole(peer.node_id, false),
                     memory_guard_tier: 'balanced',
                     accelerator: 'metal',
                 });
@@ -1172,6 +1321,7 @@ function clusterV2Wizard() {
             if (!this.selectedModelPath) return;
             this.planLoading = true;
             this.planError = '';
+            this.planFitFailure = null;
             this.plan = null;
             try {
                 const model = this.selectedModel();
@@ -1193,6 +1343,7 @@ function clusterV2Wizard() {
             } catch (error) {
                 this.planError =
                     error?.message || 'Could not build the layer split';
+                this.planFitFailure = this.parseFitFailure(this.planError);
             } finally {
                 this.planLoading = false;
             }

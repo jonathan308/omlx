@@ -830,7 +830,7 @@ def run_cluster_performance_probe(
         raise ValueError("distributed working directory must be absolute")
 
     with tempfile.TemporaryDirectory(
-        prefix="omlx-distributed-performance-"
+        prefix="omlx-cluster-performance-"
     ) as temporary_name:
         temporary = Path(temporary_name)
         _install_cluster_ssh_wrapper(temporary)
@@ -1172,7 +1172,6 @@ def discover_remote_python_executable(
         "/opt/omlx/bin/python",
         "/usr/local/bin/python3",
         "/usr/bin/python3",
-        "~/omlx-distributed/.venv/bin/python",
         "python3",
     )
     seen: set[str] = set()
@@ -1214,8 +1213,48 @@ def discover_remote_python_executable(
         except ValueError:
             continue
     raise DistributedLaunchError(
-        f"{ssh_target} has no Python interpreter that can import oMLX"
+        f"{ssh_target} has no Python interpreter that can import oMLX "
+        f"(tried: {', '.join(seen)})"
     )
+
+
+# Process-lifetime cache, one discovery per (host, preferred) pair. The answer
+# only changes when the peer is reinstalled, and the callers run on dashboard
+# polls — re-probing a peer on every poll is the retry storm this exists to
+# prevent. Failures are deliberately not cached: a peer that was mid-install
+# must be able to recover on the next attempt.
+_RESOLVED_REMOTE_PYTHON: dict[tuple[str, str], str] = {}
+
+
+def resolve_remote_python(
+    ssh_target: str,
+    *,
+    preferred: str | None = None,
+    timeout: float = 8.0,
+    runner: SSHRunner | None = None,
+) -> str:
+    """The peer's oMLX-capable interpreter, resolved over SSH at use time.
+
+    There is no built-in default remote path — one developer's checkout layout
+    is another peer's 404. ``preferred`` (an interpreter a previous probe
+    carried back) is tried first; otherwise the peer's own launchers and
+    system Pythons are searched, and every candidate must prove it can
+    ``import omlx`` before it is returned. When nothing works, the raised
+    ``DistributedLaunchError`` names every interpreter that was tried.
+    """
+
+    key = (ssh_target, str(preferred or ""))
+    if runner is None and key in _RESOLVED_REMOTE_PYTHON:
+        return _RESOLVED_REMOTE_PYTHON[key]
+    resolved = discover_remote_python_executable(
+        ssh_target,
+        preferred=preferred or sys.executable,
+        timeout=timeout,
+        runner=runner if runner is not None else subprocess.run,
+    )
+    if runner is None:
+        _RESOLVED_REMOTE_PYTHON[key] = resolved
+    return resolved
 
 
 def discover_remote_system_python(
@@ -2114,7 +2153,7 @@ class DistributedJobSupervisor:
                 python_executable=self.python_executable,
             )
 
-        self._temporary = tempfile.TemporaryDirectory(prefix="omlx-distributed-launch-")
+        self._temporary = tempfile.TemporaryDirectory(prefix="omlx-cluster-launch-")
         hostfile = Path(self._temporary.name) / "hostfile.json"
         _install_cluster_ssh_wrapper(Path(self._temporary.name))
         hostfile.write_text(

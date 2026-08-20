@@ -5751,11 +5751,21 @@
                     }
                     const gib = 1024 ** 3;
                     let changed = false;
+                    const unusable = [];
                     (body.nodes || []).forEach(measured => {
                         const node = this.clusterPlanNodes.find(
                             n => String(n.node_id || '').trim() === measured.node_id
                         );
-                        if (!node || !measured.capacity_bytes) return;
+                        if (!node) return;
+                        // A node whose interpreter probe failed is reported
+                        // per-node (marked unusable) rather than failing the
+                        // whole request — name it instead of retry-storming.
+                        if (measured.unusable) {
+                            unusable.push(measured);
+                            node.measured = measured.error || 'Unavailable';
+                            return;
+                        }
+                        if (!measured.capacity_bytes) return;
                         const capacityGiB = Number(
                             (measured.capacity_bytes / gib).toFixed(2)
                         );
@@ -5796,6 +5806,14 @@
                         );
                         node.measured = measured.summary;
                     });
+                    if (unusable.length) {
+                        this.clusterBudgetsError = unusable
+                            .map(
+                                m =>
+                                    `${m.node_id}: ${m.error || 'could not be measured'}`
+                            )
+                            .join(' · ');
+                    }
                     if (changed) {
                         this.clusterCatalogue = null;
                         this.invalidateClusterPlan();

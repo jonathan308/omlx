@@ -68,6 +68,7 @@ from .launch import (
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
+    resolve_remote_python,
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
 )
@@ -109,7 +110,6 @@ from .replan import (
 )
 from .runtime import read_runtime_markers
 from .staging import (
-    DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
     home_relative_model_path,
     index_shards,
@@ -673,9 +673,9 @@ def _model_and_nodes(request: ClusterPlanRequest):
             model = remote_model_layout(
                 validate_ssh_target(source),
                 model_path,
-                python_executable=(
-                    request.model_source_python or DEFAULT_REMOTE_PYTHON
-                ),
+                # None lets the peer's own interpreter be discovered over SSH
+                # (launch.resolve_remote_python); it is never assumed.
+                python_executable=request.model_source_python,
             )
         else:
             # A coordinator may retain only its previous pipeline stage.  Such
@@ -964,9 +964,7 @@ def _staging_for(
                 if _local_ssh_target(source_host)
                 else validate_ssh_target(source_host)
             ),
-            source_python_executable=(
-                request.model_source_python or DEFAULT_REMOTE_PYTHON
-            ),
+            source_python_executable=request.model_source_python,
         )
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc), "ready": False}
@@ -2847,9 +2845,7 @@ def _performance_optimized_deployment(
         remote_model_layout(
             validate_ssh_target(source),
             deployment.model,
-            python_executable=(
-                request.model_source_python or DEFAULT_REMOTE_PYTHON
-            ),
+            python_executable=request.model_source_python,
         )
         if source
         and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
@@ -2974,6 +2970,10 @@ async def cluster_node_roles() -> dict[str, Any]:
                 "summary": role.summary,
                 "detail": role.detail,
                 "reserve_bytes": role.reserve_bytes,
+                # Clients rendering a usable budget (the cluster v2 wizard)
+                # compute reserve_for() from this pair rather than mirroring
+                # the constants by hand.
+                "reserve_fraction": role.reserve_fraction,
             }
             for role in ROLES.values()
         ],
@@ -3005,33 +3005,46 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
     async def _for(host: Any) -> dict[str, Any]:
         capacity_bytes = 0
         capacity_source: str | None = None
-        if not _local_ssh_target(host.ssh):
-            capacity_bytes = await asyncio.to_thread(
-                probe_remote_admission_ceiling,
-                host.ssh,
-                # No fallback to sys.executable: inside the packaged app that
-                # is a bundled interpreter which exists on the peer but cannot
-                # import oMLX, so every poll 503'd (#2680). Unknown means the
-                # probe discovers the peer's own interpreter.
-                python_executable=host.python_executable,
+        try:
+            if not _local_ssh_target(host.ssh):
+                capacity_bytes = await asyncio.to_thread(
+                    probe_remote_admission_ceiling,
+                    host.ssh,
+                    # No fallback to sys.executable: inside the packaged app that
+                    # is a bundled interpreter which exists on the peer but cannot
+                    # import oMLX, so every poll 503'd (#2680). Unknown means the
+                    # probe discovers the peer's own interpreter.
+                    python_executable=host.python_executable,
+                )
+                capacity_source = "admission_ceiling"
+            budget = await asyncio.to_thread(
+                suggest_budget,
+                role=request.roles.get(host.node_id, "headless"),
+                ssh_target=host.ssh,
+                capacity_bytes=capacity_bytes,
+                capacity_source=capacity_source,
             )
-            capacity_source = "admission_ceiling"
-        budget = await asyncio.to_thread(
-            suggest_budget,
-            role=request.roles.get(host.node_id, "headless"),
-            ssh_target=host.ssh,
-            capacity_bytes=capacity_bytes,
-            capacity_source=capacity_source,
-        )
+        except (DistributedLaunchError, OSError, RuntimeError, ValueError) as exc:
+            # One enrolled Mac that no longer runs oMLX must not fail the
+            # measurement of every other node: a whole-request 503 made the
+            # legacy dashboard retry on every poll. The node is reported in
+            # place, marked unusable with the reason, and the caller's skip of
+            # zero-capacity rows does the rest.
+            return {
+                "node_id": host.node_id,
+                "ssh": host.ssh,
+                "capacity_bytes": 0,
+                "reserve_bytes": 0,
+                "usable_bytes": 0,
+                "role": request.roles.get(host.node_id, "headless"),
+                "capacity_source": "unavailable",
+                "summary": "",
+                "unusable": True,
+                "error": str(exc),
+            }
         return {"node_id": host.node_id, "ssh": host.ssh, **budget.to_dict()}
 
-    try:
-        nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
-    except (DistributedLaunchError, OSError, ValueError) as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not measure every Mac's usable model memory: {exc}",
-        ) from exc
+    nodes = list(await asyncio.gather(*(_for(host) for host in hosts)))
     return {"nodes": nodes}
 
 
@@ -3068,14 +3081,16 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
                 return host.node_id, "127.0.0.1", [], str(exc)
         try:
             validated = validate_ssh_target(target)
+            # An unknown interpreter is discovered on the peer (and cached
+            # per host), never assumed from one machine's checkout layout.
+            source_python = host.python_executable or await asyncio.to_thread(
+                resolve_remote_python, validated
+            )
             models = await asyncio.to_thread(
                 remote_model_inventory,
                 validated,
-                python_executable=(
-                    host.python_executable or "~/omlx-distributed/.venv/bin/python"
-                ),
+                python_executable=source_python,
             )
-            source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
             models = [
                 dict(model, python_executable=source_python) for model in models
             ]
@@ -3131,9 +3146,7 @@ def _catalogue_for_candidates(
                 else remote_model_layout(
                     validate_ssh_target(source),
                     candidate.model_path,
-                    python_executable=(
-                        candidate.model_source_python or DEFAULT_REMOTE_PYTHON
-                    ),
+                    python_executable=candidate.model_source_python,
                 )
             )
             fit = assess_model(

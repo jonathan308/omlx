@@ -868,6 +868,66 @@ def test_remote_python_discovery_finds_gui_bootstrapped_cuda_worker():
     )
 
 
+def test_remote_python_discovery_names_everything_it_tried():
+    """A peer with no usable interpreter must say what was searched — never
+    leave the operator guessing which path was assumed."""
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 127, "", "not found")
+
+    with pytest.raises(DistributedLaunchError) as excinfo:
+        discover_remote_python_executable(
+            "mini", preferred="/missing/python", runner=runner
+        )
+
+    message = str(excinfo.value)
+    assert "no Python interpreter that can import oMLX" in message
+    for tried in (
+        "/missing/python",
+        "~/.omlx/bin/omlx-cluster-python",
+        "/usr/bin/python3",
+        "python3",
+    ):
+        assert tried in message
+
+
+def test_resolve_remote_python_caches_per_host_for_the_process(monkeypatch):
+    """Dashboard polls re-resolve constantly; the SSH search must run once."""
+
+    monkeypatch.setattr(launch, "_RESOLVED_REMOTE_PYTHON", {})
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv[-1])
+        if argv[-1].startswith("/opt/omlx/bin/python"):
+            return subprocess.CompletedProcess(argv, 0, "/opt/omlx/bin/python\n", "")
+        return subprocess.CompletedProcess(argv, 127, "", "not found")
+
+    monkeypatch.setattr(launch.subprocess, "run", runner)
+
+    assert launch.resolve_remote_python("studio") == "/opt/omlx/bin/python"
+    calls_after_first = len(calls)
+    assert launch.resolve_remote_python("studio") == "/opt/omlx/bin/python"
+    assert len(calls) == calls_after_first, "a cached answer costs no SSH"
+    # A different host — or a different carried interpreter — is a new search.
+    assert launch.resolve_remote_python("mini") == "/opt/omlx/bin/python"
+    assert len(calls) > calls_after_first
+
+
+def test_resolve_remote_python_failure_says_what_was_tried(monkeypatch):
+    monkeypatch.setattr(launch, "_RESOLVED_REMOTE_PYTHON", {})
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 127, "", "not found")
+
+    monkeypatch.setattr(launch.subprocess, "run", runner)
+
+    with pytest.raises(DistributedLaunchError, match="tried:"):
+        launch.resolve_remote_python("mini")
+    # Failures are not cached: a peer mid-install recovers on the next poll.
+    assert launch._RESOLVED_REMOTE_PYTHON == {}
+
+
 def test_preinstall_cuda_host_remains_visible_but_not_runnable():
     payload = {
         "protocol_version": None,

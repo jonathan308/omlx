@@ -585,6 +585,41 @@
                     </div>
                 </div>
 
+                <!-- Per-node roles: how much of each Mac the cluster may take.
+                     Default is unchanged (this Mac = Workstation, peers =
+                     Headless); changing one re-runs the plan. -->
+                <div class="mt-4" data-cluster-v2-node-roles>
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Memory each Mac contributes</div>
+                    <div class="space-y-2">
+                        <template x-for="device in planRoleDevices()" :key="device.node_id">
+                            <div class="flex items-center justify-between gap-3 rounded-xl border border-neutral-200 px-3 py-2">
+                                <div class="min-w-0">
+                                    <div class="text-xs font-semibold text-neutral-900 truncate"
+                                         x-text="deviceName(device)"></div>
+                                    <div class="text-[10px] text-neutral-500 mt-0.5"
+                                         x-text="deviceRamLabel(device) + ' · ' + usableGbLabel(device)"
+                                         data-cluster-v2-usable-budget></div>
+                                </div>
+                                <div class="flex rounded-lg border border-neutral-200 overflow-hidden flex-shrink-0"
+                                     data-cluster-v2-role-picker>
+                                    <button type="button" @click="setNodeRole(device, 'workstation')"
+                                            :class="nodeRole(device.node_id, !!device.is_self) === 'workstation'
+                                                ? 'bg-neutral-900 text-white'
+                                                : 'text-neutral-600 hover:bg-neutral-50'"
+                                            class="px-2.5 py-1 text-[10px] font-semibold transition-colors"
+                                            data-cluster-v2-role-workstation>Workstation</button>
+                                    <button type="button" @click="setNodeRole(device, 'headless')"
+                                            :class="nodeRole(device.node_id, !!device.is_self) === 'headless'
+                                                ? 'bg-neutral-900 text-white'
+                                                : 'text-neutral-600 hover:bg-neutral-50'"
+                                            class="px-2.5 py-1 text-[10px] font-semibold transition-colors border-l border-neutral-200"
+                                            data-cluster-v2-role-headless>Headless</button>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
                 <!-- Planning progress / error -->
                 <div class="mt-4 flex items-center gap-2 text-xs text-neutral-500" x-show="planLoading">
                     <svg class="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -592,6 +627,21 @@
                 </div>
                 <div class="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700"
                      x-show="planError" x-text="planError"></div>
+
+                <!-- Fit failure, made actionable: the shortfall in GiB plus a
+                     one-click fix when headless everywhere would close it. -->
+                <div x-show="planFitFailure" x-cloak
+                     class="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+                     data-cluster-v2-fit-banner>
+                    <span x-text="fitShortfallLabel() + ' more memory is needed than these roles allow. Headless Macs keep only a 10% margin; Workstation keeps at least half for whoever is using it.'"></span>
+                    <button type="button"
+                            x-show="planFitFailure && planFitFailure.canFixWithHeadless"
+                            @click="switchAllToHeadless()"
+                            class="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-semibold text-amber-900 border border-amber-300 rounded-lg hover:bg-amber-100"
+                            data-cluster-v2-fit-switch-headless>
+                        Switch all to Headless and retry
+                    </button>
+                </div>
 
                 <!-- Visual layer split bar -->
                 <template x-if="plan">

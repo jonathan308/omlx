@@ -16,6 +16,8 @@ Nothing here starts a server, opens a socket, or touches mlx.
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/peer-probe",
     "/admin/api/cluster/autoconfigure",
     "/admin/api/cluster/plan",
+    "/admin/api/cluster/node-roles",
     "/admin/api/cluster/deployments",
 }
 
@@ -414,3 +417,193 @@ def test_add_by_ip_validates_then_offers_the_join_flow():
     assert "port >= 1 && port <= 65535" in javascript
     # A verified address flows straight into the joiner code panel (one click).
     assert "beginJoinAddr(`${ip}:${port}`" in javascript
+
+
+# --- Plan step: per-node roles, usable budgets, actionable fit failures -------
+
+
+def _run_wizard(body: str) -> dict:
+    """Execute the shipped wizard component under Node with stubbed I/O."""
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute the wizard component")
+    script = f"""
+{_read(JAVASCRIPT)}
+const component = clusterV2Wizard();
+{body}
+"""
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+_WIZARD_TWO_MACS = """
+const roles = JSON.parse(
+  require('fs').readFileSync(
+    %s,
+    'utf8',
+  ),
+).roles;
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'Node A', caps: { ram_gb: 256 }, addrs: [] },
+  paired: [
+    { node_id: 'node-b', friendly_name: 'Node B', caps: { ram_gb: 128 }, addrs: [], paired: true },
+  ],
+  discovered: [],
+};
+component.roleOptions = roles;
+""" % json.dumps(str(FIXTURES / "node_roles.json"))
+
+
+def test_plan_step_has_a_per_node_role_picker_with_defaults_unchanged():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-node-roles" in template
+    assert "data-cluster-v2-role-picker" in template
+    assert "data-cluster-v2-role-workstation" in template
+    assert "data-cluster-v2-role-headless" in template
+    assert "data-cluster-v2-usable-budget" in template
+    # Default stays as it always was: this Mac workstation, peers headless.
+    assert "isSelf ? 'workstation' : 'headless'" in javascript
+    # Changing a role re-runs the plan (on click — no silent flips).
+    setter = javascript.split("setNodeRole(device, role) {", 1)[1]
+    assert "this.runPlan()" in setter
+    # planNodes() reads the picker state instead of hard-coding roles.
+    planner = javascript.split("planNodes() {", 1)[1].split("},", 1)[0]
+    assert "this.nodeRole(self.node_id, true)" in planner
+    assert "this.nodeRole(peer.node_id, false)" in planner
+    assert "role: 'workstation'" not in planner
+    assert "role: 'headless'" not in planner
+
+
+def test_role_reserve_math_comes_from_the_server_with_a_synced_mirror():
+    javascript = _read(JAVASCRIPT)
+
+    assert "'/admin/api/cluster/node-roles'" in javascript
+    assert "reserve_fraction" in javascript
+    # The offline mirror names the module it mirrors so they cannot drift
+    # apart silently.
+    mirror = javascript.split("CLUSTER_V2_ROLE_FALLBACK", 2)[0]
+    assert "node_role.py" in mirror
+
+    # The fixture pins the endpoint contract against node_role.py itself.
+    from omlx.cluster.node_role import ROLES
+
+    fixture = _fixtures()["node_roles.json"]
+    assert fixture["default"] == "headless"
+    by_key = {role["key"]: role for role in fixture["roles"]}
+    for key, role in ROLES.items():
+        assert by_key[key]["label"] == role.label
+        assert by_key[key]["reserve_bytes"] == role.reserve_bytes
+        assert by_key[key]["reserve_fraction"] == role.reserve_fraction
+
+
+def test_fit_failure_banner_is_actionable_and_never_silent():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-fit-banner" in template
+    assert "data-cluster-v2-fit-switch-headless" in template
+    assert "Switch all to Headless and retry" in template
+    assert "parseFitFailure" in javascript
+    assert r"at least (\d+) additional bytes" in javascript
+    assert "canFixWithHeadless" in javascript
+    # The all-headless flip exists only as the click handler — runPlan parses
+    # the failure but never mutates nodeRoles itself.
+    runner = javascript.split("async runPlan() {", 1)[1].split("},", 1)[0]
+    assert "nodeRoles" not in runner.replace("this.nodeRoles =", "")
+    assert "this.nodeRoles[" not in runner
+
+
+def test_role_picker_defaults_reserve_math_and_replan():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+const gib = 1024 ** 3;
+let replans = 0;
+component.runPlan = async () => { replans += 1; };
+component.selectedModelPath = '/models/m';
+
+const defaults = component.planNodes().map((node) => node.role);
+component.setNodeRole(component.pairedDevices()[0], 'workstation');
+const afterPick = component.planNodes().map((node) => node.role);
+
+process.stdout.write(JSON.stringify({
+  defaults,
+  afterPick,
+  replans,
+  wsReserve256: component.reserveBytesFor('workstation', 256 * gib),
+  hlReserve128: component.reserveBytesFor('headless', 128 * gib),
+  wsReserve64: component.reserveBytesFor('workstation', 64 * gib),
+  usableSelf: component.usableGbLabel(component.allDevices()[0]),
+}));
+""",
+    )
+
+    gib = 1024**3
+    assert result["defaults"] == ["workstation", "headless"]
+    assert result["afterPick"] == ["workstation", "workstation"]
+    assert result["replans"] == 1, "a role change re-runs the plan"
+    # node_role.py reserve_for(): workstation max(32 GiB, 50%), headless 10%.
+    assert result["wsReserve256"] == 128 * gib
+    assert result["hlReserve128"] == int(128 * gib * 0.1)
+    assert result["wsReserve64"] == 32 * gib, "the 32 GiB floor binds"
+    assert result["usableSelf"] == "128 GB usable as Workstation"
+
+
+def test_fit_failure_parses_the_shortfall_and_flips_only_on_click():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+const gib = 1024 ** 3;
+// A 274 GiB model across a 256 + 128 GiB pair: the workstation reserve on
+// this Mac is exactly what makes the plan fail.
+const failure = component.parseFitFailure(
+  'model does not fit the supplied per-node budgets (at least 33294121120 additional bytes required)',
+);
+const otherError = component.parseFitFailure('ssh: connect timeout');
+const noFigure = component.parseFitFailure(
+  'model does not fit the supplied per-node budgets',
+);
+const hugeGap = component.parseFitFailure(
+  'model does not fit the supplied per-node budgets (at least 999999999999 additional bytes required)',
+);
+const rolesBefore = { ...component.nodeRoles };
+const gainBytes = component.headlessGainBytes();
+component.planFitFailure = failure;
+const label = component.fitShortfallLabel();
+
+let replans = 0;
+component.runPlan = async () => { replans += 1; };
+component.selectedModelPath = '/models/m';
+component.switchAllToHeadless().then(() => {
+  process.stdout.write(JSON.stringify({
+    shortfall: failure.shortfallBytes,
+    canFix: failure.canFixWithHeadless,
+    gainBytes,
+    otherError: otherError === null,
+    noFigure: noFigure === null,
+    hugeCanFix: hugeGap.canFixWithHeadless,
+    rolesBefore,
+    rolesAfter: component.planNodes().map((node) => node.role),
+    replans,
+    label,
+  }));
+});
+""",
+    )
+
+    assert result["shortfall"] == 33294121120
+    assert result["canFix"] is True
+    assert result["gainBytes"] >= result["shortfall"]
+    assert result["otherError"] is True
+    assert result["noFigure"] is True
+    assert result["hugeCanFix"] is False, "an unclosable gap offers no button"
+    assert result["rolesBefore"] == {}, "parsing the error never flips roles"
+    assert result["rolesAfter"] == ["headless", "headless"]
+    assert result["replans"] == 1, "the click re-runs the plan"
+    assert result["label"] == "31.0 GiB"
