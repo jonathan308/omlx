@@ -644,6 +644,44 @@ class PeerCaps:
         )
 
 
+def _rdma_fabric_caps(caps: "PeerCaps", runner: Callable[..., Any] = subprocess.run) -> None:
+    """Detect the Thunderbolt RDMA fabric and set ``thunderbolt``/``jaccl``.
+
+    macOS-only, best-effort, never raises: ``rdma_ctl status`` reports
+    whether RDMA is enabled and ``ibv_devices`` lists the ``rdma_*`` devices,
+    which exist only on the Thunderbolt fabric. The wizard's RDMA check row
+    and the JACCL-vs-ring backend choice both key off these flags.
+    """
+
+    if sys.platform != "darwin":
+        return
+    rdma_ctl = "/usr/bin/rdma_ctl"
+    ibv_devices = "/usr/bin/ibv_devices"
+    if not (os.path.exists(rdma_ctl) and os.path.exists(ibv_devices)):
+        return
+    try:
+        status = runner(  # noqa: S603 - fixed system executable
+            [rdma_ctl, "status"], capture_output=True, text=True, timeout=5.0, check=False
+        )
+        enabled = (
+            status.returncode == 0
+            and status.stdout.strip().splitlines()
+            and status.stdout.strip().splitlines()[0].strip().lower() == "enabled"
+        )
+        devices = runner(  # noqa: S603 - fixed system executable
+            [ibv_devices], capture_output=True, text=True, timeout=5.0, check=False
+        )
+        rdma_devs = (
+            [line.split()[0] for line in devices.stdout.splitlines() if line.startswith("rdma_")]
+            if devices.returncode == 0
+            else []
+        )
+        caps.thunderbolt = bool(rdma_devs)
+        caps.jaccl = bool(enabled and rdma_devs)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def local_caps() -> PeerCaps:
     """Best-effort local capability snapshot; never raises."""
 
@@ -678,6 +716,7 @@ def local_caps() -> PeerCaps:
                 )
     except (OSError, subprocess.SubprocessError):
         pass
+    _rdma_fabric_caps(caps)
     return caps
 
 

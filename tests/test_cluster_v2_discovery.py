@@ -930,3 +930,57 @@ def test_blocked_suspicion_flag_lifecycle():
     service._local_network_blocked_suspected = True
     service._handle_hello(7, service._cluster_hash, ("fe80::99", 53413), sock)
     assert service._local_network_blocked_suspected is False
+
+
+def test_rdma_fabric_caps_detects_jaccl_when_enabled_with_devices():
+    from omlx.cluster import discovery
+
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args[0])
+
+        class Result:
+            returncode = 0
+            stdout = (
+                "enabled\n"
+                if args[0].endswith("rdma_ctl")
+                else "rdma_en6\nrdma_en1\n"
+            )
+
+        return Result()
+
+    caps = discovery.PeerCaps()
+    discovery._rdma_fabric_caps(caps, runner=runner)
+    if discovery.sys.platform == "darwin":
+        assert caps.thunderbolt is True
+        assert caps.jaccl is True
+
+
+def test_rdma_fabric_caps_stays_false_when_disabled_or_no_devices():
+    from omlx.cluster import discovery
+
+    def disabled(args, **kwargs):
+        class Result:
+            returncode = 0
+            stdout = "disabled\n" if args[0].endswith("rdma_ctl") else "rdma_en6\n"
+
+        return Result()
+
+    caps = discovery.PeerCaps()
+    discovery._rdma_fabric_caps(caps, runner=disabled)
+    if discovery.sys.platform == "darwin":
+        assert caps.thunderbolt is True  # fabric exists; RDMA is just off
+        assert caps.jaccl is False
+
+    def failing(args, **kwargs):
+        class Result:
+            returncode = 1
+            stdout = ""
+
+        return Result()
+
+    caps = discovery.PeerCaps()
+    discovery._rdma_fabric_caps(caps, runner=failing)
+    assert caps.thunderbolt is False
+    assert caps.jaccl is False

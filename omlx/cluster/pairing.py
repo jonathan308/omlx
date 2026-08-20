@@ -1329,10 +1329,15 @@ class PairingManager:
                 "node_id": node_id,
                 "state": "approved",
                 "paired_at": key_record.get("paired_at"),
+                # Same coordinator block approve() returns: the joiner
+                # persists it via complete_join, so caps/ssh key must ride
+                # here too — the poll path is the only one the UI drives.
                 "coordinator": {
                     "node_id": self.node_id,
                     "friendly_name": self.friendly_name,
+                    "caps": self._caps_provider() if self._caps_provider else {},
                     "addrs": [],
+                    "ssh_public_key": self._ssh_key_provider(),
                 },
             }
             package = key_record.get("cluster_key_package")
