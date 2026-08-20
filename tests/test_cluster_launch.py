@@ -24,6 +24,7 @@ from omlx.cluster.launch import (
     _local_runtime_versions,
     build_mlx_launch_argv,
     discover_remote_python_executable,
+    discover_remote_system_python,
     preflight_remote_hosts,
     probe_remote_host,
     probe_remote_system_host,
@@ -926,6 +927,42 @@ def test_resolve_remote_python_failure_says_what_was_tried(monkeypatch):
         launch.resolve_remote_python("mini")
     # Failures are not cached: a peer mid-install recovers on the next poll.
     assert launch._RESOLVED_REMOTE_PYTHON == {}
+
+
+@pytest.mark.parametrize(
+    "discover",
+    [discover_remote_python_executable, discover_remote_system_python],
+)
+def test_remote_python_discovery_preserves_ssh_transport_failure(discover):
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            255,
+            "",
+            "Permission denied (publickey,password,keyboard-interactive).\n",
+        )
+
+    with pytest.raises(DistributedLaunchError, match="Permission denied"):
+        discover(
+            "user@studio.local",
+            preferred="/usr/bin/python3",
+            runner=runner,
+        )
+
+
+def test_system_python_discovery_keeps_genuine_interpreter_failure():
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 127, "", "command not found")
+
+    with pytest.raises(
+        DistributedLaunchError,
+        match="no Python interpreter for hardware discovery",
+    ):
+        discover_remote_system_python(
+            "user@studio.local",
+            preferred="/missing/python3",
+            runner=runner,
+        )
 
 
 def test_preinstall_cuda_host_remains_visible_but_not_runnable():
