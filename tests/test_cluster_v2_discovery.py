@@ -945,7 +945,11 @@ def test_rdma_fabric_caps_detects_jaccl_when_enabled_with_devices():
             stdout = (
                 "enabled\n"
                 if args[0].endswith("rdma_ctl")
-                else "rdma_en6\nrdma_en1\n"
+                # Real ibv_devices output: two-row header, indented devices.
+                else "    device          \t   node GUID\n"
+                "    ------          \t----------------\n"
+                "    rdma_en6        \t715a4d3d9c48ac05\n"
+                "    rdma_en1        \t705a4d3d9c48ac05\n"
             )
 
         return Result()
