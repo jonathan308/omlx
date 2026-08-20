@@ -54,7 +54,9 @@ def test_merge_dedupes_on_node_id(tmp_path):
     discovered = registry.discovered()
     assert len(discovered) == 1
     assert discovered[0]["friendly_name"] == "studio-a-renamed"
-    assert discovered[0]["caps"] == {"ram_gb": 128}
+    # Non-downgrading merge: the later announcement's real ram_gb wins, and
+    # the chip it did not carry survives instead of being erased.
+    assert discovered[0]["caps"] == {"chip": "M3 Ultra", "ram_gb": 128}
 
 
 def test_mark_paired_persists_atomically_with_private_permissions(tmp_path):
@@ -156,3 +158,61 @@ def test_get_device_registry_requires_configuration():
     reset_configured_device_registry()
     with pytest.raises(RuntimeError, match="not configured"):
         get_device_registry()
+
+
+def test_merge_on_paired_device_never_downgrades_caps_or_addrs(tmp_path):
+    """A discovery HELLO carries structurally complete but value-empty caps;
+    merging it over a pairing-exchanged record must not erase real data."""
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.mark_paired(
+        "node-b",
+        friendly_name="laptop-b",
+        caps={"chip": "M5 Max", "ram_gb": 128, "thunderbolt": True, "jaccl": True},
+        addrs=["198.51.100.20", "fe80::99"],
+    )
+
+    # Sparse announcement: empty caps values, link-local-only addrs.
+    registry.merge(
+        {
+            "node_id": "node-b",
+            "friendly_name": "",
+            "caps": {
+                "chip": "",
+                "ram_gb": 0.0,
+                "backends": [],
+                "thunderbolt": False,
+                "jaccl": False,
+            },
+            "addrs": [{"ip": "fe80::42", "if_type": "unknown"}],
+        }
+    )
+
+    device = registry.get("node-b")
+    assert device["caps"] == {
+        "chip": "M5 Max",
+        "ram_gb": 128,
+        "thunderbolt": True,
+        "jaccl": True,
+    }
+    assert device["last_addrs"] == ["198.51.100.20", "fe80::99", "fe80::42"]
+
+    # And the persisted file agrees after a reload.
+    restored = DeviceRegistry(tmp_path / "devices.json")
+    assert restored.get("node-b")["caps"]["ram_gb"] == 128
+    assert "198.51.100.20" in restored.get("node-b")["last_addrs"]
+
+
+def test_merge_on_discovered_device_also_merges_without_downgrade(tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.merge(_announce("node-c", "studio-c"))
+    registry.merge(
+        {
+            "node_id": "node-c",
+            "caps": {"chip": "", "ram_gb": 0.0, "backends": [], "thunderbolt": False, "jaccl": False},
+            "addrs": [{"ip": "fe80::7", "if_type": "unknown"}],
+        }
+    )
+    device = registry.get("node-c")
+    assert device["caps"]["chip"] == "M3 Ultra"
+    assert device["caps"]["ram_gb"] == 96
+    assert device["last_addrs"] == ["fe80::1", "fe80::7"]

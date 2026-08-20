@@ -322,6 +322,48 @@ class DeviceRegistry:
 
     # -- merge API (discovery + pairing) ------------------------------------
 
+    @staticmethod
+    def _merge_caps(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        """Field-wise non-downgrading caps merge.
+
+        A discovery HELLO carries a structurally complete but value-empty
+        caps dict (``{"chip": "", "ram_gb": 0.0, ...}``); a truthiness check
+        would let it clobber the real capabilities exchanged at pairing.
+        Only real values win: non-empty chip, non-zero ram_gb, the union of
+        backends, and sticky-true fabric flags.
+        """
+
+        merged = dict(existing)
+        if incoming.get("chip"):
+            merged["chip"] = incoming["chip"]
+        if incoming.get("ram_gb"):
+            merged["ram_gb"] = incoming["ram_gb"]
+        backends = incoming.get("backends")
+        if backends:
+            merged["backends"] = sorted(
+                set(existing.get("backends") or []) | set(backends)
+            )
+        for flag in ("thunderbolt", "jaccl"):
+            # Sticky-true, but never introduce the key out of nowhere —
+            # records that never had fabric flags keep their shape.
+            if existing.get(flag) or incoming.get(flag) or flag in existing:
+                merged[flag] = bool(existing.get(flag)) or bool(incoming.get(flag))
+        for key, value in incoming.items():
+            if key not in merged and value:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _merge_addrs(existing: list[str], incoming: list[str]) -> list[str]:
+        """Union, preserving order — a later sparse announcement must not
+        drop routable addresses the pairing recorded."""
+
+        merged = list(existing)
+        for ip in incoming:
+            if ip not in merged:
+                merged.append(ip)
+        return merged[:16]
+
     def merge(
         self,
         device: Any,
@@ -333,7 +375,8 @@ class DeviceRegistry:
         Accepts any object/dict with ``node_id`` and optional
         ``friendly_name``/``caps``/``addrs`` or ``last_addrs`` (a discovery
         ``PeerRecord`` works as-is). Updates to an already-paired device are
-        persisted; updates to an unpaired device stay memory-only.
+        persisted; updates to an unpaired device stay memory-only. Merges
+        never downgrade: empty announced fields cannot erase known ones.
         """
 
         record = self._coerce(device)
@@ -344,9 +387,13 @@ class DeviceRegistry:
                 if record.get("friendly_name"):
                     merged["friendly_name"] = record["friendly_name"]
                 if record.get("caps"):
-                    merged["caps"] = dict(record["caps"])
+                    merged["caps"] = self._merge_caps(
+                        dict(merged.get("caps") or {}), record["caps"]
+                    )
                 if record.get("last_addrs"):
-                    merged["last_addrs"] = list(record["last_addrs"])
+                    merged["last_addrs"] = self._merge_addrs(
+                        list(merged.get("last_addrs") or []), record["last_addrs"]
+                    )
                 if paired_at is not None:
                     merged["paired_at"] = float(paired_at)
                 previous = dict(self._paired)
@@ -358,9 +405,16 @@ class DeviceRegistry:
                 self.load_error = None
                 return dict(merged)
             merged = self._discovered.get(node_id, {"node_id": node_id})
-            for key in ("friendly_name", "caps", "last_addrs"):
-                if record.get(key):
-                    merged[key] = record[key]
+            if record.get("friendly_name"):
+                merged["friendly_name"] = record["friendly_name"]
+            if record.get("caps"):
+                merged["caps"] = self._merge_caps(
+                    dict(merged.get("caps") or {}), record["caps"]
+                )
+            if record.get("last_addrs"):
+                merged["last_addrs"] = self._merge_addrs(
+                    list(merged.get("last_addrs") or []), record["last_addrs"]
+                )
             self._discovered[node_id] = merged
             return dict(merged)
 
