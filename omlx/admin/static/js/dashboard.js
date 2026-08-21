@@ -8284,7 +8284,7 @@
                                 guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
                                 guided_grammar: this.modelSettings.guided_grammar_enabled
                                     ? (this.modelSettings.guided_grammar || null)
-                                    : 0,
+                                    : null,
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
@@ -8469,7 +8469,11 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        // FastAPI 422s return detail as an array of objects —
+                        // render the messages, never "[object Object]".
+                        alert(Array.isArray(data.detail)
+                            ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ')
+                            : (data.detail || window.t('js.error.save_model_settings_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
