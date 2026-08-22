@@ -56,6 +56,8 @@ class NodePerformanceProfile:
     measured_at: str
     samples: int
     source: str = "synthetic_mlx_probe"
+    promotable: bool = True
+    qualification_reason: str = ""
 
     def __post_init__(self) -> None:
         if not self.node_id:
@@ -70,6 +72,10 @@ class NodePerformanceProfile:
             raise ValueError("performance profile samples are out of range")
         if self.source != "synthetic_mlx_probe":
             raise ValueError("performance profile source is unsupported")
+        if not isinstance(self.promotable, bool):
+            raise ValueError("performance profile promotable must be a boolean")
+        if not isinstance(self.qualification_reason, str):
+            raise ValueError("performance profile qualification reason must be text")
         object.__setattr__(
             self,
             "decode_weight_bytes_per_second",
@@ -117,6 +123,8 @@ class NodePerformanceProfile:
             "measured_at": self.measured_at,
             "samples": self.samples,
             "source": self.source,
+            "promotable": self.promotable,
+            "qualification_reason": self.qualification_reason,
         }
 
     @classmethod
@@ -141,6 +149,8 @@ class NodePerformanceProfile:
                 measured_at=str(payload["measured_at"]),
                 samples=int(payload["samples"]),
                 source=str(payload.get("source", "synthetic_mlx_probe")),
+                promotable=payload.get("promotable", True),
+                qualification_reason=str(payload.get("qualification_reason", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             if isinstance(exc, ValueError) and not isinstance(exc, KeyError):
@@ -405,6 +415,8 @@ def performance_profiles_from_records(
                     record.get("measured_at") or datetime.now(UTC).isoformat()
                 ),
                 samples=int(record.get("samples", 1)),
+                promotable=record.get("promotable", True),
+                qualification_reason=str(record.get("qualification_reason", "")),
             )
         )
     return tuple(profiles)

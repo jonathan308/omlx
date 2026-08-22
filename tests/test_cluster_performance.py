@@ -204,6 +204,19 @@ def test_performance_profiles_reject_nonfinite_measurements():
         NodePerformanceProfile.from_dict(payload)
 
 
+def test_low_power_measurement_round_trips_as_nonpromotable():
+    payload = _profile("node", 0, 10).to_dict() | {
+        "promotable": False,
+        "qualification_reason": "Low Power Mode was enabled during calibration",
+    }
+
+    profile = NodePerformanceProfile.from_dict(payload)
+
+    assert profile.promotable is False
+    assert "Low Power Mode" in profile.qualification_reason
+    assert profile.to_dict()["promotable"] is False
+
+
 def _deployment() -> ClusterDeployment:
     return ClusterDeployment(
         deployment_id="probe",
@@ -323,6 +336,42 @@ def test_cluster_performance_probe_never_passes_ring_connections_to_jaccl():
     assert report["ok"] is True
     assert report["backend"] == "jaccl"
     assert report["connections_per_ip"] == 1
+
+
+def test_cluster_performance_probe_marks_low_power_records_unpromotable():
+    def runner(argv, *, timeout, env):
+        records = [
+            {
+                "type": "performance_result",
+                "rank": rank,
+                "size": 2,
+                "decode_weight_bytes_per_second": 100 + rank,
+                "prefill_weight_bytes_per_second": 200 + rank,
+                "collective_latency_seconds": 0.001,
+                "collective_bandwidth_bytes_per_second": 10_000,
+                "samples": 5,
+                "measured_at": "2026-07-26T12:00:00+00:00",
+                "promotable": rank == 0,
+                "qualification_reason": (
+                    "" if rank == 0 else "Low Power Mode was enabled"
+                ),
+            }
+            for rank in (0, 1)
+        ]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="\n".join(json.dumps(record) for record in records),
+            stderr="",
+        )
+
+    report = run_cluster_performance_probe(_deployment(), runner=runner)
+
+    assert report["ok"] is True
+    assert report["promotable"] is False
+    assert report["unqualified_ranks"] == [1]
+    assert "Low Power Mode" in report["qualification_reason"]
+    assert report["profiles"][1]["promotable"] is False
 
 
 class _ValidatedPipeline:

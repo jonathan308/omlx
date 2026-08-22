@@ -62,6 +62,8 @@ def _collective_measurements(
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
 
+    from .probe import detect_low_power_mode
+
     group = mx.distributed.init()
     rank = group.rank()
     barrier = mx.distributed.all_sum(mx.array(1), stream=mx.cpu)
@@ -87,6 +89,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         iterations=args.iterations,
     )
     _evaluate(mx, mx.distributed.all_sum(mx.array(1), stream=mx.cpu))
+    power = detect_low_power_mode()
+    promotable = not power.low_power_mode_enabled
     return {
         "type": "performance_result",
         "rank": rank,
@@ -100,6 +104,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "prefill_rows": args.prefill_rows,
         "samples": args.iterations,
         "measured_at": datetime.now(UTC).isoformat(),
+        "power": power.to_dict(),
+        "promotable": promotable,
+        "qualification_reason": (
+            "Low Power Mode was enabled during synthetic calibration"
+            if not promotable
+            else ""
+        ),
     }
 
 

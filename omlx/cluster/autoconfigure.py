@@ -646,6 +646,7 @@ class PreflightIssue:
     kind: str  # "model_missing", "runtime_mismatch", "unreachable", "import_missing"
     detail: str
     remediation: str = ""
+    blocking: bool = True
 
 
 def preflight_issues(
@@ -695,6 +696,24 @@ def preflight_issues(
                     )
 
         node = payload.get("node") or {}
+        power = node.get("power") if isinstance(node.get("power"), dict) else {}
+        if power.get("low_power_mode_enabled") is True:
+            modes = []
+            if power.get("ac_low_power_mode") is True:
+                modes.append("AC Power")
+            if power.get("battery_low_power_mode") is True:
+                modes.append("Battery Power")
+            issues.append(
+                PreflightIssue(
+                    node_id,
+                    "low_power_mode",
+                    "Low Power Mode is enabled"
+                    + (f" for {' and '.join(modes)}" if modes else "")
+                    + "; synthetic calibration will be ignored until it is "
+                    "disabled in System Settings",
+                    blocking=False,
+                )
+            )
         if node.get("accelerator") == "cuda" and node.get("memory_kind") == "vram":
             issues.append(
                 PreflightIssue(
@@ -726,8 +745,14 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
 
     if not issues:
         return "All peers are reachable and ready."
+    blockers = [issue for issue in issues if issue.blocking]
+    guidance = [issue for issue in issues if not issue.blocking]
+    if not blockers:
+        return "Peers are reachable. " + " ".join(
+            issue.detail + "." for issue in guidance
+        )
     by_kind: dict[str, list[str]] = {}
-    for issue in issues:
+    for issue in blockers:
         by_kind.setdefault(issue.kind, []).append(issue.node_id)
     parts = []
     labels = {
@@ -736,12 +761,15 @@ def describe_preflight(issues: Sequence[PreflightIssue]) -> str:
         "runtime_mismatch": "running a different MLX version",
         "import_missing": "missing a Python package this model needs",
         "cuda_memory_guard_unavailable": "using unsupported discrete CUDA memory",
+        "low_power_mode": "using Low Power Mode",
     }
     for kind, nodes in by_kind.items():
         parts.append(f"{', '.join(sorted(set(nodes)))} {labels.get(kind, kind)}")
     sentence = "Cannot activate yet: " + "; ".join(parts) + "."
+    if guidance:
+        sentence += " " + " ".join(issue.detail + "." for issue in guidance)
     commands = list(
-        dict.fromkeys(issue.remediation for issue in issues if issue.remediation)
+        dict.fromkeys(issue.remediation for issue in blockers if issue.remediation)
     )
     if commands:
         sentence += " Run: " + "  ".join(commands)

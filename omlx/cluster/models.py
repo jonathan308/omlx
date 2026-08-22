@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -107,6 +107,27 @@ class RouteCapability:
 
 
 @dataclass(frozen=True)
+class PowerModeCapability:
+    """Read-only macOS performance-state facts relevant to calibration."""
+
+    ac_low_power_mode: bool | None = None
+    battery_low_power_mode: bool | None = None
+    source: str = "unavailable"
+
+    @property
+    def low_power_mode_enabled(self) -> bool:
+        return self.ac_low_power_mode is True or self.battery_low_power_mode is True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "ac_low_power_mode": self.ac_low_power_mode,
+            "battery_low_power_mode": self.battery_low_power_mode,
+            "low_power_mode_enabled": self.low_power_mode_enabled,
+        }
+
+
+@dataclass(frozen=True)
 class ClusterStatus:
     collected_at: str
     hostname: str
@@ -118,6 +139,7 @@ class ClusterStatus:
     transport_state: TransportState
     rdma: RDMACapability
     thunderbolt_ports: tuple[ThunderboltPort, ...]
+    power: PowerModeCapability = field(default_factory=PowerModeCapability)
     route: RouteCapability | None = None
     # The live ProcessMemoryEnforcer ceiling can be lower than both physical
     # RAM and MLX's nominal recommended working set when another application
@@ -162,6 +184,7 @@ class ClusterStatus:
                 "fabric_kind": self.fabric_kind,
                 "fabric_group_id": self.fabric_group_id,
                 "fabric_verified": self.fabric_verified,
+                "power": self.power.to_dict(),
             },
             "runtime": self.runtime.to_dict(),
             "transport": {

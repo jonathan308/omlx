@@ -101,7 +101,7 @@ from .planner import (
     remote_model_layout,
     synthetic_model_layout,
 )
-from .probe import collect_cluster_status
+from .probe import collect_cluster_status, detect_low_power_mode
 from .registry import get_cluster_registry, get_device_registry
 from .identity import get_node_identity
 from .replan import (
@@ -590,6 +590,8 @@ def _node_budgets(
         performance = profiles[rank] if rank < len(profiles) else None
         if performance is None and node.performance is not None:
             performance = NodePerformanceProfile.from_dict(node.performance)
+        if performance is not None and not performance.promotable:
+            performance = None
         reserve_bytes = _reserve_bytes_for(node)
         # A target is a preference, not an admission override. The measured
         # budget or workstation role can legitimately shrink between the
@@ -810,6 +812,10 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 
 _QUALIFIED_TP_SHARD_WEIGHTS_ENV = "OMLX_TP_QUALIFIED_SHARD_WEIGHTS"
+
+
+class _UnpromotablePerformanceCalibration(ValueError):
+    """Synthetic measurements captured under a known throttled power state."""
 
 
 def _operator_qualified_tp_shard_weights(
@@ -1263,7 +1269,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     peer_statuses: dict[str, Any] = {}
     if request.preflight and request.hosts:
         for host in request.hosts:
-            if host.ssh in {"127.0.0.1", "localhost"}:
+            if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+                peer_statuses[host.node_id] = {
+                    "runtime_compatible": True,
+                    "status": {
+                        "runtime": {},
+                        "node": {"power": detect_low_power_mode().to_dict()},
+                    },
+                }
                 continue
             try:
                 peer_statuses[host.node_id] = await asyncio.to_thread(
@@ -1477,6 +1490,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 run_cluster_performance_probe,
                 probe_deployment,
             )
+            if performance_probe.get("promotable") is False:
+                raise _UnpromotablePerformanceCalibration(
+                    str(
+                        performance_probe.get("qualification_reason")
+                        or "Low Power Mode was enabled during calibration"
+                    )
+                )
             profiles = tuple(
                 NodePerformanceProfile.from_dict(profile)
                 for profile in performance_probe.get("profiles", ())
@@ -1518,6 +1538,20 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             performance_probe["status"] = "applied_before_staging"
             performance_probe["plan_changed"] = performance_changes["changed"]
             performance_probe["plan_changes"] = performance_changes
+        except _UnpromotablePerformanceCalibration as exc:
+            profiled_request_nodes = list(ordered_request_nodes)
+            performance_probe = {
+                "ok": False,
+                "promotable": False,
+                "status": "power_limited",
+                "reason": str(exc)[:1000],
+                "plan_changed": False,
+            }
+            warnings.append(
+                "Low Power Mode is enabled on a calibration rank; synthetic "
+                "measurements were ignored for placement. Turn it off in "
+                "System Settings before recalibrating."
+            )
         except (DistributedLaunchError, OSError, PlanningError, ValueError) as exc:
             # First-run performance calibration is an optimization, not a
             # prerequisite. Keep the safe memory plan and say why. Profiles
@@ -1571,7 +1605,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # Structured as well as summarised: an issue that carries a command is
         # a fix the user can paste, and a sentence hides it.
         "preflight_issues": [asdict(issue) for issue in issues],
-        "ready_to_activate": not issues and staging_ready and fabric_ready,
+        "ready_to_activate": (
+            not any(issue.blocking for issue in issues)
+            and staging_ready
+            and fabric_ready
+        ),
         "warnings": _redact_diagnostic(warnings),
         "transports": [transport.__dict__ for transport in transports],
         "plan": plan_payload,
@@ -2849,6 +2887,8 @@ def _request_performance_profiles(
             raise ValueError(
                 "node performance profiles must match the activation rank order"
             )
+    if any(not profile.promotable for profile in profiles):
+        return ()
     return profiles
 
 
@@ -3518,6 +3558,13 @@ async def _activate_and_report(
                         run_cluster_performance_probe,
                         deployment,
                     )
+                    if performance_probe.get("promotable") is False:
+                        raise _UnpromotablePerformanceCalibration(
+                            str(
+                                performance_probe.get("qualification_reason")
+                                or "Low Power Mode was enabled during calibration"
+                            )
+                        )
                     candidate_deployment, candidate_plan = await asyncio.to_thread(
                         _performance_optimized_deployment,
                         deployment,
@@ -3550,6 +3597,14 @@ async def _activate_and_report(
                     else:
                         deployment, plan = candidate_deployment, candidate_plan
                         performance_probe["status"] = "applied"
+                except _UnpromotablePerformanceCalibration as exc:
+                    performance_probe = {
+                        "ok": False,
+                        "promotable": False,
+                        "status": "power_limited",
+                        "reason": str(exc)[:1000],
+                        "plan_changed": False,
+                    }
                 except (DistributedLaunchError, OSError, ValueError) as exc:
                     # Benchmark failure must not make a memory-safe deployment
                     # unusable. Persist the exact memory-only fallback instead.
