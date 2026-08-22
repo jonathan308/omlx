@@ -967,6 +967,43 @@ def install_server_telemetry(
             self._omlx_tokens: dict[Any, list[int]] = {}
             telemetry.register_batch_generator(self)
 
+        @staticmethod
+        def _at_generation_boundary(sequence: Any) -> bool:
+            """Whether one staged sequence has only its decode seed token."""
+
+            return bool(
+                isinstance(sequence, (tuple, list))
+                and len(sequence) == 1
+                and isinstance(sequence[0], (tuple, list))
+                and len(sequence[0]) == 1
+            )
+
+        def _about_to_enter_generation(self) -> bool:
+            current = getattr(self, "_currently_processing", ())
+            if any(
+                self._at_generation_boundary(item[0])
+                for item in current
+                if isinstance(item, (tuple, list)) and item
+            ):
+                return True
+            pending = getattr(self, "_unprocessed_sequences", ())
+            return any(
+                self._at_generation_boundary(item[1])
+                for item in pending
+                if isinstance(item, (tuple, list)) and len(item) > 1
+            )
+
+        def _synchronize_rank_transition(self) -> None:
+            # Drain any lazy final-layer collective before the next differently
+            # shaped graph is constructed. Then use a two-way control barrier;
+            # rank-zero sendall alone is not an acknowledgement.
+            mx.synchronize(self.stream)
+            if control_plane is not None:
+                control_plane.barrier()
+                return
+            vote = mx.distributed.all_sum(mx.array(1, dtype=mx.int32))
+            mx.eval(vote)
+
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
             telemetry.bind_pending_uid(uids)
@@ -1026,9 +1063,16 @@ def install_server_telemetry(
                 self._omlx_tokens.pop(uid, None)
 
         def next(self) -> Any:
+            if self._about_to_enter_generation():
+                self._synchronize_rank_transition()
             started = time.perf_counter()
             prompt_responses, generation_responses = super().next()
             elapsed = time.perf_counter() - started
+            if any(
+                getattr(response, "finish_reason", None) is not None
+                for response in generation_responses
+            ):
+                self._synchronize_rank_transition()
             for response in prompt_responses:
                 progress = getattr(response, "progress", None)
                 uid = getattr(response, "uid", None)

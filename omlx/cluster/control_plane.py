@@ -15,10 +15,12 @@ from typing import Any
 _HANDSHAKE_MAGIC = b"OC2H"
 _MESSAGE_MAGIC = b"OC2M"
 _OWNED_BYTES_MAGIC = b"OC2B"
+_BARRIER_MAGIC = b"OC2R"
 _VERSION = 1
 _HANDSHAKE = struct.Struct("!4sII64s")
 _HEADER = struct.Struct("!4sIIII")
 _OWNED_BYTES_HEADER = struct.Struct("!4sIIIII")
+_BARRIER_PACKET = struct.Struct("!4sIII")
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
 
 _ACTIVE_LOCK = threading.Lock()
@@ -322,6 +324,66 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 expected_size=expected_size,
             )
             return owned
+
+    def barrier(self) -> None:
+        """Wait until every rank reaches one ordered control boundary.
+
+        A rank-zero broadcast is not a barrier: ``sendall`` may return after
+        copying into the kernel socket buffer while a worker is still finishing
+        its prior Metal graph. Prompt-to-decode and terminal batch transitions
+        need a two-way rendezvous so no rank can construct a differently shaped
+        tensor collective early.
+        """
+
+        with self._operation_lock:
+            self._sequence += 1
+            sequence = self._sequence
+            if self.rank == 0:
+                for rank in range(1, self.world_size):
+                    stream = self._peers.get(rank)
+                    if stream is None:
+                        raise RuntimeError("rank-control barrier peer is not connected")
+                    magic, version, received_sequence, received_rank = (
+                        _BARRIER_PACKET.unpack(_recv_exact(stream, _BARRIER_PACKET.size))
+                    )
+                    if (
+                        magic != _BARRIER_MAGIC
+                        or version != _VERSION
+                        or received_sequence != sequence
+                        or received_rank != rank
+                    ):
+                        raise RuntimeError("rank-control barrier arrival is invalid")
+                release = _BARRIER_PACKET.pack(
+                    _BARRIER_MAGIC,
+                    _VERSION,
+                    sequence,
+                    0,
+                )
+                for rank in range(1, self.world_size):
+                    self._peers[rank].sendall(release)
+                return
+
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            stream.sendall(
+                _BARRIER_PACKET.pack(
+                    _BARRIER_MAGIC,
+                    _VERSION,
+                    sequence,
+                    self.rank,
+                )
+            )
+            magic, version, received_sequence, coordinator = _BARRIER_PACKET.unpack(
+                _recv_exact(stream, _BARRIER_PACKET.size)
+            )
+            if (
+                magic != _BARRIER_MAGIC
+                or version != _VERSION
+                or received_sequence != sequence
+                or coordinator != 0
+            ):
+                raise RuntimeError("rank-control barrier release is invalid")
 
     def close(self) -> None:
         global _ACTIVE_CONTROL_PLANE

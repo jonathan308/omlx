@@ -80,6 +80,7 @@ def test_rank_control_plane_broadcasts_fixed_bytes_from_nonzero_owner():
                 obj = control.broadcast_object(
                     {"kind": "request"} if rank == 0 else None
                 )
+                control.barrier()
                 from_worker = control.broadcast_owned_bytes(
                     worker_owned if rank == 1 else None,
                     source_rank=1,
