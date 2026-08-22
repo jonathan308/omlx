@@ -363,6 +363,10 @@ _DEEPSEEK_V4_NAX_OA_PREFILL = os.getenv(
     "OMLX_DSV4_NAX_OA_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = False
+_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL = os.getenv(
+    "OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = False
 
 
 def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
@@ -437,6 +441,136 @@ def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
         use_nax=True,
         nax_variant=0,
     )
+
+
+def _stock_attention_qkv_finalizer(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Tuple[mx.array, mx.array]:
+    """Preserve the established four-operation BF16 finalizer graph."""
+
+    q = mx.fast.rms_norm(q_raw, None, attn.config.rms_norm_eps)
+    q = q.transpose(0, 2, 1, 3)
+    q = attn.rope(q, offset)
+    kv = attn.kv_norm(kv_raw).reshape(
+        q_raw.shape[0], 1, q_raw.shape[1], attn.head_dim
+    )
+    kv = attn.rope(kv, offset)
+    return q, kv
+
+
+def _attention_finalizer_native_inputs(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Optional[Tuple[mx.array, mx.array, float]]:
+    """Preflight both native finalizers before either graph node is created."""
+
+    if (
+        not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
+        or getattr(attn, "training", False)
+        or is_dspark_verify_armed()
+        or type(offset) is not int
+        or not 0 <= offset <= 0x7FFFFFFF
+    ):
+        return None
+    if (
+        q_raw.ndim != 4
+        or q_raw.shape[0] != 1
+        or q_raw.shape[1] != 1024
+        or q_raw.shape[2] not in (24, 32, 40)
+        or q_raw.shape[3] != 512
+        or q_raw.dtype != mx.bfloat16
+        or kv_raw.shape != (1, 1024, 512)
+        or kv_raw.dtype != mx.bfloat16
+        or getattr(attn, "head_dim", None) != 512
+    ):
+        return None
+
+    kv_norm = getattr(attn, "kv_norm", None)
+    rope = getattr(attn, "rope", None)
+    config = getattr(attn, "config", None)
+    if (
+        kv_norm is None
+        or not callable(getattr(kv_norm, "get", None))
+        or rope is None
+        or not callable(getattr(rope, "_get_freqs", None))
+        or config is None
+    ):
+        return None
+    weight = kv_norm.get("weight")
+    if (
+        weight is None
+        or weight.shape != (512,)
+        or weight.dtype != mx.bfloat16
+    ):
+        return None
+
+    try:
+        eps = float(config.rms_norm_eps)
+        if not math.isfinite(eps) or eps <= 0:
+            return None
+        freqs = rope._get_freqs(512, False)
+        if freqs.shape != (256,) or freqs.dtype != mx.float32:
+            return None
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not (
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_q_head_rms_rope")
+            and glm_fast.has_symbol("ds4_kv_rms_rope")
+        ):
+            return None
+    except Exception:
+        # All capability and frequency checks precede graph construction. Old
+        # extensions and custom RoPE modules retain the stock four-op path.
+        return None
+    return weight, freqs, eps
+
+
+def _finalize_attention_qkv(
+    attn: nn.Module,
+    q_raw: mx.array,
+    kv_raw: mx.array,
+    offset: Any,
+) -> Tuple[mx.array, mx.array]:
+    """Select the exact native pair or the unchanged stock graph, once."""
+
+    native_inputs = _attention_finalizer_native_inputs(
+        attn, q_raw, kv_raw, offset
+    )
+    if native_inputs is None:
+        return _stock_attention_qkv_finalizer(attn, q_raw, kv_raw, offset)
+
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    weight, freqs, eps = native_inputs
+    global _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED:
+        _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE prefill "
+            "finalizers (M=1024, H=%d; "
+            "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0 disables)",
+            q_raw.shape[2],
+        )
+
+    q_raw = mx.contiguous(q_raw)
+    kv_raw = mx.contiguous(kv_raw)
+    weight = mx.contiguous(weight)
+    freqs = mx.contiguous(freqs)
+    q = glm_fast.ds4_q_head_rms_rope(q_raw, freqs, offset, eps)
+    kv = glm_fast.ds4_kv_rms_rope(
+        kv_raw,
+        weight,
+        freqs,
+        offset,
+        eps,
+    )
+    return q, kv
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -2641,14 +2775,10 @@ class LocalAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        q_raw = self.wq_b(self.q_norm(self.wq_a(x)))
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
+        kv_raw = self.wkv(x)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
             key_rows = _consume_rotating_verify_rows(cache, kv)
@@ -2754,14 +2884,10 @@ class CompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        q_raw = self.wq_b(self.q_norm(self.wq_a(x)))
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
+        kv_raw = self.wkv(x)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
             compressed_kv, compressed_gate = self.compressor.project(x)
@@ -2934,13 +3060,11 @@ class SparseCompressedAttention(nn.Module):
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
+        q_raw = self.wq_b(q_residual).reshape(
+            B, L, self.n_heads, self.head_dim
+        )
+        kv_raw = self.wkv(x)
+        q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and L <= 6:
             compressed_kv, compressed_gate = self.compressor.project(x)

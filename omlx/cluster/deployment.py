@@ -124,6 +124,10 @@ _RANK_ENV_DEFAULTS = (
     # Default-off until the full TP A/B clears; exporting the value prevents
     # coordinator/worker capability decisions from diverging.
     ("OMLX_DSV4_NAX_OA_PREFILL", "0"),
+    # Exact M=1024 BF16 Q/KV RMSNorm+RoPE finalizers for the supported
+    # H24/H32/H40 TP shapes. Keep pair selection identical across ranks while
+    # the full distributed A/B remains operator-controlled.
+    ("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"),
     # Optional routed-MoE-only TP split layered over a signed unequal outer
     # plan. Empty preserves the outer split. One hostfile value is exported to
     # every rank so a mixed plan cannot diverge locally.

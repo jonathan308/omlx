@@ -65,7 +65,8 @@
   "gate": {
     "minimum_combined_speedup": 1.1,
     "passed": true,
-    "production_dispatch": false,
+    "production_dispatch": "default_off",
+    "environment": "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
     "m5_measurement": "pending"
   },
   "server_touched": false,

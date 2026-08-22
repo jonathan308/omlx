@@ -84,10 +84,18 @@ gain. This is a quantified bound, not a distributed throughput claim.
 
 ## Shipping state
 
-The symbols remain isolated. There is no environment flag or call from
-`deepseek_v4_model.py`; caches, collectives, training, and verification are
-unchanged. A later promotion should first run the H40 primitive on the M5 and
-then full TP exactness/A-B, because only the local M3 rank was timed here.
+The exact pair is available through a strict default-off production seam:
+`OMLX_DSV4_ATTN_FINALIZER_PREFILL=1`. Before either native graph node is
+created, one shared preflight requires BF16 B1/M1024/D512 Q and KV, H24/H32/H40,
+the supplied contiguous FP32 `[256]` frequency buffer, BF16 KV norm weight,
+non-negative scalar offset, non-training/non-verification mode, and both native
+symbols. Any rejection builds the unchanged four-operation stock graph. There
+is no exception-based retry after selection.
+
+The cluster hostfile exports an explicit `0` by default, preventing rank-local
+selection drift. Caches and collectives are unchanged. The seam is ready for a
+full TP exactness/A-B, but remains off because only the local M3 rank was timed
+here; H40 still needs physical M5 measurement.
 
 Reproduce the local gate with:
 

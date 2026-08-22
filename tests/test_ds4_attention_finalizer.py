@@ -47,7 +47,7 @@ def test_metal_source_freezes_mlx_reduction_rounding_and_rope_order():
     assert "metal::fast::sin" in source
 
 
-def test_symbols_are_built_and_exposed_but_not_model_dispatched():
+def test_symbols_are_built_and_reached_only_through_default_off_pair_gate():
     root = Path(__file__).parents[1]
     cmake = (root / "omlx/custom_kernels/glm_moe_dsa/csrc/CMakeLists.txt").read_text()
     bindings = (root / "omlx/custom_kernels/glm_moe_dsa/csrc/bindings.cpp").read_text()
@@ -55,10 +55,12 @@ def test_symbols_are_built_and_exposed_but_not_model_dispatched():
 
     assert "ds4_attention_finalizer.cpp" in cmake
     assert "ds4_attention_finalizer.metal" in cmake
+    assert '"OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"' in model
+    assert "_attention_finalizer_native_inputs" in model
     for symbol in ("ds4_q_head_rms_rope", "ds4_kv_rms_rope"):
         assert symbol in bindings
         assert symbol in fast.NATIVE_SYMBOLS
-        assert symbol not in model
+        assert symbol in model
 
 
 def test_python_wrappers_expose_normalized_debug_boundary():
@@ -89,4 +91,5 @@ def test_recorded_real_gate_is_exact_and_above_threshold():
     assert result["max_abs"] == 0.0
     assert result["gate"]["passed"] is True
     assert result["rank0_confirmation"]["combined_speedup"] >= 1.10
-    assert result["gate"]["production_dispatch"] is False
+    assert result["gate"]["production_dispatch"] == "default_off"
+    assert result["gate"]["environment"] == "OMLX_DSV4_ATTN_FINALIZER_PREFILL"
