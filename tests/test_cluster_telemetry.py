@@ -482,7 +482,7 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     assert mlx_server.BatchGenerator is FakeBatchGenerator
 
 
-def test_server_patch_broadcasts_distributed_request_point_to_point(monkeypatch):
+def test_server_patch_broadcasts_distributed_request_with_checked_gather(monkeypatch):
     import mlx.core as mx
     import mlx_lm.server as mlx_server
 
@@ -507,14 +507,14 @@ def test_server_patch_broadcasts_distributed_request_point_to_point(monkeypatch)
             shareable = self._share_object(request[1:] if request else None)
             return None if shareable is None else (request[0], *shareable)
 
-    sent = []
+    gathered = []
     monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
     monkeypatch.setattr(mx.distributed, "init", lambda: Group())
     monkeypatch.setattr(
         mx.distributed,
-        "send",
-        lambda value, target: sent.append((target, value.dtype, value.tolist()))
-        or value,
+        "all_gather",
+        lambda value, group=None: gathered.append((value.dtype, value.tolist()))
+        or mx.concatenate([value, mx.zeros_like(value)]),
     )
     monkeypatch.setattr(mx, "eval", lambda *_values: None)
     target = _Queue()
@@ -528,23 +528,27 @@ def test_server_patch_broadcasts_distributed_request_point_to_point(monkeypatch)
     assert queue._queue is target
     assert request == "request"
     assert args == {"max_tokens": 7}
-    assert len(sent) == 2
-    assert sent[0][0:2] == (1, mx.int32)
-    assert sent[0][2][0] == len(bytes(sent[1][2]))
-    assert sent[1][0:2] == (1, mx.uint8)
+    assert len(gathered) == 2
+    assert gathered[0][0] == mx.uint8
+    assert len(gathered[0][1]) == 64
+    assert gathered[1][0] == mx.uint8
+    assert len(gathered[1][1]) > 0
 
 
-def test_server_patch_receives_distributed_request_point_to_point(monkeypatch):
+def test_server_patch_receives_distributed_request_with_checked_gather(monkeypatch):
     import pickle
 
     import mlx.core as mx
     import mlx_lm.server as mlx_server
 
     payload = pickle.dumps(("request", {"max_tokens": 7}))
-    received = [
-        mx.array([len(payload)], dtype=mx.int32),
-        mx.array(payload, dtype=mx.uint8),
-    ]
+    import struct
+    import zlib
+
+    header = struct.pack(">III", 0x4F4D4C58, len(payload), zlib.crc32(payload)).ljust(
+        64, b"\0"
+    )
+    calls = []
 
     class Group:
         @staticmethod
@@ -573,8 +577,13 @@ def test_server_patch_receives_distributed_request_point_to_point(monkeypatch):
     monkeypatch.setattr(mx.distributed, "init", lambda: Group())
     monkeypatch.setattr(
         mx.distributed,
-        "recv_like",
-        lambda _value, source: received.pop(0) if source == 0 else None,
+        "all_gather",
+        lambda value, group=None: calls.append(value.tolist())
+        or (
+            mx.concatenate([mx.array(header, dtype=mx.uint8), value])
+            if len(calls) == 1
+            else mx.concatenate([mx.array(payload, dtype=mx.uint8), value])
+        ),
     )
 
     with install_server_telemetry(_Marker(), prefill_guard=None):
@@ -584,7 +593,7 @@ def test_server_patch_receives_distributed_request_point_to_point(monkeypatch):
     assert isinstance(queue, _TelemetryQueue)
     assert request == "request"
     assert args == {"max_tokens": 7}
-    assert received == []
+    assert len(calls) == 2
 
 
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(

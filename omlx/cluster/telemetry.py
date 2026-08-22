@@ -29,6 +29,8 @@ _MAX_CANCEL_FILE_BYTES = 64 * 1024
 # but it must never be able to turn one corrupt transport word into an
 # unbounded worker allocation.
 _MAX_SHARED_REQUEST_BYTES = 256 * 1024 * 1024
+_SHARED_OBJECT_MAGIC = 0x4F4D4C58  # ASCII "OMLX"
+_SHARED_OBJECT_HEADER_BYTES = 64
 
 # How often a rank refreshes its marker with nothing to report.
 #
@@ -1129,10 +1131,14 @@ def install_server_telemetry(
             # all-sums: the producer contributes pickle length/data and every
             # worker contributes zeros. Tiny JACCL reductions are the wrong
             # primitive for an owned byte stream and can corrupt either the
-            # request or later cancellation lists. Send the exact bytes
-            # point-to-point instead. This is also O(N) bytes rather than
-            # running a reduction kernel for data that has only one producer.
+            # request or later cancellation lists. Direct send/recv is also
+            # unsuitable here: MLX-LM polls and retires batches on slightly
+            # different host timelines, and a lost JACCL send completion then
+            # leaves one rank in teardown. Use identically ordered all-gathers
+            # with a fixed, checksummed control envelope instead.
             import pickle
+            import struct
+            import zlib
 
             group = mx.distributed.init()
             world_size = int(group.size())
@@ -1143,31 +1149,54 @@ def install_server_telemetry(
                     raise RuntimeError(
                         "distributed object exceeds the 256 MiB safety bound"
                     )
-                length = mx.array([len(payload)], dtype=mx.int32)
-                sent_length = length
-                for target in range(1, world_size):
-                    sent_length = mx.distributed.send(sent_length, target)
-                mx.eval(sent_length)
-                if payload:
-                    data = mx.array(payload, dtype=mx.uint8)
-                    sent_data = data
-                    for target in range(1, world_size):
-                        sent_data = mx.distributed.send(sent_data, target)
-                    mx.eval(sent_data)
-                return obj
+                checksum = zlib.crc32(payload)
+                header_bytes = struct.pack(
+                    ">III", _SHARED_OBJECT_MAGIC, len(payload), checksum
+                ).ljust(_SHARED_OBJECT_HEADER_BYTES, b"\0")
+                local_header = mx.array(header_bytes, dtype=mx.uint8)
+            else:
+                payload = b""
+                local_header = mx.zeros(
+                    (_SHARED_OBJECT_HEADER_BYTES,), dtype=mx.uint8
+                )
 
-            length = mx.distributed.recv_like(mx.zeros((1,), dtype=mx.int32), 0)
-            size = int(length.item())
-            if size < 0 or size > _MAX_SHARED_REQUEST_BYTES:
+            gathered_header = mx.distributed.all_gather(local_header, group=group)
+            rank_zero_header = bytes(
+                gathered_header[:_SHARED_OBJECT_HEADER_BYTES].tolist()
+            )
+            try:
+                magic, size, checksum = struct.unpack(">III", rank_zero_header[:12])
+            except struct.error as exc:
+                raise RuntimeError(
+                    "distributed object broadcast has a malformed header"
+                ) from exc
+            if magic != _SHARED_OBJECT_MAGIC:
+                raise RuntimeError(
+                    "distributed object broadcast failed its magic-header check"
+                )
+            if size > _MAX_SHARED_REQUEST_BYTES:
                 raise RuntimeError(
                     "distributed object broadcast has an invalid byte length: "
                     f"{size}"
                 )
             if size == 0:
                 return None
-            data = mx.distributed.recv_like(mx.zeros((size,), dtype=mx.uint8), 0)
+
+            local_data = (
+                mx.array(payload, dtype=mx.uint8)
+                if rank == 0
+                else mx.zeros((size,), dtype=mx.uint8)
+            )
+            gathered_data = mx.distributed.all_gather(local_data, group=group)
+            rank_zero_data = bytes(gathered_data[:size].tolist())
+            if zlib.crc32(rank_zero_data) != checksum:
+                raise RuntimeError(
+                    "distributed object broadcast failed its CRC32 integrity check"
+                )
+            if rank == 0:
+                return obj
             try:
-                return pickle.loads(bytes(data.tolist()))
+                return pickle.loads(rank_zero_data)
             except Exception as exc:
                 raise RuntimeError(
                     "distributed object broadcast failed integrity decoding"
