@@ -293,6 +293,29 @@ def test_ds4f_moe_override_keeps_outer_attention_and_shared_split(
             assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == 64
 
 
+def test_ds4f_non_moe_override_keeps_routed_banks_on_equal_outer_plan(
+    dsv4, monkeypatch
+):
+    monkeypatch.delenv("OMLX_TP_SHARD_WEIGHTS", raising=False)
+    monkeypatch.delenv("OMLX_TP_MOE_SHARD_WEIGHTS", raising=False)
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,1")
+    for rank in (0, 1):
+        model = _tiny_ds4f(dsv4, heads=8, moe_intermediate=128)
+        model.shard(_FakeGroup(rank, 2))
+        for layer in model.model.pipeline_layers:
+            assert layer.attn.n_heads == (6 if rank == 0 else 2)
+            assert layer.ffn.shared_experts.gate_proj.weight.shape[0] == (
+                96 if rank == 0 else 32
+            )
+            assert layer.ffn.shared_experts.down_proj.weight.shape[1] == (
+                96 if rank == 0 else 32
+            )
+            # The signed outer plan is equal, so routed banks remain 2:2.
+            assert layer.ffn.switch_mlp.gate_proj.weight.shape[1] == 64
+            assert layer.ffn.switch_mlp.up_proj.weight.shape[1] == 64
+            assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == 64
+
+
 def test_ds4f_moe_override_reconstructs_routed_banks_exactly(dsv4, monkeypatch):
     monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,1")
     monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "2,2")
@@ -354,6 +377,43 @@ def test_real_ds4f_three_five_outer_accepts_equal_moe_banks(dsv4, monkeypatch):
     assert dsv4._validated_ds4_moe_tp_weights(
         args, _FakeGroup(0, 2), (3, 5)
     ) == (4, 4)
+
+
+def test_real_ds4f_equal_outer_accepts_three_five_non_moe_split(
+    dsv4, monkeypatch
+):
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    args = SimpleNamespace(
+        num_attention_heads=64,
+        o_groups=8,
+        moe_intermediate_size=2048,
+    )
+    assert dsv4._validated_ds4_non_moe_tp_weights(
+        args, _FakeGroup(0, 2), None
+    ) == (3, 5)
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    (
+        ("4", "one positive weight per TP rank"),
+        ("3,0", "one positive weight per TP rank"),
+        ("3,4", "must sum"),
+    ),
+)
+def test_ds4f_non_moe_override_fails_before_sharding(
+    dsv4, monkeypatch, override, message
+):
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", override)
+    args = SimpleNamespace(
+        num_attention_heads=64,
+        o_groups=8,
+        moe_intermediate_size=2048,
+    )
+    with pytest.raises(ValueError, match=message):
+        dsv4._validated_ds4_non_moe_tp_weights(
+            args, _FakeGroup(0, 2), None
+        )
 
 
 def test_unequal_tp_slices_quantized_values_on_exact_group_boundaries(dsv4):

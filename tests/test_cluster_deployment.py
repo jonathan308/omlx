@@ -110,6 +110,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_TP_MOE_SHARD_WEIGHTS",
+        "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
         "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES",
     ):
@@ -141,6 +142,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_FULL_MOE_DECODE=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_TP_MOE_SHARD_WEIGHTS=" in envs
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES=268435456" in envs
 

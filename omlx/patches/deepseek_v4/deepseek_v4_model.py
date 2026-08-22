@@ -178,6 +178,54 @@ def _validated_ds4_moe_tp_weights(
     return weights
 
 
+def _validated_ds4_non_moe_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+    outer_weights: Optional[Tuple[int, ...]],
+) -> Optional[Tuple[int, ...]]:
+    """Optional attention/shared/vocab split over a conservative outer plan."""
+
+    raw = os.environ.get("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return outer_weights
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain integers"
+        ) from exc
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
+        raise ValueError(
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain one positive weight "
+            "per TP rank"
+        )
+    units = int(args.num_attention_heads) // int(args.o_groups)
+    if sum(weights) != units:
+        raise ValueError(
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must sum to the heads in each "
+            "DS4 output group"
+        )
+    intermediate = int(getattr(args, "moe_intermediate_size", 0) or 0)
+    if intermediate <= 0 or intermediate % units:
+        raise ValueError(
+            "DS4 shared-expert intermediate size is not divisible by the "
+            "non-MoE override sum"
+        )
+    boundaries = [sum(weights[:rank]) for rank in range(1, len(weights))]
+    if any(intermediate * boundary % units for boundary in boundaries):
+        raise ValueError(
+            "non-MoE override does not preserve shared-expert boundaries"
+        )
+    local_widths = [intermediate * weight // units for weight in weights]
+    if any(width % 32 for width in local_widths):
+        raise ValueError(
+            "non-MoE override must preserve 32-value MXFP4 quant groups"
+        )
+    return None if len(set(weights)) == 1 else weights
+
+
 def _weighted_segment_slice(
     value: mx.array,
     *,
@@ -3335,9 +3383,12 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
-        shard_weights = _validated_ds4_tp_weights(self.args, group)
+        outer_shard_weights = _validated_ds4_tp_weights(self.args, group)
+        shard_weights = _validated_ds4_non_moe_tp_weights(
+            self.args, group, outer_shard_weights
+        )
         moe_shard_weights = _validated_ds4_moe_tp_weights(
-            self.args, group, shard_weights
+            self.args, group, outer_shard_weights
         )
         for layer in self.model.layers:
             layer.attn.sharding_group = group

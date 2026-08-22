@@ -124,6 +124,10 @@ _RANK_ENV_DEFAULTS = (
     # plan. Empty preserves the outer split. One hostfile value is exported to
     # every rank so a mixed plan cannot diverge locally.
     ("OMLX_TP_MOE_SHARD_WEIGHTS", ""),
+    # Conservative mixed-plan form: keep the signed outer plan equal for
+    # admission, then opt only non-routed tensors into a qualified unequal
+    # split. Empty preserves the signed outer assignment.
+    ("OMLX_TP_NON_MOE_SHARD_WEIGHTS", ""),
     # Large standalone output projections are exact row shards. The default
     # threshold avoids adding a collective to small models where it cannot
     # repay its latency, while keeping every rank on the same decision.
