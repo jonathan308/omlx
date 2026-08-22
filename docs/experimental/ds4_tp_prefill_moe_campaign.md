@@ -51,9 +51,11 @@ cannot enter the lossless path without array-equal proof.
 The proposed primitive ABI is frozen by
 `benchmarks/bench_ds4_tp_prefill_moe_campaign.py` as
 `deepseek_mxfp4_gather_qmm_pair_swiglu_blocks`.
-The unbuilt fixed-shape Metal sketch lives in
-`benchmarks/prototypes/ds4_tp_prefill_moe_phase_a.metal`; it is intentionally
-not listed in CMake.
+The original fixed-shape sketch remains in
+`benchmarks/prototypes/ds4_tp_prefill_moe_phase_a.metal`. Its phase-A kernel is
+now exposed as an isolated native symbol by
+`omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe.{cpp,h,metal}` for the
+M3/M5 ABBA gate. No model, planner, or runtime path calls the symbol.
 
 The kernel keeps BM32/BN32/BK32 and the existing Steel MMA K sequence. One
 threadgroup stages X once, loads independent up and gate MXFP4 tiles, and
@@ -69,6 +71,23 @@ projection outputs are stored. The epilogue then applies:
 The first parity gate is `mx.array_equal` at that activated boundary. Final
 logits alone are not sufficient. Promotion also requires cache/logit parity
 through a real prompt and no regression of the current rollback path.
+
+### Phase-A fixed-shape result (2026-08-22)
+
+The callable isolated symbol is exact versus pair-concat on both Macs, after
+replacing the sketch's algebraic sigmoid with MLX's stable `Sigmoid` functor.
+It does not pass the performance gate:
+
+| Host | Shared-X | Pair-concat | Stock | Speedup vs faster baseline |
+|---|---:|---:|---:|---:|
+| M3 Ultra rank 0 | 8.209 ms | 8.017 ms | 9.091 ms | 0.977x |
+| M5 Max rank 1 | 9.369 ms | 9.306 ms | 7.541 ms | 0.805x |
+
+On M5, stock NAX is itself not array-equal to the Steel pair-concat path
+(maximum activated-boundary difference 0.0078125), so the requested equality
+to both references is unsatisfiable there. The symbol remains isolated and
+unused; there is no production feature flag or dispatch. Machine-readable
+results are in `ds4_tp_prefill_moe_phase_a_results_2026-08-22.json`.
 
 Run the same ABBA-style harness separately on both machines after the isolated
 symbol exists:

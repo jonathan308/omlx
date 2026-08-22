@@ -130,6 +130,7 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_blocks",
     "deepseek_mxfp4_gather_qmm_pair_blocks",
     "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
+    "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
     "deepseek_mxfp4_gather_qmm_expert",
     "deepseek_mxfp4_full_decode",
     "deepseek_affine_gather_qmm_blocks",
@@ -667,6 +668,45 @@ def deepseek_mxfp4_gather_qmm_pair_concat_blocks(
         )
     raise RuntimeError(
         "deepseek_mxfp4_gather_qmm_pair_concat_blocks native kernel is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
+    x: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    activation_limit: float = 10.0,
+    variant: int = 2,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated fixed-shape DS4 shared-X gate/up + LimitedSwiGLU probe.
+
+    There is deliberately no production dispatch or fallback. The native
+    binding accepts only FP16 ``[6144,1,4096]`` input, the equal-TP2 DS4 MXFP4
+    expert tables, BM32/BN32/BK32 (variant 2), and activation limit 10.
+    """
+    if _ext is not None and hasattr(
+        _ext, "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks"
+    ):
+        return _ext.deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
+            x,
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            block_meta,
+            block_count,
+            activation_limit,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks native kernel is unavailable"
     )
 
 

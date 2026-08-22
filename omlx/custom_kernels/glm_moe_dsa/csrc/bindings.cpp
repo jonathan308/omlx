@@ -4,6 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "ds4_prefill_moe.h"
 #include "deepseek_v4_sparse_attention.h"
 #include "dspark_gemm.h"
 #include "dspark_qmv.h"
@@ -192,6 +193,19 @@ NB_MODULE(_ext, m) {
       "block_meta"_a,
       "block_count"_a,
       "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_swiglu_blocks,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "activation_limit"_a = 10.0f,
+      "variant"_a = 2,
       "stream"_a = nb::none());
   m.def(
       "deepseek_affine_gather_qmm_blocks",

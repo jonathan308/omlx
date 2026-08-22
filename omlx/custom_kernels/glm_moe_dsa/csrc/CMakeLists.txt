@@ -37,6 +37,7 @@ target_sources(
   omlx_glm_kernel_ops
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.cpp
@@ -59,6 +60,7 @@ if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
       ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.metal
       ${CMAKE_CURRENT_LIST_DIR}/dspark_qmv.metal
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
+      ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal)

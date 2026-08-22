@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 from pathlib import Path
 
 import pytest
@@ -111,17 +112,60 @@ def test_materialization_and_roofline_contract_for_tp4_4_m1024():
 
 
 def test_isolated_metal_prototype_keeps_shared_x_and_ordered_non_atomic_tail():
-    source = (
+    prototype = (
         Path(__file__).parents[1]
         / "benchmarks/prototypes/ds4_tp_prefill_moe_phase_a.metal"
     ).read_text()
+    native = (
+        Path(__file__).parents[1]
+        / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe.metal"
+    ).read_text()
 
-    assert "prototype_ds4_mxfp4_pair_swiglu_f16_bm32_bn32" in source
-    assert "loader_x.load_safe(x_dims);" in source
-    assert source.count("loader_x.load_safe(x_dims);") == 1
-    assert "mma_up.mma(Xs, Wup);" in source
-    assert "mma_gate.mma(Xs, Wgate);" in source
-    assert "prototype_ds4_moe_top6_post_down_bf16" in source
-    assert "for (int slot = 0; slot < 6; ++slot)" in source
-    assert "route_value * route_score" in source
-    assert "atomic_" not in source
+    assert "prototype_ds4_mxfp4_pair_swiglu_f16_bm32_bn32" in prototype
+    assert "prototype_ds4_moe_top6_post_down_bf16" in prototype
+    assert "for (int slot = 0; slot < 6; ++slot)" in prototype
+    assert "route_value * route_score" in prototype
+    assert "atomic_" not in prototype
+
+    assert "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks" in native
+    assert native.count("loader_x.load_safe(x_dims);") == 1
+    assert "mma_up.mma(Xs, Wup);" in native
+    assert "mma_gate.mma(Xs, Wgate);" in native
+    assert "Sigmoid{}(gate)" in native
+    assert "T(T(gate * sigmoid_gate) * up)" in native
+    assert "atomic_" not in native
+
+
+def test_phase_a_native_symbol_is_isolated_from_production_dispatch():
+    root = Path(__file__).parents[1]
+    symbol = "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks"
+    allowed = {
+        root / "omlx/custom_kernels/glm_moe_dsa/fast.py",
+        root / "omlx/custom_kernels/glm_moe_dsa/csrc/bindings.cpp",
+        root / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe.cpp",
+        root / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe.h",
+        root / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe.metal",
+    }
+    production_hits = []
+    for path in (root / "omlx").rglob("*.py"):
+        if path not in allowed and symbol in path.read_text():
+            production_hits.append(path)
+    assert production_hits == []
+
+
+def test_recorded_two_host_phase_a_gate_is_rejected():
+    path = (
+        Path(__file__).parents[1]
+        / "docs/experimental/ds4_tp_prefill_moe_phase_a_results_2026-08-22.json"
+    )
+    report = json.loads(path.read_text())
+    m3 = report["hosts"]["m3_ultra_rank0"]
+    m5 = report["hosts"]["m5_max_rank1"]
+
+    assert m3["candidate_vs_pair_concat_exact"] is True
+    assert m5["candidate_vs_pair_concat_exact"] is True
+    assert m3["speedup_vs_faster_baseline"] < 1.05
+    assert m5["speedup_vs_faster_baseline"] < 1.05
+    assert m5["pair_concat_vs_stock_exact"] is False
+    assert report["outcome"]["promoted"] is False
+    assert report["outcome"]["production_dispatch"] is False
