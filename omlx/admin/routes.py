@@ -187,6 +187,19 @@ class ModelSettingsRequest(BaseModel):
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
 
+    @field_validator("guided_grammar", mode="before")
+    @classmethod
+    def _coerce_guided_grammar(cls, value: Any) -> Any:
+        # Dashboard builds before the null-fix sent 0 for "no grammar", and a
+        # browser tab older than the frontend patch still does. A falsy
+        # non-string means unset — coerce it instead of 422ing the whole save
+        # over a field the user never touched. Truthy non-strings still 422.
+        if value is None or isinstance(value, str):
+            return value
+        if not value:
+            return None
+        return value
+
 
 class CreateProfileRequest(BaseModel):
     """Request body for creating a per-model profile."""

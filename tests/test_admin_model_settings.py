@@ -192,3 +192,20 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+def test_guided_grammar_disabled_sentinel_from_older_clients_is_unset():
+    """Dashboards older than the null-fix send guided_grammar=0 when the
+    toggle is off; that must not 422 the entire settings save."""
+    from omlx.admin.routes import ModelSettingsRequest
+
+    assert ModelSettingsRequest(guided_grammar=0).guided_grammar is None
+    assert ModelSettingsRequest(guided_grammar=False).guided_grammar is None
+    # Real grammars and explicit empty strings pass through unchanged.
+    assert ModelSettingsRequest(guided_grammar="start: x").guided_grammar == "start: x"
+    assert ModelSettingsRequest(guided_grammar="").guided_grammar == ""
+    # Truthy non-strings are still a client error, not a silent coercion.
+    import pytest
+
+    with pytest.raises(Exception):
+        ModelSettingsRequest(guided_grammar=42)
