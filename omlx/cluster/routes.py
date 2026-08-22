@@ -2779,6 +2779,22 @@ def _create_deployment(
     if host_ids != node_ids:
         raise ValueError("rank-ordered host IDs must match node budget IDs")
 
+    host_rdma: list[Any] = [tuple(host.rdma) for host in request.hosts]
+    if request.backend != "ring" and any(not rdma for rdma in host_rdma):
+        # Clients (the cluster v2 wizard among them) legitimately activate
+        # without RDMA rows — they know the link exists, not the interface
+        # names, and only the live names survive macOS renumbering a
+        # Thunderbolt port. Derive the full matrix here, the same way the
+        # transports report does, or the ClusterDeployment constructor
+        # rejects the activation with nothing the user can act on.
+        interfaces = [probe_host_interfaces(host.ssh) for host in request.hosts]
+        matrix = build_rdma_matrix(interfaces)
+        if not matrix.ok:
+            raise ValueError(
+                f"cannot use the {request.backend} backend: {matrix.reason}"
+            )
+        host_rdma = [list(row) for row in matrix.rows]
+
     deployment = ClusterDeployment(
         deployment_id=(
             request.deployment_id.strip()
@@ -2792,10 +2808,10 @@ def _create_deployment(
                 node_id=host.node_id.strip(),
                 ssh=host.ssh,
                 ips=tuple(host.ips),
-                rdma=tuple(host.rdma),
+                rdma=tuple(host_rdma[index]),
                 python_executable=host.python_executable,
             )
-            for host in request.hosts
+            for index, host in enumerate(request.hosts)
         ),
         assignments=plan.assignments,
         plan_hash=plan.plan_hash,

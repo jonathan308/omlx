@@ -5,6 +5,8 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -2363,3 +2365,131 @@ def test_peer_health_transition_records_one_incident(tmp_path, monkeypatch):
     fresh = "/admin/api/cluster/peer-health?hosts=studio.local&deployment_id=d2"
     assert client.get(fresh).json()["healthy"] is False
     assert len(store.list()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Activation derives the RDMA matrix clients cannot know.
+#
+# The cluster v2 wizard knows the Thunderbolt link exists but not the
+# interface names — and only the live names survive macOS renumbering a
+# port. A jaccl activation with empty host.rdma rows used to die inside the
+# ClusterDeployment constructor with nothing the user could act on.
+# ---------------------------------------------------------------------------
+
+
+def _fake_plan(node_ids, layers=8):
+    from omlx.cluster.planner import PipelineAssignment
+
+    class _Plan:
+        plan_hash = "a" * 64
+
+        def __init__(self):
+            self.assignments = tuple(
+                PipelineAssignment(
+                    node_id=node_id,
+                    rank=index,
+                    start_layer=0,
+                    end_layer=layers,
+                    layer_weight_bytes=1024,
+                    fixed_weight_bytes=0,
+                    reserve_bytes=0,
+                    capacity_bytes=1 << 40,
+                )
+                for index, node_id in enumerate(node_ids)
+            )
+
+        def to_dict(self):
+            return {"assignments": [], "plan_hash": self.plan_hash}
+
+    return _Plan()
+
+
+def _activation_request(backend):
+    return routes.ClusterDeploymentRequest(
+        model_path="/tmp/model",
+        backend=backend,
+        approved_placement="x" * 16,
+        nodes=[
+            routes.ClusterPlanNodeRequest(
+                node_id="studio",
+                capacity_bytes=1 << 40,
+                role="workstation",
+                memory_guard_tier="balanced",
+                accelerator="metal",
+            ),
+            routes.ClusterPlanNodeRequest(
+                node_id="m5",
+                capacity_bytes=1 << 40,
+                role="headless",
+                memory_guard_tier="balanced",
+                accelerator="metal",
+            ),
+        ],
+        hosts=[
+            routes.ClusterHostRequest(
+                node_id="studio", ssh="127.0.0.1", ips=["10.0.1.1"]
+            ),
+            routes.ClusterHostRequest(
+                node_id="m5", ssh="m5.local", ips=["10.0.1.2"]
+            ),
+        ],
+    )
+
+
+def test_activation_fills_the_rdma_matrix_when_hosts_ship_without_one(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_host_interfaces",
+        lambda host: {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 24)], rdma={"en4"}
+            ),
+            "m5.local": _interfaces(
+                "m5.local", [("en5", "10.0.1.2", 24)], rdma={"en5"}
+            ),
+        }[host],
+    )
+
+    deployment, _ = routes._create_deployment(_activation_request("jaccl"))
+
+    assert deployment.hosts[0].rdma == (None, "rdma_en4")
+    assert deployment.hosts[1].rdma == ("rdma_en5", None)
+
+
+def test_activation_names_the_matrix_blocker_instead_of_crashing(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    monkeypatch.setattr(
+        routes,
+        "probe_host_interfaces",
+        lambda host: {
+            "127.0.0.1": _interfaces(
+                "127.0.0.1", [("en4", "10.0.1.1", 24)], rdma={"en4"}
+            ),
+            # The peer never turned RDMA on — the matrix cannot exist.
+            "m5.local": _interfaces("m5.local", [("en5", "10.0.1.2", 24)]),
+        }[host],
+    )
+
+    with pytest.raises(ValueError, match="cannot use the jaccl backend"):
+        routes._create_deployment(_activation_request("jaccl"))
+
+
+def test_ring_activation_never_probes_for_rdma(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+
+    def forbidden(host):
+        raise AssertionError("ring backend must not probe RDMA interfaces")
+
+    monkeypatch.setattr(routes, "probe_host_interfaces", forbidden)
+
+    deployment, _ = routes._create_deployment(_activation_request("ring"))
+    assert deployment.hosts[0].rdma == ()
