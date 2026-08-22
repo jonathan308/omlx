@@ -113,6 +113,9 @@ _RANK_ENV_DEFAULTS = (
     # not cleared on both Macs.
     ("OMLX_DSV4_FULL_MOE_DECODE", "0"),
     ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1"),
+    # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
+    # same explicit A/B value; default remains off pending the TP2 model gate.
+    ("OMLX_DSV4_MOE_TAIL8", "0"),
     # Large standalone output projections are exact row shards. The default
     # threshold avoids adding a collective to small models where it cannot
     # repay its latency, while keeping every rank on the same decision.

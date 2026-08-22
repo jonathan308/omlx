@@ -56,6 +56,13 @@ _DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS = int(
     os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1")
 )
 _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED = False
+# Exact M3-family M=1024 prefill route-tail kernels. Default OFF until the
+# two-host full-model gate clears. The fixed native ABI makes decode and every
+# non-DS4/equal-TP2 shape fall back before any candidate operation is queued.
+_DEEPSEEK_MXFP4_TAIL8 = os.environ.get(
+    "OMLX_DSV4_MOE_TAIL8", "0"
+).strip().lower() in ("1", "true", "on")
+_DEEPSEEK_MXFP4_TAIL8_LOGGED = False
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -476,6 +483,65 @@ class SwitchGLU(nn.Module):
             and not getattr(self.activation, "fp32", False)
         )
 
+    def _can_use_mxfp4_tail8_prefill(
+        self,
+        request_shape,
+        indices,
+        x_sorted,
+        original_dtype,
+        native_kinds,
+        use_f16_moe,
+        block_plan,
+    ) -> bool:
+        if not _DEEPSEEK_MXFP4_TAIL8 or self.training or is_nax_available():
+            return False
+        if request_shape != (1, 1024, 4096) or indices.shape != (1, 1024, 6):
+            return False
+        if (
+            x_sorted.shape != (6144, 1, 4096)
+            or x_sorted.dtype != mx.float16
+            or original_dtype != mx.bfloat16
+            or not use_f16_moe
+            or native_kinds != ("mxfp4", "mxfp4", "mxfp4")
+            or block_plan is None
+        ):
+            return False
+        projections = (self.up_proj, self.gate_proj, self.down_proj)
+        if not all(
+            isinstance(projection, QuantizedSwitchLinear)
+            for projection in projections
+        ):
+            return False
+        up, gate, down = projections
+        if (
+            up["weight"].shape != (256, 1024, 512)
+            or up["scales"].shape != (256, 1024, 128)
+            or gate["weight"].shape != up["weight"].shape
+            or gate["scales"].shape != up["scales"].shape
+            or down["weight"].shape != (256, 4096, 128)
+            or down["scales"].shape != (256, 4096, 32)
+        ):
+            return False
+        block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
+            block_plan
+        )
+        if (
+            block_variant != 2
+            or block_meta.shape != (448, 3)
+            or block_count.shape != (1,)
+        ):
+            return False
+        activation_limit = getattr(self.activation, "limit", None)
+        if activation_limit != 10.0 or getattr(self.activation, "fp32", False):
+            return False
+        return all(
+            glm_fast.has_symbol(symbol)
+            for symbol in (
+                "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
+                "deepseek_mxfp4_gather_qmm_blocks_tail8",
+            )
+        )
+
     def __call__(self, x, indices, scores=None) -> mx.array:
         if self._can_use_mxfp4_full_decode(x, indices, scores):
             global _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED
@@ -501,6 +567,7 @@ class SwitchGLU(nn.Module):
                 float(self.activation.limit),
             )
 
+        request_shape = tuple(x.shape)
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 
@@ -569,11 +636,40 @@ class SwitchGLU(nn.Module):
             and self.up_proj.num_experts == self.gate_proj.num_experts
             and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
         )
+        use_tail8_prefill = use_pair_proj and self._can_use_mxfp4_tail8_prefill(
+            request_shape,
+            indices,
+            x,
+            original_dtype,
+            native_kinds,
+            use_f16_moe,
+            block_plan,
+        )
         if use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
             )
-            if glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_pair_concat_blocks"):
+            if use_tail8_prefill:
+                global _DEEPSEEK_MXFP4_TAIL8_LOGGED
+                if not _DEEPSEEK_MXFP4_TAIL8_LOGGED:
+                    _DEEPSEEK_MXFP4_TAIL8_LOGGED = True
+                    logging.getLogger(__name__).info(
+                        "DeepSeek V4 exact BM8 route-tail prefill kernels active"
+                    )
+                x = glm_fast.deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
+                    x,
+                    self.up_proj["weight"],
+                    self.up_proj["scales"],
+                    self.gate_proj["weight"],
+                    self.gate_proj["scales"],
+                    block_meta,
+                    block_count,
+                    float(self.activation.limit),
+                    block_variant,
+                )
+            elif glm_fast.has_symbol(
+                "deepseek_mxfp4_gather_qmm_pair_concat_blocks"
+            ):
                 x_pair = glm_fast.deepseek_mxfp4_gather_qmm_pair_concat_blocks(
                     x,
                     self.up_proj["weight"],
@@ -626,22 +722,32 @@ class SwitchGLU(nn.Module):
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
-        x = self.activation(x_up, x_gate)
-        if (
-            block_plan is not None
-            and native_kinds is not None
-            and native_kinds[2] == "affine"
-            and isinstance(self.down_proj, QuantizedSwitchLinear)
-            and x.dtype != self.down_proj["scales"].dtype
-            and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
-        ):
-            x = x.astype(self.down_proj["scales"].dtype)
-        x = self.down_proj(
-            x,
-            idx,
-            sorted_indices=do_sort,
-            block_plan=block_plan,
-        )
+        if use_tail8_prefill:
+            x = glm_fast.deepseek_mxfp4_gather_qmm_blocks_tail8(
+                x,
+                self.down_proj["weight"],
+                self.down_proj["scales"],
+                block_meta,
+                block_count,
+                block_variant,
+            )
+        else:
+            x = self.activation(x_up, x_gate)
+            if (
+                block_plan is not None
+                and native_kinds is not None
+                and native_kinds[2] == "affine"
+                and isinstance(self.down_proj, QuantizedSwitchLinear)
+                and x.dtype != self.down_proj["scales"].dtype
+                and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
+            ):
+                x = x.astype(self.down_proj["scales"].dtype)
+            x = self.down_proj(
+                x,
+                idx,
+                sorted_indices=do_sort,
+                block_plan=block_plan,
+            )
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)

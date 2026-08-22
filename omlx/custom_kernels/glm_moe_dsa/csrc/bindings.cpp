@@ -209,6 +209,29 @@ NB_MODULE(_ext, m) {
       "variant"_a = 2,
       "stream"_a = nb::none());
   m.def(
+      "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "activation_limit"_a = 10.0f,
+      "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_gather_qmm_blocks_tail8",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_blocks_tail8,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
       "deepseek_v4_qkv_compressor_bundle_b1",
       &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
       "x"_a,

@@ -1,9 +1,10 @@
 # DS4 TP prefill MoE tail8 probe
 
-This is an isolated, unbuilt strict-lossless probe for the next routed-MoE
-prefill experiment. The public TP2 model currently owns the M3 GPU, so no new
-GPU timing was taken and nothing is wired into CMake, bindings, model dispatch,
-the server, or the remote node.
+This began as an isolated strict-lossless probe for the next routed-MoE
+prefill experiment. Its two fixed-shape kernels are now wired into the local
+native extension and a strict production dispatch gate, but the gate remains
+default off. The server and remote node were not stopped, replanned, or
+modified.
 
 ## Candidate: dynamic BM8 route microtiles inside one BM32 block
 
@@ -26,20 +27,37 @@ FP32 MMA accumulation, FP16 projection/down store, stable MLX `Sigmoid`, and
 LimitedSwiGLU ordering. The pair kernel still shares X and avoids the 24 MiB
 pair temporary. A matching down prototype applies the same route-row cull.
 
-The unbuilt source is
-`benchmarks/prototypes/ds4_tp_prefill_moe_tail8.metal`. Future isolated symbols
-are frozen as:
+The original sketch is
+`benchmarks/prototypes/ds4_tp_prefill_moe_tail8.metal`; the isolated native
+source is `omlx/custom_kernels/glm_moe_dsa/csrc/ds4_prefill_moe_tail8.metal`.
+The symbols are:
 
 ```text
 deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(...)
 deepseek_mxfp4_gather_qmm_blocks_tail8(...)
 ```
 
-Neither symbol exists in the current native extension.
+Both symbols accept only the exact M=1024/equal-TP2 FP16 shapes. The production
+gate additionally requires MXFP4 on all three projections, BM32 variant 2,
+BF16 model input, activation limit 10, both native symbols, and a pre-NAX GPU.
+`OMLX_DSV4_MOE_TAIL8=0` is the shipped default and every failed predicate
+falls back before either candidate kernel is enqueued. Decode cannot match the
+fixed request shape and remains unchanged.
 
-The standalone source compiled cleanly to a temporary AIR object with the
-shipping Metal toolchain and the same strict flags as the native target. It
-was not linked, installed, or executed on the GPU.
+## M3 isolated GPU gate
+
+Two real-weight layer-20 ABBA runs passed exactness at pair, down, and composed
+projection boundaries:
+
+| Run | Pair | Down | Composed |
+|---|---:|---:|---:|
+| warmup 2, cycles 4 | 1.234x | 1.172x | 1.186x |
+| warmup 3, cycles 8 | 1.154x | 1.179x | 1.220x |
+
+The confirmation medians were 7.0395 versus 8.1241 ms for pair, 3.6505 versus
+4.3038 ms for down, and 9.9456 versus 12.1347 ms composed. Every compared
+array was bit-exact. Machine-readable results are in
+`ds4_tp_prefill_moe_tail8_results_2026-08-22.json`.
 
 ## Why this is the remaining plausible ds4-metal transfer
 
@@ -103,20 +121,15 @@ mid before any staging. Therefore a strict-lossless gate/up→SwiGLU→down
 persistent kernel cannot simultaneously avoid mid and preserve one weight
 read on this GPU. Recomputing gate/up per output supertile is worse.
 
-## Next safe gate
+## Remaining promotion gates
 
-When the public model is deliberately unloaded, a native agent can wire the
-two isolated symbols and run:
+The isolated gate can be rerun with:
 
 ```bash
 python benchmarks/bench_ds4_tp_prefill_moe_tail8.py \
   --model /path/to/DS4-Flash --rank 0 --strict
 ```
 
-The harness gates the pair, down, and composed gate/up/activation/down
-projection boundaries separately. Promotion requires `mx.array_equal` at all
-three and at least 1.05x for the composed projection versus the current M3
-path. The separate phase-B deterministic reduction must then preserve local
-routed output, followed by a real route-count capture and cold-prefill
-full-model gate. Until then this remains an evidence-backed prototype, not a
-speed claim.
+The M3 primitive gate has cleared, but production remains off pending an M5
+measurement, TP2 full-model cold-prefill parity/performance, and real route
+count coverage. The separate phase-B deterministic reduction is unchanged.

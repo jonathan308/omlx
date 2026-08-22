@@ -48,8 +48,8 @@ bool row_contiguous(const array& arr) {
 
 class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
  public:
-  explicit DS4Mxfp4PairSwiGLUBlocksPrimitive(Stream stream)
-      : Primitive(stream) {}
+  explicit DS4Mxfp4PairSwiGLUBlocksPrimitive(Stream stream, bool tail8 = false)
+      : Primitive(stream), tail8_(tail8) {}
 
   static bool unsupported(
       const array& x,
@@ -118,8 +118,11 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
 
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto kernel = d.get_kernel(
-        "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_"
-        "float16_t_bm32_bn32_bk32_wm1_wn2",
+        tail8_
+            ? "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8_"
+              "float16_t_bm32_bn32_bk32_wm1_wn2"
+            : "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_"
+              "float16_t_bm32_bn32_bk32_wm1_wn2",
         lib);
     auto& encoder = metal::get_command_encoder(s);
     encoder.set_compute_pipeline_state(kernel);
@@ -142,6 +145,102 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
   }
 
   DEFINE_NAME(DS4Mxfp4PairSwiGLUBlocks)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const DS4Mxfp4PairSwiGLUBlocksPrimitive&>(other);
+    return tail8_ == rhs.tail8_;
+  }
+  auto state() const {
+    return std::make_tuple(tail8_);
+  }
+
+ private:
+  bool tail8_;
+};
+
+class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
+ public:
+  explicit DS4Mxfp4DownTail8BlocksPrimitive(Stream stream) : Primitive(stream) {}
+
+  static bool unsupported(
+      const array& x,
+      const array& weight,
+      const array& scales,
+      const array& block_meta,
+      const array& block_count,
+      int variant,
+      Stream s) {
+    if (s.device == Device::cpu || x.dtype() != float16 ||
+        weight.dtype() != uint32 || scales.dtype() != uint8 ||
+        block_meta.dtype() != int32 || block_count.dtype() != int32) {
+      return true;
+    }
+    if (x.ndim() != 3 || weight.ndim() != 3 || scales.ndim() != 3 ||
+        block_meta.ndim() != 2 || block_count.ndim() != 1) {
+      return true;
+    }
+    if (!row_contiguous(x) || !row_contiguous(weight) ||
+        !row_contiguous(scales) || !row_contiguous(block_meta) ||
+        !row_contiguous(block_count)) {
+      return true;
+    }
+    if (x.shape() != Shape{kRoutes, 1, kIntermediate} ||
+        weight.shape() !=
+            Shape{kExperts, kHidden, kIntermediate / kValuesPerU32} ||
+        scales.shape() !=
+            Shape{kExperts, kHidden, kIntermediate / kGroupSize} ||
+        block_meta.shape() != Shape{kMaxBlocks, 3} ||
+        block_count.shape() != Shape{1}) {
+      return true;
+    }
+    return variant != kVariant;
+  }
+
+  void eval_cpu(
+      const std::vector<array>& /* inputs */,
+      std::vector<array>& /* outputs */) override {
+    throw std::runtime_error(
+        "DS4Mxfp4DownTail8BlocksPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const auto& x = inputs[0];
+    const auto& weight = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& block_meta = inputs[3];
+    const auto& block_count = inputs[4];
+
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel(
+        "deepseek_mxfp4_gather_qmm_blocks_tail8_"
+        "float16_t_bm32_bn32_bk32_wm1_wn2",
+        lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(x, 0);
+    encoder.set_input_array(weight, 1);
+    encoder.set_input_array(scales, 2);
+    encoder.set_input_array(block_meta, 3);
+    encoder.set_input_array(block_count, 4);
+    encoder.set_output_array(out, 5);
+    encoder.set_bytes(kMaxBlocks, 6);
+    encoder.set_bytes(kRoutes, 7);
+    encoder.set_bytes(kHidden, 8);
+    encoder.set_bytes(kIntermediate, 9);
+    encoder.dispatch_threadgroups(
+        MTL::Size(kHidden / kBN, kMaxBlocks, 1),
+        MTL::Size(kWM * kWN * 32, 1, 1));
+  }
+
+  DEFINE_NAME(DS4Mxfp4DownTail8Blocks)
   DEFINE_INPUT_OUTPUT_SHAPE()
   bool is_equivalent(const Primitive& /* other */) const override {
     return true;
@@ -202,6 +301,74 @@ array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
       Shape{kRoutes, 1, kIntermediate},
       float16,
       std::make_shared<DS4Mxfp4PairSwiGLUBlocksPrimitive>(stream),
+      std::move(inputs));
+}
+
+array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
+    const array& x,
+    const array& up_weight,
+    const array& up_scales,
+    const array& gate_weight,
+    const array& gate_scales,
+    const array& block_meta,
+    const array& block_count,
+    float activation_limit,
+    int variant,
+    StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (DS4Mxfp4PairSwiGLUBlocksPrimitive::unsupported(
+          x,
+          up_weight,
+          up_scales,
+          gate_weight,
+          gate_scales,
+          block_meta,
+          block_count,
+          activation_limit,
+          variant,
+          stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels."
+        "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8] isolated "
+        "symbol requires the fixed M=1024 equal-TP2 phase-A shape.");
+  }
+  std::vector<array> inputs = {
+      x,
+      up_weight,
+      up_scales,
+      gate_weight,
+      gate_scales,
+      block_meta,
+      block_count};
+  return array(
+      Shape{kRoutes, 1, kIntermediate},
+      float16,
+      std::make_shared<DS4Mxfp4PairSwiGLUBlocksPrimitive>(stream, true),
+      std::move(inputs));
+}
+
+array deepseek_mxfp4_gather_qmm_blocks_tail8(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& block_meta,
+    const array& block_count,
+    int variant,
+    StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (DS4Mxfp4DownTail8BlocksPrimitive::unsupported(
+          x, weight, scales, block_meta, block_count, variant, stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_blocks_tail8] "
+        "isolated symbol requires FP16 x [6144,1,1024], MXFP4 down "
+        "[256,4096,128], scales [256,4096,32], block_meta [448,3], "
+        "and variant=2.");
+  }
+  std::vector<array> inputs = {x, weight, scales, block_meta, block_count};
+  return array(
+      Shape{kRoutes, 1, kHidden},
+      float16,
+      std::make_shared<DS4Mxfp4DownTail8BlocksPrimitive>(stream),
       std::move(inputs));
 }
 

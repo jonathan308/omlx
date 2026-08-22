@@ -131,6 +131,8 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_pair_blocks",
     "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
     "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
+    "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
+    "deepseek_mxfp4_gather_qmm_blocks_tail8",
     "deepseek_v4_qkv_compressor_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
     "deepseek_mxfp4_full_decode",
@@ -708,6 +710,67 @@ def deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
         )
     raise RuntimeError(
         "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks native kernel is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
+    x: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    activation_limit: float = 10.0,
+    variant: int = 2,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated M3 DS4 pair/SwiGLU BM8 route-tail probe."""
+    if _ext is not None and hasattr(
+        _ext, "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8"
+    ):
+        return _ext.deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
+            x,
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            block_meta,
+            block_count,
+            activation_limit,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8 native kernel "
+        "is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_blocks_tail8(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    variant: int = 2,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated M3 DS4 down-projection BM8 route-tail probe."""
+    if _ext is not None and hasattr(_ext, "deepseek_mxfp4_gather_qmm_blocks_tail8"):
+        return _ext.deepseek_mxfp4_gather_qmm_blocks_tail8(
+            x,
+            weight,
+            scales,
+            block_meta,
+            block_count,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_blocks_tail8 native kernel is unavailable"
     )
 
 
