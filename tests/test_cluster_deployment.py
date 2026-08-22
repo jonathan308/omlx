@@ -98,6 +98,10 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_CLUSTER_TRACE_COLLECTIVES",
         "OMLX_DSV4_INDEXER_ROW_TP",
         "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
+        "OMLX_DSV4_ADAPTIVE_PREFILL",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_STEP",
+        "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE",
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
@@ -119,6 +123,10 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_CLUSTER_TRACE_COLLECTIVES=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL=1" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER=4096" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_STEP=1024" in envs
+    assert "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE=2048" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs

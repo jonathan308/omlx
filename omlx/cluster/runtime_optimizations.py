@@ -16,6 +16,10 @@ from typing import Any
 from .performance import ExecutionSettings
 
 _PREFILL_CLEAR_CACHE_EVERY_ENV = "OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY"
+_DSV4_ADAPTIVE_PREFILL_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL"
+_DSV4_ADAPTIVE_PREFILL_AFTER_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER"
+_DSV4_ADAPTIVE_PREFILL_STEP_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_STEP"
+_DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
 
 
 def _capability(
@@ -46,6 +50,57 @@ def _prefill_clear_cache_every() -> int:
             f"{_PREFILL_CLEAR_CACHE_EVERY_ENV} must be a non-negative integer"
         )
     return every
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _deepseek_v4_adaptive_prefill(
+    model: Any,
+    execution: ExecutionSettings,
+    *,
+    pipeline_parallel: bool,
+) -> tuple[bool, bool, int, int, int, str]:
+    """Choose the measured DS4 chunk schedule that avoids context taper."""
+
+    enabled = os.environ.get(_DSV4_ADAPTIVE_PREFILL_ENV, "1").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    after = _positive_env_int(_DSV4_ADAPTIVE_PREFILL_AFTER_ENV, 4096)
+    step = _positive_env_int(_DSV4_ADAPTIVE_PREFILL_STEP_ENV, 1024)
+    max_base = _positive_env_int(_DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV, 2048)
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    is_ds4 = any(
+        bool(getattr(getattr(layer, "attn", None), "dspark", False))
+        for layer in (layers if isinstance(layers, list) else ())
+    )
+    base = min(int(execution.prefill_step_size), max_base)
+    active = bool(enabled and is_ds4 and not pipeline_parallel and base > step)
+    if active:
+        reason = (
+            f"DS4 uses {base}-token chunks through {after} tokens, then "
+            f"{step}-token chunks to avoid measured long-context taper"
+        )
+    elif not enabled:
+        reason = "DS4 adaptive prefill is disabled by the operator"
+    elif not is_ds4:
+        reason = "model is not DeepSeek V4 Flash"
+    elif pipeline_parallel:
+        reason = "DS4 adaptive prefill currently requires tensor parallelism"
+    else:
+        reason = f"configured prefill step is already {base} tokens"
+    return enabled, active, after, step, base, reason
 
 
 def _supports_coordinator_sampling(
@@ -544,6 +599,18 @@ def install_runtime_optimizations(
         fused_decode_active,
         fused_decode_reason,
     ) = _deepseek_v4_fused_decode_capability(model)
+    (
+        adaptive_prefill_enabled,
+        adaptive_prefill_active,
+        adaptive_prefill_after,
+        adaptive_prefill_step,
+        adaptive_prefill_base,
+        adaptive_prefill_reason,
+    ) = _deepseek_v4_adaptive_prefill(
+        model,
+        execution,
+        pipeline_parallel=pipeline_parallel,
+    )
     raw_indexer_owner = os.environ.get(
         "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", ""
     ).strip().lower()
@@ -736,6 +803,11 @@ def install_runtime_optimizations(
             enabled=fused_decode_enabled,
             active=fused_decode_active,
             reason=fused_decode_reason,
+        ),
+        "deepseek_v4_adaptive_prefill": _capability(
+            enabled=adaptive_prefill_enabled,
+            active=adaptive_prefill_active,
+            reason=adaptive_prefill_reason,
         ),
     }
     if not sampling_active and not skip_logits_active:
@@ -956,9 +1028,20 @@ def install_runtime_optimizations(
             tokens_array = mx.array(tokens)
 
         chunk_index = 0
+        processed_tokens = 0
         while tokens_array.shape[1] > 0:
             chunk_index += 1
-            width = min(instance.prefill_step_size, tokens_array.shape[1])
+            if adaptive_prefill_active:
+                if processed_tokens < adaptive_prefill_after:
+                    width = min(
+                        adaptive_prefill_base,
+                        adaptive_prefill_after - processed_tokens,
+                    )
+                else:
+                    width = adaptive_prefill_step
+            else:
+                width = instance.prefill_step_size
+            width = min(width, tokens_array.shape[1])
             instance.model(
                 tokens_array[:, :width],
                 cache=instance.prompt_cache,
@@ -966,6 +1049,7 @@ def install_runtime_optimizations(
             )
             mx.eval([cache.state for cache in instance.prompt_cache])
             tokens_array = tokens_array[:, width:]
+            processed_tokens += width
             finish_prefill_chunk(
                 chunk_index,
                 final=tokens_array.shape[1] == 0 and max_padding == 0,

@@ -742,6 +742,63 @@ def test_tensor_prefill_skips_discarded_vocab_projection(monkeypatch):
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
 
 
+def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
+    class Cache:
+        state = mx.array([0])
+
+    class Attention:
+        dspark = True
+
+    class Layer:
+        attn = Attention()
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(layers=[Layer()])
+            self.calls = []
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            self.calls.append((value.shape[1], skip_lm_head))
+            return None
+
+    class Batch:
+        uids = ["request"]
+        prefill_step_size = 4096
+
+        def __init__(self, model):
+            self.model = model
+            self.tokens = [[]]
+            self.prompt_cache = [Cache()]
+
+    monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096")
+    monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024")
+    monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048")
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    model = DS4Model()
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("throughput"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["deepseek_v4_adaptive_prefill"]["active"] is True
+        mlx_generate.PromptProcessingBatch.prompt(
+            Batch(model),
+            [list(range(7168))],
+        )
+
+    assert model.calls == [
+        (2048, True),
+        (2048, True),
+        (1024, True),
+        (1024, True),
+        (1024, True),
+    ]
+
+
 def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):
     class Cache:
         state = mx.array([0])

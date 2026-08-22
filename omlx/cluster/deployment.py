@@ -84,6 +84,12 @@ _RANK_ENV_DEFAULTS = (
     # saved score work; the threshold turns the split on where context taper
     # begins instead of perturbing short-prompt performance.
     ("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"),
+    # DS4's 2K prefill chunk wins at medium context, while 1K avoids the 14K
+    # taper. The worker switches only after the first 4K tokens.
+    ("OMLX_DSV4_ADAPTIVE_PREFILL", "1"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
+    ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
     # Decode has one sparse-indexer row, so row TP cannot divide it. The
     # measured fastest rank computes the exact top-k once and broadcasts only
     # 512 int32 indices; ``off`` restores replicated indexer work.
