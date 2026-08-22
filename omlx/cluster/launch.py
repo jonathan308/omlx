@@ -566,8 +566,21 @@ def run_cluster_performance_probe(
         )
     except ValueError as exc:
         raise DistributedLaunchError(str(exc)) from exc
+    promotable = all(profile.promotable for profile in profiles)
+    reasons = tuple(
+        dict.fromkeys(
+            profile.qualification_reason
+            for profile in profiles
+            if not profile.promotable and profile.qualification_reason
+        )
+    )
     return {
         "ok": True,
+        "promotable": promotable,
+        "qualification_reason": "; ".join(reasons),
+        "unqualified_ranks": [
+            profile.rank for profile in profiles if not profile.promotable
+        ],
         "backend": deployment.backend,
         "world_size": deployment.world_size,
         "connections_per_ip": (
@@ -942,6 +955,35 @@ def memory_bytes():
     except Exception:
         return 0
 
+def power_mode():
+    if platform.system() != "Darwin":
+        return {
+            "source": "unsupported",
+            "ac_low_power_mode": None,
+            "battery_low_power_mode": None,
+            "low_power_mode_enabled": False,
+        }
+    code, output = run(["/usr/bin/pmset", "-g", "custom"])
+    sections = {}
+    current = None
+    if code == 0:
+        for raw_line in output.splitlines():
+            line = raw_line.strip().lower()
+            if line == "ac power:":
+                current = "ac"
+            elif line == "battery power:":
+                current = "battery"
+            elif current and line.startswith("lowpowermode"):
+                parts = line.split()
+                if len(parts) == 2 and parts[1] in ("0", "1"):
+                    sections[current] = parts[1] == "1"
+    return {
+        "source": "pmset" if sections else "unavailable",
+        "ac_low_power_mode": sections.get("ac"),
+        "battery_low_power_mode": sections.get("battery"),
+        "low_power_mode_enabled": any(sections.values()),
+    }
+
 # Look for an oMLX install rather than asserting there isn't one. This runs
 # under a plain system interpreter, so importing omlx is not expected to work
 # even when the app is present; anything found here means the runtime exists
@@ -1035,6 +1077,7 @@ payload = {
         "fabric_verified": False,
         "worker_runtime_ready": False,
         "worker_runtime_evidence": worker_runtime_evidence(),
+        "power": power_mode(),
     },
     "runtime": {
         "omlx_version": "",
@@ -1408,6 +1451,7 @@ _PREFLIGHT_SCRIPT = (
     "import importlib.metadata as m,json,pathlib,platform,sys\n"
     "from omlx.cluster.memory_guard import ceiling_breakdown\n"
     "from omlx.cluster.models import CLUSTER_PROTOCOL_VERSION as p\n"
+    "from omlx.cluster.probe import detect_low_power_mode\n"
     "from omlx.cluster.staging import validate_staged_model as validate\n"
     "from omlx._torch_stub import install as install_torch_stub\n"
     "install_torch_stub()\n"
@@ -1435,6 +1479,7 @@ _PREFLIGHT_SCRIPT = (
     "v['python']=platform.python_version()\n"
     "v['admission-ceiling-bytes']=int("
     "ceiling_breakdown(sys.argv[4]).get('hard_limit',0))\n"
+    "v['power']=detect_low_power_mode().to_dict()\n"
     "v['model-exists']=x.is_dir()\n"
     "if v['model-exists']:\n"
     "    v.update(validate(x,int(sys.argv[2]),int(sys.argv[3])))\n"
@@ -1457,6 +1502,17 @@ def preflight_remote_hosts(
     expected = _local_runtime_versions()
     script = _PREFLIGHT_SCRIPT
     local_python_version = platform.python_version()
+    from .probe import detect_low_power_mode
+
+    local_power = detect_low_power_mode()
+    local_power_warnings = (
+        [
+            "Low Power Mode is enabled; synthetic performance calibration "
+            "from this rank is not promotable."
+        ]
+        if local_power.low_power_mode_enabled
+        else []
+    )
     results: list[dict[str, Any]] = []
     local_model_exists = Path(deployment.model).is_dir()
     assignments = sorted(deployment.assignments, key=lambda item: item.rank)
@@ -1507,7 +1563,8 @@ def preflight_remote_hosts(
                     "model_identity": local_identity,
                     "stage_ready": local_validation.get("stage_ready"),
                     "admission_ceiling_bytes": local_admission_ceiling,
-                    "runtime_warnings": [],
+                    "runtime_warnings": local_power_warnings,
+                    "power": local_power.to_dict(),
                     "local": True,
                 }
             )
@@ -1571,6 +1628,12 @@ def preflight_remote_hosts(
         if blocking is not None:
             mismatches.append(blocking)
         runtime_warnings = [warning] if warning is not None else []
+        power = versions.get("power") if isinstance(versions.get("power"), dict) else {}
+        if power.get("low_power_mode_enabled") is True:
+            runtime_warnings.append(
+                "Low Power Mode is enabled; synthetic performance calibration "
+                "from this rank is not promotable."
+            )
         if versions.get("model-exists") is not True:
             mismatches.append(
                 f"model directory is missing on remote host: {deployment.model}"
@@ -1602,6 +1665,7 @@ def preflight_remote_hosts(
                     versions.get("admission-ceiling-bytes") or 0
                 ),
                 "runtime_warnings": runtime_warnings,
+                "power": power,
                 "local": False,
             }
         )

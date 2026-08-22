@@ -723,6 +723,33 @@ def test_selected_context_is_the_runtime_kv_ceiling():
     assert execution.max_kv_size == 262144
 
 
+def test_low_power_synthetic_profile_cannot_shape_node_budget():
+    node = routes.ClusterPlanNodeRequest(
+        node_id="m5-max",
+        capacity_bytes=128 * 1024**3,
+        reserve_bytes=8 * 1024**3,
+        performance={
+            "node_id": "m5-max",
+            "rank": 0,
+            "decode_weight_bytes_per_second": 100.0,
+            "prefill_weight_bytes_per_second": 200.0,
+            "collective_latency_seconds": 0.001,
+            "collective_bandwidth_bytes_per_second": 10_000.0,
+            "backend": "jaccl",
+            "measured_at": "2026-08-22T00:00:00+00:00",
+            "samples": 5,
+            "source": "synthetic_mlx_probe",
+            "promotable": False,
+            "qualification_reason": "Low Power Mode was enabled",
+        },
+    )
+
+    budget = routes._node_budgets([node])[0]
+
+    assert budget.performance is None
+    assert routes._request_performance_profiles([node]) == ()
+
+
 def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch):
     gib = 1024**3
 

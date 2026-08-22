@@ -961,6 +961,36 @@ def test_preflight_is_quiet_when_everything_matches():
     assert describe_preflight(issues) == "All peers are reachable and ready."
 
 
+def test_preflight_surfaces_low_power_mode_as_nonblocking_guidance():
+    from omlx.cluster.autoconfigure import describe_preflight, preflight_issues
+
+    issues = preflight_issues(
+        {
+            "m5-max": {
+                "runtime_compatible": True,
+                "status": {
+                    "runtime": {"mlx_version": "0.32.0"},
+                    "node": {
+                        "power": {
+                            "low_power_mode_enabled": True,
+                            "ac_low_power_mode": True,
+                            "battery_low_power_mode": False,
+                        }
+                    },
+                },
+            }
+        },
+        model_path=None,
+    )
+
+    assert [(issue.kind, issue.blocking) for issue in issues] == [
+        ("low_power_mode", False)
+    ]
+    guidance = describe_preflight(issues)
+    assert "Low Power Mode" in guidance
+    assert "System Settings" in guidance
+
+
 def test_preflight_does_not_invent_problems_from_missing_data():
     """A peer that does not report its models must not be called broken."""
 

@@ -525,6 +525,46 @@ def test_auto_tuning_replans_from_the_budgets_the_user_approved(cluster, monkeyp
     assert mbp["planned_weight_bytes"] < dropped.planned_weight_bytes
 
 
+def test_low_power_calibration_is_reported_but_never_promoted(
+    cluster, monkeypatch
+):
+    profiles = [
+        _profile("mbp", 0, 60e9) | {
+            "promotable": False,
+            "qualification_reason": "Low Power Mode was enabled",
+        },
+        _profile("studio", 1, 20e9),
+    ]
+    monkeypatch.setattr(
+        routes,
+        "run_cluster_performance_probe",
+        lambda _deployment: {
+            "ok": True,
+            "promotable": False,
+            "qualification_reason": "Low Power Mode was enabled",
+            "unqualified_ranks": [0],
+            "profiles": profiles,
+        },
+    )
+
+    preview = _preview(cluster)
+    response = _activate(cluster, auto_tune=True)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["performance_probe"] == {
+        "ok": False,
+        "promotable": False,
+        "status": "power_limited",
+        "reason": "Low Power Mode was enabled",
+        "plan_changed": False,
+    }
+    assert payload["deployment"]["performance_profiles"] == []
+    assert payload["plan"]["placement_signature"] == preview[
+        "placement_signature"
+    ]
+
+
 def test_a_replan_that_moves_layers_is_reported_and_not_applied(
     cluster, monkeypatch
 ):
