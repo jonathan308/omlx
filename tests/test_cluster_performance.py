@@ -27,6 +27,7 @@ from omlx.cluster.planner import (
 from omlx.cluster.runtime_optimizations import (
     _MTPVocabCoordinator,
     _deepseek_v4_fused_decode_capability,
+    _deepseek_v4_outer_prefill_step,
     _indexer_row_parallel_capability,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
@@ -843,6 +844,193 @@ def test_ds4_long_request_uses_1k_from_its_first_outer_chunk(monkeypatch):
         )
 
     assert model.calls == [1024, 1024]
+
+
+def _outer_prefill_batch(
+    *,
+    generation_uids=(),
+    pending=(),
+    current=(),
+    prefill_limit=4,
+    completion_limit=8,
+):
+    """Minimal mirrored MLX-LM BatchGenerator state for scheduling tests."""
+
+    prompt_uids = [uid for uid, _segments, _total in current]
+    totals = {uid: total for uid, _segments, total in current}
+    tokens = {uid: [0] * total for uid, _segments, total in current}
+    staged_current = [
+        [segments, 0, total] for _uid, segments, total in current
+    ]
+    staged_pending = []
+    for uid, segments, total in pending:
+        totals[uid] = total
+        tokens[uid] = [0] * total
+        staged_pending.append((uid, segments, 1, None, [], None, None, None))
+    return SimpleNamespace(
+        prefill_step_size=2048,
+        prefill_batch_size=prefill_limit,
+        completion_batch_size=completion_limit,
+        _generation_batch=SimpleNamespace(uids=list(generation_uids)),
+        _prompt_batch=SimpleNamespace(
+            uids=prompt_uids,
+            tokens=[[] for _uid in prompt_uids],
+            _omlx_total_prompt_lengths=totals,
+        ),
+        _currently_processing=staged_current,
+        _unprocessed_sequences=staged_pending,
+        _omlx_tokens=tokens,
+    )
+
+
+def test_ds4_outer_prefill_yield_is_decode_and_request_aware():
+    long_pending = ((7, [[0] * 6000], 6000),)
+    short_pending = ((8, [[0] * 4096], 4096),)
+
+    active = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=long_pending,
+    )
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            active,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 1024
+    )
+
+    # Idle long requests retain the wider outer slice (and its lower scheduler
+    # / allocator overhead), while the adaptive prompt loop still performs the
+    # measured-fast 1024-token model calls internally.
+    idle = _outer_prefill_batch(pending=long_pending)
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            idle,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 2048
+    )
+
+    # A short request does not opt into the long-context kernel schedule, so
+    # the fairness wrapper must not silently change its prefill shape.
+    short = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=short_pending,
+    )
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            short,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 2048
+    )
+
+    # Only rows that can enter this turn count. A long request behind the one
+    # available prompt slot cannot shrink the short request ahead of it.
+    queued = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=short_pending + long_pending,
+        prefill_limit=1,
+    )
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            queued,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 2048
+    )
+
+
+def test_ds4_outer_prefill_yields_when_decode_promotes_this_turn():
+    batch = _outer_prefill_batch(
+        current=(
+            (1, [[1]], 1),  # promoted to generation before prompt processing
+            (2, [[0] * 6000], 6000),
+        ),
+    )
+
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            batch,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 1024
+    )
+
+
+def test_ds4_runtime_caps_only_outer_turn_and_restores_class():
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    model = DS4Model()
+    batch = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=((7, [[0] * 6000], 6000),),
+    )
+    batch._stream = mx.default_stream(mx.default_device())
+    observed = []
+    batch._next = lambda: observed.append(batch.prefill_step_size) or ([], [])
+    original_next = mlx_generate.BatchGenerator.next
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["deepseek_v4_prefill_yield"]["active"] is True
+        assert mlx_generate.BatchGenerator.next is not original_next
+        mlx_generate.BatchGenerator.next(batch)
+        assert batch.prefill_step_size == 2048
+
+        def fail_turn():
+            assert batch.prefill_step_size == 1024
+            raise RuntimeError("synthetic scheduler failure")
+
+        batch._next = fail_turn
+        with pytest.raises(RuntimeError, match="synthetic scheduler failure"):
+            mlx_generate.BatchGenerator.next(batch)
+        assert batch.prefill_step_size == 2048
+
+    assert observed == [1024]
+    assert mlx_generate.BatchGenerator.next is original_next
+
+
+def test_non_ds4_runtime_does_not_patch_outer_scheduler():
+    class OtherModel:
+        def __init__(self):
+            self.model = SimpleNamespace(layers=[])
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    original_next = mlx_generate.BatchGenerator.next
+    with install_runtime_optimizations(
+        OtherModel(),
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["deepseek_v4_prefill_yield"]["active"] is False
+        assert mlx_generate.BatchGenerator.next is original_next
+
+    assert mlx_generate.BatchGenerator.next is original_next
 
 
 def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):

@@ -11,6 +11,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 from .performance import ExecutionSettings
@@ -101,6 +102,182 @@ def _deepseek_v4_adaptive_prefill(
     else:
         reason = f"configured prefill step is already {base} tokens"
     return enabled, active, after, step, base, reason
+
+
+def _safe_batch_len(batch: Any) -> int:
+    """Return a batch's row count without assuming a concrete MLX-LM type."""
+
+    try:
+        return max(0, int(len(batch)))
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return max(0, int(len(getattr(batch, "uids", ()))))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+
+def _at_generation_boundary(segments: Any) -> bool:
+    """Whether a staged prompt has only its one-token decode seed left."""
+
+    try:
+        return len(segments) == 1 and len(segments[0]) == 1
+    except (TypeError, IndexError):
+        return False
+
+
+def _known_prompt_total(instance: Any, uid: Any) -> int | None:
+    """Read the rank-identical full prompt length recorded by telemetry."""
+
+    prompt_batch = getattr(instance, "_prompt_batch", None)
+    totals = getattr(prompt_batch, "_omlx_total_prompt_lengths", None)
+    if isinstance(totals, dict) and uid in totals:
+        try:
+            return max(0, int(totals[uid]))
+        except (TypeError, ValueError):
+            pass
+
+    # ``install_server_telemetry`` keeps the exact full token sequence for
+    # every uid.  Its length is independent of how much prefix cache each rank
+    # restored, so it is safe to use for a lockstep scheduling decision.
+    tokens = getattr(instance, "_omlx_tokens", None)
+    if isinstance(tokens, dict) and uid in tokens:
+        try:
+            return max(0, int(len(tokens[uid])))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _current_prompt_total(
+    instance: Any,
+    uid: Any,
+    index: int,
+    staged: Any,
+) -> int | None:
+    """Recover one current row's original length without telemetry metadata."""
+
+    known = _known_prompt_total(instance, uid)
+    if known is not None:
+        return known
+    try:
+        processed = max(0, int(staged[1]))
+        remaining_total = max(0, int(staged[2]))
+        stored = getattr(instance._prompt_batch, "tokens", ())[index]
+        cached_prefix = max(0, len(stored) - processed)
+        return cached_prefix + remaining_total
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _pending_prompt_total(instance: Any, staged: Any) -> int | None:
+    """Recover one queued row's original length from BatchGenerator state."""
+
+    try:
+        uid = staged[0]
+    except (IndexError, TypeError):
+        return None
+    known = _known_prompt_total(instance, uid)
+    if known is not None:
+        return known
+    try:
+        segments = staged[1]
+        cached_prefix = staged[4]
+        return len(cached_prefix) + sum(len(segment) for segment in segments)
+    except (IndexError, TypeError):
+        return None
+
+
+def _deepseek_v4_outer_prefill_step(
+    instance: Any,
+    *,
+    long_after: int,
+    kernel_step: int,
+) -> int:
+    """Choose the DS4 outer scheduler slice for this exact batch turn.
+
+    Long DS4 prompts intentionally use 1024-token model calls: that width is
+    substantially faster at high context than the 2048-token route.  MLX-LM's
+    outer scheduler normally hands ``PromptProcessingBatch.prompt`` 2048 (or
+    4096) tokens, however, so the adaptive prompt loop executes two (or four)
+    expensive 1024-token calls before returning control to an active decode.
+
+    Cap only that *outer* slice to one kernel call when this turn contains both
+    a decode and long-prompt prefill work.  Idle long prompts retain the wider
+    outer slice and allocator reuse.  The decision uses only mirrored batch
+    structure and full request lengths -- never local clocks -- so TP ranks
+    stay in collective lockstep.
+    """
+
+    try:
+        configured = max(1, int(instance.prefill_step_size))
+        kernel_step = max(1, int(kernel_step))
+        long_after = max(0, int(long_after))
+    except (AttributeError, TypeError, ValueError):
+        return 1
+    if configured <= kernel_step:
+        return configured
+
+    generation_batch = getattr(instance, "_generation_batch", None)
+    generation_rows = _safe_batch_len(generation_batch)
+    try:
+        completion_limit = max(1, int(instance.completion_batch_size))
+    except (AttributeError, TypeError, ValueError):
+        completion_limit = max(1, generation_rows + 1)
+
+    # Pinned MLX-LM returns after the generation step when this batch is full,
+    # so no prefill slice runs in that turn and there is nothing to cap.
+    if generation_rows >= completion_limit:
+        return configured
+
+    prompt_batch = getattr(instance, "_prompt_batch", None)
+    prompt_uids = list(getattr(prompt_batch, "uids", ()) or ())
+    current = list(getattr(instance, "_currently_processing", ()) or ())
+    will_decode = generation_rows > 0
+    has_long_prefill = False
+
+    for index, uid in enumerate(prompt_uids):
+        if index >= len(current):
+            total = _known_prompt_total(instance, uid)
+            has_long_prefill |= total is not None and total > long_after
+            continue
+        staged = current[index]
+        try:
+            segments = staged[0]
+        except (IndexError, TypeError):
+            segments = ()
+        if _at_generation_boundary(segments):
+            # BatchGenerator promotes this row before processing prompt rows,
+            # so another long row in the same turn already contends with a
+            # latency-sensitive decode even if generation_batch is empty now.
+            will_decode = True
+            continue
+        total = _current_prompt_total(instance, uid, index, staged)
+        has_long_prefill |= total is not None and total > long_after
+
+    pending = getattr(instance, "_unprocessed_sequences", ()) or ()
+    try:
+        prefill_limit = max(0, int(instance.prefill_batch_size))
+    except (AttributeError, TypeError, ValueError):
+        prefill_limit = len(prompt_uids)
+    pending_slots = max(0, prefill_limit - len(prompt_uids))
+    pending_slots = min(
+        pending_slots,
+        max(0, completion_limit - generation_rows),
+    )
+    for staged in islice(iter(pending), pending_slots):
+        try:
+            segments = staged[1]
+        except (IndexError, TypeError):
+            segments = ()
+        if _at_generation_boundary(segments):
+            will_decode = True
+            continue
+        total = _pending_prompt_total(instance, staged)
+        has_long_prefill |= total is not None and total > long_after
+
+    if will_decode and has_long_prefill:
+        return min(configured, kernel_step)
+    return configured
 
 
 def _supports_coordinator_sampling(
@@ -673,6 +850,11 @@ def install_runtime_optimizations(
         and pipeline_parallel
         and execution.prefill_step_size > 1
     )
+    outer_prefill_yield_active = bool(
+        adaptive_prefill_active
+        and skip_logits_active
+        and callable(getattr(mlx_generate.BatchGenerator, "next", None))
+    )
     batching_enabled = execution.pipeline_microbatch_size > 1
     batching_active = batching_enabled and batchable
     capabilities = {
@@ -809,6 +991,20 @@ def install_runtime_optimizations(
             active=adaptive_prefill_active,
             reason=adaptive_prefill_reason,
         ),
+        "deepseek_v4_prefill_yield": _capability(
+            enabled=adaptive_prefill_enabled,
+            active=outer_prefill_yield_active,
+            reason=(
+                f"long DS4 outer slices yield after one "
+                f"{adaptive_prefill_step}-token model call while decode is live"
+                if outer_prefill_yield_active
+                else (
+                    adaptive_prefill_reason
+                    if not adaptive_prefill_active
+                    else prompt_reason
+                )
+            ),
+        ),
     }
     if not sampling_active and not skip_logits_active:
         yield capabilities
@@ -818,6 +1014,9 @@ def install_runtime_optimizations(
     original_send = mx.distributed.send
     original_pipeline_call = type(pipeline_model).__call__
     original_generation_step = mlx_generate.GenerationBatch._step
+    original_batch_next = (
+        mlx_generate.BatchGenerator.next if outer_prefill_yield_active else None
+    )
     original_prompt = (
         mlx_generate.PromptProcessingBatch.prompt
         if prefill_active or skip_logits_active
@@ -1079,6 +1278,27 @@ def install_runtime_optimizations(
             mx.eval([cache.state for cache in instance.prompt_cache])
             finish_prefill_chunk(chunk_index, final=True)
 
+    def yielding_batch_next(instance: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run one MLX-LM turn with a contention-only DS4 outer slice cap."""
+
+        previous_step = instance.prefill_step_size
+        effective_step = _deepseek_v4_outer_prefill_step(
+            instance,
+            long_after=adaptive_prefill_after,
+            kernel_step=adaptive_prefill_step,
+        )
+        if effective_step >= int(previous_step):
+            return original_batch_next(instance, *args, **kwargs)
+        # Only the outer extraction width changes. PromptProcessingBatch keeps
+        # its configured width, and the adaptive DS4 loop still owns the exact
+        # 1024-token model-call schedule. The generation thread is the sole
+        # owner of this BatchGenerator, so the temporary value cannot race.
+        instance.prefill_step_size = effective_step
+        try:
+            return original_batch_next(instance, *args, **kwargs)
+        finally:
+            instance.prefill_step_size = previous_step
+
     def coordinator_generation_step(instance: Any) -> Any:
         """Pinned GenerationBatch._step with one token collective per batch."""
 
@@ -1203,6 +1423,8 @@ def install_runtime_optimizations(
         type(pipeline_model).__call__ = local_pipeline_output
     if sampling_active:
         mlx_generate.GenerationBatch._step = coordinator_generation_step
+    if outer_prefill_yield_active:
+        mlx_generate.BatchGenerator.next = yielding_batch_next
     if prefill_active:
         mlx_generate.PromptProcessingBatch.prompt = staggered_pipeline_prompt
     elif skip_logits_active:
@@ -1212,6 +1434,8 @@ def install_runtime_optimizations(
     finally:
         if original_prompt is not None:
             mlx_generate.PromptProcessingBatch.prompt = original_prompt
+        if original_batch_next is not None:
+            mlx_generate.BatchGenerator.next = original_batch_next
         if sampling_active:
             mlx_generate.GenerationBatch._step = original_generation_step
         if sampling_active and pipeline_parallel:
