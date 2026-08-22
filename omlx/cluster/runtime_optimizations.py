@@ -1050,6 +1050,16 @@ def install_runtime_optimizations(
             mx.eval([cache.state for cache in instance.prompt_cache])
             tokens_array = tokens_array[:, width:]
             processed_tokens += width
+            if (
+                adaptive_prefill_active
+                and processed_tokens == adaptive_prefill_after
+                and tokens_array.shape[1] > 0
+            ):
+                # The 2K scratch high-water mark otherwise remains in MLX's
+                # allocator and the following 1K phase retains the same taper.
+                # Cache states were evaluated above, so releasing allocator
+                # scratch here is a graph-safe one-time boundary.
+                mx.clear_cache()
             finish_prefill_chunk(
                 chunk_index,
                 final=tokens_array.shape[1] == 0 and max_padding == 0,

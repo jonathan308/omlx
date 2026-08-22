@@ -774,7 +774,8 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096")
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024")
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048")
-    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    clears = []
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
     model = DS4Model()
 
     with install_runtime_optimizations(
@@ -797,6 +798,7 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
         (1024, True),
         (1024, True),
     ]
+    assert clears == [True, True], "one transition release plus the final release"
 
 
 def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):
