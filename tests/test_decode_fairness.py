@@ -13,6 +13,7 @@ import pytest
 
 from omlx.decode_activity import get_decode_activity
 from omlx.scheduler import (
+    _CONTENDED_CHUNK_FLOOR,
     _CONTENDED_PREFILL_CHUNK,
     Scheduler,
     SchedulerConfig,
@@ -30,9 +31,14 @@ def _quiet_decode_activity():
     get_prefill_tracker().clear()
 
 
-def _make_scheduler(**config_kwargs) -> Scheduler:
-    model = MagicMock()
-    model.layers = []
+def _make_scheduler(
+    model=None, model_type: str | None = None, **config_kwargs
+) -> Scheduler:
+    if model is None:
+        model = MagicMock()
+        model.layers = []
+    if model_type is not None:
+        model.model_type = model_type
     tokenizer = MagicMock()
     tokenizer.eos_token_id = 2
     config = SchedulerConfig(
@@ -181,6 +187,108 @@ class TestQwen35PrefillFloor:
         s = _make_scheduler()
         assert s._qwen35_prefill_floor == 0
         assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+
+class TestDS4PrefillFloor:
+    """DeepSeek V4 chunk floor under the same headroom probe as qwen3_5.
+
+    The probe reads total system RAM via omlx.settings.get_system_memory and
+    grants the 4096 floor at >= 64 GiB; it is patched in every test here so
+    the suite is deterministic on any machine.
+    """
+
+    @staticmethod
+    def _patch_system_memory(monkeypatch, gib: int):
+        monkeypatch.setattr(
+            "omlx.settings.get_system_memory", lambda: gib * 1024**3
+        )
+
+    def test_probe_grants_floor_with_headroom(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        assert s._qwen35_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 4096
+
+    def test_probe_grants_floor_for_mtp_variant(self, monkeypatch):
+        # The MTP sibling model_type shares the deepseek_v4 prefix.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4_mtp")
+        assert s._ds4_prefill_floor == 4096
+
+    def test_probe_denies_floor_without_headroom(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 32)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_probe_failure_leaves_default_2048(self, monkeypatch):
+        def _boom():
+            raise OSError("no sysconf")
+
+        monkeypatch.setattr("omlx.settings.get_system_memory", _boom)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_probe_falls_back_to_config_model_type(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        model = MagicMock()
+        model.layers = []
+        model.model_type = ""  # force the model.config.model_type fallback
+        model.config.model_type = "deepseek_v4"
+        s = _make_scheduler(model=model)
+        assert s._ds4_prefill_floor == 4096
+
+    def test_qwen35_probe_unchanged(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="qwen3_5_moe")
+        assert s._qwen35_prefill_floor == 4096
+        assert s._ds4_prefill_floor == 0
+        self._patch_system_memory(monkeypatch, 32)
+        s = _make_scheduler(model_type="qwen3_5_moe")
+        assert s._qwen35_prefill_floor == 0
+        assert s._ds4_prefill_floor == 0
+
+    def test_other_families_unaffected(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        for model_type in ("deepseek_v3", "deepseek_v32", "glm4_moe", "llama"):
+            s = _make_scheduler(model_type=model_type)
+            assert s._ds4_prefill_floor == 0, model_type
+            assert s._qwen35_prefill_floor == 0, model_type
+            assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+    def test_floor_is_a_floor_not_a_cap(self, monkeypatch):
+        # A larger configured step size is left alone.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4", prefill_step_size=8192)
+        assert s._prefill_step_size_for_progress(0, 100000) == 8192
+
+    def test_contended_cap_still_wins(self, monkeypatch):
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        s.running = {"r1": MagicMock()}
+        assert (
+            s._prefill_step_size_for_progress(0, 100000)
+            == _CONTENDED_PREFILL_CHUNK
+        )
+
+    def test_contended_cap_shrinks_below_floor_to_contended_floor(
+        self, monkeypatch
+    ):
+        # Slow measured prefill tps -> stall-target cap bottoms out at
+        # _CONTENDED_CHUNK_FLOOR (256), well below the 4096 family floor.
+        self._patch_system_memory(monkeypatch, 256)
+        s = _make_scheduler(model_type="deepseek_v4")
+        assert s._ds4_prefill_floor == 4096
+        s.running = {"r1": MagicMock()}
+        s._prefill_tps_best = 100.0
+        assert s._contended_prefill_cap() == _CONTENDED_CHUNK_FLOOR
+        assert (
+            s._prefill_step_size_for_progress(0, 100000)
+            == _CONTENDED_CHUNK_FLOOR
+        )
 
 
 class TestAdaptiveChunkCap:

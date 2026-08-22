@@ -1994,6 +1994,17 @@ class Scheduler:
         # at 4096 when the machine has headroom; the prefill memory guard
         # still shrinks chunks under pressure, so small Macs are unchanged.
         self._qwen35_prefill_floor = 0
+        # DeepSeek V4 (native sparse indexer + ratio-128 attention over a
+        # PoolingCache): the prefill indexer kernel handles partial 64x64
+        # tiles (patches/deepseek_v4/indexer_dispatch.py), so chunk sizes
+        # need no scheduler-visible alignment; 4096 is 64-aligned and a
+        # multiple of the 2048 pooling block size, so when the paged-cache
+        # boundary clamp shrinks a chunk it still lands on an exact block
+        # boundary. Same machine-headroom gate as the qwen3_5 path: floor
+        # at 4096 only when the probe passes, and the prefill memory
+        # guard / adaptive throttle / decode-fairness contention cap still
+        # shrink chunks on top of the floor.
+        self._ds4_prefill_floor = 0
         try:
             _mt = str(getattr(model, "model_type", "") or "")
             if not _mt:
@@ -2005,8 +2016,13 @@ class Scheduler:
 
                 if get_system_memory() >= 64 * 1024**3:
                     self._qwen35_prefill_floor = 4096
+            elif _mt.startswith("deepseek_v4"):
+                from .settings import get_system_memory
+
+                if get_system_memory() >= 64 * 1024**3:
+                    self._ds4_prefill_floor = 4096
         except Exception:
-            logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)
+            logger.debug("prefill floor probe failed", exc_info=True)
 
         self._minimax_m3_adaptive_prefill = None
         try:
@@ -5116,7 +5132,12 @@ class Scheduler:
         adaptive_prefill = getattr(self, "_minimax_m3_adaptive_prefill", None)
         if adaptive_prefill is None:
             size = self.config.prefill_step_size
-            floor = getattr(self, "_qwen35_prefill_floor", 0)
+            # Model-family chunk floors (qwen3_5 / deepseek_v4). A model is
+            # exactly one family, so the max is that family's floor (or 0).
+            floor = max(
+                getattr(self, "_qwen35_prefill_floor", 0),
+                getattr(self, "_ds4_prefill_floor", 0),
+            )
             if floor and size < floor:
                 size = floor
             return size
