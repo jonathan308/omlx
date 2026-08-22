@@ -309,7 +309,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         with self._operation_lock:
             self._sequence += 1
             sequence = self._sequence
-            _trace_control(self.rank, sequence, "barrier-enter")
+            _trace_control(self.rank, sequence, "owned-bytes-enter")
             if self.rank == source_rank:
                 header = _OWNED_BYTES_HEADER.pack(
                     _OWNED_BYTES_MAGIC,
@@ -368,6 +368,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         with self._operation_lock:
             self._sequence += 1
             sequence = self._sequence
+            _trace_control(self.rank, sequence, "barrier-enter")
             if self.rank == 0:
                 for rank in range(1, self.world_size):
                     stream = self._peers.get(rank)

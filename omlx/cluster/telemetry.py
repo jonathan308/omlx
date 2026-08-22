@@ -964,6 +964,7 @@ def install_server_telemetry(
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
+            self._omlx_batch_trace_steps = 0
             telemetry.register_batch_generator(self)
 
         @staticmethod
@@ -1091,7 +1092,54 @@ def install_server_telemetry(
                 self._omlx_tokens.pop(uid, None)
 
         def next(self) -> Any:
-            if self._about_to_enter_generation():
+            at_boundary = self._about_to_enter_generation()
+            if (
+                os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0")
+                .strip()
+                .lower()
+                in {"1", "true", "on", "yes"}
+                and self._omlx_batch_trace_steps < 10
+            ):
+                self._omlx_batch_trace_steps += 1
+                current = getattr(self, "_currently_processing", ())
+                pending = getattr(self, "_unprocessed_sequences", ())
+                print(
+                    "OMLX_BATCH_TRACE:"
+                    + json.dumps(
+                        {
+                            "rank": int(mx.distributed.init().rank()),
+                            "step": self._omlx_batch_trace_steps,
+                            "at_generation_boundary": at_boundary,
+                            "prompt_uids": list(
+                                getattr(
+                                    getattr(self, "_prompt_batch", None),
+                                    "uids",
+                                    (),
+                                )
+                            ),
+                            "generation_uids": list(
+                                getattr(
+                                    getattr(self, "_generation_batch", None),
+                                    "uids",
+                                    (),
+                                )
+                            ),
+                            "current_segments": [
+                                [len(segment) for segment in item[0]]
+                                for item in current
+                                if isinstance(item, (tuple, list)) and item
+                            ],
+                            "pending_segments": [
+                                [len(segment) for segment in item[1]]
+                                for item in pending
+                                if isinstance(item, (tuple, list)) and len(item) > 1
+                            ],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            if at_boundary:
                 self._synchronize_rank_transition()
             started = time.perf_counter()
             prompt_responses, generation_responses = super().next()
