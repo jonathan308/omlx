@@ -4,6 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "ds4_attention_finalizer.h"
 #include "ds4_projection_qmm.h"
 #include "ds4_prefill_moe.h"
 #include "ds4_qkv_bundle.h"
@@ -231,6 +232,25 @@ NB_MODULE(_ext, m) {
       "block_meta"_a,
       "block_count"_a,
       "variant"_a = 2,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_q_head_rms_rope",
+      &omlx::glm_kernels::ds4_q_head_rms_rope,
+      "q"_a,
+      "freqs"_a,
+      "offset"_a,
+      "eps"_a,
+      "return_normalized"_a = false,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_kv_rms_rope",
+      &omlx::glm_kernels::ds4_kv_rms_rope,
+      "kv"_a,
+      "weight"_a,
+      "freqs"_a,
+      "offset"_a,
+      "eps"_a,
+      "return_normalized"_a = false,
       "stream"_a = nb::none());
   m.def(
       "ds4_projection_mxfp8_qmm",

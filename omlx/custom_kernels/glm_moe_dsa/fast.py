@@ -133,6 +133,8 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
     "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
     "deepseek_mxfp4_gather_qmm_blocks_tail8",
+    "ds4_q_head_rms_rope",
+    "ds4_kv_rms_rope",
     "ds4_projection_mxfp8_qmm",
     "deepseek_v4_qkv_compressor_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
@@ -829,6 +831,52 @@ def ds4_projection_mxfp8_qmm(
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("ds4_projection_mxfp8_qmm native kernel is unavailable")
+
+
+def ds4_q_head_rms_rope(
+    q: mx.array,
+    freqs: mx.array,
+    offset: int,
+    eps: float,
+    return_normalized: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated exact DS4 M=1024 Q-head RMSNorm+RoPE finalizer."""
+    if _ext is not None and hasattr(_ext, "ds4_q_head_rms_rope"):
+        return _ext.ds4_q_head_rms_rope(
+            q,
+            freqs,
+            offset,
+            eps,
+            return_normalized,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("ds4_q_head_rms_rope native kernel is unavailable")
+
+
+def ds4_kv_rms_rope(
+    kv: mx.array,
+    weight: mx.array,
+    freqs: mx.array,
+    offset: int,
+    eps: float,
+    return_normalized: bool = False,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated exact DS4 M=1024 weighted KV RMSNorm+RoPE finalizer."""
+    if _ext is not None and hasattr(_ext, "ds4_kv_rms_rope"):
+        return _ext.ds4_kv_rms_rope(
+            kv,
+            weight,
+            freqs,
+            offset,
+            eps,
+            return_normalized,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("ds4_kv_rms_rope native kernel is unavailable")
 
 
 def ds4_projection_nax_kernels_built() -> bool:
