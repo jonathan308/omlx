@@ -264,7 +264,7 @@ class DeviceRegistry:
             raise ValueError("cluster device entry is missing paired_at")
         caps = item.get("caps")
         last_addrs = item.get("last_addrs")
-        return {
+        device = {
             "node_id": node_id,
             "friendly_name": friendly_name,
             "caps": dict(caps) if isinstance(caps, dict) else {},
@@ -275,6 +275,16 @@ class DeviceRegistry:
             if isinstance(last_addrs, list)
             else [],
         }
+        http_port = item.get("http_port")
+        if http_port is not None:
+            if (
+                not isinstance(http_port, int)
+                or isinstance(http_port, bool)
+                or not 1 <= http_port <= 65535
+            ):
+                raise ValueError("cluster device entry has an invalid HTTP port")
+            device["http_port"] = http_port
+        return device
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +384,8 @@ class DeviceRegistry:
                     merged["last_addrs"] = self._merge_addrs(
                         list(merged.get("last_addrs") or []), record["last_addrs"]
                     )
+                if record.get("http_port"):
+                    merged["http_port"] = record["http_port"]
                 if paired_at is not None:
                     merged["paired_at"] = float(paired_at)
                 previous = dict(self._paired)
@@ -395,6 +407,8 @@ class DeviceRegistry:
                 merged["last_addrs"] = self._merge_addrs(
                     list(merged.get("last_addrs") or []), record["last_addrs"]
                 )
+            if record.get("http_port"):
+                merged["http_port"] = record["http_port"]
             self._discovered[node_id] = merged
             return dict(merged)
 
@@ -407,6 +421,7 @@ class DeviceRegistry:
                 "node_id": getattr(device, "node_id", None),
                 "friendly_name": getattr(device, "friendly_name", None),
                 "caps": getattr(device, "caps", None),
+                "http_port": getattr(device, "http_port", None),
             }
             addrs = getattr(device, "addrs", None)
             if addrs is not None:
@@ -435,6 +450,15 @@ class DeviceRegistry:
             normalized["last_addrs"] = [
                 str(a) for a in addrs if isinstance(a, str)
             ][:16]
+        http_port = record.get("http_port")
+        if http_port is not None and http_port != 0 and http_port != "":
+            if (
+                not isinstance(http_port, int)
+                or isinstance(http_port, bool)
+                or not 1 <= http_port <= 65535
+            ):
+                raise ValueError("device record has an invalid HTTP port")
+            normalized["http_port"] = http_port
         return normalized
 
     def mark_paired(
@@ -444,6 +468,7 @@ class DeviceRegistry:
         friendly_name: str | None = None,
         caps: dict[str, Any] | None = None,
         addrs: list[str] | None = None,
+        http_port: int | None = None,
         paired_at: float | None = None,
     ) -> dict[str, Any]:
         """Promote a device to trusted/paired and persist it."""
@@ -452,6 +477,12 @@ class DeviceRegistry:
             existing = self._paired.get(node_id) or self._discovered.get(
                 node_id, {}
             )
+            if http_port is not None and (
+                not isinstance(http_port, int)
+                or isinstance(http_port, bool)
+                or not 1 <= http_port <= 65535
+            ):
+                raise ValueError("paired device HTTP port is invalid")
             device = {
                 "node_id": node_id,
                 "friendly_name": friendly_name
@@ -467,6 +498,9 @@ class DeviceRegistry:
                 if addrs is not None
                 else list(existing.get("last_addrs") or []),
             }
+            effective_port = http_port or existing.get("http_port")
+            if effective_port:
+                device["http_port"] = int(effective_port)
             previous = dict(self._paired)
             self._paired[node_id] = device
             self._discovered.pop(node_id, None)
@@ -493,14 +527,17 @@ class DeviceRegistry:
                 raise
             # Keep a memory-only discovered shell so the UI can still show
             # the now-untrusted device if it is still announcing.
+            shell = {
+                "node_id": node_id,
+                "friendly_name": device["friendly_name"],
+                "caps": device["caps"],
+                "last_addrs": device["last_addrs"],
+            }
+            if device.get("http_port"):
+                shell["http_port"] = device["http_port"]
             self._discovered.setdefault(
                 node_id,
-                {
-                    "node_id": node_id,
-                    "friendly_name": device["friendly_name"],
-                    "caps": device["caps"],
-                    "last_addrs": device["last_addrs"],
-                },
+                shell,
             )
             return True
 

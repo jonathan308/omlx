@@ -45,6 +45,24 @@ def test_discovered_devices_are_memory_only(tmp_path):
     assert restored.paired() == []
 
 
+def test_unpaired_http_endpoint_never_gains_a_persisted_foothold(tmp_path):
+    path = tmp_path / "devices.json"
+    registry = DeviceRegistry(path)
+
+    registry.merge(
+        _announce(
+            "node-a",
+            "studio-a",
+            http_port=9123,
+            addrs=[{"ip": "10.0.0.2", "if_type": "manual"}],
+        )
+    )
+
+    assert registry.discovered()[0]["http_port"] == 9123
+    assert not path.exists()
+    assert DeviceRegistry(path).discovered() == []
+
+
 def test_merge_dedupes_on_node_id(tmp_path):
     registry = DeviceRegistry(tmp_path / "devices.json")
 
@@ -89,6 +107,53 @@ def test_merge_updates_paired_device_without_losing_trust(tmp_path):
     assert device["paired_at"] == 1.0
     # The update was persisted.
     assert DeviceRegistry(path).get("node-a")["caps"] == {"chip": "M4"}
+
+
+def test_verified_http_port_survives_pairing_updates_and_reboot(tmp_path):
+    path = tmp_path / "devices.json"
+    registry = DeviceRegistry(path)
+    registry.merge(
+        _announce(
+            "node-a",
+            "studio-a",
+            http_port=9123,
+            addrs=[{"ip": "10.0.0.2", "if_type": "manual"}],
+        )
+    )
+
+    paired = registry.mark_paired("node-a", paired_at=10.0)
+
+    assert paired["http_port"] == 9123
+    assert paired["last_addrs"] == ["10.0.0.2"]
+    restored = DeviceRegistry(path)
+    assert restored.get("node-a")["http_port"] == 9123
+
+    # A later verified endpoint replaces the port without weakening trust.
+    restored.merge(
+        {
+            "node_id": "node-a",
+            "http_port": 8123,
+            "addrs": [{"ip": "10.0.0.3", "if_type": "manual"}],
+        }
+    )
+    after_update = DeviceRegistry(path).get("node-a")
+    assert after_update["http_port"] == 8123
+    assert after_update["last_addrs"] == ["10.0.0.2", "10.0.0.3"]
+
+
+def test_invalid_persisted_http_port_fails_closed(tmp_path):
+    path = tmp_path / "devices.json"
+    path.write_text(
+        '{"schema_version":1,"devices":[{'
+        '"node_id":"a","friendly_name":"A","paired_at":1,'
+        '"http_port":70000}]}',
+        encoding="utf-8",
+    )
+
+    registry = DeviceRegistry(path)
+
+    assert registry.paired() == []
+    assert "HTTP port" in (registry.load_error or "")
 
 
 def test_merge_never_downgrades_paired_to_discovered(tmp_path):

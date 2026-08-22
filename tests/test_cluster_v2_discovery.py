@@ -329,6 +329,66 @@ def test_failed_probe_keeps_candidate_unverified_for_retry():
     assert service._candidates[("10.0.0.5", 8000)]["verified"] is False
 
 
+def test_paired_manual_address_and_port_rehydrate_after_reboot(tmp_path):
+    path = tmp_path / "devices.json"
+    registry = DeviceRegistry(path)
+    registry.mark_paired(
+        "bbbb-node",
+        friendly_name="studio-b",
+        addrs=["10.0.0.5", "fe80::1", "not-an-ip"],
+        http_port=9123,
+        paired_at=1.0,
+    )
+    restored = DeviceRegistry(path)
+    calls = []
+
+    service, _ = _service(
+        "aaaa-node",
+        registry=restored,
+        prober=lambda ip, port, timeout: calls.append((ip, port))
+        or {
+            "node_id": "bbbb-node",
+            "friendly_name": "studio-b",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
+
+    assert ("10.0.0.5", 9123) in service._candidates
+    assert service._candidates[("10.0.0.5", 9123)]["node_id"] == "bbbb-node"
+    assert service._candidates[("10.0.0.5", 9123)]["if_type"] == "paired"
+    assert all(ip != "not-an-ip" for ip, _ in service._candidates)
+    assert all(ip != "fe80::1" for ip, _ in service._candidates)
+
+    service.probe_now()
+
+    assert calls == [("10.0.0.5", 9123)]
+    [peer] = service.peers()
+    assert peer.node_id == "bbbb-node"
+    assert peer.http_port == 9123
+    assert peer.paired is True
+    assert peer.state == "discovered"
+
+
+def test_legacy_paired_address_rehydrates_on_the_configured_default_port(tmp_path):
+    registry = DeviceRegistry(tmp_path / "devices.json")
+    registry.mark_paired(
+        "bbbb-node",
+        friendly_name="studio-b",
+        addrs=["10.0.0.8"],
+        paired_at=1.0,
+    )
+
+    service, _ = _service(
+        "aaaa-node",
+        registry=DeviceRegistry(registry.path),
+        config=DiscoveryConfig(cluster_name="omlx", http_port=8765),
+    )
+
+    assert ("10.0.0.8", 8765) in service._candidates
+    assert service._candidates[("10.0.0.8", 8765)]["node_id"] == "bbbb-node"
+
+
 def test_probe_sweep_respects_interval():
     calls: list[tuple[str, int]] = []
     clock = FakeClock()

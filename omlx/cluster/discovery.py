@@ -1024,6 +1024,7 @@ class DiscoveryService:
         self._zc_instance: Any | None = None
         self._zc_browser: Any | None = None
         self._zc_info: Any | None = None
+        self._rehydrate_paired_candidates()
 
     # -- public API ----------------------------------------------------------
 
@@ -1111,6 +1112,65 @@ class DiscoveryService:
 
         self._add_candidate(str(ip), int(port), node_id=None, if_type="manual")
         # Probe on the next maintenance tick; tests may call probe_now().
+
+    def _rehydrate_paired_candidates(self) -> None:
+        """Seed probes from trusted addresses that survived a server restart.
+
+        Discovery announcements are deliberately best-effort on macOS. A peer
+        that was manually added over a direct Thunderbolt address must remain
+        reachable when multicast is blocked, so paired registry rows retain the
+        verified address and HTTP port. Unpaired discoveries are never read here
+        because the registry keeps them memory-only.
+        """
+
+        paired = getattr(self.registry, "paired", None)
+        if not callable(paired):
+            return
+        try:
+            records = paired()
+        except Exception:
+            logger.debug("paired discovery seeds could not be read", exc_info=True)
+            return
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            node_id = record.get("node_id")
+            # Schema-v1 rows written before endpoint persistence have no port.
+            # oMLX nodes conventionally share the configured server port (the
+            # same documented heuristic as Tailscale discovery); a successful
+            # probe writes the exact value back for subsequent restarts.
+            port = record.get("http_port") or self.config.http_port
+            if (
+                not isinstance(node_id, str)
+                or not node_id
+                or not isinstance(port, int)
+                or isinstance(port, bool)
+                or not 1 <= port <= 65535
+            ):
+                continue
+            for raw_ip in record.get("last_addrs") or ():
+                if not isinstance(raw_ip, str):
+                    continue
+                try:
+                    # Scope identifiers are process/interface-local and cannot
+                    # safely survive a reboot. Retain the address itself; a
+                    # routable/manual IPv4 remains the deterministic path.
+                    parsed = ipaddress.ip_address(raw_ip.split("%", 1)[0])
+                except ValueError:
+                    continue
+                # A persisted IPv6 scope identifier cannot be trusted after
+                # interface renumbering, and link-local IPv6 without a scope is
+                # not dialable. Multicast can rediscover it with a fresh scope;
+                # deterministic reboot recovery uses the routable/manual path.
+                if parsed.version == 6 and parsed.is_link_local:
+                    continue
+                ip = str(parsed)
+                self._add_candidate(
+                    ip,
+                    port,
+                    node_id=node_id,
+                    if_type="paired",
+                )
 
     def start(self) -> None:
         with self._lock:
@@ -1517,7 +1577,10 @@ class DiscoveryService:
                 candidate = {
                     "node_id": node_id,
                     "if_type": if_type,
-                    "last_probe": 0.0,
+                    # Due immediately even when oMLX starts within the first
+                    # few seconds after boot and the monotonic clock is < the
+                    # normal probe interval.
+                    "last_probe": float("-inf"),
                     "rtt": None,
                     "verified": False,
                 }
@@ -1603,6 +1666,7 @@ class DiscoveryService:
                     "friendly_name": peer.friendly_name,
                     "caps": peer.caps.to_dict(),
                     "addrs": peer.addrs,
+                    "http_port": peer.http_port,
                 }
             )
             with self._lock:
