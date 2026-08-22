@@ -244,6 +244,30 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     service = discovery_service_or_none()
 
     paired: list[dict[str, Any]] = registry.paired() if registry else []
+    paired_ids = {row["node_id"] for row in paired}
+    # Membership in this list IS the paired state, but the registry rows do
+    # not carry the flag themselves -- the self record below sets it
+    # explicitly. Without it, wizard consumers keyed on device.paired (the
+    # per-Mac role list, the card's Pair/Paired state) treat an already
+    # paired peer as unpaired.
+    for row in paired:
+        row["paired"] = True
+
+    # Seam with Module B's enrollment: a paired device that completed SSH
+    # TOFU enrollment carries its enrolled ssh_target, so the UI probes and
+    # plans against the enrolled target instead of guessing from probe IPs.
+    try:
+        from .enrollment import get_cluster_enrollment
+
+        enrollment = get_cluster_enrollment()
+    except RuntimeError:
+        enrollment = None
+    if enrollment is not None:
+        enrolled = {node.node_id: node for node in enrollment.list_nodes()}
+        for row in paired:
+            node = enrolled.get(row.get("node_id"))
+            if node is not None:
+                row["ssh_target"] = node.ssh
     discovered_records: dict[str, dict[str, Any]] = {}
     if registry:
         for entry in registry.discovered():

@@ -93,6 +93,19 @@ def test_devices_returns_inventory_with_multicast_signal(_configured_stores):
     assert payload["mdns_available"] is False
 
 
+def test_devices_paired_rows_carry_paired_flag(_configured_stores):
+    """Wizard consumers key on device.paired (the per-Mac role list filters
+    on it, and the device card's Pair/Paired state derives from it), so
+    rows in the paired list must carry the flag explicitly -- list
+    membership alone is not visible to those consumers."""
+    _, registry, client = _configured_stores
+    registry.mark_paired("peer-1", friendly_name="studio-b", paired_at=10.0)
+
+    payload = client.get("/api/cluster/devices").json()
+
+    assert payload["paired"][0]["paired"] is True
+
+
 def test_devices_reflects_live_discovery_service(
     _configured_stores, tmp_path
 ):
