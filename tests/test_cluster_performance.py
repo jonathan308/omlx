@@ -786,10 +786,10 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
         pipeline_parallel=False,
     ) as capabilities:
         assert capabilities["deepseek_v4_adaptive_prefill"]["active"] is True
-        mlx_generate.PromptProcessingBatch.prompt(
-            Batch(model),
-            [list(range(7168))],
-        )
+        batch = Batch(model)
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(2048))])
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(2048))])
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(3072))])
 
     assert model.calls == [
         (2048, True),
@@ -798,7 +798,7 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
         (1024, True),
         (1024, True),
     ]
-    assert clears == [True, True], "one transition release plus the final release"
+    assert clears == [True, True, True]
 
 
 def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):

@@ -1010,6 +1010,14 @@ def install_runtime_optimizations(
         if callable(before_prompt):
             before_prompt()
 
+        # ``PromptProcessingBatch.prompt`` is called once per outer MLX-LM
+        # chunk, not once per complete request. The accumulated token history
+        # is therefore the persistent context position for the adaptive switch
+        # (and already includes a restored prefix-cache key when present).
+        processed_tokens = min(
+            (len(stored) for stored in instance.tokens),
+            default=0,
+        )
         for stored, incoming in zip(instance.tokens, tokens):
             stored += incoming
 
@@ -1028,7 +1036,6 @@ def install_runtime_optimizations(
             tokens_array = mx.array(tokens)
 
         chunk_index = 0
-        processed_tokens = 0
         while tokens_array.shape[1] > 0:
             chunk_index += 1
             if adaptive_prefill_active:
@@ -1050,16 +1057,6 @@ def install_runtime_optimizations(
             mx.eval([cache.state for cache in instance.prompt_cache])
             tokens_array = tokens_array[:, width:]
             processed_tokens += width
-            if (
-                adaptive_prefill_active
-                and processed_tokens == adaptive_prefill_after
-                and tokens_array.shape[1] > 0
-            ):
-                # The 2K scratch high-water mark otherwise remains in MLX's
-                # allocator and the following 1K phase retains the same taper.
-                # Cache states were evaluated above, so releasing allocator
-                # scratch here is a graph-safe one-time boundary.
-                mx.clear_cache()
             finish_prefill_chunk(
                 chunk_index,
                 final=tokens_array.shape[1] == 0 and max_padding == 0,
