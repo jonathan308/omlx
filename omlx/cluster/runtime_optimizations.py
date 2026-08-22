@@ -1546,13 +1546,33 @@ def install_runtime_optimizations(
         else:
             sampled = mx.zeros((len(instance.uids),), dtype=mx.int32)
 
-        # GenerationBatch pipelines this decision and can retire a
-        # max_tokens=1 sequence before a point-to-point send/recv pair reaches
-        # the same graph boundary on every rank. Keep the stock synchronized
-        # sampler's collective ordering for the non-MTP path. MTP decisions
-        # use their explicit point-to-point protocol because their verify
-        # cycle provides a shared materialization boundary.
-        sampled = mx.distributed.all_sum(sampled, group=group)
+        # Pipeline decisions have one owner. A tiny JACCL int32 all_sum can
+        # return an uninitialised high-bit value after the readiness canary
+        # even while large activation collectives remain healthy. Broadcast
+        # the rank-zero token explicitly instead. Materializing the worker's
+        # stage output before recv keeps the activation send ahead of this
+        # decision edge; the explicit eval also gives terminal one-token
+        # requests a shared boundary before GenerationBatch filters the row.
+        if pipeline_parallel:
+            if coordinator:
+                synchronized = sampled
+                for target in range(1, world_size):
+                    synchronized = mx.distributed.send(
+                        synchronized,
+                        target,
+                    )
+            else:
+                if logits is not None:
+                    mx.eval(logits)
+                synchronized = mx.distributed.recv_like(
+                    mx.zeros(sampled.shape, dtype=mx.int32),
+                    0,
+                )
+            sampled = synchronized
+        else:
+            # Pure TP reductions carry partial tensor results throughout the
+            # model and retain the proven synchronized sampler ordering.
+            sampled = mx.distributed.all_sum(sampled, group=group)
         mx.eval(sampled)
         instance._next_tokens = sampled.astype(mx.uint32)
         instance._next_logprobs = list(logprobs)

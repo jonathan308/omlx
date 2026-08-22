@@ -519,6 +519,11 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
         lambda value, group=None: value,
     )
     monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(
+        mx.distributed,
+        "recv_like",
+        lambda _value, _source: mx.array([5], dtype=mx.int32),
+    )
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
@@ -534,6 +539,7 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     assert model.calls == [True]
     assert tokens == [3]
     assert type(tokens[0]) is int
+    assert batch._next_tokens.tolist() == [5]
     assert len(batch._next_logprobs) == 1
     assert batch._next_logprobs[0].shape == (32,)
 
