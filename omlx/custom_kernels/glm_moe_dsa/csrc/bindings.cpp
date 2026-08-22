@@ -224,4 +224,18 @@ NB_MODULE(_ext, m) {
       "indices"_a,
       "variant"_a = 0,
       "stream"_a = nb::none());
+  m.def(
+      "deepseek_mxfp4_full_decode",
+      &omlx::glm_kernels::deepseek_mxfp4_full_decode,
+      "x"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "down_weight"_a,
+      "down_scales"_a,
+      "indices"_a,
+      "scores"_a,
+      "activation_limit"_a,
+      "stream"_a = nb::none());
 }

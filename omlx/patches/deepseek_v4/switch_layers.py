@@ -37,6 +37,14 @@ _NAX_STOCK_MODE = os.environ.get("OMLX_DEEPSEEK_MOE_NAX", "").strip().lower()
 _NAX_STOCK_MIN_ROUTES = int(
     os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
 )
+# Experimental full routed-MoE decode primitive.  Default OFF until its
+# whole-SwitchGLU A/B clears exact parity and end-to-end throughput gates.
+_DEEPSEEK_MXFP4_FULL_DECODE = os.environ.get(
+    "OMLX_DSV4_FULL_MOE_DECODE", "0"
+).strip().lower() in ("1", "true", "on")
+_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS = int(
+    os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1")
+)
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -413,7 +421,56 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def _can_use_mxfp4_full_decode(self, x, indices, scores) -> bool:
+        if not _DEEPSEEK_MXFP4_FULL_DECODE or self.training or scores is None:
+            return False
+        if x.ndim < 2 or indices.ndim < 1 or indices.shape[-1] != 6:
+            return False
+        tokens = indices.size // 6
+        if not 1 <= tokens <= _DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS:
+            return False
+        if scores.shape != indices.shape or scores.dtype != mx.float32:
+            return False
+        if x.dtype not in (mx.float16, mx.bfloat16):
+            return False
+        projections = (self.up_proj, self.gate_proj, self.down_proj)
+        if not all(isinstance(p, QuantizedSwitchLinear) for p in projections):
+            return False
+        if not all(
+            p.group_size == 32
+            and p.bits == 4
+            and p.mode == "mxfp4"
+            and p.get("biases") is None
+            and "bias" not in p
+            and p["weight"].dtype == mx.uint32
+            and p["scales"].dtype == mx.uint8
+            for p in projections
+        ):
+            return False
+        if not glm_fast.has_symbol("deepseek_mxfp4_full_decode"):
+            return False
+        activation_limit = getattr(self.activation, "limit", None)
+        return (
+            isinstance(activation_limit, (int, float))
+            and activation_limit >= 0
+            and not getattr(self.activation, "fp32", False)
+        )
+
     def __call__(self, x, indices, scores=None) -> mx.array:
+        if self._can_use_mxfp4_full_decode(x, indices, scores):
+            return glm_fast.deepseek_mxfp4_full_decode(
+                x,
+                self.up_proj["weight"],
+                self.up_proj["scales"],
+                self.gate_proj["weight"],
+                self.gate_proj["scales"],
+                self.down_proj["weight"],
+                self.down_proj["scales"],
+                indices,
+                scores,
+                float(self.activation.limit),
+            )
+
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
 

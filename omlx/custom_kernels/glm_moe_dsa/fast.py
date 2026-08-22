@@ -115,6 +115,7 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_pair_blocks",
     "deepseek_mxfp4_gather_qmm_pair_concat_blocks",
     "deepseek_mxfp4_gather_qmm_expert",
+    "deepseek_mxfp4_full_decode",
     "deepseek_affine_gather_qmm_blocks",
     "deepseek_affine_gather_qmm_pair_concat_blocks",
 )
@@ -643,6 +644,38 @@ def deepseek_mxfp4_gather_qmm_expert(
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("deepseek_mxfp4_gather_qmm_expert native kernel is unavailable")
+
+
+def deepseek_mxfp4_full_decode(
+    x: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    down_weight: mx.array,
+    down_scales: mx.array,
+    indices: mx.array,
+    scores: mx.array,
+    activation_limit: float,
+    *,
+    stream=None,
+) -> mx.array:
+    """Opt-in two-dispatch MXFP4 routed-MoE decode primitive."""
+    if _ext is not None and hasattr(_ext, "deepseek_mxfp4_full_decode"):
+        return _ext.deepseek_mxfp4_full_decode(
+            x,
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            down_weight,
+            down_scales,
+            indices,
+            scores,
+            activation_limit,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_mxfp4_full_decode native kernel is unavailable")
 
 
 def deepseek_affine_gather_qmm_blocks(
