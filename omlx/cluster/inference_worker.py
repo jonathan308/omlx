@@ -184,6 +184,93 @@ def _wait_for_serve_release(
         sleep(min(0.05, remaining))
 
 
+_MAX_PREFILL_SHAPE_WARMUP_TOKENS = 4096
+
+
+def _planned_prefill_shape_warmup_tokens(
+    optimizations: Any,
+    *,
+    tensor_parallel_size: int,
+) -> int:
+    """Return a bounded, adapter-qualified prefill shape to compile at load.
+
+    Runtime optimizations own the model/schedule detection.  The worker only
+    consumes their machine-readable shape after the supervisor has released
+    every loaded rank, which keeps this distributed forward from becoming an
+    unsafe load barrier.  Unknown models and old optimization providers have
+    no shape metadata and therefore remain unchanged.
+    """
+
+    if tensor_parallel_size <= 1 or not isinstance(optimizations, dict):
+        return 0
+    capability = optimizations.get("deepseek_v4_adaptive_prefill")
+    if not isinstance(capability, dict) or capability.get("active") is not True:
+        return 0
+    raw = capability.get("shape_warmup_tokens", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    if not 1 <= raw <= _MAX_PREFILL_SHAPE_WARMUP_TOKENS:
+        return 0
+    return raw
+
+
+def _run_prefill_shape_warmup(
+    mx: Any,
+    model: Any,
+    *,
+    tokens: int,
+    max_kv_size: int | None,
+    cache_factory: Any = None,
+    clock: Any = time.perf_counter,
+) -> dict[str, Any]:
+    """Execute one cache-safe prefill forward and retain only kernel state.
+
+    A 1K DS4 full-model forward visits every compression-ratio variant and
+    creates the Metal pipeline states used by long prompts.  Its KV cache and
+    allocator scratch are temporary; ``mx.clear_cache`` drops both classes of
+    reusable buffers while Metal's in-process compute-pipeline cache remains.
+    """
+
+    if not 1 <= int(tokens) <= _MAX_PREFILL_SHAPE_WARMUP_TOKENS:
+        raise ValueError("prefill shape warmup token count is out of bounds")
+    if cache_factory is None:
+        from mlx_lm.models.cache import make_prompt_cache
+
+        cache_factory = make_prompt_cache
+
+    prompt_cache = cache_factory(model, max_kv_size=max_kv_size)
+    token_batch = mx.zeros((1, int(tokens)), dtype=mx.int32)
+    mx.eval(token_batch)
+    mx.synchronize()
+    started = float(clock())
+    output = None
+    cache_states = []
+    try:
+        output = model(
+            token_batch,
+            cache=prompt_cache,
+            skip_lm_head=True,
+        )
+        cache_states = [cache.state for cache in prompt_cache]
+        if output is None:
+            mx.eval(cache_states)
+        else:
+            mx.eval(output, cache_states)
+        mx.synchronize()
+        elapsed = max(0.0, float(clock()) - started)
+    finally:
+        # The evaluated warmup graph has no dependency on these Python roots.
+        # Dropping them before clearing the allocator prevents a hidden warmup
+        # cache from consuming the smaller rank's steady-state headroom.
+        del output, cache_states, prompt_cache, token_batch
+        mx.clear_cache()
+    return {
+        "active": True,
+        "tokens": int(tokens),
+        "elapsed_seconds": elapsed,
+    }
+
+
 def _cross_thread_generation_stream(mx: Any) -> Any:
     """Create the one MLX stream used by both rank loading and generation.
 
@@ -1701,6 +1788,30 @@ def run_worker(args: argparse.Namespace) -> int:
                     plan_hash,
                     world_size,
                 )
+                warmup_tokens = _planned_prefill_shape_warmup_tokens(
+                    optimizations,
+                    tensor_parallel_size=tensor_parallel_size,
+                )
+                if warmup_tokens:
+                    marker.update(
+                        "ready",
+                        load_stage="warming_prefill_shape",
+                        prefill_shape_warmup={
+                            "active": True,
+                            "tokens": warmup_tokens,
+                        },
+                    )
+                    warmup_report = _run_prefill_shape_warmup(
+                        mx,
+                        provider.model,
+                        tokens=warmup_tokens,
+                        max_kv_size=args.max_kv_size,
+                    )
+                    marker.update(
+                        "ready",
+                        load_stage="ready",
+                        prefill_shape_warmup=warmup_report,
+                    )
                 control_context = (
                     RankControlPlane(
                         rank=rank,

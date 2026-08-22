@@ -832,6 +832,7 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096")
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024")
     monkeypatch.setenv("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048")
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", raising=False)
     clears = []
     monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
     model = DS4Model()
@@ -844,6 +845,12 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
         pipeline_parallel=False,
     ) as capabilities:
         assert capabilities["deepseek_v4_adaptive_prefill"]["active"] is True
+        assert (
+            capabilities["deepseek_v4_adaptive_prefill"][
+                "shape_warmup_tokens"
+            ]
+            == 1024
+        )
         batch = Batch(model)
         mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(2048))])
         mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(2048))])

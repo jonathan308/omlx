@@ -24,6 +24,7 @@ _DSV4_ADAPTIVE_PREFILL_STEP_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_STEP"
 _DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
 _DSV4_PREFILL_YIELD_ENV = "OMLX_DSV4_PREFILL_YIELD"
 _DSV4_PREFILL_ASYNC_DEPTH_ENV = "OMLX_DSV4_PREFILL_ASYNC_DEPTH"
+_CLUSTER_PREFILL_SHAPE_WARMUP_ENV = "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP"
 
 
 def _capability(
@@ -1101,6 +1102,20 @@ def install_runtime_optimizations(
             reason=prefill_async_reason,
         ),
     }
+    # A long DS4 request repeatedly executes this exact inner model-call
+    # width.  Publish it as machine-readable launch metadata so the rank
+    # worker can compile the shape after every rank has loaded, but before the
+    # HTTP listener accepts a user request.  Keeping the warmup outside this
+    # context manager's setup is deliberate: the first rank to finish loading
+    # must not enter a collective while a peer is still materializing weights.
+    shape_warmup_enabled = os.environ.get(
+        _CLUSTER_PREFILL_SHAPE_WARMUP_ENV, "1"
+    ).strip().lower() in {"1", "true", "on", "yes"}
+    capabilities["deepseek_v4_adaptive_prefill"]["shape_warmup_tokens"] = (
+        adaptive_prefill_step
+        if shape_warmup_enabled and adaptive_prefill_active and skip_logits_active
+        else 0
+    )
     if not sampling_active and not skip_logits_active:
         yield capabilities
         return

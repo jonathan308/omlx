@@ -22,6 +22,8 @@ from omlx.cluster.inference_worker import (
     _configure_tensor_shard_weights,
     _execution_settings,
     _install_distributed_model_protocol,
+    _planned_prefill_shape_warmup_tokens,
+    _run_prefill_shape_warmup,
     _server_arguments,
     _trace_collectives,
     _wait_for_serve_release,
@@ -114,6 +116,106 @@ def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
             2,
             timeout=0,
         )
+
+
+def test_prefill_shape_warmup_requires_qualified_tp_metadata():
+    qualified = {
+        "deepseek_v4_adaptive_prefill": {
+            "active": True,
+            "shape_warmup_tokens": 1024,
+        }
+    }
+
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=2,
+        )
+        == 1024
+    )
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=1,
+        )
+        == 0
+    )
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            {"deepseek_v4_adaptive_prefill": {"active": False}},
+            tensor_parallel_size=2,
+        )
+        == 0
+    )
+    qualified["deepseek_v4_adaptive_prefill"]["shape_warmup_tokens"] = 8192
+    assert (
+        _planned_prefill_shape_warmup_tokens(
+            qualified,
+            tensor_parallel_size=2,
+        )
+        == 0
+    )
+
+
+def test_prefill_shape_warmup_evaluates_cache_then_releases_scratch():
+    calls = []
+
+    class FakeMX:
+        int32 = "int32"
+
+        @staticmethod
+        def zeros(shape, *, dtype):
+            calls.append(("zeros", shape, dtype))
+            return "token-batch"
+
+        @staticmethod
+        def eval(*values):
+            calls.append(("eval", values))
+
+        @staticmethod
+        def synchronize():
+            calls.append(("synchronize",))
+
+        @staticmethod
+        def clear_cache():
+            calls.append(("clear_cache",))
+
+    class Model:
+        def __call__(self, tokens, **kwargs):
+            calls.append(("model", tokens, kwargs))
+            return "hidden-output"
+
+    caches = [SimpleNamespace(state="cache-0"), SimpleNamespace(state="cache-1")]
+
+    def cache_factory(model, *, max_kv_size):
+        calls.append(("cache_factory", model, max_kv_size))
+        return caches
+
+    ticks = iter((10.0, 10.25))
+    model = Model()
+    report = _run_prefill_shape_warmup(
+        FakeMX,
+        model,
+        tokens=1024,
+        max_kv_size=32768,
+        cache_factory=cache_factory,
+        clock=lambda: next(ticks),
+    )
+
+    assert report == {
+        "active": True,
+        "tokens": 1024,
+        "elapsed_seconds": 0.25,
+    }
+    assert ("cache_factory", model, 32768) in calls
+    assert ("zeros", (1, 1024), "int32") in calls
+    assert (
+        "model",
+        "token-batch",
+        {"cache": caches, "skip_lm_head": True},
+    ) in calls
+    assert ("eval", ("hidden-output", ["cache-0", "cache-1"])) in calls
+    assert calls[-1] == ("clear_cache",)
 
 
 def test_distributed_mtp_pins_one_signed_depth_on_every_rank(tmp_path, monkeypatch):
