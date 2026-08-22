@@ -128,6 +128,56 @@ def _validated_ds4_tp_weights(
     return weights
 
 
+def _validated_ds4_moe_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+    outer_weights: Optional[Tuple[int, ...]],
+) -> Optional[Tuple[int, ...]]:
+    """Optional routed-MoE-only split over a signed unequal outer TP plan."""
+
+    raw = os.environ.get("OMLX_TP_MOE_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return outer_weights
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS must contain integers"
+        ) from exc
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS must contain one positive weight "
+            "per TP rank"
+        )
+    if outer_weights is None:
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS requires a signed unequal outer "
+            "OMLX_TP_SHARD_WEIGHTS plan"
+        )
+    if sum(weights) != sum(outer_weights):
+        raise ValueError(
+            "OMLX_TP_MOE_SHARD_WEIGHTS must sum to the signed outer TP weights"
+        )
+
+    intermediate = int(getattr(args, "moe_intermediate_size", 0) or 0)
+    total = sum(weights)
+    if intermediate <= 0 or intermediate % total:
+        raise ValueError(
+            "routed MoE intermediate size is not divisible by the override sum"
+        )
+    boundaries = [sum(weights[:rank]) for rank in range(1, len(weights))]
+    if any(intermediate * boundary % total for boundary in boundaries):
+        raise ValueError("routed MoE override does not preserve model boundaries")
+    local_widths = [intermediate * weight // total for weight in weights]
+    if any(width % 32 for width in local_widths):
+        raise ValueError(
+            "routed MoE override must preserve 32-value MXFP4 quant groups"
+        )
+    return weights
+
+
 def _weighted_segment_slice(
     value: mx.array,
     *,
@@ -3286,6 +3336,9 @@ class Model(nn.Module):
         N = group.size()
         rank = group.rank()
         shard_weights = _validated_ds4_tp_weights(self.args, group)
+        moe_shard_weights = _validated_ds4_moe_tp_weights(
+            self.args, group, shard_weights
+        )
         for layer in self.model.layers:
             layer.attn.sharding_group = group
             indexer = getattr(layer.attn, "indexer", None)
@@ -3345,17 +3398,17 @@ class Model(nn.Module):
                 layer.ffn.switch_mlp.gate_proj,
                 "all-to-sharded",
                 group=group,
-                weights=shard_weights,
+                weights=moe_shard_weights,
             )
             _shard_inplace_weighted(
                 layer.ffn.switch_mlp.down_proj,
                 "sharded-to-all",
                 group=group,
-                weights=shard_weights,
+                weights=moe_shard_weights,
             )
             _shard_inplace_weighted(
                 layer.ffn.switch_mlp.up_proj,
                 "all-to-sharded",
                 group=group,
-                weights=shard_weights,
+                weights=moe_shard_weights,
             )

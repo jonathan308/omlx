@@ -169,7 +169,7 @@ class _FakeGroup:
         return self._size
 
 
-def _tiny_ds4f(dsv4, *, heads=4):
+def _tiny_ds4f(dsv4, *, heads=4, moe_intermediate=4):
     """4 heads / 2 o_groups, so TP=2 interleaves: rank r keeps head r of each
     group — [0, 2] and [1, 3] — not the contiguous halves [0, 1] / [2, 3]."""
     args = dsv4.ModelArgs.from_dict(
@@ -178,7 +178,7 @@ def _tiny_ds4f(dsv4, *, heads=4):
             "vocab_size": 32,
             "hidden_size": 8,
             "intermediate_size": 16,
-            "moe_intermediate_size": 4,
+            "moe_intermediate_size": moe_intermediate,
             "num_hidden_layers": 2,
             "num_attention_heads": heads,
             "num_key_value_heads": 1,
@@ -268,6 +268,92 @@ def test_ds4f_unequal_tp_keeps_paired_head_and_mlp_boundaries(dsv4, monkeypatch)
             assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == (
                 3 if rank == 0 else 1
             )
+
+
+def test_ds4f_moe_override_keeps_outer_attention_and_shared_split(
+    dsv4, monkeypatch
+):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,1")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "2,2")
+    for rank in (0, 1):
+        model = _tiny_ds4f(dsv4, heads=8, moe_intermediate=128)
+        model.shard(_FakeGroup(rank, 2))
+        for layer in model.model.pipeline_layers:
+            # Attention and dense/shared MLPs retain the signed outer 3:1.
+            assert layer.attn.n_heads == (6 if rank == 0 else 2)
+            assert layer.ffn.shared_experts.gate_proj.weight.shape[0] == (
+                96 if rank == 0 else 32
+            )
+            assert layer.ffn.shared_experts.down_proj.weight.shape[1] == (
+                96 if rank == 0 else 32
+            )
+            # Only routed expert banks move to the explicit equal split.
+            assert layer.ffn.switch_mlp.gate_proj.weight.shape[1] == 64
+            assert layer.ffn.switch_mlp.up_proj.weight.shape[1] == 64
+            assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == 64
+
+
+def test_ds4f_moe_override_reconstructs_routed_banks_exactly(dsv4, monkeypatch):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,1")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "2,2")
+    mx.random.seed(101)
+    reference = _tiny_ds4f(dsv4, heads=8, moe_intermediate=128)
+    ref = reference.model.pipeline_layers[0].ffn.switch_mlp
+    gate_shards = []
+    up_shards = []
+    down_shards = []
+    for rank in (0, 1):
+        mx.random.seed(101)
+        model = _tiny_ds4f(dsv4, heads=8, moe_intermediate=128)
+        model.shard(_FakeGroup(rank, 2))
+        routed = model.model.pipeline_layers[0].ffn.switch_mlp
+        gate_shards.append(routed.gate_proj.weight)
+        up_shards.append(routed.up_proj.weight)
+        down_shards.append(routed.down_proj.weight)
+
+    rebuilt_gate = mx.concatenate(gate_shards, axis=1)
+    rebuilt_up = mx.concatenate(up_shards, axis=1)
+    rebuilt_down = mx.concatenate(down_shards, axis=2)
+    mx.eval(rebuilt_gate, rebuilt_up, rebuilt_down)
+    assert mx.array_equal(rebuilt_gate, ref.gate_proj.weight).item()
+    assert mx.array_equal(rebuilt_up, ref.up_proj.weight).item()
+    assert mx.array_equal(rebuilt_down, ref.down_proj.weight).item()
+
+
+@pytest.mark.parametrize(
+    "outer, override, intermediate, message",
+    (
+        (None, "2,2", 128, "requires a signed unequal outer"),
+        ((3, 1), "4", 128, "one positive weight per TP rank"),
+        ((3, 1), "2,0", 128, "one positive weight per TP rank"),
+        ((3, 1), "3,3", 128, "must sum"),
+        ((3, 1), "2,2", 130, "not divisible"),
+        ((3, 1), "1,3", 96, "32-value MXFP4"),
+    ),
+)
+def test_ds4f_moe_override_fails_before_sharding(
+    dsv4, monkeypatch, outer, override, intermediate, message
+):
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", override)
+    args = SimpleNamespace(moe_intermediate_size=intermediate)
+    with pytest.raises(ValueError, match=message):
+        dsv4._validated_ds4_moe_tp_weights(args, _FakeGroup(0, 2), outer)
+
+
+def test_ds4f_moe_override_default_reuses_outer_weights(dsv4, monkeypatch):
+    monkeypatch.delenv("OMLX_TP_MOE_SHARD_WEIGHTS", raising=False)
+    args = SimpleNamespace(moe_intermediate_size=2048)
+    assert dsv4._validated_ds4_moe_tp_weights(
+        args, _FakeGroup(0, 2), (3, 5)
+    ) == (3, 5)
+
+
+def test_real_ds4f_three_five_outer_accepts_equal_moe_banks(dsv4, monkeypatch):
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
+    args = SimpleNamespace(moe_intermediate_size=2048)
+    assert dsv4._validated_ds4_moe_tp_weights(
+        args, _FakeGroup(0, 2), (3, 5)
+    ) == (4, 4)
 
 
 def test_unequal_tp_slices_quantized_values_on_exact_group_boundaries(dsv4):

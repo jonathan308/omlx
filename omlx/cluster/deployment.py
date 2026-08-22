@@ -120,6 +120,10 @@ _RANK_ENV_DEFAULTS = (
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.
     ("OMLX_DSV4_MOE_TAIL8", "0"),
+    # Optional routed-MoE-only TP split layered over a signed unequal outer
+    # plan. Empty preserves the outer split. One hostfile value is exported to
+    # every rank so a mixed plan cannot diverge locally.
+    ("OMLX_TP_MOE_SHARD_WEIGHTS", ""),
     # Large standalone output projections are exact row shards. The default
     # threshold avoids adding a collective to small models where it cannot
     # repay its latency, while keeping every rank on the same decision.
