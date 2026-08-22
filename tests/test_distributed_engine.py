@@ -756,6 +756,38 @@ async def test_distributed_transport_error_reports_bounded_launcher_exit():
 
 
 @pytest.mark.asyncio
+async def test_distributed_transport_error_marks_ready_runtime_terminal(monkeypatch):
+    def handler(request):
+        raise httpx.RemoteProtocolError(
+            "server disconnected",
+            request=request,
+        )
+
+    engine = _ready_engine(handler)
+    engine._supervisor.status = lambda: SimpleNamespace(
+        returncode=None,
+        failure_reason=None,
+        phase="ready",
+        stderr_tail=("request accepted",),
+    )
+
+    async def no_wait(_delay):
+        return None
+
+    monkeypatch.setattr(distributed.asyncio, "sleep", no_wait)
+    try:
+        with pytest.raises(
+            DistributedInferenceError,
+            match="connection closed while the cluster was ready",
+        ):
+            await engine.generate("hello")
+        assert engine.runtime_failed_reason is not None
+        assert "connection closed" in engine.runtime_failed_reason
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_distributed_engine_rejects_unimplemented_grammar():
     def handler(request):
         raise AssertionError("backend should not be called")

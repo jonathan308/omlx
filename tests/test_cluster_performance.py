@@ -372,23 +372,47 @@ class _WorkerGroup:
         (_WorkerGroup(), None, [0]),
     ],
 )
-def test_mtp_token_collective_uses_signed_transport(
+def test_mtp_token_decision_uses_point_to_point_transport(
     monkeypatch, group, proposal, expected_input
 ):
     observed = []
 
-    def all_sum(value, group=None):
-        observed.append((value.dtype, value.tolist()))
+    def send(value, target):
+        observed.append(("send", target, value.dtype, value.tolist()))
+        return value
+
+    def recv_like(value, source):
+        observed.append(("recv", source, value.dtype, value.tolist()))
         return mx.array([129279], dtype=mx.int32)
 
-    monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+    monkeypatch.setattr(mx.distributed, "send", send)
+    monkeypatch.setattr(mx.distributed, "recv_like", recv_like)
     coordinator = _MTPVocabCoordinator(mx, group, output_size=129280)
 
     result = coordinator.sync_tokens(proposal, (1,))
 
-    assert observed == [(mx.int32, expected_input)]
+    if group.rank() == 0:
+        assert observed == [("send", 1, mx.int32, expected_input)]
+    else:
+        assert observed == [("recv", 0, mx.int32, expected_input)]
     assert result.dtype == mx.uint32
     assert result.tolist() == [129279]
+
+
+def test_mtp_decision_packet_uses_point_to_point_transport(monkeypatch):
+    observed = []
+
+    def send(value, target):
+        observed.append((target, value.dtype, value.tolist()))
+        return value
+
+    monkeypatch.setattr(mx.distributed, "send", send)
+    coordinator = _MTPVocabCoordinator(mx, _Group(), output_size=129280)
+
+    result = coordinator.sync_packet(mx.array([3, 42, 7]), 3)
+
+    assert result == [3, 42, 7]
+    assert observed == [(1, mx.int32, [3, 42, 7])]
 
 
 def test_asymmetric_tensor_capability_reports_the_local_fraction(monkeypatch):
@@ -488,12 +512,12 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
         execution_profile("balanced"),
         sampling_rank_only=True,
     )
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(
         mx.distributed,
-        "all_sum",
-        lambda value, group=None: value,
+        "recv_like",
+        lambda value, _source: mx.array([3], dtype=mx.int32),
     )
-    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
@@ -830,7 +854,7 @@ def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch
         "recv_like",
         lambda value, source: mx.array([[4.0, 5.0, 9.0]]),
     )
-    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx.distributed, "send", lambda value, _target: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     with install_runtime_optimizations(
@@ -891,8 +915,8 @@ def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token
     )
     monkeypatch.setattr(
         mx.distributed,
-        "all_sum",
-        lambda value, group=None: mx.array([5], dtype=mx.uint32),
+        "recv_like",
+        lambda value, _source: mx.array([5], dtype=mx.int32),
     )
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 

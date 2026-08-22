@@ -365,41 +365,54 @@ class _MTPVocabCoordinator:
         self.mx.eval(sent)
         return None
 
+    def _broadcast_int32(self, value: Any | None, shape: tuple[int, ...]) -> Any:
+        """Broadcast one tiny rank-zero decision without a JACCL reduction.
+
+        These values are decisions, not partial results. Expressing a broadcast
+        as ``all_sum(rank0_value, worker_zeros)`` needlessly routes them through
+        JACCL's reduction kernel. More importantly, repeated 1--7 element
+        reductions can return an uninitialised high-bit value on one peer under
+        sustained MTP traffic even though the large tensor collectives remain
+        healthy. A chained point-to-point send is both less work and matches
+        the actual protocol: rank zero owns the decision and every worker
+        consumes that exact value.
+
+        Keep the send result in the returned lazy graph. This avoids adding a
+        host synchronization to the decode loop while ensuring every send is
+        evaluated before a caller can consume the decision.
+        """
+
+        if self.is_coordinator:
+            if value is None or tuple(value.shape) != shape:
+                raise RuntimeError("MTP coordinator produced an invalid decision")
+            broadcast = value.astype(self.mx.int32)
+            for target in range(1, self.world_size):
+                broadcast = self.mx.distributed.send(broadcast, target)
+            return broadcast
+
+        template = self.mx.zeros(shape, dtype=self.mx.int32)
+        return self.mx.distributed.recv_like(template, 0)
+
     def sync_tokens(self, proposal: Any | None, shape: tuple[int, ...]) -> Any:
-        # Token IDs are always below 2**31.  Keep the transport representation
-        # signed: the decision-packet path below already uses int32 and is the
-        # path exercised most heavily by JACCL.  More importantly, returning a
-        # uint32 token lets a corrupted high bit survive until MLX interprets
-        # the Python value as an array index, where it kills mlx-lm's private
-        # generation thread with the opaque "Slice indices must be 32-bit"
-        # error.  The final uint32 cast retains GenerationBatch's cache-input
-        # contract while making the collective itself fail in the signed
-        # token-ID domain.
         if self.is_coordinator:
             if proposal is None:
                 raise RuntimeError("MTP coordinator produced no token proposal")
-            value = proposal.astype(self.mx.int32)
+            value = proposal
         else:
-            value = self.mx.zeros(shape, dtype=self.mx.int32)
-        return self.mx.distributed.all_sum(value, group=self.group).astype(
-            self.mx.uint32
-        )
+            value = None
+        return self._broadcast_int32(value, shape).astype(self.mx.uint32)
 
     def sync_packet(self, packet: Any | None, length: int) -> list[int]:
-        if self.is_coordinator:
-            if packet is None or tuple(packet.shape) != (length,):
-                raise RuntimeError("MTP coordinator produced an invalid decision packet")
-            value = packet.astype(self.mx.int32)
-        else:
-            value = self.mx.zeros((length,), dtype=self.mx.int32)
-        value = self.mx.distributed.all_sum(value, group=self.group)
+        value = self._broadcast_int32(packet, (length,))
         return [int(item) for item in value.tolist()]
 
     def sync_scalar(self, value: int) -> int:
-        packet = self.mx.array(
-            [int(value)] if self.is_coordinator else [0], dtype=self.mx.int32
+        packet = (
+            self.mx.array([int(value)], dtype=self.mx.int32)
+            if self.is_coordinator
+            else None
         )
-        packet = self.mx.distributed.all_sum(packet, group=self.group)
+        packet = self._broadcast_int32(packet, (1,))
         return int(packet.item())
 
 
@@ -1054,10 +1067,17 @@ def install_runtime_optimizations(
         else:
             sampled = mx.zeros((len(instance.uids),), dtype=mx.int32)
 
-        # Rank zero contributes the selected IDs; all other ranks contribute
-        # zeros. Every rank therefore advances the same local KV state without
-        # gathering a hidden-state tensor.
-        sampled = mx.distributed.all_sum(sampled, group=group)
+        # Rank zero owns the sampled IDs. Broadcast them point-to-point rather
+        # than reducing worker zeros into the decision: tiny JACCL reductions
+        # are unnecessary here and have a distinct corruption failure mode
+        # under sustained decode traffic.
+        if coordinator:
+            broadcast = sampled
+            for target in range(1, int(group.size())):
+                broadcast = mx.distributed.send(broadcast, target)
+            sampled = broadcast
+        else:
+            sampled = mx.distributed.recv_like(sampled, 0)
         instance._next_tokens = sampled.astype(mx.uint32)
         instance._next_logprobs = list(logprobs)
         mx.async_eval(

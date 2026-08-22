@@ -432,12 +432,8 @@ class DistributedBatchedEngine(BatchedEngine):
         """
 
         status = self._supervisor.status()
-        for _ in range(5):
-            if (
-                status.failure_reason
-                or status.returncode is not None
-                or status.stderr_tail
-            ):
+        for _ in range(40):
+            if status.failure_reason or status.returncode is not None:
                 break
             await asyncio.sleep(0.05)
             status = self._supervisor.status()
@@ -460,8 +456,12 @@ class DistributedBatchedEngine(BatchedEngine):
                 f"rank-zero connection closed while the cluster was "
                 f"{status.phase} ({type(exc).__name__})"
             )
-        if status.failure_reason or status.returncode is not None:
-            self._mark_runtime_failed(detail)
+        # The endpoint is loopback and private to this engine. A connection
+        # disappearing mid-request means the rank-zero serving contract is no
+        # longer trustworthy even when mlx.launch has not published its exit
+        # code yet. Mark it terminal now so the pool hides the stale model and
+        # tears the deployment down as soon as this request lease drains.
+        self._mark_runtime_failed(detail)
         kind = "stream" if stream else "request"
         return DistributedInferenceError(f"rank-zero inference {kind} failed: {detail}")
 
