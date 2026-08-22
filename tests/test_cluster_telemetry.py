@@ -531,6 +531,76 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     assert mlx_server.BatchGenerator is FakeBatchGenerator
 
 
+def test_pipeline_cache_plan_requires_rank_and_physical_coherence(monkeypatch):
+    import struct
+
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class FakePromptCache:
+        value = "rank-zero-cache"
+
+        def fetch_nearest_cache(self, _model, tokens):
+            return self.value, tokens[2:]
+
+        def __len__(self):
+            return 1
+
+        nbytes = 64
+
+    class ControlPlane:
+        peer_plan = (2, 2, 0)
+
+        def __init__(self):
+            self.calls = []
+
+        def broadcast_owned_bytes(self, payload, *, source_rank, expected_size):
+            self.calls.append((source_rank, payload))
+            assert expected_size == 24
+            return (
+                payload
+                if source_rank == 0
+                else struct.pack("!QQQ", *self.peer_plan)
+            )
+
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+    control = ControlPlane()
+
+    with install_server_telemetry(
+        _Marker(),
+        prefill_guard=None,
+        control_plane=control,
+    ):
+        cache = mlx_server.LRUPromptCache()
+        tokens = [1, 2, 3, 4]
+
+        # Identical rank plans preserve each stage's local cache object.
+        assert cache.fetch_nearest_cache("model", tokens) == (
+            "rank-zero-cache",
+            [3, 4],
+        )
+
+        # A peer miss would post a four-row receive for this rank's two-row
+        # activation. Both ranks instead discard their cache and prefill four.
+        control.peer_plan = (0, 4, 0)
+        assert cache.fetch_nearest_cache("model", tokens) == (None, tokens)
+
+        # Equal advertised suffixes are also rejected when the copied cache is
+        # physically still at four tokens after an unsupported arbitrary trim.
+        FakePromptCache.value = [
+            SimpleNamespace(caches=(SimpleNamespace(offset=4),))
+        ]
+        control.peer_plan = (2, 2, 1)
+        assert cache.fetch_nearest_cache("model", tokens) == (None, tokens)
+
+    assert [source for source, _payload in control.calls] == [0, 1] * 3
+
+
 def test_server_patch_broadcasts_distributed_request_with_checked_gather(monkeypatch):
     import mlx.core as mx
     import mlx_lm.server as mlx_server

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 import shutil
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -978,9 +979,100 @@ def install_server_telemetry(
             ssd_cache_dir, step=snapshot_step, max_entries=ssd_max_entries
         )
     try:
-        world_size = int(mx.distributed.init().size())
+        group = mx.distributed.init()
+        world_size = int(group.size())
+        rank = int(group.rank())
     except Exception:
         world_size = 1
+        rank = 0
+
+    def prompt_cache_positions(cache: Any) -> tuple[int, ...]:
+        """Best-effort logical token positions for a rank-local cache copy."""
+
+        positions: list[int] = []
+        for item in cache or ():
+            nested = getattr(item, "caches", None)
+            entries = nested if isinstance(nested, (list, tuple)) else (item,)
+            for entry in entries:
+                # DS4 PoolingCache.offset counts compressed rows rather than
+                # source tokens.  Reconstruct the logical source position so
+                # a failed arbitrary trim cannot masquerade as a valid hit.
+                ratio = getattr(entry, "ratio", None)
+                remainder = getattr(entry, "remainder", None)
+                pooled = getattr(entry, "_pool_len", None)
+                if all(isinstance(value, int) for value in (ratio, remainder, pooled)):
+                    positions.append(int(pooled) * int(ratio) + int(remainder))
+                    continue
+                offset = getattr(entry, "offset", None)
+                if isinstance(offset, int):
+                    positions.append(offset)
+        return tuple(positions)
+
+    def agree_prompt_cache_plan(
+        cache: Any,
+        tokens: list[int],
+        rest: list[int],
+    ) -> tuple[Any, list[int]]:
+        """Use a cache only when every rank will prefill the same suffix.
+
+        Pipeline stages can have different cache types.  In particular, one
+        DS4 stage may be able to trim a longer cached conversation to a common
+        prefix while another stage containing a recurrent cache cannot.  The
+        stock rank-local lookup then gives the stages different input lengths;
+        JACCL reports ``IBV_WC_LOC_LEN_ERR`` when the activation send reaches a
+        receive posted for the other length.
+
+        Exchange both the reused-prefix and suffix lengths before the first
+        model call.  Any disagreement makes every rank discard its local copy
+        and perform the same full prefill.  The reliable TCP control plane is
+        preferred because these are owned scalar values, not tensor
+        reductions; the fixed-shape reduction is retained for older launchers.
+        """
+
+        if world_size <= 1:
+            return cache, rest
+
+        reused = len(tokens) - len(rest) if cache is not None else 0
+        suffix = len(rest) if cache is not None else len(tokens)
+        positions = prompt_cache_positions(cache)
+        incoherent = int(any(position != reused for position in positions))
+        local = (reused, suffix, incoherent)
+        plans: list[tuple[int, int, int]] = []
+        if control_plane is not None:
+            for source in range(world_size):
+                payload = (
+                    struct.pack("!QQQ", *local) if rank == source else None
+                )
+                packet = control_plane.broadcast_owned_bytes(
+                    payload,
+                    source_rank=source,
+                    expected_size=24,
+                )
+                plans.append(struct.unpack("!QQQ", packet))
+        else:
+            fields = [0] * (3 * world_size)
+            fields[3 * rank : 3 * rank + 3] = local
+            agreed = mx.distributed.all_sum(
+                mx.array(fields, dtype=mx.int32)
+            )
+            mx.eval(agreed)
+            values = [int(value) for value in agreed.tolist()]
+            plans = [
+                tuple(values[3 * source : 3 * source + 3])
+                for source in range(world_size)
+            ]
+
+        if not any(plan[2] for plan in plans) and all(
+            plan == plans[0] for plan in plans[1:]
+        ):
+            return cache, rest
+
+        logger.warning(
+            "Prompt-cache plan diverged across ranks (%s); rebuilding the "
+            "request with a full synchronized prefill",
+            plans,
+        )
+        return None, list(tokens)
 
     def agree_ssd_boundary(model: Any, tokens: list[int]) -> int:
         """Longest prefix boundary every rank can restore for ``tokens``, or 0.
@@ -1256,7 +1348,7 @@ def install_server_telemetry(
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            return cache, rest
+            return agree_prompt_cache_plan(cache, tokens, rest)
 
         def prefetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
             """Look up once during caught preflight, then hand it to MLX-LM."""
