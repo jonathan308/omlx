@@ -395,6 +395,7 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
             "deepseek_v4_fused_decode_attention",
             "deepseek_v4_adaptive_prefill",
             "deepseek_v4_prefill_yield",
+            "deepseek_v4_prefill_async",
         )
     }
     payload = _marker(
@@ -425,6 +426,7 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
     )
     assert job["optimizations"]["deepseek_v4_adaptive_prefill"]["active"] is True
     assert job["optimizations"]["deepseek_v4_prefill_yield"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_prefill_async"]["active"] is True
 
 
 def test_runtime_markers_ignore_symlinks_and_invalid_json(tmp_path):

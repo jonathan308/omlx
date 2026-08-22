@@ -617,6 +617,7 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
             "deepseek_v4_fused_decode_attention",
             "deepseek_v4_adaptive_prefill",
             "deepseek_v4_prefill_yield",
+            "deepseek_v4_prefill_async",
         ):
             optional = capabilities.get(key)
             if optional is None:
