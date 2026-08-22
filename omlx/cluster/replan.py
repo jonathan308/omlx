@@ -25,6 +25,9 @@ Derivation caveats (documented contract, not bugs):
   the split control must pass explicit ``nodes``.
 - KV reservations and per-rank context limits are recomputed by the planner
   from ``target_context_tokens``, never copied forward.
+- Signed performance profiles *are* copied forward.  Dropping them silently
+  turns a heterogeneous tensor deployment back into an equal split on every
+  replan, even when the previous activation already measured both ranks.
 """
 
 from __future__ import annotations
@@ -42,18 +45,24 @@ def nodes_from_deployment(deployment: ClusterDeployment) -> list[dict[str, Any]]
     recoverable from a signed plan and are reset to automatic.
     """
 
+    profiles = {
+        (profile.rank, profile.node_id): profile
+        for profile in deployment.performance_profiles
+    }
     nodes: list[dict[str, Any]] = []
     for assignment in sorted(deployment.assignments, key=lambda item: item.rank):
-        nodes.append(
-            {
-                "node_id": assignment.node_id,
-                "capacity_bytes": assignment.capacity_bytes,
-                "reserve_bytes": assignment.reserve_bytes,
-                "manual_memory_limit": assignment.manual_memory_limit,
-                "role": assignment.role or "headless",
-                "memory_guard_tier": assignment.memory_guard_tier,
-            }
-        )
+        payload: dict[str, Any] = {
+            "node_id": assignment.node_id,
+            "capacity_bytes": assignment.capacity_bytes,
+            "reserve_bytes": assignment.reserve_bytes,
+            "manual_memory_limit": assignment.manual_memory_limit,
+            "role": assignment.role or "headless",
+            "memory_guard_tier": assignment.memory_guard_tier,
+        }
+        profile = profiles.get((assignment.rank, assignment.node_id))
+        if profile is not None:
+            payload["performance"] = profile.to_dict()
+        nodes.append(payload)
     return nodes
 
 
