@@ -114,6 +114,64 @@ def _approval_for(payload: dict) -> str:
     return routes._placement_signature(plan.to_dict())
 
 
+def test_operator_qualified_tp_weights_are_default_absent(monkeypatch):
+    monkeypatch.delenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", raising=False)
+
+    assert (
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=2,
+            node_count=2,
+        )
+        is None
+    )
+
+
+def test_operator_qualified_tp_weights_parse_one_pure_stage(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3, 5")
+
+    assert routes._operator_qualified_tp_shard_weights(
+        tensor_parallel_size=2,
+        node_count=2,
+    ) == ((3, 5),)
+
+
+@pytest.mark.parametrize(
+    ("value", "tensor_parallel_size", "node_count", "match"),
+    [
+        ("3,nope", 2, 2, "must contain exactly"),
+        ("3", 2, 2, "must contain exactly"),
+        ("3,0", 2, 2, "must contain exactly"),
+        ("3,5", 2, 3, "supported only for pure tensor parallelism"),
+    ],
+)
+def test_operator_qualified_tp_weights_reject_unsafe_shapes(
+    monkeypatch,
+    value,
+    tensor_parallel_size,
+    node_count,
+    match,
+):
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", value)
+
+    with pytest.raises(routes.PlanningError, match=match):
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=tensor_parallel_size,
+            node_count=node_count,
+        )
+
+
+def test_operator_qualified_tp_weights_are_ignored_for_pipeline(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3,5")
+
+    assert (
+        routes._operator_qualified_tp_shard_weights(
+            tensor_parallel_size=1,
+            node_count=2,
+        )
+        is None
+    )
+
+
 class _ReadyClusterEngine:
     def __init__(self, deployment, *, fail_canary: bool = False):
         self.deployment = deployment

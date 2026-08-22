@@ -2411,6 +2411,11 @@ def plan_hybrid(
             for node, weight in zip(stage_groups[0], weights)
         )
         if not fits:
+            if qualified_tensor_shard_weights is not None:
+                raise PlanningError(
+                    "qualified tensor shard weights do not fit every pure-TP "
+                    "rank's memory and weight ceilings"
+                )
             stage_shard_weights[0] = (1,) * tensor_parallel_size
 
     # MLX-LM sends activations from the highest rank (early layers) down to rank

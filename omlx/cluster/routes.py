@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -808,6 +809,50 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
     }
 
 
+_QUALIFIED_TP_SHARD_WEIGHTS_ENV = "OMLX_TP_QUALIFIED_SHARD_WEIGHTS"
+
+
+def _operator_qualified_tp_shard_weights(
+    *,
+    tensor_parallel_size: int,
+    node_count: int,
+) -> tuple[tuple[int, ...], ...] | None:
+    """Parse the coordinator-only experimental pure-TP shard override.
+
+    The setting is deliberately absent from every request schema: only the
+    operator controlling the coordinator process can qualify a vector.  It is
+    ignored for pipeline-only planning and rejected for hybrid topology.  The
+    planner still validates the model's exact shard-unit sum and memory fit;
+    workers never read this environment variable and derive their weights from
+    the signed rank assignments.
+    """
+
+    raw = os.environ.get(_QUALIFIED_TP_SHARD_WEIGHTS_ENV)
+    if raw is None or tensor_parallel_size <= 1:
+        return None
+    if tensor_parallel_size != node_count:
+        raise PlanningError(
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} is supported only for pure "
+            "tensor parallelism across every selected node"
+        )
+    value = raw.strip()
+    if not value or len(value) > 4096:
+        raise PlanningError(
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} must be a comma-separated "
+            "vector of positive integers"
+        )
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != tensor_parallel_size or any(
+        re.fullmatch(r"[1-9][0-9]*", part) is None for part in parts
+    ):
+        raise PlanningError(
+            f"{_QUALIFIED_TP_SHARD_WEIGHTS_ENV} must contain exactly "
+            f"{tensor_parallel_size} comma-separated positive integers in "
+            "rank order"
+        )
+    return (tuple(int(part) for part in parts),)
+
+
 def _create_cluster_plan(request: ClusterPlanRequest):
     if (
         request.tensor_parallel_size > 1
@@ -856,6 +901,12 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=(
+                _operator_qualified_tp_shard_weights(
+                    tensor_parallel_size=request.tensor_parallel_size,
+                    node_count=len(nodes),
+                )
+            ),
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
@@ -1185,6 +1236,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             measurements = {}
 
     try:
+        qualified_tensor_shard_weights = (
+            _operator_qualified_tp_shard_weights(
+                tensor_parallel_size=len(nodes),
+                node_count=len(nodes),
+            )
+            if request.strategy != "pipeline"
+            else None
+        )
         choice = choose_parallelism(
             model,
             nodes,
@@ -1194,6 +1253,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             measurements=measurements,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1301,6 +1361,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             tensor_parallel_size=choice.tensor_parallel_size,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=(
+                qualified_tensor_shard_weights
+                if choice.tensor_parallel_size > 1
+                else None
+            ),
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -2895,6 +2960,12 @@ def _build_performance_plan(
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
+            qualified_tensor_shard_weights=(
+                _operator_qualified_tp_shard_weights(
+                    tensor_parallel_size=tensor_parallel_size,
+                    node_count=len(nodes),
+                )
+            ),
         )
     return plan_unequal_pipeline(
         model,
