@@ -529,9 +529,11 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
         batchable=True,
     ) as capabilities:
         assert capabilities["rank_zero_logits"]["active"] is True
-        mlx_generate.GenerationBatch._step(batch)
+        tokens, _ = mlx_generate.GenerationBatch._step(batch)
 
     assert model.calls == [True]
+    assert tokens == [3]
+    assert type(tokens[0]) is int
     assert len(batch._next_logprobs) == 1
     assert batch._next_logprobs[0].shape == (32,)
 

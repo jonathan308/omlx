@@ -1563,7 +1563,14 @@ def install_runtime_optimizations(
         )
 
         mx.eval(inputs, instance._current_logprobs)
-        input_values = inputs.tolist()
+        # MLX uint32 scalar/list values are valid model tokens but are not
+        # valid Python indexing objects on every MLX build. The private
+        # server later indexes ``r.logprobs[r.token]`` and pipeline canaries
+        # exposed this as "Slice indices must be 32-bit integers" after the
+        # fourth token. Flatten the batch decision and publish ordinary Python
+        # ints at the Response boundary; the device-side next-token array stays
+        # uint32 and all collective ordering is unchanged.
+        input_values = [int(token) for token in inputs.reshape(-1).tolist()]
         for sequence_tokens, token in zip(instance.tokens, input_values):
             sequence_tokens.append(token)
         return input_values, instance._current_logprobs
