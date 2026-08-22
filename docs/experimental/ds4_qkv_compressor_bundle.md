@@ -72,6 +72,27 @@ position, cache, or distributed argument. Each bank must retain stock MLX's
 per-row K walk/reduction and one BF16 store; only dispatch packaging and shared
 activation loads may change.
 
+The first isolated implementation uses one MLX primitive and command encoder
+but queues two Metal dispatches: an unequal-row MXFP8 Q-A/raw-KV bank and a
+four-buffer BF16 dense bank. Both write directly into the packed output; there
+is no host boundary or intermediate concatenation. The native diagnostic
+`deepseek_v4_qkv_compressor_bundle_b1_dispatches()` reports `2`. No production
+model path references either symbol.
+
+### Fixed B1 result (2026-08-22)
+
+All six packed slices are array-equal to both separate stock projections and
+the exact grouped-stock baseline on M3 Ultra and M5 Max. The implementation
+does not pass the 1.05x performance gate:
+
+| Host | Native (2 dispatches) | Grouped stock (2) | Separate (6) | Speedup vs faster baseline |
+|---|---:|---:|---:|---:|
+| M3 Ultra | 0.2474 ms | 0.2372 ms | 0.2435 ms | 0.959x |
+| M5 Max | 0.3891 ms | 0.3707 ms | 0.3838 ms | 0.953x |
+
+The symbol therefore remains isolated and unused. Machine-readable results
+are in `ds4_qkv_compressor_bundle_b1_results_2026-08-22.json`.
+
 ## Gates
 
 The B1 gate compares all six slices with `mx.array_equal`, then compares

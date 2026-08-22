@@ -277,6 +277,31 @@ def _abba(
     return result
 
 
+def _balanced_timings(
+    evaluate: Callable[[Any], None],
+    functions: dict[str, Callable[[], Any]],
+    cycles: int,
+) -> dict[str, dict[str, float]]:
+    names = tuple(functions)
+    for _ in range(3):
+        for name in names:
+            evaluate(functions[name]())
+    samples = {name: [] for name in names}
+    orders = (
+        names,
+        tuple(reversed(names)),
+        names[1:] + names[:1],
+        tuple(reversed(names[1:] + names[:1])),
+    )
+    for _ in range(cycles):
+        for order in orders:
+            for name in order:
+                start = time.perf_counter_ns()
+                evaluate(functions[name]())
+                samples[name].append((time.perf_counter_ns() - start) / 1e6)
+    return {name: _summary(values) for name, values in samples.items()}
+
+
 def run_stock_probe(model: Path, layer: int, rows: int, cycles: int) -> dict[str, Any]:
     """Measure only already-available MLX groupings; not the native candidate."""
 
@@ -378,12 +403,166 @@ def run_stock_probe(model: Path, layer: int, rows: int, cycles: int) -> dict[str
     }
 
 
+def run_native_b1_probe(
+    model: Path,
+    layer: int,
+    cycles: int,
+    min_speedup: float,
+) -> dict[str, Any]:
+    """Run the fixed ratio-4 native bundle against both exact baselines."""
+
+    import mlx.core as mx
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if LAYER_RATIOS[layer] != 4:
+        raise ValueError("native B1 probe requires a ratio-4 layer")
+    if not fast.has_symbol(NATIVE_B1_SYMBOL):
+        raise RuntimeError(f"native bundle symbol {NATIVE_B1_SYMBOL!r} unavailable")
+
+    index = json.loads((model / "model.safetensors.index.json").read_text())["weight_map"]
+    files: dict[str, Any] = {}
+
+    def load(key: str):
+        filename = index[key]
+        if filename not in files:
+            files[filename] = mx.load(str(model / filename))
+        return files[filename][key]
+
+    def load_quant(name: str):
+        return (
+            load(_tensor_key(layer, name)).view(mx.uint32),
+            load(_tensor_key(layer, name, "scales")),
+        )
+
+    q_a = load_quant("wq_a")
+    raw_kv = load_quant("wkv")
+    dense = [
+        load(_tensor_key(layer, spec.name))
+        for spec in projections(4)
+        if spec.storage == "bf16"
+    ]
+    q_group = (
+        mx.concatenate((q_a[0], raw_kv[0]), axis=0),
+        mx.concatenate((q_a[1], raw_kv[1]), axis=0),
+    )
+    dense_group = mx.concatenate(dense, axis=0)
+    mx.eval(*q_a, *raw_kv, *dense, *q_group, dense_group)
+    mx.random.seed(42002)
+    x = mx.random.normal((1, HIDDEN)).astype(mx.bfloat16)
+    mx.eval(x)
+
+    qmm_kwargs = dict(
+        transpose=True,
+        group_size=32,
+        bits=8,
+        mode="mxfp8",
+    )
+
+    def qmm(pair):
+        return mx.quantized_matmul(
+            x,
+            pair[0],
+            scales=pair[1],
+            biases=None,
+            **qmm_kwargs,
+        )
+
+    def separate():
+        return (qmm(q_a), qmm(raw_kv), *(x @ weight.T for weight in dense))
+
+    def grouped():
+        quant = qmm(q_group)
+        packed_dense = x @ dense_group.T
+        result = [quant[:, :Q_RANK], quant[:, Q_RANK:]]
+        cursor = 0
+        for weight in dense:
+            result.append(packed_dense[:, cursor : cursor + weight.shape[0]])
+            cursor += weight.shape[0]
+        return tuple(result)
+
+    slices = packed_slices(4)
+
+    def native():
+        packed = fast.deepseek_v4_qkv_compressor_bundle_b1(
+            x,
+            q_a[0],
+            q_a[1],
+            raw_kv[0],
+            raw_kv[1],
+            *dense,
+        )
+        return tuple(packed[:, start:stop] for start, stop in slices.values())
+
+    def evaluate(values):
+        mx.eval(*values)
+        mx.synchronize()
+
+    separate_value = separate()
+    grouped_value = grouped()
+    native_value = native()
+    evaluate(separate_value)
+    evaluate(grouped_value)
+    evaluate(native_value)
+    native_vs_separate = [
+        bool(mx.array_equal(actual, expected).item())
+        for actual, expected in zip(native_value, separate_value)
+    ]
+    native_vs_grouped = [
+        bool(mx.array_equal(actual, expected).item())
+        for actual, expected in zip(native_value, grouped_value)
+    ]
+    grouped_vs_separate = [
+        bool(mx.array_equal(actual, expected).item())
+        for actual, expected in zip(grouped_value, separate_value)
+    ]
+
+    timings = _balanced_timings(
+        evaluate,
+        {"separate": separate, "grouped": grouped, "native": native},
+        cycles,
+    )
+    faster_baseline = min(
+        timings["separate"]["median_ms"], timings["grouped"]["median_ms"]
+    )
+    speedup = faster_baseline / timings["native"]["median_ms"]
+    passed = (
+        all(native_vs_separate)
+        and all(native_vs_grouped)
+        and all(grouped_vs_separate)
+        and speedup >= min_speedup
+    )
+    return {
+        "device": mx.device_info(),
+        "layer": layer,
+        "ratio": 4,
+        "rows": 1,
+        "packed_slices": slices,
+        "dispatches": {
+            "separate": 6,
+            "grouped": 2,
+            "native": fast.deepseek_v4_qkv_compressor_bundle_b1_dispatches(),
+        },
+        "projection_array_equal": {
+            "native_vs_separate": native_vs_separate,
+            "native_vs_grouped": native_vs_grouped,
+            "grouped_vs_separate": grouped_vs_separate,
+        },
+        "timings": timings,
+        "speedup_vs_faster_baseline": speedup,
+        "min_speedup": min_speedup,
+        "passed": passed,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path)
     parser.add_argument("--layer", type=int, default=2)
     parser.add_argument("--rows", default="1,1024")
     parser.add_argument("--cycles", type=int, default=12)
+    parser.add_argument("--min-speedup", type=float, default=1.05)
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
     report = analysis_report()
     if args.model:
@@ -393,6 +572,15 @@ def main() -> None:
             run_stock_probe(model, args.layer, int(rows), args.cycles)
             for rows in args.rows.split(",")
         ]
+        try:
+            report["native_b1_probe"] = run_native_b1_probe(
+                model, args.layer, args.cycles, args.min_speedup
+            )
+        except RuntimeError as exc:
+            report["native_b1_probe"] = {"available": False, "error": str(exc)}
+        if args.strict and not report["native_b1_probe"].get("passed", False):
+            print(json.dumps(report, indent=2, sort_keys=True))
+            raise SystemExit(2)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

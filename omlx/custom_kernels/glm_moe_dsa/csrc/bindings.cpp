@@ -5,6 +5,7 @@
 
 #include "dsa_indexer.h"
 #include "ds4_prefill_moe.h"
+#include "ds4_qkv_bundle.h"
 #include "deepseek_v4_sparse_attention.h"
 #include "dspark_gemm.h"
 #include "dspark_qmv.h"
@@ -207,6 +208,22 @@ NB_MODULE(_ext, m) {
       "activation_limit"_a = 10.0f,
       "variant"_a = 2,
       "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor_bundle_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "compressor_wkv"_a,
+      "compressor_wgate"_a,
+      "index_compressor_wkv"_a,
+      "index_compressor_wgate"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor_bundle_b1_dispatches",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1_dispatches);
   m.def(
       "deepseek_affine_gather_qmm_blocks",
       &omlx::glm_kernels::deepseek_affine_gather_qmm_blocks,

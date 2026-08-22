@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from benchmarks.bench_ds4_qkv_compressor_bundle import (
@@ -58,8 +59,30 @@ def test_first_native_abi_stops_before_ape_and_cache_mutation():
 
 def test_symbol_remains_outside_production_until_gate_passes():
     root = Path(__file__).parents[1]
+    allowed = {root / "omlx/custom_kernels/glm_moe_dsa/fast.py"}
     hits = []
     for path in (root / "omlx").rglob("*.py"):
-        if NATIVE_B1_SYMBOL in path.read_text():
+        if path not in allowed and NATIVE_B1_SYMBOL in path.read_text():
             hits.append(path)
     assert hits == []
+
+
+def test_recorded_b1_gate_is_lossless_but_rejected_on_both_hosts():
+    report = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "docs/experimental/ds4_qkv_compressor_bundle_b1_results_2026-08-22.json"
+        ).read_text()
+    )
+    assert report["dispatches"] == {
+        "separate": 6,
+        "grouped_stock": 2,
+        "native": 2,
+    }
+    for host in report["hosts"].values():
+        assert host["all_six_slices_exact_vs_separate"] is True
+        assert host["all_six_slices_exact_vs_grouped"] is True
+        assert host["speedup_vs_faster_baseline"] < 1.05
+        assert host["passed"] is False
+    assert report["outcome"]["promoted"] is False
+    assert report["outcome"]["production_dispatch"] is False
