@@ -850,32 +850,6 @@ class _TelemetryQueue:
         return self._queue.put(item, *args, **kwargs)
 
 
-class _RankSynchronousTimeBudget:
-    """Yield exactly one model step before the next rank-control round.
-
-    MLX-LM's distributed ``TimeBudget`` runs up to 25 ``BatchGenerator.next``
-    calls before ranks exchange their cancellation list. On heterogeneous Macs,
-    the faster worker can cross the prompt/decode boundary while rank zero is
-    still finishing the prior step. The resulting collectives have different
-    shapes (for example ``[1, 1, 4096]`` versus ``[1, 7, 4096]``), which looks
-    like an RDMA completion loss but is actually rank schedule divergence.
-
-    One step per outer round makes rank zero's existing request and cancellation
-    broadcasts the schedule boundary. It also admits newly queued continuous-
-    batch requests every token instead of only after a 25-step burst.
-    """
-
-    def __iter__(self) -> "_RankSynchronousTimeBudget":
-        self._pending = True
-        return self
-
-    def __next__(self) -> None:
-        if not getattr(self, "_pending", False):
-            raise StopIteration
-        self._pending = False
-        return None
-
-
 @contextmanager
 def install_server_telemetry(
     marker: MarkerWriter,
@@ -1036,46 +1010,6 @@ def install_server_telemetry(
                 if isinstance(item, (tuple, list)) and len(item) > 1
             )
 
-        def _synchronize_rank_transition(self) -> None:
-            # Drain any lazy final-layer collective before the next differently
-            # shaped graph is constructed. Then use a two-way control barrier;
-            # rank-zero sendall alone is not an acknowledgement.
-            mx.synchronize(self.stream)
-            if control_plane is not None:
-                try:
-                    control_plane.barrier()
-                except RuntimeError as exc:
-                    current = getattr(self, "_currently_processing", ())
-                    pending = getattr(self, "_unprocessed_sequences", ())
-                    state = {
-                        "prompt_uids": list(
-                            getattr(getattr(self, "_prompt_batch", None), "uids", ())
-                        ),
-                        "generation_uids": list(
-                            getattr(
-                                getattr(self, "_generation_batch", None),
-                                "uids",
-                                (),
-                            )
-                        ),
-                        "current_segments": [
-                            [len(segment) for segment in item[0]]
-                            for item in current
-                            if isinstance(item, (tuple, list)) and item
-                        ],
-                        "pending_segments": [
-                            [len(segment) for segment in item[1]]
-                            for item in pending
-                            if isinstance(item, (tuple, list)) and len(item) > 1
-                        ],
-                    }
-                    raise RuntimeError(
-                        f"{exc}; local batch state={state}"
-                    ) from exc
-                return
-            vote = mx.distributed.all_sum(mx.array(1, dtype=mx.int32))
-            mx.eval(vote)
-
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
             telemetry.bind_pending_uid(uids)
@@ -1182,16 +1116,9 @@ def install_server_telemetry(
                     ),
                     flush=True,
                 )
-            if at_boundary:
-                self._synchronize_rank_transition()
             started = time.perf_counter()
             prompt_responses, generation_responses = super().next()
             elapsed = time.perf_counter() - started
-            if any(
-                getattr(response, "finish_reason", None) is not None
-                for response in generation_responses
-            ):
-                self._synchronize_rank_transition()
             for response in prompt_responses:
                 progress = getattr(response, "progress", None)
                 uid = getattr(response, "uid", None)
@@ -1314,14 +1241,6 @@ def install_server_telemetry(
             self.__dict__["_omlx_local_should_stop"] = bool(value)
 
     class TelemetryResponseGenerator(original):
-        def _generate(self) -> Any:
-            # Set on the instance from inside the generation thread. Replacing
-            # mlx_lm.server.TimeBudget globally is insufficient when a rank has
-            # already bound the original class object; this guarantees the same
-            # one-step schedule on every process before its first request.
-            self._time_budget = _RankSynchronousTimeBudget()
-            return super()._generate()
-
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
