@@ -22,6 +22,7 @@ from omlx.cluster.performance import NodePerformanceProfile
 from omlx.cluster.planner import (
     ModelLayout,
     NodeBudget,
+    PlanningError,
     _deepseek_v4_compress_ratios,
     _kv_bytes_for_stage,
     _kv_bytes_per_token_per_layer,
@@ -30,6 +31,7 @@ from omlx.cluster.planner import (
     _max_context_for_stage,
     _tensor_parallel_divisors,
     _tensor_parallel_shard_units,
+    _tensor_shard_weights,
     _supports_tensor_parallel,
     inspect_safetensors_layout,
     plan_hybrid,
@@ -462,7 +464,7 @@ def _performance(node_id, rank, rate):
     )
 
 
-def test_measured_ds4f_tp_assigns_five_eighths_to_the_faster_mac():
+def test_synthetic_ds4f_tp_candidate_does_not_self_promote():
     layout = _ds4f_layout(layer_weight_bytes=(20 * GIB,) * 4)
     nodes = [
         NodeBudget(
@@ -481,11 +483,65 @@ def test_measured_ds4f_tp_assigns_five_eighths_to_the_faster_mac():
         ),
     ]
 
+    candidate = _tensor_shard_weights(
+        layout,
+        nodes,
+        workload_profile="balanced",
+    )
     plan = plan_hybrid(layout, nodes, tensor_parallel_size=2)
+
+    assert candidate == (5, 3)
+    assert [item.tensor_parallel_shard_weight for item in plan.assignments] == [4, 4]
+    assert [item.layer_weight_bytes // GIB for item in plan.assignments] == [40, 40]
+    assert max(item.predicted_stage_seconds for item in plan.assignments) > 0
+
+
+def test_e2e_qualified_ds4f_tp_can_assign_five_eighths_to_faster_mac():
+    layout = _ds4f_layout(layer_weight_bytes=(20 * GIB,) * 4)
+    nodes = [
+        NodeBudget(
+            node_id="m3-ultra",
+            capacity_bytes=128 * GIB,
+            reserve_bytes=2 * GIB,
+            rank=0,
+            performance=_performance("m3-ultra", 0, 100e9),
+        ),
+        NodeBudget(
+            node_id="m5-max",
+            capacity_bytes=128 * GIB,
+            reserve_bytes=2 * GIB,
+            rank=1,
+            performance=_performance("m5-max", 1, 60e9),
+        ),
+    ]
+
+    plan = plan_hybrid(
+        layout,
+        nodes,
+        tensor_parallel_size=2,
+        qualified_tensor_shard_weights=((5, 3),),
+    )
 
     assert [item.tensor_parallel_shard_weight for item in plan.assignments] == [5, 3]
     assert [item.layer_weight_bytes // GIB for item in plan.assignments] == [50, 30]
-    assert max(item.predicted_stage_seconds for item in plan.assignments) > 0
+
+
+@pytest.mark.parametrize(
+    "weights, message",
+    (
+        (((5, 2),), "sum"),
+        (((5, 3, 1),), "positive integers"),
+        (((5, 0),), "positive integers"),
+    ),
+)
+def test_e2e_qualified_ds4f_tp_weights_fail_closed(weights, message):
+    with pytest.raises(PlanningError, match=message):
+        plan_hybrid(
+            _ds4f_layout(),
+            _nodes(2, capacity_gib=128),
+            tensor_parallel_size=2,
+            qualified_tensor_shard_weights=weights,
+        )
 
 
 def test_kv_fixed_term_is_reserved_on_top_of_per_token_growth():

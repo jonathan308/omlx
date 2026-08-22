@@ -2091,25 +2091,38 @@ def _tp_profile_rate(
     return 1.0 / seconds_per_byte
 
 
+def _equal_tensor_shard_weights(
+    model: ModelLayout,
+    size: int,
+) -> tuple[int, ...]:
+    """Return the architecture's exact equal TP partition."""
+
+    units = int(model.tensor_parallel_shard_units)
+    if units < size or units % size:
+        return (1,) * size
+    return (units // size,) * size
+
+
 def _tensor_shard_weights(
     model: ModelLayout,
     group: Sequence[NodeBudget],
     *,
     workload_profile: ExecutionProfileName,
 ) -> tuple[int, ...]:
-    """Choose the fastest exact integer shard allocation for one TP group.
+    """Nominate an asymmetric shard allocation from synthetic rank probes.
 
     The adapter-declared unit count is deliberately small (DS4 has eight), so
-    Hamilton apportionment gives a deterministic near-optimal split. We retain
-    equal sharding unless the measured critical path improves by at least 2%;
-    noisy probes therefore cannot turn a symmetric graph asymmetric.
+    Hamilton apportionment gives a deterministic candidate.  This function is
+    advisory: generic matrix probes do not model architecture-specific kernel
+    shapes, replicated work, or collective changes, so ``plan_hybrid`` never
+    activates its result without separately qualified end-to-end evidence.
     """
 
     size = len(group)
     units = int(model.tensor_parallel_shard_units)
+    equal = _equal_tensor_shard_weights(model, size)
     if units < size or units % size:
-        return (1,) * size
-    equal = (units // size,) * size
+        return equal
     if not all(node.performance is not None for node in group):
         return equal
     rates = [
@@ -2242,6 +2255,7 @@ def plan_hybrid(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    qualified_tensor_shard_weights: Sequence[Sequence[int]] | None = None,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
@@ -2330,14 +2344,50 @@ def plan_hybrid(
         tuple(ordered_nodes[stage * tensor_parallel_size : (stage + 1) * tensor_parallel_size])
         for stage in range(pipeline_stages)
     ]
-    stage_shard_weights = [
-        _tensor_shard_weights(
-            model,
-            group,
-            workload_profile=workload_profile,
-        )
-        for group in stage_groups
-    ]
+    # Synthetic matrix rates remain useful diagnostics and pipeline-planning
+    # inputs, but live DS4 A/B proved they can predict the wrong TP layout:
+    # 5:3 was estimated faster and measured 5.6% slower in decode and 15-16%
+    # slower in prefill than 4:4.  Equal sharding is therefore the safe default.
+    # An asymmetric vector enters a signed plan only after a matched full-model
+    # calibration explicitly qualifies it and passes it here.
+    if qualified_tensor_shard_weights is None:
+        stage_shard_weights = [
+            _equal_tensor_shard_weights(model, tensor_parallel_size)
+            for _group in stage_groups
+        ]
+    else:
+        if len(qualified_tensor_shard_weights) != pipeline_stages:
+            raise PlanningError(
+                "qualified tensor shard weights must contain one vector per "
+                "pipeline stage"
+            )
+        units = int(model.tensor_parallel_shard_units)
+        if units < tensor_parallel_size or units % tensor_parallel_size:
+            raise PlanningError(
+                "this model does not declare an exact asymmetric TP partition"
+            )
+        stage_shard_weights = []
+        for stage, raw_weights in enumerate(qualified_tensor_shard_weights):
+            if (
+                len(raw_weights) != tensor_parallel_size
+                or any(
+                    isinstance(weight, bool)
+                    or not isinstance(weight, int)
+                    or weight < 1
+                    for weight in raw_weights
+                )
+            ):
+                raise PlanningError(
+                    f"qualified tensor shard weights for stage {stage} must "
+                    f"contain {tensor_parallel_size} positive integers"
+                )
+            weights = tuple(int(weight) for weight in raw_weights)
+            if sum(weights) != units:
+                raise PlanningError(
+                    f"qualified tensor shard weights for stage {stage} must "
+                    f"sum to the model's {units} exact shard units"
+                )
+            stage_shard_weights.append(weights)
 
     # A performance split is useful only if the larger shard still fits. For
     # the executable pure-TP topology the layer range is already known, so

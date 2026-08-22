@@ -710,6 +710,7 @@ _PLACEMENT_FIELDS = (
     "memory_guard_tier",
     "tensor_parallel_rank",
     "tensor_parallel_size",
+    "tensor_parallel_shard_weight",
 )
 
 

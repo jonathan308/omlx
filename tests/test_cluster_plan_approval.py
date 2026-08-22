@@ -662,6 +662,34 @@ def test_the_approval_signature_ignores_tuning_that_moves_no_layer(cluster):
     assert routes._placement_signature(coarse) == routes._placement_signature(fine)
 
 
+def test_the_approval_signature_binds_tensor_shard_weights():
+    row = {
+        "rank": 0,
+        "node_id": "local",
+        "start_layer": 0,
+        "end_layer": 43,
+        "planned_weight_bytes": 100,
+        "kv_cache_bytes": 1,
+        "max_context_tokens": 32768,
+        "reserve_bytes": 10,
+        "capacity_bytes": 200,
+        "manual_memory_limit": False,
+        "role": "headless",
+        "memory_guard_tier": "balanced",
+        "tensor_parallel_rank": 0,
+        "tensor_parallel_size": 2,
+        "tensor_parallel_shard_weight": 4,
+    }
+    equal = {"assignments": [row]}
+    asymmetric = {
+        "assignments": [row | {"tensor_parallel_shard_weight": 5}]
+    }
+
+    assert routes._placement_signature(equal) != routes._placement_signature(
+        asymmetric
+    )
+
+
 def test_an_approved_plan_survives_auto_tune_when_the_probe_cannot_run(
     cluster, monkeypatch
 ):
