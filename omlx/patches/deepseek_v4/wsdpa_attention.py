@@ -11,9 +11,9 @@ necessary FLOPs (measured 39-48 ms per layer-call at L=2048, head_dim=512).
 This module computes the identical math with a single fused Metal kernel that
 visits only visible rows (fp32 online softmax in fixed row order, sink in the
 denominator). Any setup/runtime failure permanently falls back to the stock
-path; OMLX_DSV4_WSDPA=0 disables the kernel outright. TP=2's 32-head shard
-uses the same kernel only for query widths >=1024; OMLX_DSV4_WSDPA_TP=0 is an
-independent rollback for that route.
+path; OMLX_DSV4_WSDPA=0 disables the kernel outright. TP=2's equal 32/32 and
+measured heterogeneous 40/24 head shards use the same kernel only for query
+widths >=1024; OMLX_DSV4_WSDPA_TP=0 is an independent rollback for that route.
 """
 
 import logging
@@ -39,11 +39,15 @@ def _wsdpa_route_enabled(*, topk: bool = False) -> bool:
 
 
 def _supported_head_shape(heads: int, query_tokens: int) -> bool:
-    """Exact DS4 full-head or measured TP4/4 WSDPA geometry."""
+    """Exact DS4 full-head or validated TP2 WSDPA geometries."""
 
     if heads == 64:
         return True
-    return bool(_TP_ENABLED and heads == 32 and query_tokens >= _TP_MIN_QUERY)
+    return bool(
+        _TP_ENABLED
+        and heads in (24, 32, 40)
+        and query_tokens >= _TP_MIN_QUERY
+    )
 
 
 def wsdpa_prefill_route_active(*, topk: bool = False) -> bool:

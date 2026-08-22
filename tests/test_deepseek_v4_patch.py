@@ -1500,7 +1500,7 @@ class TestDeepseekV4CompressedNativeAttention:
 
         assert result is None
 
-    @pytest.mark.parametrize("heads", (64, 32))
+    @pytest.mark.parametrize("heads", (64, 40, 32, 24))
     def test_topk_wsdpa_dispatch_ignores_native_sparse_disable(
         self, applied_patch, monkeypatch, heads
     ):

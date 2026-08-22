@@ -1148,7 +1148,7 @@ def _sparse_pooled_attention(
         and q.dtype in (mx.float16, mx.bfloat16)
         and topk.dtype == mx.uint32
         and B >= 1
-        and H in (32, 64)
+        and H in (24, 32, 40, 64)
         and L > 4
         and D == 512
         and local_kv.ndim == 4
@@ -1173,8 +1173,8 @@ def _sparse_pooled_attention(
             if out is not None:
                 return out
         # The separate native sparse kernel is still specialized to the full
-        # 64-head model. TP=2/H=32 either returned through WSDPA above or keeps
-        # the exact composed fallback below.
+        # 64-head model. TP=2/H in {24, 32, 40} either returned through WSDPA
+        # above or keeps the exact composed fallback below.
         if H == 64 and not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
             try:
                 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
