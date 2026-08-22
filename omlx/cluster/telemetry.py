@@ -109,6 +109,7 @@ class RuntimeTelemetry:
         self._uid_to_request: dict[Any, int] = {}
         self._request_to_uid: dict[int, Any] = {}
         self._request_contexts: dict[int, Any] = {}
+        self._request_queues: dict[int, Any] = {}
         self._pending_uid = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
@@ -330,6 +331,13 @@ class RuntimeTelemetry:
             if request_id in self._requests:
                 self._request_contexts[request_id] = context
 
+    def register_response_queue(self, request_id: int, queue: Any) -> None:
+        """Retain the raw rank-local queue so shared removal can terminate it."""
+
+        with self._lock:
+            if request_id in self._requests:
+                self._request_queues[request_id] = queue
+
     def bind_pending_uid(self, uids: Any) -> None:
         """Bind MLX-LM's generated batch UID to the observed queue request."""
 
@@ -359,22 +367,32 @@ class RuntimeTelemetry:
             return
         now = float(self._clock())
         changed = False
+        queues_to_close: list[Any] = []
         with self._lock:
             for uid in uid_values:
                 request_id = self._uid_to_request.pop(uid, None)
                 if request_id is None:
                     continue
                 self._request_to_uid.pop(request_id, None)
-                changed = (
-                    self._finish_locked(
-                        request_id,
-                        now=now,
-                        status="cancelled",
-                    )
-                    or changed
+                queue = self._request_queues.get(request_id)
+                finished = self._finish_locked(
+                    request_id,
+                    now=now,
+                    status="cancelled",
                 )
+                if finished and queue is not None:
+                    queues_to_close.append(queue)
+                changed = finished or changed
             if changed:
                 self._publish_locked(now, force=True)
+        # Wake the rank-zero HTTP collector only after releasing telemetry's
+        # lock. Worker dummy queues receive the same terminal sentinel, which
+        # is harmless and keeps queue semantics symmetric.
+        for queue in queues_to_close:
+            try:
+                queue.put(None)
+            except Exception as exc:
+                logger.debug("Could not terminate cancelled response queue: %s", exc)
 
     def register_batch_generator(self, generator: Any) -> None:
         """Remember the live generator for telemetry, never rank-local removal."""
@@ -573,6 +591,7 @@ class RuntimeTelemetry:
             self._pending_uid.request_id = None
         uid = self._request_to_uid.pop(request_id, None)
         self._request_contexts.pop(request_id, None)
+        self._request_queues.pop(request_id, None)
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
@@ -825,6 +844,7 @@ class _TelemetryQueue:
         self._queue = queue
         self._telemetry = telemetry
         self._request_id = telemetry.begin_request()
+        telemetry.register_response_queue(self._request_id, queue)
         self._finished = False
 
     def put(self, item: Any, *args: Any, **kwargs: Any) -> Any:

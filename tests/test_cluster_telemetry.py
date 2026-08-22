@@ -307,6 +307,27 @@ def test_queue_observer_preserves_mlx_lm_queue_contract():
     assert snapshot["completion_tokens_total"] == 1
 
 
+def test_shared_uid_removal_terminates_the_waiting_response_queue():
+    telemetry = RuntimeTelemetry(_Marker(), publish_interval=0)
+    target = _Queue()
+    queue = _TelemetryQueue(target, telemetry)
+    context = SimpleNamespace(
+        prompt=[1, 2, 3],
+        prompt_cache_count=0,
+        stop=lambda: None,
+    )
+    queue.put(context)
+    telemetry.bind_pending_uid((91,))
+
+    telemetry.cancel_uids([91])
+
+    assert [item[0] for item in target.items] == [context, None]
+    snapshot = telemetry.snapshot()
+    assert snapshot["active_requests"] == 0
+    assert snapshot["requests_cancelled"] == 1
+    assert snapshot["last_request"]["status"] == "cancelled"
+
+
 def test_telemetry_marker_failure_never_interrupts_inference():
     class BrokenMarker:
         def update(self, phase, **extra):
