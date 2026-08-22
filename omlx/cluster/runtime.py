@@ -205,6 +205,10 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         value.get("aggregate_decode_tps", 0.0),
         "metrics aggregate_decode_tps",
     )
+    result["aggregate_wall_tps"] = _nonnegative_float(
+        value.get("aggregate_wall_tps", 0.0),
+        "metrics aggregate_wall_tps",
+    )
 
     cache = value.get("cache")
     if cache is not None:

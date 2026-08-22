@@ -73,6 +73,46 @@ def test_telemetry_calculates_ttft_prefill_and_decode_rates():
     assert marker.updates[-1][0] == "ready"
 
 
+def test_aggregate_decode_tps_uses_decode_time_not_uptime():
+    """Idle uptime must not dilute the aggregate decode rate.
+
+    The old divisor (process uptime) reported ~2 tok/s on a deployment whose
+    requests decoded at ~23 tok/s, because a serving rank is mostly idle
+    between requests.
+    """
+    clock = _Clock()
+    marker = _Marker()
+    telemetry = RuntimeTelemetry(marker, clock=clock, publish_interval=0)
+    request_id = telemetry.begin_request()
+    telemetry.observe_context(request_id, prompt_tokens=10, cached_tokens=0)
+
+    clock.value = 10.0  # queue + prefill before the first decoded token
+    telemetry.observe_token(request_id)
+    clock.value = 11.0
+    telemetry.observe_token(request_id)
+    clock.value = 12.0
+    telemetry.finish_request(request_id)
+
+    # 90 s of idle uptime before anyone reads the marker.
+    clock.value = 102.0
+    snapshot = telemetry.snapshot()
+    # 2 tokens over the 2 s decode window (first token -> finish).
+    assert snapshot["aggregate_decode_tps"] == 1.0
+    # The old semantic survives under an honest name.
+    assert snapshot["aggregate_wall_tps"] == 2 / 102.0
+
+    # An in-flight request contributes its decode window while active.
+    request_id = telemetry.begin_request()
+    telemetry.observe_context(request_id, prompt_tokens=4, cached_tokens=0)
+    clock.value = 202.0
+    telemetry.observe_token(request_id)
+    clock.value = 204.0
+    telemetry.observe_token(request_id)
+    snapshot = telemetry.snapshot()
+    # (2 finished tokens + 2 active) / (2 s finished + 2 s active).
+    assert snapshot["aggregate_decode_tps"] == 1.0
+
+
 def test_telemetry_publishes_live_mlx_lm_prefill_progress():
     clock = _Clock()
     marker = _Marker()
@@ -134,6 +174,51 @@ def test_telemetry_publishes_live_mlx_lm_prefill_progress():
     assert request["prefill_progress"]["active"] is False
     assert request["prefill_progress"]["processed"] == 8_000
     assert request["ttft_seconds"] == 8.25
+
+
+def test_completed_prefill_progress_clock_stops_at_prefill_end():
+    """Decode time must not leak into prefill_progress elapsed/average.
+
+    Observed on the live TP=2 deployment: a request with ttft 2.49 s reported
+    prefill_progress.elapsed 25.3 s and average_speed 16 tok/s because the
+    snapshot divided processed tokens by (finish_time - prefill_start).
+    """
+
+    clock = _Clock()
+    telemetry = RuntimeTelemetry(_Marker(), clock=clock, publish_interval=0)
+    request_id = telemetry.begin_request()
+
+    clock.value = 0.5
+    telemetry.observe_context(request_id, prompt_tokens=407, cached_tokens=0)
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((73,))
+
+    # Single 407-token chunk finishes prefill at t=2.99 (≈163 tok/s).
+    clock.value = 2.99
+    telemetry.observe_prefill_progress(73, processed_tokens=407, total_tokens=407)
+    telemetry.observe_token(request_id)
+
+    # Decode runs for ~23 s, then the request finishes.
+    clock.value = 26.0
+    for _ in range(545):
+        telemetry.observe_token(request_id)
+    telemetry.finish_request(request_id)
+
+    request = telemetry.snapshot()["last_request"]
+    progress = request["prefill_progress"]
+    assert request["ttft_seconds"] == 2.99
+    assert request["elapsed_seconds"] == 26.0
+    assert progress["active"] is False
+    # Frozen at the final chunk callback, not at finish time.
+    assert progress["elapsed"] == 2.49
+    assert progress["average_speed"] == 407 / 2.49
+    assert request["prefill_tps"] == 407 / 2.99
+
+    # A later heartbeat re-snapshot must not age the completed prefill either.
+    clock.value = 60.0
+    progress = telemetry.snapshot()["last_request"]["prefill_progress"]
+    assert progress["elapsed"] == 2.49
+    assert progress["average_speed"] == 407 / 2.49
 
 
 def test_live_prefill_separates_recent_chunk_rate_from_sustained_average():

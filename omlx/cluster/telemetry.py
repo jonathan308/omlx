@@ -108,6 +108,11 @@ class RuntimeTelemetry:
         self._prompt_tokens_total = 0
         self._completion_tokens_total = 0
         self._cached_tokens_total = 0
+        # Sum of per-request decode windows (first-token -> finish) for
+        # finished requests. aggregate_decode_tps divides generated tokens by
+        # this decode time, not by process uptime: uptime is mostly idle, so
+        # the old divisor reported ~2 tok/s while requests decoded at ~23.
+        self._decode_seconds_total = 0.0
         self._batch_steps = 0
         self._busy_seconds = 0.0
         self._idle_seconds = 0.0
@@ -539,6 +544,8 @@ class RuntimeTelemetry:
         self._prompt_tokens_total += sample.prompt_tokens
         self._completion_tokens_total += sample.completion_tokens
         self._cached_tokens_total += sample.cached_tokens
+        if sample.first_token_at is not None and sample.completion_tokens > 0:
+            self._decode_seconds_total += max(0.0, now - sample.first_token_at)
         self._last_completed = self._sample_snapshot(
             sample,
             now=now,
@@ -573,7 +580,26 @@ class RuntimeTelemetry:
             max(0, sample.prefill_processed_tokens),
         )
         prefill_started_at = sample.prefill_started_at or sample.started_at
-        prefill_elapsed = max(0.0, now - prefill_started_at)
+        prefill_active = status == "running" and first is None
+        # Freeze the prefill clock when prefill is done. ``now`` is the
+        # snapshot/finish instant, so an unfrozen elapsed keeps growing through
+        # the whole decode phase (observed: elapsed 25.3 s with ttft 2.49 s)
+        # and average_speed collapses to a few tok/s on every long decode.
+        # The last progress callback lands with the final chunk; when no
+        # callback ever arrived, the first token is the honest upper bound.
+        if prefill_active:
+            prefill_end = now
+        elif (
+            prefill_total > 0
+            and prefill_processed >= prefill_total
+            and sample.prefill_updated_at is not None
+        ):
+            prefill_end = sample.prefill_updated_at
+        elif first is not None:
+            prefill_end = first
+        else:
+            prefill_end = now
+        prefill_elapsed = max(0.0, prefill_end - prefill_started_at)
         prefill_average_speed = (
             prefill_processed / prefill_elapsed
             if prefill_processed > 0 and prefill_elapsed > 0
@@ -584,7 +610,6 @@ class RuntimeTelemetry:
             # processed prompt tokens divided by total time so far. The recent
             # chunk remains separate below for ETA and diagnostics.
             prefill_tps = prefill_average_speed or sample.prefill_speed
-        prefill_active = status == "running" and first is None
         prefill_remaining = max(0, prefill_total - prefill_processed)
         prefill_eta = (
             prefill_remaining / sample.prefill_speed
@@ -636,6 +661,12 @@ class RuntimeTelemetry:
         )
         uptime = max(0.0, now - self._started_at)
         total_generated = self._completion_tokens_total + active_completion_tokens
+        active_decode_seconds = sum(
+            now - sample.first_token_at
+            for sample in self._requests.values()
+            if sample.first_token_at is not None
+        )
+        decode_seconds = self._decode_seconds_total + active_decode_seconds
         utilization_denominator = self._busy_seconds + self._idle_seconds
         pipeline_utilization = (
             self._busy_seconds / utilization_denominator
@@ -654,7 +685,12 @@ class RuntimeTelemetry:
             "prompt_tokens_total": self._prompt_tokens_total,
             "completion_tokens_total": self._completion_tokens_total,
             "cached_tokens_total": self._cached_tokens_total,
-            "aggregate_decode_tps": (total_generated / uptime if uptime > 0 else 0.0),
+            "aggregate_decode_tps": (
+                total_generated / decode_seconds if decode_seconds > 0 else 0.0
+            ),
+            # The pre-fix semantic (tokens / process uptime, idle included),
+            # kept under an honest name for capacity planning views.
+            "aggregate_wall_tps": (total_generated / uptime if uptime > 0 else 0.0),
             "cache": {
                 "affinity": (
                     "deployment"
