@@ -95,7 +95,8 @@ from .planner import (
     synthetic_model_layout,
 )
 from .probe import collect_cluster_status
-from .registry import get_cluster_registry
+from .registry import get_cluster_registry, get_device_registry
+from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -3070,11 +3071,45 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
     }
 
 
+def _requested_links_fast(nodes: list[ClusterPlanNodeRequest]) -> bool:
+    """Whether every requested peer sits on a fast (JACCL/Thunderbolt) link.
+
+    The catalogue's default tie-break prefers pipeline at equal width because
+    it survives slow links; when the paired registry shows every requested
+    peer is reachable over JACCL/Thunderbolt RDMA, tensor parallelism is the
+    better recommendation — it splits per-token compute across the group.
+    The coordinator's own row is not in the paired registry, so only
+    non-self node_ids are consulted. Unknown or unpaired peers fail closed:
+    pipeline stays the recommendation where tensor would crawl.
+    """
+
+    if len(nodes) < 2:
+        return False
+    try:
+        identity = get_node_identity()
+        registry = get_device_registry()
+    except RuntimeError:
+        return False
+    for node in nodes:
+        if node.node_id == identity.node_id:
+            continue
+        if not registry.is_paired(node.node_id):
+            return False
+        record = registry.get(node.node_id) or {}
+        caps = record.get("caps")
+        if not isinstance(caps, dict):
+            return False
+        if not (caps.get("jaccl") or caps.get("thunderbolt")):
+            return False
+    return True
+
+
 def _catalogue_for_candidates(
     candidates: list[ClusterCatalogueModelRequest],
     nodes: list[NodeBudget],
     *,
     workload_profile: str,
+    prefer_tensor: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -3097,6 +3132,7 @@ def _catalogue_for_candidates(
                 model_id=candidate.id,
                 declared_context_tokens=candidate.model_context_length,
                 workload_profile=workload_profile,
+                prefer_tensor=prefer_tensor,
             )
         except (OSError, PlanningError, RuntimeError, ValueError) as exc:
             fit = ModelFit(
@@ -3137,6 +3173,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
     """
 
     nodes = _node_budgets(request.nodes)
+    prefer_tensor = _requested_links_fast(request.nodes)
 
     paths = [Path(item) for item in request.model_paths]
     if request.model_dir:
@@ -3158,6 +3195,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
             request.models,
             nodes,
             workload_profile=request.execution_profile,
+            prefer_tensor=prefer_tensor,
         )
     else:
         catalogue = await asyncio.to_thread(
@@ -3165,6 +3203,7 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
             paths,
             nodes,
             workload_profile=request.execution_profile,
+            prefer_tensor=prefer_tensor,
         )
         model_rows = [fit.to_dict() for fit in catalogue]
     runnable = [row for row in model_rows if row["fits"]]
