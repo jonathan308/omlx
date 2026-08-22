@@ -512,12 +512,12 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
         execution_profile("balanced"),
         sampling_rank_only=True,
     )
-    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(
         mx.distributed,
-        "recv_like",
-        lambda value, _source: mx.array([3], dtype=mx.int32),
+        "all_sum",
+        lambda value, group=None: value,
     )
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
     monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
@@ -854,7 +854,7 @@ def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch
         "recv_like",
         lambda value, source: mx.array([[4.0, 5.0, 9.0]]),
     )
-    monkeypatch.setattr(mx.distributed, "send", lambda value, _target: value)
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     with install_runtime_optimizations(
@@ -915,8 +915,8 @@ def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token
     )
     monkeypatch.setattr(
         mx.distributed,
-        "recv_like",
-        lambda value, _source: mx.array([5], dtype=mx.int32),
+        "all_sum",
+        lambda value, group=None: mx.array([5], dtype=mx.int32),
     )
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
