@@ -20,6 +20,7 @@ from mlx_lm.models.switch_layers import SwitchLinear
 
 from omlx.cluster.tensor_strategies import (
     _gather_vocab_logits,
+    _native_layerwise_shard,
     _shard_auxiliary_vocab_heads,
     _shard_output_head,
     _shard_switch_mlp_uneven,
@@ -37,6 +38,55 @@ class _FakeGroup:
 
     def size(self):
         return self._size
+
+
+def test_ds4_native_sharding_materializes_only_the_lazy_local_slice(monkeypatch):
+    class Layer:
+        def __init__(self, name):
+            self.value = name + "-full"
+
+        def parameters(self):
+            return [self.value]
+
+    class Model:
+        model_type = "deepseek_v4"
+
+        def __init__(self):
+            self.layers = [Layer("zero"), Layer("one")]
+
+        def shard(self, _group):
+            assert len(self.layers) == 1
+            layer = self.layers[0]
+            layer.value = layer.value.replace("-full", "-shard")
+
+    class FakeMX:
+        def __init__(self):
+            self.evaluated = []
+            self.syncs = 0
+            self.clears = 0
+
+        def eval(self, values):
+            self.evaluated.extend(values)
+
+        def synchronize(self):
+            self.syncs += 1
+
+        def clear_cache(self):
+            self.clears += 1
+
+    model = Model()
+    fake_mx = FakeMX()
+    monkeypatch.delenv("OMLX_TP_LAZY_NATIVE_SHARD", raising=False)
+    monkeypatch.setattr(
+        "omlx.cluster.tensor_strategies.native_shard_is_layer_local",
+        lambda _shard: (True, "test"),
+    )
+
+    _native_layerwise_shard(model, _FakeGroup(0), fake_mx, None)
+
+    assert fake_mx.evaluated == ["zero-shard", "one-shard"]
+    assert fake_mx.syncs == fake_mx.clears == 2
+    assert [layer.value for layer in model.layers] == ["zero-shard", "one-shard"]
 
 
 def _linear_with_weight(weight):

@@ -9,6 +9,7 @@ models whose installed MLX-LM class already implements ``shard()``.
 from __future__ import annotations
 
 import ast
+import gc
 import inspect
 import os
 import textwrap
@@ -21,6 +22,7 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 _VOCAB_PARALLEL_MODE_ENV = "OMLX_CLUSTER_VOCAB_PARALLEL"
 _VOCAB_PARALLEL_MIN_BYTES_ENV = "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES"
 _VOCAB_PARALLEL_MIN_BYTES = 256 * 1024**2
+_LAZY_NATIVE_SHARD_ENV = "OMLX_TP_LAZY_NATIVE_SHARD"
 
 
 @dataclass(frozen=True)
@@ -572,12 +574,29 @@ def _native_layerwise_shard(
     if not original or any(layer is None for layer in original):
         raise RuntimeError("native tensor sharding requires a complete model")
     total = len(original)
+    lazy_mode = os.environ.get(_LAZY_NATIVE_SHARD_ENV, "auto").strip().lower()
+    if lazy_mode not in {"auto", "1", "true", "on", "0", "false", "off"}:
+        raise ValueError(
+            f"{_LAZY_NATIVE_SHARD_ENV} must be auto, on, or off; got {lazy_mode!r}"
+        )
+    lazy_before_shard = lazy_mode in {"1", "true", "on"} or (
+        lazy_mode == "auto" and _model_type(model).startswith("deepseek_v4")
+    )
     try:
         for index, layer in enumerate(original):
-            mx.eval(layer.parameters())
+            if not lazy_before_shard:
+                mx.eval(layer.parameters())
             owner.layers = [layer]
             model.shard(group)
             mx.eval(layer.parameters())
+            # Drop the full lazy source graph before the next 3–4 GB layer is
+            # touched. Synchronize first so the contiguous local slice owns its
+            # bytes, then collect Python graph cycles and return freed Metal
+            # buffers instead of wiring them until the 128 GB rank stalls.
+            synchronize = getattr(mx, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+            gc.collect()
             mx.clear_cache()
             _emit(
                 progress,
