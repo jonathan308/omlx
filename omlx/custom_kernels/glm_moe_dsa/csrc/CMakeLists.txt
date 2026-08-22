@@ -38,6 +38,7 @@ target_sources(
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/ds4_attention_finalizer.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe_nax.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_projection_qmm.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle.cpp
@@ -173,8 +174,21 @@ if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
               ${OMLX_GLM_METAL_HEADERS}
       COMMENT "Building ds4_projection_qmm_nax.air"
       VERBATIM)
+    set(OMLX_GLM_PREFILL_MOE_NAX_AIR
+        ${CMAKE_CURRENT_BINARY_DIR}/ds4_prefill_moe_nax.air)
+    add_custom_command(
+      OUTPUT ${OMLX_GLM_PREFILL_MOE_NAX_AIR}
+      COMMAND
+        xcrun -sdk macosx metal ${OMLX_GLM_NAX_METAL_FLAGS} -c
+        ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe_nax.metal
+        ${OMLX_GLM_METAL_INCLUDE_ARGS} -o ${OMLX_GLM_PREFILL_MOE_NAX_AIR}
+      DEPENDS ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe_nax.metal
+              ${OMLX_GLM_METAL_HEADERS}
+      COMMENT "Building ds4_prefill_moe_nax.air"
+      VERBATIM)
     set(OMLX_GLM_NAX_AIR ${OMLX_GLM_INDEXER_NAX_AIR}
-                         ${OMLX_GLM_PROJECTION_NAX_AIR})
+                         ${OMLX_GLM_PROJECTION_NAX_AIR}
+                         ${OMLX_GLM_PREFILL_MOE_NAX_AIR})
     set(OMLX_GLM_NAX_METALLIB
         ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_glm_kernels_nax.metallib)
     add_custom_command(

@@ -135,6 +135,7 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_blocks_tail8",
     "ds4_q_head_rms_rope",
     "ds4_kv_rms_rope",
+    "deepseek_mxfp4_gather_qmm_blocks_nax",
     "ds4_projection_mxfp8_qmm",
     "deepseek_v4_qkv_compressor_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
@@ -889,6 +890,32 @@ def ds4_projection_nax_device_available() -> bool:
     if _ext is None or not hasattr(_ext, "ds4_projection_nax_device_available"):
         return False
     return bool(_ext.ds4_projection_nax_device_available())
+
+
+def deepseek_mxfp4_gather_qmm_blocks_nax(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated BF16 M5/NAX DS4 M=1024 expert-block projection."""
+    if _ext is not None and hasattr(
+        _ext, "deepseek_mxfp4_gather_qmm_blocks_nax"
+    ):
+        return _ext.deepseek_mxfp4_gather_qmm_blocks_nax(
+            x,
+            weight,
+            scales,
+            block_meta,
+            block_count,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_blocks_nax native kernel is unavailable"
+    )
 
 
 def deepseek_v4_qkv_compressor_bundle_b1_dispatches() -> int:

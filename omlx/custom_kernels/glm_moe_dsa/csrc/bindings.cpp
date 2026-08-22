@@ -5,6 +5,7 @@
 
 #include "dsa_indexer.h"
 #include "ds4_attention_finalizer.h"
+#include "ds4_prefill_moe_nax.h"
 #include "ds4_projection_qmm.h"
 #include "ds4_prefill_moe.h"
 #include "ds4_qkv_bundle.h"
@@ -268,6 +269,15 @@ NB_MODULE(_ext, m) {
   m.def(
       "ds4_projection_nax_device_available",
       &omlx::glm_kernels::ds4_projection_nax_device_available);
+  m.def(
+      "deepseek_mxfp4_gather_qmm_blocks_nax",
+      &omlx::glm_kernels::deepseek_mxfp4_gather_qmm_blocks_nax,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "stream"_a = nb::none());
   m.def(
       "deepseek_v4_qkv_compressor_bundle_b1",
       &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
