@@ -1078,6 +1078,14 @@ def install_runtime_optimizations(
             sampled = broadcast
         else:
             sampled = mx.distributed.recv_like(sampled, 0)
+        # The generation step pipelines the *next* sample behind the token it
+        # returns. On a max_tokens=1 request that next graph is discarded as
+        # soon as rank zero retires the batch; a lazy send can therefore vanish
+        # while a worker has already entered its recv. Materialize this tiny
+        # owned decision before either rank can filter the sequence. The host
+        # sync is not additive to token latency: mlx-lm must materialize the
+        # returned token at the same boundary to build the response.
+        mx.eval(sampled)
         instance._next_tokens = sampled.astype(mx.uint32)
         instance._next_logprobs = list(logprobs)
         mx.async_eval(
