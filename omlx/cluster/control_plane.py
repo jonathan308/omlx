@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pickle
+import os
 import socket
 import struct
 import threading
@@ -25,6 +26,21 @@ _MAX_OBJECT_BYTES = 256 * 1024 * 1024
 
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_CONTROL_PLANE: "RankControlPlane | None" = None
+
+
+def _trace_control(rank: int, sequence: int, operation: str, detail: str = "") -> None:
+    if os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0").strip().lower() not in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }:
+        return
+    print(
+        "OMLX_CONTROL_TRACE:"
+        + f"rank={rank} sequence={sequence} operation={operation} detail={detail}",
+        flush=True,
+    )
 
 
 def _recv_exact(stream: socket.socket, size: int) -> bytes:
@@ -188,6 +204,12 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     zlib.crc32(payload),
                 )
                 packet = header + payload
+                _trace_control(
+                    self.rank,
+                    self._sequence,
+                    "broadcast-send",
+                    f"type={type(obj).__name__} bytes={len(payload)}",
+                )
                 for rank in range(1, self.world_size):
                     self._peers[rank].sendall(packet)
                 return obj
@@ -210,7 +232,14 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             payload = _recv_exact(stream, size) if size else b""
             if zlib.crc32(payload) != checksum:
                 raise RuntimeError("rank-control object failed CRC32")
-            return pickle.loads(payload) if payload else None
+            result = pickle.loads(payload) if payload else None
+            _trace_control(
+                self.rank,
+                self._sequence,
+                "broadcast-recv",
+                f"type={type(result).__name__} bytes={len(payload)}",
+            )
+            return result
 
     def _owned_bytes_packet(
         self,
@@ -280,6 +309,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         with self._operation_lock:
             self._sequence += 1
             sequence = self._sequence
+            _trace_control(self.rank, sequence, "barrier-enter")
             if self.rank == source_rank:
                 header = _OWNED_BYTES_HEADER.pack(
                     _OWNED_BYTES_MAGIC,
@@ -367,6 +397,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 )
                 for rank in range(1, self.world_size):
                     self._peers[rank].sendall(release)
+                _trace_control(self.rank, sequence, "barrier-release")
                 return
 
             stream = self._stream
@@ -396,6 +427,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     f"magic={magic!r} version={version} "
                     f"sequence={received_sequence} coordinator={coordinator}"
                 )
+            _trace_control(self.rank, sequence, "barrier-exit")
 
     def close(self) -> None:
         global _ACTIVE_CONTROL_PLANE
