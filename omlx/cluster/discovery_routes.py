@@ -256,16 +256,40 @@ def _enrich_paired_row(
                 )
     if addrs:
         row["addrs"] = addrs
+    # Persisted membership is not liveness. Until this process has observed the
+    # peer, render an amber/suspect shell instead of the old implicit green row.
+    row.setdefault("http_port", 0)
     if record is None:
+        row["state"] = "suspect"
+        row["last_seen"] = None
+        row.setdefault("link", "unknown")
         return
     caps = row.get("caps") or {}
     if not caps.get("ram_gb") or not caps.get("chip"):
         known_caps = record.get("caps") or {}
         if known_caps.get("ram_gb") or known_caps.get("chip"):
             row["caps"] = dict(known_caps)
-    for key in ("version", "friendly_name", "link"):
-        if not row.get(key) and record.get(key):
+    for key in ("version", "friendly_name"):
+        if record.get(key):
             row[key] = record[key]
+    state = record.get("state")
+    row["state"] = (
+        state if state in {"discovered", "suspect", "dead"} else "suspect"
+    )
+    last_seen = record.get("last_seen")
+    row["last_seen"] = (
+        float(last_seen)
+        if isinstance(last_seen, (int, float)) and not isinstance(last_seen, bool)
+        else None
+    )
+    row["link"] = str(record.get("link") or "unknown")
+    http_port = record.get("http_port")
+    if (
+        isinstance(http_port, int)
+        and not isinstance(http_port, bool)
+        and 1 <= http_port <= 65535
+    ):
+        row["http_port"] = http_port
 
 
 @discovery_router.get("/devices")
@@ -317,21 +341,27 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
             node = enrolled.get(row.get("node_id"))
             if node is not None:
                 row["ssh_target"] = node.ssh
-    discovered_records: dict[str, dict[str, Any]] = {}
+    observed_records: dict[str, dict[str, Any]] = {}
     if registry:
         for entry in registry.discovered():
-            discovered_records[entry["node_id"]] = entry
+            observed_records[entry["node_id"]] = entry
     if service is not None:
         for peer in service.peers():
-            if peer.paired:
-                continue
-            discovered_records[peer.node_id] = peer.to_dict()
+            # Paired peers still belong in the observation map: their live
+            # state, timestamp, port and interface metadata enrich the durable
+            # paired shell. They are filtered only from the unpaired list.
+            observed_records[peer.node_id] = peer.to_dict()
+    discovered_records = {
+        node_id: record
+        for node_id, record in observed_records.items()
+        if node_id not in paired_ids and not record.get("paired")
+    }
 
     # Devices paired before caps were exchanged carry empty caps on disk;
     # enrich them from what discovery has actually seen before suppressing
     # their node_ids from the discovered list below.
     for row in paired:
-        _enrich_paired_row(row, discovered_records.get(row.get("node_id")))
+        _enrich_paired_row(row, observed_records.get(row.get("node_id")))
 
     # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
     # the moment pairing completes, so a stale (possibly dead) record for a

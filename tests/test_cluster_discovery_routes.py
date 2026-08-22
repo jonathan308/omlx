@@ -19,6 +19,7 @@ from omlx.cluster.identity import (
     reset_configured_identity,
 )
 from omlx.cluster.registry import (
+    DeviceRegistry,
     configure_device_registry,
     reset_configured_device_registry,
 )
@@ -543,6 +544,8 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
             {"ip": "192.168.1.21", "if_type": "tb"},
         ],
         http_port=8000,
+        paired=True,
+        last_seen=1234.5,
         state="dead",
     )
     peer.link = "tb"
@@ -561,6 +564,9 @@ def test_devices_enriches_paired_row_from_discovery_record(_configured_stores):
     }
     assert row["version"] == "1.2.3"
     assert row["link"] == "tb"
+    assert row["state"] == "dead"
+    assert row["last_seen"] == 1234.5
+    assert row["http_port"] == 8000
     # Normalized addrs: last_addrs entries come first with the "paired"
     # marker; the discovered record upgrades if_type where the IP matches
     # and appends addresses the pairing flow never saw.
@@ -601,5 +607,55 @@ def test_devices_paired_row_normalizes_last_addrs_and_keeps_ssh_target(
         {"ip": "192.168.1.21", "if_type": "paired"},
     ]
     assert "version" not in row
+    assert row["state"] == "suspect"
+    assert row["last_seen"] is None
+    assert row["http_port"] == 0
     # The enrollment seam still applies on top of the normalization.
     assert row["ssh_target"] == "omlx@studio-b.local"
+
+
+def test_manual_paired_endpoint_persists_and_rehydrates_on_reboot(
+    _configured_stores,
+):
+    identity, registry, client = _configured_stores
+    registry.mark_paired("tb-peer", friendly_name="m5-max", paired_at=1.0)
+
+    def prober(ip, port, timeout):
+        if (ip, port) == ("10.0.0.2", 9123):
+            return {
+                "node_id": "tb-peer",
+                "friendly_name": "m5-max",
+                "version": "0.6.1",
+                "cluster_name": "omlx",
+            }
+        return None
+
+    service = _live_service(registry, prober)
+    response = client.post(
+        "/api/cluster/devices/manual",
+        json={"ip": "10.0.0.2", "port": 9123},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["verified"] is True
+    persisted = DeviceRegistry(registry.path)
+    record = persisted.get("tb-peer")
+    assert record["last_addrs"] == ["10.0.0.2"]
+    assert record["http_port"] == 9123
+
+    row = client.get("/api/cluster/devices").json()["paired"][0]
+    assert row["state"] == "discovered"
+    assert row["last_seen"] is not None
+    assert row["http_port"] == 9123
+
+    rebooted = DiscoveryService(
+        identity,
+        persisted,
+        DiscoveryConfig(cluster_name="omlx", http_port=8000),
+        prober=prober,
+        interface_lister=lambda: [],
+        zeroconf_module=None,
+    )
+    assert ("10.0.0.2", 9123) in rebooted._candidates
+    assert rebooted._candidates[("10.0.0.2", 9123)]["node_id"] == "tb-peer"
+    service.stop()
