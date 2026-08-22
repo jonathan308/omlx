@@ -45,6 +45,25 @@ CATEGORIES = (
     "misc",
 )
 COMPUTE_CATEGORIES = tuple(item for item in CATEGORIES if item != "collectives")
+ATTENTION_PROJECTION_DETAILS = (
+    "q_a",
+    "q_b",
+    "raw_wkv",
+    "compressor_wkv",
+    "compressor_gate",
+    "o_a",
+    "o_b",
+)
+INDEXER_PROJECTION_DETAILS = (
+    "indexer_q",
+    "indexer_weights",
+    "indexer_compressor_wkv",
+    "indexer_compressor_gate",
+)
+PROJECTION_DETAIL_CATEGORIES = (
+    *ATTENTION_PROJECTION_DETAILS,
+    *INDEXER_PROJECTION_DETAILS,
+)
 PROFILE_SCHEMA_VERSION = 1
 
 
@@ -517,9 +536,7 @@ class TimingRecorder:
 
     def milliseconds(self) -> dict[str, float]:
         return {
-            category: self.nanoseconds.get(category, 0) / 1e6
-            for category in COMPUTE_CATEGORIES
-            if category != "misc"
+            category: value / 1e6 for category, value in self.nanoseconds.items()
         }
 
 
@@ -534,9 +551,16 @@ class DS4LayerInstrumentation:
     )
     _DIRECT_DOWN_SYMBOLS = ("deepseek_mxfp4_gather_qmm_blocks_tail8",)
 
-    def __init__(self, layer: Any, recorder: TimingRecorder) -> None:
+    def __init__(
+        self,
+        layer: Any,
+        recorder: TimingRecorder,
+        *,
+        projection_detail: bool = False,
+    ) -> None:
         self.layer = layer
         self.recorder = recorder
+        self.projection_detail = projection_detail
         self._stack = ExitStack()
         self._module_categories: dict[int, str] = {}
         self._patched_classes: set[type] = set()
@@ -578,25 +602,56 @@ class DS4LayerInstrumentation:
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
         attn = self.layer.attn
-        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-            self._register(getattr(attn, name, None), "attention_projections")
+        attention_labels = (
+            ("wq_a", "q_a"),
+            ("wq_b", "q_b"),
+            ("wkv", "raw_wkv"),
+            ("wo_a", "o_a"),
+            ("wo_b", "o_b"),
+        )
+        for name, detail in attention_labels:
+            self._register(
+                getattr(attn, name, None),
+                detail if self.projection_detail else "attention_projections",
+            )
         compressor = getattr(attn, "compressor", None)
         if compressor is not None:
-            self._register(getattr(compressor, "wkv", None), "attention_projections")
-            self._register(getattr(compressor, "wgate", None), "attention_projections")
+            self._register(
+                getattr(compressor, "wkv", None),
+                "compressor_wkv"
+                if self.projection_detail
+                else "attention_projections",
+            )
+            self._register(
+                getattr(compressor, "wgate", None),
+                "compressor_gate"
+                if self.projection_detail
+                else "attention_projections",
+            )
 
         indexer = getattr(attn, "indexer", None)
         if indexer is not None:
             # The outer bracket owns its compressor projections, score kernel,
             # deterministic top-k, and compact gather without double counting.
-            self._register(indexer, "indexer")
-            for module in (
-                getattr(indexer, "wq_b", None),
-                getattr(indexer, "weights_proj", None),
-                getattr(getattr(indexer, "compressor", None), "wkv", None),
-                getattr(getattr(indexer, "compressor", None), "wgate", None),
-            ):
-                self._register(module, "indexer")
+            if not self.projection_detail:
+                self._register(indexer, "indexer")
+            indexer_labels = (
+                (getattr(indexer, "wq_b", None), "indexer_q"),
+                (getattr(indexer, "weights_proj", None), "indexer_weights"),
+                (
+                    getattr(getattr(indexer, "compressor", None), "wkv", None),
+                    "indexer_compressor_wkv",
+                ),
+                (
+                    getattr(getattr(indexer, "compressor", None), "wgate", None),
+                    "indexer_compressor_gate",
+                ),
+            )
+            for module, detail in indexer_labels:
+                self._register(
+                    module,
+                    detail if self.projection_detail else "indexer",
+                )
 
         switch = self.layer.ffn.switch_mlp
         self._register(switch.up_proj, "routed_moe_pair")
@@ -752,6 +807,7 @@ def profile_real_layers(
     layers: Sequence[int],
     warmup: int,
     cycles: int,
+    projection_detail: bool = False,
 ) -> dict[str, Any]:
     """Run full real-block forwards and return per-layer category medians."""
 
@@ -771,7 +827,11 @@ def profile_real_layers(
                 evaluate=_evaluate_array_leaves,
                 barrier_overhead_ns=barrier_overhead,
             )
-            with DS4LayerInstrumentation(layer, recorder):
+            with DS4LayerInstrumentation(
+                layer,
+                recorder,
+                projection_detail=projection_detail,
+            ):
                 for cycle in range(warmup + cycles):
                     cache = _new_layer_cache(model, position)
                     _warm_layer_cache(
@@ -809,7 +869,34 @@ def profile_real_layers(
                         )
                         / 1e6,
                     )
-                    components = recorder.milliseconds()
+                    raw_components = recorder.milliseconds()
+                    details = {
+                        category: raw_components.get(category, 0.0)
+                        for category in PROJECTION_DETAIL_CATEGORIES
+                    }
+                    if projection_detail:
+                        components = {
+                            "attention_projections": sum(
+                                details[category]
+                                for category in ATTENTION_PROJECTION_DETAILS
+                            ),
+                            "indexer": sum(
+                                details[category]
+                                for category in INDEXER_PROJECTION_DETAILS
+                            ),
+                            "routed_moe_pair": raw_components.get(
+                                "routed_moe_pair", 0.0
+                            ),
+                            "routed_moe_down": raw_components.get(
+                                "routed_moe_down", 0.0
+                            ),
+                        }
+                    else:
+                        components = {
+                            category: raw_components.get(category, 0.0)
+                            for category in COMPUTE_CATEGORIES
+                            if category != "misc"
+                        }
                     measured = sum(components.values())
                     components["misc"] = max(0.0, total_ms - measured)
                     if cycle >= warmup:
@@ -817,6 +904,7 @@ def profile_real_layers(
                             {
                                 "total_ms": total_ms,
                                 "components_ms": components,
+                                "projection_details_ms": details,
                                 "calls": dict(recorder.calls),
                             }
                         )
@@ -836,6 +924,13 @@ def profile_real_layers(
                     )
                     for category in COMPUTE_CATEGORIES
                 },
+                "median_projection_details_ms": {
+                    category: statistics.median(
+                        sample["projection_details_ms"].get(category, 0.0)
+                        for sample in samples
+                    )
+                    for category in PROJECTION_DETAIL_CATEGORIES
+                },
             }
 
     ratio_counts: defaultdict[int, int] = defaultdict(int)
@@ -852,11 +947,19 @@ def profile_real_layers(
         )
 
     representative_stage_ms = {category: 0.0 for category in COMPUTE_CATEGORIES}
+    representative_projection_ms = {
+        category: 0.0 for category in PROJECTION_DETAIL_CATEGORIES
+    }
     for ratio, count in ratio_counts.items():
         reports = by_ratio[ratio]
         for category in COMPUTE_CATEGORIES:
             representative_stage_ms[category] += count * statistics.mean(
                 report["median_components_ms"][category] for report in reports
+            )
+        for category in PROJECTION_DETAIL_CATEGORIES:
+            representative_projection_ms[category] += count * statistics.mean(
+                report["median_projection_details_ms"][category]
+                for report in reports
             )
     return {
         "schema_version": PROFILE_SCHEMA_VERSION,
@@ -870,6 +973,8 @@ def profile_real_layers(
             str(key): value for key, value in sorted(ratio_counts.items())
         },
         "representative_stage_compute_ms": representative_stage_ms,
+        "representative_stage_projection_ms": representative_projection_ms,
+        "projection_detail": projection_detail,
     }
 
 
@@ -917,6 +1022,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, nargs="*")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--cycles", type=int, default=3)
+    parser.add_argument("--projection-detail", action="store_true")
     parser.add_argument("--baseline-tps", type=float, default=628.76)
     parser.add_argument("--target-tps", type=float, default=1000.0)
     parser.add_argument("--collective-bandwidth-gbps", type=float, default=6.2)
@@ -941,6 +1047,7 @@ def main() -> None:
         layers=layers,
         warmup=args.warmup,
         cycles=args.cycles,
+        projection_detail=args.projection_detail,
     )
     collectives = modeled_collective_ms(
         shape,
