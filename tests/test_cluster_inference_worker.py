@@ -219,6 +219,33 @@ def test_eager_load_graph_is_visible_to_mlx_lm_generation_thread():
     assert FakeResponseGenerator._generate is original
 
 
+def test_generation_thread_failure_forces_rank_exit(monkeypatch):
+    import mlx.core as mx
+
+    exits = []
+
+    class FakeResponseGenerator:
+        def _generate(self):
+            raise RuntimeError("token collective corrupted")
+
+    monkeypatch.setattr(
+        inference_worker,
+        "_fatal_generation_thread_exit",
+        lambda: exits.append(inference_worker._FATAL_GENERATION_EXIT_CODE),
+    )
+    original = FakeResponseGenerator._generate
+    with _bind_generation_thread_stream(
+        FakeResponseGenerator,
+        mx,
+        mx.new_thread_unsafe_stream(mx.default_device()),
+    ):
+        with pytest.raises(RuntimeError, match="token collective corrupted"):
+            FakeResponseGenerator()._generate()
+
+    assert exits == [70]
+    assert FakeResponseGenerator._generate is original
+
+
 def _assignment() -> PipelineAssignment:
     return PipelineAssignment(
         node_id="studio",

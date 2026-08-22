@@ -366,13 +366,24 @@ class _MTPVocabCoordinator:
         return None
 
     def sync_tokens(self, proposal: Any | None, shape: tuple[int, ...]) -> Any:
+        # Token IDs are always below 2**31.  Keep the transport representation
+        # signed: the decision-packet path below already uses int32 and is the
+        # path exercised most heavily by JACCL.  More importantly, returning a
+        # uint32 token lets a corrupted high bit survive until MLX interprets
+        # the Python value as an array index, where it kills mlx-lm's private
+        # generation thread with the opaque "Slice indices must be 32-bit"
+        # error.  The final uint32 cast retains GenerationBatch's cache-input
+        # contract while making the collective itself fail in the signed
+        # token-ID domain.
         if self.is_coordinator:
             if proposal is None:
                 raise RuntimeError("MTP coordinator produced no token proposal")
-            value = proposal.astype(self.mx.uint32)
+            value = proposal.astype(self.mx.int32)
         else:
-            value = self.mx.zeros(shape, dtype=self.mx.uint32)
-        return self.mx.distributed.all_sum(value, group=self.group)
+            value = self.mx.zeros(shape, dtype=self.mx.int32)
+        return self.mx.distributed.all_sum(value, group=self.group).astype(
+            self.mx.uint32
+        )
 
     def sync_packet(self, packet: Any | None, length: int) -> list[int]:
         if self.is_coordinator:
@@ -1039,14 +1050,15 @@ def install_runtime_optimizations(
                 sampled = mx.concatenate(all_samples, axis=0)
             else:
                 sampled = instance.fallback_sampler(logprobs)
+            sampled = sampled.astype(mx.int32)
         else:
-            sampled = mx.zeros((len(instance.uids),), dtype=mx.uint32)
+            sampled = mx.zeros((len(instance.uids),), dtype=mx.int32)
 
         # Rank zero contributes the selected IDs; all other ranks contribute
         # zeros. Every rank therefore advances the same local KV state without
         # gathering a hidden-state tensor.
         sampled = mx.distributed.all_sum(sampled, group=group)
-        instance._next_tokens = sampled
+        instance._next_tokens = sampled.astype(mx.uint32)
         instance._next_logprobs = list(logprobs)
         mx.async_eval(
             instance._next_tokens,

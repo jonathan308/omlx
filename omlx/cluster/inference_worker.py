@@ -49,6 +49,8 @@ _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 
 logger = logging.getLogger(__name__)
 
+_FATAL_GENERATION_EXIT_CODE = 70
+
 
 def _emit_event(payload: dict[str, Any]) -> None:
     print(
@@ -73,6 +75,20 @@ def _cross_thread_generation_stream(mx: Any) -> Any:
     return stream
 
 
+def _fatal_generation_thread_exit() -> None:
+    """Terminate a rank whose sole generation thread has crashed.
+
+    mlx-lm's private server does not propagate an exception escaping
+    ``ResponseGenerator._generate`` back to its HTTP/main thread.  Leaving the
+    process alive is worse than exiting: requests hang, the marker continues
+    to look superficially live, and peers discover the loss only after the
+    watchdog deadline.  A dedicated exit code lets mlx.launch and the oMLX
+    supervisor fail the deployment immediately.
+    """
+
+    os._exit(_FATAL_GENERATION_EXIT_CODE)
+
+
 @contextmanager
 def _bind_generation_thread_stream(
     response_generator_type: Any,
@@ -86,7 +102,17 @@ def _bind_generation_thread_stream(
     @wraps(original_generate)
     def generate_on_rank_stream(instance: Any) -> Any:
         mx.set_default_stream(stream)
-        return original_generate(instance)
+        try:
+            return original_generate(instance)
+        except Exception:
+            logger.critical(
+                "Fatal exception escaped the distributed generation thread; "
+                "terminating rank with exit code %d",
+                _FATAL_GENERATION_EXIT_CODE,
+                exc_info=True,
+            )
+            _fatal_generation_thread_exit()
+            raise
 
     response_generator_type._generate = generate_on_rank_stream
     try:

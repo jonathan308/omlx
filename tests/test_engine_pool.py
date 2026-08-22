@@ -3339,6 +3339,27 @@ class TestEnginePoolInUseLease:
         pool._unload_engine.assert_awaited_once_with("leased")
 
     @pytest.mark.asyncio
+    async def test_failed_distributed_runtime_is_hidden_and_unloaded_on_release(self):
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("clustered")
+        entry.in_use = 1
+        entry.engine.runtime_failed_reason = "rank 1 generation thread exited"
+        pool._entries = {"clustered": entry}
+        pool._unload_engine = AsyncMock()
+
+        assert pool.loaded_model_count == 0
+        assert pool.get_loaded_model_ids() == []
+        status = pool.get_status()
+        assert status["loaded_count"] == 0
+        assert status["models"][0]["loaded"] is False
+
+        await pool.release_engine("clustered")
+
+        assert entry.in_use == 0
+        assert entry.pending_unload_reason is None
+        pool._unload_engine.assert_awaited_once_with("clustered")
+
+    @pytest.mark.asyncio
     async def test_release_engine_keeps_pending_while_scheduler_active(self):
         """A drained lease is not enough if scheduler requests are still active."""
         pool = _make_pool(ceiling=0)

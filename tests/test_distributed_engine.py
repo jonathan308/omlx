@@ -725,6 +725,7 @@ async def test_distributed_transport_error_surfaces_peer_failure_reason():
             match="Studio stopped publishing its runtime heartbeat",
         ):
             await engine.generate("hello")
+        assert "Studio stopped publishing" in engine.runtime_failed_reason
     finally:
         await engine._client.aclose()
 
@@ -1270,6 +1271,7 @@ async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch)
     try:
         with pytest.raises(DistributedInferenceError, match="not serving"):
             await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert engine.runtime_failed_reason == "rank 1 (peer) stopped heartbeating"
     finally:
         await engine._client.aclose()
 
@@ -1312,6 +1314,7 @@ async def test_preflight_rejects_a_reported_failure_without_probing(monkeypatch)
         with pytest.raises(DistributedInferenceError, match="rank 1 connection"):
             await engine.preflight_chat([{"role": "user", "content": "hi"}])
         assert probed == []
+        assert engine.runtime_failed_reason == "rank 1 connection closed"
     finally:
         await engine._client.aclose()
 

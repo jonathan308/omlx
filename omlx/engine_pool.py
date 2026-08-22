@@ -711,7 +711,7 @@ class EnginePool:
     @property
     def loaded_model_count(self) -> int:
         """Number of currently loaded models."""
-        return sum(1 for e in self._entries.values() if e.engine is not None)
+        return sum(1 for e in self._entries.values() if self._entry_is_loaded(e))
 
     async def apply_embedding_batch_size(self, batch_size: int) -> None:
         """Apply embedding batch size to future and currently loaded embedding engines."""
@@ -844,7 +844,21 @@ class EnginePool:
 
     def get_loaded_model_ids(self) -> list[str]:
         """Get list of currently loaded model IDs."""
-        return [mid for mid, e in self._entries.items() if e.engine is not None]
+        return [mid for mid, e in self._entries.items() if self._entry_is_loaded(e)]
+
+    @staticmethod
+    def _entry_runtime_failure(entry: EngineEntry) -> str | None:
+        engine = entry.engine
+        if engine is None:
+            return None
+        reason = getattr(engine, "runtime_failed_reason", None)
+        return reason if isinstance(reason, str) and bool(reason.strip()) else None
+
+    @classmethod
+    def _entry_is_loaded(cls, entry: EngineEntry) -> bool:
+        """Treat a terminal distributed worker as unloaded during teardown."""
+
+        return entry.engine is not None and cls._entry_runtime_failure(entry) is None
 
     def get_entry(self, model_id: str) -> EngineEntry | None:
         """Get entry for a specific model, or None if not found."""
@@ -1180,7 +1194,11 @@ class EnginePool:
                 remaining = rank_side()
             except Exception:
                 remaining = None
-            if remaining:
+            if (
+                isinstance(remaining, int)
+                and not isinstance(remaining, bool)
+                and remaining > 0
+            ):
                 return True
         return False
 
@@ -1735,6 +1753,14 @@ class EnginePool:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
+            if e is not None:
+                failure = self._entry_runtime_failure(e)
+                if failure and not e.pending_unload_reason:
+                    self._mark_pending_unload_locked(
+                        model_id,
+                        f"distributed runtime failed: {failure}",
+                        allow_pinned=True,
+                    )
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
@@ -2939,7 +2965,7 @@ class EnginePool:
                 {
                     "id": mid,
                     "model_path": e.model_path,
-                    "loaded": e.engine is not None,
+                    "loaded": self._entry_is_loaded(e),
                     "is_loading": e.is_loading,
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
@@ -2972,7 +2998,7 @@ class EnginePool:
             "current_model_memory": self._current_model_memory,
             "model_count": len(self._entries),
             "loaded_count": sum(
-                1 for e in self._entries.values() if e.engine is not None
+                1 for e in self._entries.values() if self._entry_is_loaded(e)
             ),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
             "load_time_observations": self._load_time_observations,

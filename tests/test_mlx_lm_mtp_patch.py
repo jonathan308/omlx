@@ -42,6 +42,17 @@ class TestApplyOrchestrator:
         import omlx.patches.mlx_lm_mtp as mtp  # noqa: F401
 
 
+def test_mtp_emitted_token_guard_rejects_collective_overflow():
+    import mlx.core as mx
+
+    from omlx.patches.mlx_lm_mtp.batch_generator import _validated_emitted_token
+
+    row = mx.zeros((129280,))
+    assert _validated_emitted_token(129279, row) == 129279
+    with pytest.raises(RuntimeError, match=r"token=4294967295, vocabulary=129280"):
+        _validated_emitted_token(2**32 - 1, row)
+
+
 class TestCacheRollback:
     def test_arrays_cache_gains_rollback_slot(self):
         from omlx.patches.mlx_lm_mtp import cache_rollback

@@ -25,6 +25,7 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    _MTPVocabCoordinator,
     _deepseek_v4_fused_decode_capability,
     _indexer_row_parallel_capability,
     install_runtime_optimizations,
@@ -362,6 +363,32 @@ class _WorkerGroup:
     @staticmethod
     def size():
         return 2
+
+
+@pytest.mark.parametrize(
+    ("group", "proposal", "expected_input"),
+    [
+        (_Group(), mx.array([129279], dtype=mx.uint32), [129279]),
+        (_WorkerGroup(), None, [0]),
+    ],
+)
+def test_mtp_token_collective_uses_signed_transport(
+    monkeypatch, group, proposal, expected_input
+):
+    observed = []
+
+    def all_sum(value, group=None):
+        observed.append((value.dtype, value.tolist()))
+        return mx.array([129279], dtype=mx.int32)
+
+    monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+    coordinator = _MTPVocabCoordinator(mx, group, output_size=129280)
+
+    result = coordinator.sync_tokens(proposal, (1,))
+
+    assert observed == [(mx.int32, expected_input)]
+    assert result.dtype == mx.uint32
+    assert result.tolist() == [129279]
 
 
 def test_asymmetric_tensor_capability_reports_the_local_fraction(monkeypatch):

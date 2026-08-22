@@ -225,6 +225,23 @@ class DistributedBatchedEngine(BatchedEngine):
         self._next_request_seq = 0
         self._peer_health: tuple[float, bool, str] | None = None
         self._peer_health_lock = asyncio.Lock()
+        self._runtime_failed_reason: str | None = None
+
+    @property
+    def runtime_failed_reason(self) -> str | None:
+        """Terminal worker failure observed by the coordinator, if any."""
+
+        return self._runtime_failed_reason
+
+    def _mark_runtime_failed(self, reason: str) -> None:
+        reason = str(reason).strip()[:2000] or "distributed worker stopped"
+        if self._runtime_failed_reason is None:
+            self._runtime_failed_reason = reason
+            logger.error(
+                "Distributed runtime is no longer serviceable (%s): %s",
+                self.deployment.deployment_id,
+                reason,
+            )
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -263,6 +280,7 @@ class DistributedBatchedEngine(BatchedEngine):
     async def start(self) -> None:
         if self._loaded:
             return
+        self._runtime_failed_reason = None
         self._validate_model_settings()
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
@@ -371,6 +389,9 @@ class DistributedBatchedEngine(BatchedEngine):
             if tail and tail not in detail:
                 detail = f"{detail} · Worker log: {tail}" if detail else tail
             suffix = f": {detail}" if detail else ""
+            self._mark_runtime_failed(
+                detail or f"distributed job exited with code {status.returncode}"
+            )
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
             )
@@ -390,6 +411,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 f"no rank-zero data for {self._request_read_timeout:g}s "
                 f"while the cluster was {status.phase}"
             )
+        if status.returncode is not None or status.failure_reason:
+            self._mark_runtime_failed(detail)
         return DistributedInferenceError(
             f"rank-zero inference {kind} timed out: {detail}"
         )
@@ -437,6 +460,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 f"rank-zero connection closed while the cluster was "
                 f"{status.phase} ({type(exc).__name__})"
             )
+        if status.failure_reason or status.returncode is not None:
+            self._mark_runtime_failed(detail)
         kind = "stream" if stream else "request"
         return DistributedInferenceError(f"rank-zero inference {kind} failed: {detail}")
 
@@ -1595,10 +1620,14 @@ class DistributedBatchedEngine(BatchedEngine):
 
         status = self._supervisor.status()
         if status.returncode is not None:
+            self._mark_runtime_failed(
+                f"distributed job exited with code {status.returncode}"
+            )
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}"
             )
         if status.failure_reason:
+            self._mark_runtime_failed(status.failure_reason)
             raise DistributedInferenceError(
                 f"distributed cluster failure: {status.failure_reason}"
             )
@@ -1635,6 +1664,7 @@ class DistributedBatchedEngine(BatchedEngine):
                         )
                     self._peer_health = cached
         if not cached[1]:
+            self._mark_runtime_failed(cached[2])
             raise DistributedInferenceError(
                 f"cluster is not serving: {cached[2]}"
             )

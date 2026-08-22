@@ -2702,6 +2702,7 @@ def _emit_batch_responses(gen_batch: Any, batch_state: _MtpBatchState) -> List[A
             raise _MtpStepFallback(f"row uid={uid} has no queued token")
 
         token_id, logprobs_1d, source = state.queue.popleft()
+        token_id = _validated_emitted_token(token_id, logprobs_1d)
         _bump_emit_stat(state, source)
 
         finish_reason: Optional[str] = None
@@ -3622,6 +3623,7 @@ def _emit_response(
     contract as the unmodified next().
     """
     Response = type(gen_batch).Response
+    token_id = _validated_emitted_token(token_id, logprobs_1d)
 
     finish_reason: Optional[str] = None
     match_sequence = None
@@ -3675,3 +3677,27 @@ def _emit_response(
             all_tokens=None,
         )
     ]
+
+
+def _validated_emitted_token(token_id: Any, logprobs_1d: Any) -> int:
+    """Return a host token ID only when it can safely index its distribution.
+
+    mlx-lm's private server indexes ``response.logprobs[response.token]`` on a
+    background thread.  An invalid distributed decision used to escape this
+    patch and kill that thread without terminating the rank process, leaving
+    the coordinator to discover the failure only through a later heartbeat
+    timeout.  Validate at the MTP boundary so the actual synchronized value
+    and vocabulary width are preserved in the rank traceback.
+    """
+
+    value = int(token_id)
+    try:
+        vocab_size = int(logprobs_1d.shape[-1])
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("MTP emitted token has no indexable logprob row") from exc
+    if value < 0 or value >= vocab_size or value >= 2**31:
+        raise RuntimeError(
+            "MTP synchronized an invalid token ID: "
+            f"token={value}, vocabulary={vocab_size}"
+        )
+    return value
