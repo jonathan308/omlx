@@ -999,7 +999,36 @@ def install_server_telemetry(
             # rank-zero sendall alone is not an acknowledgement.
             mx.synchronize(self.stream)
             if control_plane is not None:
-                control_plane.barrier()
+                try:
+                    control_plane.barrier()
+                except RuntimeError as exc:
+                    current = getattr(self, "_currently_processing", ())
+                    pending = getattr(self, "_unprocessed_sequences", ())
+                    state = {
+                        "prompt_uids": list(
+                            getattr(getattr(self, "_prompt_batch", None), "uids", ())
+                        ),
+                        "generation_uids": list(
+                            getattr(
+                                getattr(self, "_generation_batch", None),
+                                "uids",
+                                (),
+                            )
+                        ),
+                        "current_segments": [
+                            [len(segment) for segment in item[0]]
+                            for item in current
+                            if isinstance(item, (tuple, list)) and item
+                        ],
+                        "pending_segments": [
+                            [len(segment) for segment in item[1]]
+                            for item in pending
+                            if isinstance(item, (tuple, list)) and len(item) > 1
+                        ],
+                    }
+                    raise RuntimeError(
+                        f"{exc}; local batch state={state}"
+                    ) from exc
                 return
             vote = mx.distributed.all_sum(mx.array(1, dtype=mx.int32))
             mx.eval(vote)

@@ -352,7 +352,13 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                         or received_sequence != sequence
                         or received_rank != rank
                     ):
-                        raise RuntimeError("rank-control barrier arrival is invalid")
+                        raise RuntimeError(
+                            "rank-control barrier arrival is invalid: "
+                            f"expected magic={_BARRIER_MAGIC!r} version={_VERSION} "
+                            f"sequence={sequence} rank={rank}; received "
+                            f"magic={magic!r} version={version} "
+                            f"sequence={received_sequence} rank={received_rank}"
+                        )
                 release = _BARRIER_PACKET.pack(
                     _BARRIER_MAGIC,
                     _VERSION,
@@ -383,7 +389,13 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 or received_sequence != sequence
                 or coordinator != 0
             ):
-                raise RuntimeError("rank-control barrier release is invalid")
+                raise RuntimeError(
+                    "rank-control barrier release is invalid: "
+                    f"expected magic={_BARRIER_MAGIC!r} version={_VERSION} "
+                    f"sequence={sequence} coordinator=0; received "
+                    f"magic={magic!r} version={version} "
+                    f"sequence={received_sequence} coordinator={coordinator}"
+                )
 
     def close(self) -> None:
         global _ACTIVE_CONTROL_PLANE
