@@ -83,8 +83,44 @@ def test_deployment_round_trip_and_worker_plan_are_json_only():
     assert restored == deployment
     assert plan_hash == deployment.plan_hash
     assert assignments == deployment.assignments
-    assert deployment.hostfile_dict()["envs"] == ["MLX_METAL_FAST_SYNCH=1"]
+    assert "MLX_METAL_FAST_SYNCH=1" in deployment.hostfile_dict()["envs"]
     assert deployment.distributed_init_backend == "jaccl"
+
+
+def test_hostfile_envs_carry_stability_defaults(monkeypatch):
+    for name in (
+        "MLX_MAX_OPS_PER_BUFFER",
+        "MLX_MAX_MB_PER_BUFFER",
+        "JACCL_PROGRESS_TIMEOUT_MS",
+        "JACCL_TIMEOUT_ACTION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    deployment = _deployment()
+
+    envs = deployment.hostfile_dict()["envs"]
+
+    # Metal command-buffer caps: an unbounded buffer overruns the GPU
+    # driver's ~10 s timeout, which answers with SIGABRT and orphaned wired
+    # memory. JACCL knobs pin the wheel's ProgressGuard/teardown-exit posture.
+    assert "MLX_MAX_OPS_PER_BUFFER=16" in envs
+    assert "MLX_MAX_MB_PER_BUFFER=512" in envs
+    assert "JACCL_PROGRESS_TIMEOUT_MS=30000" in envs
+    assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
+
+
+def test_hostfile_envs_respect_operator_overrides(monkeypatch):
+    monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "32")
+    monkeypatch.setenv("JACCL_PROGRESS_TIMEOUT_MS", "60000")
+    deployment = _deployment()
+
+    envs = deployment.hostfile_dict()["envs"]
+
+    assert "MLX_MAX_OPS_PER_BUFFER=32" in envs
+    assert "MLX_MAX_OPS_PER_BUFFER=16" not in envs
+    assert "JACCL_PROGRESS_TIMEOUT_MS=60000" in envs
+    # Untouched knobs keep their tuned defaults.
+    assert "MLX_MAX_MB_PER_BUFFER=512" in envs
+    assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
 
 
 def test_deployment_round_trip_preserves_the_selected_context():

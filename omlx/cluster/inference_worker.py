@@ -484,8 +484,64 @@ def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
     return str(root / f"{args.deployment_id}-rank-{rank}")
 
 
+def _release_metal_memory(reason: str) -> None:
+    """Best-effort Metal release before a force-exit.
+
+    Ported from ThunderMLX's ``clear_mlx_cache`` (run_with_watchdog.py), the
+    fix for "176 GB wired with no owning process": ``clear_cache()`` alone only
+    drops the Metal *cache pool* — the wired model weights stay stranded in
+    kernel wired memory when ``os._exit`` skips every finally/atexit handler.
+    ``set_wired_limit(0)`` unwires the model allocation so the OS reclaims it
+    on process death. Every step is guarded: a rank whose MLX import or Metal
+    queue is already broken must still reach its exit.
+    """
+
+    try:
+        import mlx.core as mx
+    except Exception:
+        # MLX never imported (or unimportable): nothing is wired, nothing to do.
+        return
+    try:
+        # Unwire first: this is what actually releases the memory the weights
+        # hold. A safe no-op when nothing is wired.
+        mx.set_wired_limit(0)
+    except Exception as exc:
+        logger.warning("set_wired_limit(0) failed (%s): %s", reason, exc)
+    with suppress(Exception):
+        mx.clear_cache()
+    metal = getattr(mx, "metal", None)
+    metal_clear = getattr(metal, "clear_cache", None)
+    if metal_clear is not None:
+        with suppress(Exception):
+            metal_clear()
+
+
 def _install_signal_handlers() -> None:
-    def interrupt(_signum: int, _frame: Any) -> None:
+    def hard_exit(signum: int, _frame: Any) -> None:
+        # The Metal release hung on a wedged GPU queue; the cleanup path must
+        # not itself stall the SIGKILL escalation waiting behind it.
+        name = signal.Signals(signum).name
+        sys.stderr.write(f"[RANK] {name} while releasing Metal memory; hard-exiting\n")
+        sys.stderr.flush()
+        os._exit(128 + signum)
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        name = signal.Signals(signum).name
+        # Release wired Metal memory while the rank can still do it itself —
+        # the coordinator escalates a wedged rank from SIGTERM to SIGKILL, and
+        # a SIGKILL cannot unwire anything (ThunderMLX's TERM/INT handlers in
+        # run_with_watchdog.py, alarm escape hatch included). The graceful
+        # KeyboardInterrupt path is unchanged for a rank that answers promptly.
+        try:
+            signal.signal(signal.SIGALRM, hard_exit)
+            signal.alarm(
+                int(os.environ.get("OMLX_CLUSTER_SIGNAL_CLEAR_TIMEOUT", "10") or "10")
+            )
+        except Exception:
+            pass
+        _release_metal_memory(f"rank received {name}")
+        with suppress(Exception):
+            signal.alarm(0)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt)
@@ -544,6 +600,7 @@ def _watch_launcher_parent(
     exit_process: Any = os._exit,
     emit_event: Any = _emit_event,
     on_abort: Any = None,
+    release_memory: Any = _release_metal_memory,
 ) -> None:
     """Fail fast if MLX's launcher exits without reaping this rank.
 
@@ -558,7 +615,10 @@ def _watch_launcher_parent(
     seconds, which catches a launcher that is alive but wedged (its ranks
     would otherwise wait in a collective forever). ``os._exit`` stays the
     last resort: ``on_abort`` fires first so in-flight requests can be
-    cancelled at a step boundary before the process disappears.
+    cancelled at a step boundary, and ``release_memory`` unwires the rank's
+    Metal allocations before the process disappears — ``os._exit`` skips
+    every finally/atexit handler, and a skipped release strands wired memory
+    until the Mac is rebooted.
     """
 
     watched = Path(watched_marker_path) if watched_marker_path else None
@@ -596,6 +656,10 @@ def _watch_launcher_parent(
             except Exception:
                 logger.warning("Launcher watchdog abort stage failed", exc_info=True)
         emit_event({"type": "launcher_lost", "reason": reason})
+        try:
+            release_memory(f"launcher watchdog exit: {reason}")
+        except Exception:
+            logger.warning("Launcher watchdog Metal release failed", exc_info=True)
         exit_process(1)
         return
 
@@ -666,6 +730,11 @@ def _start_peer_watchdog(
     def on_lost(reason: str) -> None:
         marker.update("peer_lost", error=reason)
         _emit_event({"type": "peer_lost", "reason": reason})
+        # Unwire and release Metal memory before the force-exit: os._exit
+        # skips every finally/atexit handler, and a skipped release strands
+        # the rank's wired allocation until the Mac is rebooted.
+        with suppress(Exception):
+            _release_metal_memory(f"peer watchdog exit: {reason}")
         os._exit(1)
 
     def on_abort(reason: str) -> None:
