@@ -1555,12 +1555,22 @@ def install_runtime_optimizations(
         # requests a shared boundary before GenerationBatch filters the row.
         if pipeline_parallel:
             if coordinator:
-                synchronized = sampled
+                decision = sampled
+                sends = []
                 for target in range(1, world_size):
-                    synchronized = mx.distributed.send(
-                        synchronized,
+                    sends.append(
+                        mx.distributed.send(
+                        decision,
                         target,
                     )
+                    )
+                # A transport send's returned array is an execution handle,
+                # not a guaranteed alias of its input on every JACCL build.
+                # Force the sends, but keep rank zero's original sampled value
+                # as its local next token.
+                if sends:
+                    mx.eval(*sends)
+                synchronized = decision
             else:
                 if logits is not None:
                     mx.eval(logits)
