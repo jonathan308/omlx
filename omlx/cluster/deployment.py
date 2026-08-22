@@ -97,11 +97,32 @@ def validate_ssh_target(value: str) -> str:
 
 def _validate_ip(value: str) -> str:
     value = value.strip()
+    # macOS reports Thunderbolt/link-local addresses with a zone id
+    # (fe80::…%en10). mlx's address parser cannot read the suffix — a rank
+    # died at startup on exactly that — and a zone only means something on
+    # the machine that named it, so it never belongs on the wire.
+    value = value.split("%", 1)[0]
     try:
         ipaddress.ip_address(value)
     except ValueError as exc:
         raise ValueError(f"invalid communication IP: {value!r}") from exc
     return value
+
+
+def _hostfile_ips(host: "ClusterHost") -> list[str]:
+    """Communication IPs in the order a rank should try them.
+
+    Routable addresses first: a link-local IPv6 without its (machine-local)
+    zone id is ambiguous, so it can only ever be a fallback. This is what
+    keeps a Mac that announces fe80:: Thunderbolt addresses alongside its
+    configured link IPs from advertising the unusable one first.
+    """
+
+    def _link_local(ip: str) -> bool:
+        return ipaddress.ip_address(ip).is_link_local
+
+    routable = [ip for ip in host.ips if not _link_local(ip)]
+    return routable + [ip for ip in host.ips if _link_local(ip)]
 
 
 def _validate_rdma_path(value: Any) -> RDMAPath:
@@ -449,7 +470,7 @@ class ClusterDeployment:
             "hosts": [
                 {
                     "ssh": host.ssh,
-                    "ips": list(host.ips),
+                    "ips": _hostfile_ips(host),
                     "rdma": [
                         list(path) if isinstance(path, tuple) else path
                         for path in host.rdma
