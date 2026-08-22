@@ -133,6 +133,7 @@ NATIVE_SYMBOLS = (
     "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks",
     "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8",
     "deepseek_mxfp4_gather_qmm_blocks_tail8",
+    "ds4_projection_mxfp8_qmm",
     "deepseek_v4_qkv_compressor_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
     "deepseek_mxfp4_full_decode",
@@ -804,6 +805,42 @@ def deepseek_v4_qkv_compressor_bundle_b1(
     raise RuntimeError(
         "deepseek_v4_qkv_compressor_bundle_b1 native kernel is unavailable"
     )
+
+
+def ds4_projection_mxfp8_qmm(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    variant: int = 0,
+    use_nax: bool = False,
+    nax_variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Isolated M=1024 MXFP8 projection tile sweep; no production route."""
+    if _ext is not None and hasattr(_ext, "ds4_projection_mxfp8_qmm"):
+        return _ext.ds4_projection_mxfp8_qmm(
+            x,
+            weight,
+            scales,
+            variant,
+            use_nax,
+            nax_variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("ds4_projection_mxfp8_qmm native kernel is unavailable")
+
+
+def ds4_projection_nax_kernels_built() -> bool:
+    if _ext is None or not hasattr(_ext, "ds4_projection_nax_kernels_built"):
+        return False
+    return bool(_ext.ds4_projection_nax_kernels_built())
+
+
+def ds4_projection_nax_device_available() -> bool:
+    if _ext is None or not hasattr(_ext, "ds4_projection_nax_device_available"):
+        return False
+    return bool(_ext.ds4_projection_nax_device_available())
 
 
 def deepseek_v4_qkv_compressor_bundle_b1_dispatches() -> int:

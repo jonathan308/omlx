@@ -4,6 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "dsa_indexer.h"
+#include "ds4_projection_qmm.h"
 #include "ds4_prefill_moe.h"
 #include "ds4_qkv_bundle.h"
 #include "deepseek_v4_sparse_attention.h"
@@ -231,6 +232,22 @@ NB_MODULE(_ext, m) {
       "block_count"_a,
       "variant"_a = 2,
       "stream"_a = nb::none());
+  m.def(
+      "ds4_projection_mxfp8_qmm",
+      &omlx::glm_kernels::ds4_projection_mxfp8_qmm,
+      "x"_a,
+      "weight"_a,
+      "scales"_a,
+      "variant"_a = 0,
+      "use_nax"_a = false,
+      "nax_variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_projection_nax_kernels_built",
+      &omlx::glm_kernels::ds4_projection_nax_kernels_built);
+  m.def(
+      "ds4_projection_nax_device_available",
+      &omlx::glm_kernels::ds4_projection_nax_device_available);
   m.def(
       "deepseek_v4_qkv_compressor_bundle_b1",
       &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
