@@ -826,6 +826,7 @@ def install_server_telemetry(
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 64,
     prefill_step_size: int = 2048,
+    control_plane: Any | None = None,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
@@ -1126,6 +1127,8 @@ def install_server_telemetry(
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
+            if control_plane is not None:
+                return control_plane.broadcast_object(obj)
 
             # MLX-LM implements every rank-zero object broadcast as two
             # all-sums: the producer contributes pickle length/data and every

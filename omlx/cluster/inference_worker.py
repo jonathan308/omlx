@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -26,6 +26,7 @@ from .deployment import (
     decode_worker_path_map,
     decode_worker_speculation,
 )
+from .control_plane import RankControlPlane
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -1610,7 +1611,19 @@ def run_worker(args: argparse.Namespace) -> int:
                     plan_hash,
                     world_size,
                 )
+                control_context = (
+                    RankControlPlane(
+                        rank=rank,
+                        world_size=world_size,
+                        host=args.control_host,
+                        port=args.control_port,
+                        token=args.control_token,
+                    )
+                    if args.control_host and args.control_port and args.control_token
+                    else nullcontext(None)
+                )
                 with (
+                    control_context as control_plane,
                     install_server_telemetry(
                         marker,
                         execution=execution,
@@ -1631,6 +1644,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             # really use, not from mlx-lm's 2048 default.
                             prefill_step_size=args.prefill_step_size,
                         ),
+                        control_plane=control_plane,
                     ),
                     _bind_generation_thread_stream(
                         ResponseGenerator,
@@ -1711,6 +1725,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="~/.omlx/cluster/runtime",
         help="Local state directory shown by the oMLX GUI on each node",
     )
+    parser.add_argument("--control-host", default="")
+    parser.add_argument("--control-port", type=int, default=0)
+    parser.add_argument("--control-token", default="")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
         "--execution-profile",
@@ -1745,6 +1762,17 @@ def main(argv: list[str] | None = None) -> int:
     args.model = str(Path(args.model).expanduser())
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535")
+    control_values = (
+        bool(args.control_host),
+        bool(args.control_port),
+        bool(args.control_token),
+    )
+    if any(control_values) and not all(control_values):
+        raise SystemExit(
+            "--control-host, --control-port and --control-token are required together"
+        )
+    if args.control_port and not 1 <= args.control_port <= 65535:
+        raise SystemExit("--control-port must be between 1 and 65535")
     for name in (
         "decode_concurrency",
         "prompt_concurrency",
