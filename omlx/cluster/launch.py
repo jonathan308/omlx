@@ -602,6 +602,23 @@ def _available_launch_ports(
     )
 
 
+def _available_control_port(host: str) -> int:
+    """Reserve a rank-zero TCP control port on the verified cluster address."""
+
+    try:
+        address = str(ipaddress.ip_address(host))
+    except ValueError as exc:
+        raise DistributedLaunchError("rank-control host is not an IP address") from exc
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            listener.bind((address, 0))
+        except OSError as exc:
+            raise DistributedLaunchError(
+                f"could not reserve rank-control port on {address}: {exc}"
+            ) from exc
+        return int(listener.getsockname()[1])
+
+
 def _package_version(name: str) -> str:
     if name == "omlx":
         try:
@@ -730,6 +747,8 @@ def build_mlx_launch_argv(
     python_executable: str = sys.executable,
     cwd: Path | None = None,
     state_dir: str = "~/.omlx/cluster/runtime",
+    control_host: str | None = None,
+    control_port: int | None = None,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
 
@@ -757,6 +776,15 @@ def build_mlx_launch_argv(
             raise ValueError(f"{label} must be between 1 and 65535")
     if api_port == collective_port:
         raise ValueError("API and collective ports must be distinct")
+    if (control_host is None) != (control_port is None):
+        raise ValueError("rank-control host and port must be provided together")
+    if control_host is not None:
+        try:
+            control_host = str(ipaddress.ip_address(control_host))
+        except ValueError as exc:
+            raise ValueError("rank-control host must be an IP address") from exc
+        if not 1 <= int(control_port) <= 65535:
+            raise ValueError("rank-control port must be between 1 and 65535")
     if cwd is not None and not cwd.is_absolute():
         raise ValueError("distributed working directory must be absolute")
 
@@ -829,6 +857,17 @@ def build_mlx_launch_argv(
             deployment.execution.tuning_reason,
         ]
     )
+    if control_host is not None and control_port is not None:
+        argv.extend(
+            [
+                "--control-host",
+                control_host,
+                "--control-port",
+                str(control_port),
+                "--control-token",
+                deployment.plan_hash,
+            ]
+        )
     if deployment.execution.prompt_cache_bytes is not None:
         argv.extend(
             [
@@ -2178,6 +2217,7 @@ class DistributedJobSupervisor:
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
         self.collective_port: int | None = None
+        self.control_port: int | None = None
         self.ready_event: dict[str, Any] | None = None
         self.rank_ready_events: dict[int, dict[str, Any]] = {}
         self.failure_event: dict[str, Any] | None = None
@@ -2229,6 +2269,8 @@ class DistributedJobSupervisor:
             encoding="utf-8",
         )
         self.port, self.collective_port = _available_launch_ports(self.deployment)
+        control_host = self.deployment.hosts[0].ips[0]
+        self.control_port = _available_control_port(control_host)
         argv = build_mlx_launch_argv(
             self.deployment,
             hostfile=hostfile,
@@ -2237,6 +2279,8 @@ class DistributedJobSupervisor:
             python_executable=self.python_executable,
             cwd=self.cwd,
             state_dir=self.state_dir,
+            control_host=control_host,
+            control_port=self.control_port,
         )
         self._phase = "loading"
         try:
@@ -2526,6 +2570,7 @@ class DistributedJobSupervisor:
         self.process = None
         self.port = None
         self.collective_port = None
+        self.control_port = None
         self.ready_event = None
         self.rank_ready_events.clear()
         self.failure_event = None
