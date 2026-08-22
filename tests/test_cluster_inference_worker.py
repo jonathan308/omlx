@@ -1452,6 +1452,16 @@ def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
     assert payload["reason"] == "peer watchdog test"
 
 
+def test_cancel_request_epoch_advances_past_an_existing_clock_jump(tmp_path):
+    path = tmp_path / "dep-9-cancel.json"
+    path.write_text(json.dumps({"epoch": 9999999999999}), encoding="utf-8")
+
+    _write_cancel_request(str(tmp_path), "dep-9", "new event", plan_hash="f" * 64)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["epoch"] == 10000000000000
+
+
 def _fake_mlx_core(calls: list[str], *, with_metal: bool = True) -> SimpleNamespace:
     metal = (
         SimpleNamespace(clear_cache=lambda: calls.append("metal.clear_cache"))

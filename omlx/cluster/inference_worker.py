@@ -823,19 +823,30 @@ def _write_cancel_request(
     mid-collective.
     """
 
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "deployment_id": deployment_id,
-        "epoch": int(time.time() * 1000),
-        "scope": "all",
-        "reason": reason,
-    }
-    if plan_hash:
-        payload["plan_hash"] = plan_hash
     try:
         root = Path(state_dir).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{deployment_id}-cancel.json"
+        epoch = int(time.time() * 1000)
+        # Reused deployment IDs can leave an old control file behind. Keep
+        # epochs strictly monotonic even if that file came from a clock jump;
+        # the new worker treats the existing epoch as its startup watermark.
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            previous_epoch = existing.get("epoch") if isinstance(existing, dict) else 0
+            if isinstance(previous_epoch, int) and not isinstance(previous_epoch, bool):
+                epoch = max(epoch, previous_epoch + 1)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "deployment_id": deployment_id,
+            "epoch": epoch,
+            "scope": "all",
+            "reason": reason,
+        }
+        if plan_hash:
+            payload["plan_hash"] = plan_hash
         temporary = path.with_name(path.name + ".tmp")
         descriptor = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600

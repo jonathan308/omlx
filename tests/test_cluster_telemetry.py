@@ -792,7 +792,13 @@ class _BatchGenerator:
         self.removed.append(list(uids))
 
 
-def _cancel_telemetry(tmp_path, clock=None):
+def _cancel_telemetry(
+    tmp_path,
+    clock=None,
+    *,
+    plan_hash="",
+    epoch_floor=0,
+):
     marker = _Marker()
     telemetry = RuntimeTelemetry(
         marker,
@@ -800,6 +806,8 @@ def _cancel_telemetry(tmp_path, clock=None):
         publish_interval=0,
         cancel_path=tmp_path / "dep-1-cancel.json",
         cancel_deployment_id="dep-1",
+        cancel_plan_hash=plan_hash,
+        cancel_epoch_floor=epoch_floor,
     )
     return telemetry
 
@@ -909,3 +917,96 @@ def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
     assert generator.removed == []
+
+
+def test_cancel_file_from_an_old_plan_or_worker_lifetime_is_ignored(tmp_path):
+    import json
+
+    telemetry = _cancel_telemetry(
+        tmp_path,
+        plan_hash="current-plan",
+        epoch_floor=1000,
+    )
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((11,))
+    cancel_path = tmp_path / "dep-1-cancel.json"
+
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "old-plan",
+                "epoch": 2000,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "current-plan",
+                "epoch": 999,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+    assert generator.removed == []
+
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "current-plan",
+                "epoch": 1001,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert generator.removed == [[11]]
+
+
+def test_existing_matching_cancel_is_a_startup_watermark_not_durable_state(tmp_path):
+    import json
+
+    cancel_path = tmp_path / "dep-1-cancel.json"
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "same-plan",
+                "epoch": 4242,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    telemetry = _cancel_telemetry(tmp_path, plan_hash="same-plan")
+    generator = _BatchGenerator()
+    telemetry.register_batch_generator(generator)
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    telemetry.bind_pending_uid((12,))
+
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+    assert generator.removed == []
+
+    payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+    payload["epoch"] = 4243
+    cancel_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert generator.removed == [[12]]

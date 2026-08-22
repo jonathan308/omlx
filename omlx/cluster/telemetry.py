@@ -86,6 +86,8 @@ class RuntimeTelemetry:
         heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
         cancel_path: Path | None = None,
         cancel_deployment_id: str = "",
+        cancel_plan_hash: str = "",
+        cancel_epoch_floor: int = 0,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -138,8 +140,19 @@ class RuntimeTelemetry:
         self._batch_generator: Any | None = None
         self._cancel_path = cancel_path
         self._cancel_deployment_id = cancel_deployment_id
-        self._last_cancel_epoch = 0
+        self._cancel_plan_hash = cancel_plan_hash
+        self._cancel_epoch_floor = max(0, int(cancel_epoch_floor))
+        self._last_cancel_epoch = max(0, self._cancel_epoch_floor - 1)
         self._last_cancel_poll_at = float("-inf")
+        # Cancellation is an edge-triggered control event, not durable desired
+        # state. A file left by a previous rank lifetime must be the startup
+        # watermark, never work applied to the first request of this process.
+        existing_cancel = self._read_cancel_request()
+        if existing_cancel is not None:
+            self._last_cancel_epoch = max(
+                self._last_cancel_epoch,
+                int(existing_cancel["epoch"]),
+            )
 
     def heartbeat(self) -> None:
         """Refresh the marker with nothing new to say.
@@ -415,8 +428,12 @@ class RuntimeTelemetry:
             and payload.get("deployment_id") != self._cancel_deployment_id
         ):
             return None
+        if self._cancel_plan_hash and payload.get("plan_hash") != self._cancel_plan_hash:
+            return None
         epoch = payload.get("epoch")
         if not isinstance(epoch, int) or isinstance(epoch, bool):
+            return None
+        if epoch < self._cancel_epoch_floor:
             return None
         return payload
 
@@ -428,6 +445,7 @@ class RuntimeTelemetry:
         payload = {
             "schema_version": 1,
             "deployment_id": self._cancel_deployment_id,
+            "plan_hash": self._cancel_plan_hash,
             "epoch": epoch,
             "cancelled": cancelled,
             "at": time.time(),
@@ -886,6 +904,12 @@ def install_server_telemetry(
         if isinstance(marker_payload, dict)
         else ""
     )
+    marker_plan_hash = (
+        str(marker_payload.get("plan_hash") or "")
+        if isinstance(marker_payload, dict)
+        else ""
+    )
+    worker_cancel_epoch_floor = int(time.time() * 1000)
     telemetry = RuntimeTelemetry(
         marker,
         execution=execution,
@@ -897,6 +921,8 @@ def install_server_telemetry(
             else None
         ),
         cancel_deployment_id=marker_deployment_id,
+        cancel_plan_hash=marker_plan_hash,
+        cancel_epoch_floor=worker_cancel_epoch_floor,
     )
 
     snapshot_ctx = threading.local()
