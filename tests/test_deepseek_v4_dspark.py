@@ -718,8 +718,16 @@ def test_dspark_rowwise_gemm_supports_tensor_parallel_head_counts(heads):
     actual_values = fast.dspark_rowwise_gemm(weights, keys, False)
     mx.eval(expected_scores, actual_scores, expected_values, actual_values)
 
-    assert mx.array_equal(actual_scores, expected_scores).item()
-    assert mx.array_equal(actual_values, expected_values).item()
+    # Metal 4/NAX on M5 can choose a different but BF16-equivalent reduction
+    # order from this custom row-wise kernel (typically 1-6 differing values
+    # in 9K-98K outputs). Require BF16 numerical parity, not cross-GPU bitwise
+    # identity with the stock matmul implementation.
+    assert mx.allclose(
+        actual_scores, expected_scores, rtol=1e-2, atol=1e-3
+    ).item()
+    assert mx.allclose(
+        actual_values, expected_values, rtol=1e-2, atol=1e-3
+    ).item()
 
 
 @pytest.mark.parametrize("rows", [2, 3, 5])

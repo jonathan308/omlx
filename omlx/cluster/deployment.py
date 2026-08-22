@@ -68,11 +68,10 @@ _RANK_ENV_DEFAULTS = (
     ("MLX_MAX_MB_PER_BUFFER", "512"),
     ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),
     ("JACCL_TIMEOUT_ACTION", "teardown-exit"),
-    # The custom two-rank mesh path uses one registered buffer for the small
-    # decode/DSpark reductions that otherwise pay the generic chunk scheduler
-    # and a second staging copy. Keep its rollback visible in the signed rank
-    # environment so an operator can A/B with ``=0`` without changing code.
-    ("JACCL_TWO_RANK_SMALL_ALLREDUCE", "1"),
+    # Live two-Mac RDMA A/B showed the experimental one-buffer two-rank path
+    # was neutral below 8 KiB and 3-6% slower at 40-512 KiB. Keep the switch
+    # visible for kernel iteration, but ship the measured generic path.
+    ("JACCL_TWO_RANK_SMALL_ALLREDUCE", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
