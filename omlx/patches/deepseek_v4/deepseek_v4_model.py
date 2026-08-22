@@ -630,13 +630,30 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
     if mask.ndim == 2:
         mask = mask[None, None]
     B, H, L, S = mask.shape
+    pooled_width = N - S
+    if pooled_width < 0:
+        raise ValueError("pooled attention mask is wider than the KV sequence")
+
+    if pool_mask is not None:
+        mask_width = int(pool_mask.shape[-1])
+        if mask_width > pooled_width:
+            # BatchPoolingCache may retain a capacity/physical tail beyond the
+            # restored row's logical pooled extent. make_mask marks that tail
+            # invalid, but broadcasting it to the shorter logical KV view
+            # fails before the values can be ignored. Logical pooled rows are
+            # prefix-contiguous, so trim only the physical tail.
+            pool_mask = pool_mask[..., :pooled_width]
+        elif mask_width < pooled_width:
+            raise ValueError(
+                "pooled attention validity mask is shorter than pooled KV"
+            )
 
     if pool_mask is None:
-        pool_mask = mx.ones((B, H, L, N - S), dtype=mx.bool_)
+        pool_mask = mx.ones((B, H, L, pooled_width), dtype=mx.bool_)
     elif pool_mask.ndim == 2:
-        pool_mask = mx.broadcast_to(pool_mask, (B, H, L, N - S))
+        pool_mask = mx.broadcast_to(pool_mask, (B, H, L, pooled_width))
     elif pool_mask.ndim == 3:
-        pool_mask = mx.broadcast_to(pool_mask[:, None], (B, H, L, N - S))
+        pool_mask = mx.broadcast_to(pool_mask[:, None], (B, H, L, pooled_width))
 
     full_mask = mx.concatenate([mask, pool_mask], axis=-1)
 

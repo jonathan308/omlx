@@ -1322,6 +1322,40 @@ class TestDeepseekV4SwitchGLU:
         assert y.shape == (1, 8, 8, 16)
 
 
+def test_pooled_mask_trims_batch_cache_physical_tail(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    local = mx.ones((1, 1, 8, 128), dtype=mx.bool_)
+    # Restored BatchPoolingCache capacity can exceed this row's logical pooled
+    # KV width. The invalid physical tail must not change the logical mask.
+    pooled = mx.concatenate(
+        [
+            mx.ones((1, 8, 25), dtype=mx.bool_),
+            mx.zeros((1, 8, 5), dtype=mx.bool_),
+        ],
+        axis=-1,
+    )
+
+    extended = dsv4._extend_mask(local, pooled, 128 + 25)
+    mx.eval(extended)
+
+    assert extended.shape == (1, 1, 8, 153)
+    assert bool(mx.all(extended).item()) is True
+
+
+def test_pooled_mask_rejects_missing_validity_columns(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    with pytest.raises(ValueError, match="shorter than pooled KV"):
+        dsv4._extend_mask(
+            mx.ones((1, 1, 2, 4), dtype=mx.bool_),
+            mx.ones((1, 2, 2), dtype=mx.bool_),
+            7,
+        )
+
+
 class TestDeepseekV4CompressedNativeAttention:
     @staticmethod
     def _attention_config(dsv4):
