@@ -90,6 +90,13 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
+    # The lossless windowed+sparse prefill kernel is head-count agnostic at
+    # the Metal level.  Carry its controls in the hostfile so every TP rank
+    # makes the same dispatch decision; coordinator-only environment values
+    # are otherwise not inherited by remote ranks launched over SSH.
+    ("OMLX_DSV4_WSDPA", "1"),
+    ("OMLX_DSV4_WSDPA_TP", "1"),
+    ("OMLX_DSV4_WSDPA_TOPK", "1"),
     # Decode has one sparse-indexer row, so row TP cannot divide it. The
     # measured fastest rank computes the exact top-k once and broadcasts only
     # 512 int32 indices; ``off`` restores replicated indexer work.

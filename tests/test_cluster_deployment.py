@@ -102,6 +102,9 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER",
         "OMLX_DSV4_ADAPTIVE_PREFILL_STEP",
         "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE",
+        "OMLX_DSV4_WSDPA",
+        "OMLX_DSV4_WSDPA_TP",
+        "OMLX_DSV4_WSDPA_TOPK",
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
@@ -127,6 +130,9 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER=4096" in envs
     assert "OMLX_DSV4_ADAPTIVE_PREFILL_STEP=1024" in envs
     assert "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE=2048" in envs
+    assert "OMLX_DSV4_WSDPA=1" in envs
+    assert "OMLX_DSV4_WSDPA_TP=1" in envs
+    assert "OMLX_DSV4_WSDPA_TOPK=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
@@ -140,6 +146,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
+    monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
     deployment = _deployment()
 
@@ -155,6 +162,8 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" not in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" not in envs
+    assert "OMLX_DSV4_WSDPA_TP=0" in envs
+    assert "OMLX_DSV4_WSDPA_TP=1" not in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs

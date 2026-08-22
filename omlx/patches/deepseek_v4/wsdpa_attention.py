@@ -336,6 +336,12 @@ def wsdpa_prefill(
             # Evaluate the first dispatch inside this fallback boundary.
             mx.eval(out)
             _ready = True
+            logger.info(
+                "DSV4 WSDPA prefill active: heads=%s query_tokens=%s ratio=%s",
+                heads,
+                q_len,
+                ratio,
+            )
         return out[None]
     except Exception:
         _broken = True
@@ -413,6 +419,14 @@ def wsdpa_topk_prefill(
             # that this independent top-k route is usable.
             mx.eval(out)
             _topk_ready = True
+            logger.info(
+                "DSV4 sparse WSDPA prefill active: heads=%s query_tokens=%s "
+                "ratio=%s topk=%s",
+                heads,
+                q_len,
+                ratio,
+                topk.shape[2],
+            )
         return out[None]
     except Exception:
         _broken = True
