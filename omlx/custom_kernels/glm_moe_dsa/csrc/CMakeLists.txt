@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_SHARED_LIBS "Build extensions as a shared library" ON)
+option(
+  OMLX_SKIP_METALLIB_BUILD
+  "Build the native wrapper against an already-staged metallib"
+  OFF)
 
 find_package(
   Python 3.8
@@ -48,7 +52,7 @@ target_compile_definitions(
          OMLX_GLM_MLX_INCLUDE_DIR="${OMLX_GLM_MLX_INCLUDE_DIR}")
 target_link_libraries(omlx_glm_kernel_ops PUBLIC mlx)
 
-if(MLX_BUILD_METAL)
+if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
   set(OMLX_GLM_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal

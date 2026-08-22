@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # Bounded read for the coordinator's cancel-request file.
 _MAX_CANCEL_FILE_BYTES = 64 * 1024
 
+# A shared request contains HTTP arguments and may include multimodal payloads,
+# but it must never be able to turn one corrupt transport word into an
+# unbounded worker allocation.
+_MAX_SHARED_REQUEST_BYTES = 256 * 1024 * 1024
+
 # How often a rank refreshes its marker with nothing to report.
 #
 # Every other publish is request-driven, so an idle deployment's marker simply
@@ -1117,7 +1122,69 @@ def install_server_telemetry(
 
     class TelemetryResponseGenerator(original):
         def _share_request(self, request: Any) -> Any:
-            shared = super()._share_request(request)
+            if not bool(getattr(self, "_is_distributed", False)):
+                shared = super()._share_request(request)
+            else:
+                # MLX-LM implements this broadcast as two all-sums: rank zero
+                # contributes the pickle length/data and every worker
+                # contributes zeros. Tiny JACCL reductions are the wrong
+                # primitive for an owned byte stream and can return a damaged
+                # first cache line under sustained traffic (observed as
+                # ``pickle.UnpicklingError: invalid load key, '\\x00'``).
+                # Send the exact rank-zero bytes point-to-point instead. This
+                # is also O(N) bytes rather than running a reduction kernel for
+                # data that has only one producer.
+                import pickle
+                from queue import Queue
+
+                group = mx.distributed.init()
+                world_size = int(group.size())
+                rank = int(getattr(self, "_rank", group.rank()))
+                if rank == 0:
+                    shareable = request[1:] if request is not None else None
+                    payload = pickle.dumps(shareable) if shareable is not None else b""
+                    if len(payload) > _MAX_SHARED_REQUEST_BYTES:
+                        raise RuntimeError(
+                            "distributed request metadata exceeds the 256 MiB safety bound"
+                        )
+                    length = mx.array([len(payload)], dtype=mx.int32)
+                    sent_length = length
+                    for target in range(1, world_size):
+                        sent_length = mx.distributed.send(sent_length, target)
+                    mx.eval(sent_length)
+                    if payload:
+                        data = mx.array(payload, dtype=mx.uint8)
+                        sent_data = data
+                        for target in range(1, world_size):
+                            sent_data = mx.distributed.send(sent_data, target)
+                        mx.eval(sent_data)
+                    if shareable is None:
+                        shared = None
+                    else:
+                        shared = request[0], *shareable
+                else:
+                    length = mx.distributed.recv_like(
+                        mx.zeros((1,), dtype=mx.int32), 0
+                    )
+                    size = int(length.item())
+                    if size < 0 or size > _MAX_SHARED_REQUEST_BYTES:
+                        raise RuntimeError(
+                            "distributed request broadcast has an invalid byte length: "
+                            f"{size}"
+                        )
+                    if size == 0:
+                        shared = None
+                    else:
+                        data = mx.distributed.recv_like(
+                            mx.zeros((size,), dtype=mx.uint8), 0
+                        )
+                        try:
+                            shareable = pickle.loads(bytes(data.tolist()))
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "distributed request broadcast failed integrity decoding"
+                            ) from exc
+                        shared = Queue(), *shareable
             if shared is None:
                 return None
             response_queue, *rest = shared

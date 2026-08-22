@@ -482,6 +482,101 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     assert mlx_server.BatchGenerator is FakeBatchGenerator
 
 
+def test_server_patch_broadcasts_distributed_request_point_to_point(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    class Group:
+        @staticmethod
+        def rank():
+            return 0
+
+        @staticmethod
+        def size():
+            return 2
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 0
+
+        def _share_request(self, request):
+            raise AssertionError("distributed path must not call MLX-LM all-sum share")
+
+    sent = []
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(
+        mx.distributed,
+        "send",
+        lambda value, target: sent.append((target, value.dtype, value.tolist()))
+        or value,
+    )
+    monkeypatch.setattr(mx, "eval", lambda *_values: None)
+    target = _Queue()
+
+    with install_server_telemetry(_Marker(), prefill_guard=None):
+        generator = mlx_server.ResponseGenerator()
+        queue, request, args = generator._share_request(
+            (target, "request", {"max_tokens": 7})
+        )
+
+    assert queue._queue is target
+    assert request == "request"
+    assert args == {"max_tokens": 7}
+    assert len(sent) == 2
+    assert sent[0][0:2] == (1, mx.int32)
+    assert sent[0][2][0] == len(bytes(sent[1][2]))
+    assert sent[1][0:2] == (1, mx.uint8)
+
+
+def test_server_patch_receives_distributed_request_point_to_point(monkeypatch):
+    import pickle
+
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    payload = pickle.dumps(("request", {"max_tokens": 7}))
+    received = [
+        mx.array([len(payload)], dtype=mx.int32),
+        mx.array(payload, dtype=mx.uint8),
+    ]
+
+    class Group:
+        @staticmethod
+        def rank():
+            return 1
+
+        @staticmethod
+        def size():
+            return 2
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 1
+
+        def _share_request(self, request):
+            raise AssertionError("distributed path must not call MLX-LM all-sum share")
+
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(
+        mx.distributed,
+        "recv_like",
+        lambda _value, source: received.pop(0) if source == 0 else None,
+    )
+
+    with install_server_telemetry(_Marker(), prefill_guard=None):
+        generator = mlx_server.ResponseGenerator()
+        queue, request, args = generator._share_request(None)
+
+    assert isinstance(queue, _TelemetryQueue)
+    assert request == "request"
+    assert args == {"max_tokens": 7}
+    assert received == []
+
+
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(
     monkeypatch,
 ):
