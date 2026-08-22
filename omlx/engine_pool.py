@@ -17,6 +17,7 @@ import asyncio
 import gc
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -57,6 +58,69 @@ logger = logging.getLogger(__name__)
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+
+_CLUSTER_RANK_STATE_DIR = "~/.omlx/cluster/runtime"
+
+
+def _cluster_rank_resident_bytes(
+    *,
+    state_dir: str | Path | None = None,
+    exclude_deployment_id: str | None = None,
+) -> int:
+    """Resident memory of live cluster rank workers in sibling processes.
+
+    Rank workers are separate processes — launched over SSH, possibly by a
+    peer coordinator — so this process's ``mx.get_active_memory()`` and
+    ``phys_footprint`` see none of the tens of GB they hold. Admission that
+    ignores them overcommits the host (observed live: a 59 GB local model
+    admitted on top of a 75 GB rank on a 128 GB node → ~77 GB of compressor
+    spill and red memory pressure). Ranks publish runtime markers carrying
+    their memory; fresh markers from live processes are charged here.
+
+    Markers belonging to the deployment currently being admitted are
+    excluded: its new ranks are not alive yet, and a stale marker from its
+    previous incarnation must not block re-activation.
+    """
+
+    try:
+        from .cluster.runtime import _marker_is_fresh, _process_is_live
+    except Exception:  # pragma: no cover - cluster module unavailable
+        return 0
+    if state_dir is None:
+        state_dir = os.environ.get(
+            "OMLX_CLUSTER_STATE_DIR", _CLUSTER_RANK_STATE_DIR
+        )
+    root = Path(state_dir).expanduser()
+    try:
+        markers = sorted(root.glob("*-rank-*.json"))
+    except OSError:
+        return 0
+    total = 0
+    for path in markers:
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (
+            exclude_deployment_id
+            and payload.get("deployment_id") == exclude_deployment_id
+        ):
+            continue
+        pid = payload.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        if not _process_is_live(pid):
+            continue
+        if not _marker_is_fresh(payload.get("updated_at", "")):
+            continue
+        resident = payload.get("load_memory_bytes")
+        if not isinstance(resident, (int, float)) or resident <= 0:
+            resident = payload.get("measured_weight_bytes")
+        if isinstance(resident, (int, float)) and resident > 0:
+            total += int(resident)
+    return total
 
 
 def _positive_int(value: object) -> int:
@@ -1530,6 +1594,12 @@ class EnginePool:
                         mx.get_active_memory(),
                         get_phys_footprint(),
                         self._current_model_memory,
+                    ) + _cluster_rank_resident_bytes(
+                        exclude_deployment_id=(
+                            deployment.deployment_id
+                            if deployment is not None
+                            else None
+                        )
                     )
                     projected = current + admission_size
                     if projected <= evict_target:
