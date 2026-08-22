@@ -53,6 +53,18 @@ def _deployment(model: str = "org/model") -> ClusterDeployment:
     )
 
 
+def _jaccl_deployment() -> ClusterDeployment:
+    deployment = _deployment()
+    return replace(
+        deployment,
+        backend="jaccl",
+        hosts=(
+            replace(deployment.hosts[0], rdma=(None, "rdma_en5")),
+            replace(deployment.hosts[1], rdma=("rdma_en6", None)),
+        ),
+    )
+
+
 def test_serve_release_is_atomic_and_mirrored_to_remote(tmp_path):
     calls = []
 
@@ -308,6 +320,49 @@ def test_supervisor_collects_every_rank_ready_event():
 
     assert [rank["rank"] for rank in status["ranks"]] == [0, 1]
     assert status["ranks"][1]["measured_weight_bytes"] == 11
+
+
+def test_supervisor_warms_jaccl_before_model_weight_loading(monkeypatch):
+    deployment = _jaccl_deployment()
+    supervisor = launch.DistributedJobSupervisor(deployment, preflight=False)
+    calls = []
+    monkeypatch.delenv("OMLX_CLUSTER_WARM_JACCL_BEFORE_LOAD", raising=False)
+    monkeypatch.setattr(
+        launch,
+        "run_cluster_performance_probe",
+        lambda selected, **kwargs: calls.append((selected, kwargs))
+        or {"world_size": 2},
+    )
+
+    result = supervisor._warm_selected_fabric()
+
+    assert result == {"world_size": 2}
+    assert calls[0][0] is deployment
+    assert calls[0][1]["python_executable"] == supervisor.python_executable
+
+
+def test_supervisor_skips_jaccl_warmup_for_ring_or_operator_override(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        launch,
+        "run_cluster_performance_probe",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+    assert (
+        launch.DistributedJobSupervisor(
+            _deployment(), preflight=False
+        )._warm_selected_fabric()
+        is None
+    )
+    monkeypatch.setenv("OMLX_CLUSTER_WARM_JACCL_BEFORE_LOAD", "0")
+    assert (
+        launch.DistributedJobSupervisor(
+            _jaccl_deployment(),
+            preflight=False,
+        )._warm_selected_fabric()
+        is None
+    )
+    assert calls == []
 
 
 def test_supervisor_persists_bounded_launcher_output(tmp_path, monkeypatch):

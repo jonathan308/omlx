@@ -2361,6 +2361,35 @@ class DistributedJobSupervisor:
     def endpoint(self) -> str | None:
         return f"http://127.0.0.1:{self.port}" if self.port is not None else None
 
+    def _warm_selected_fabric(self) -> dict[str, Any] | None:
+        """Create and retire one verified JACCL group before loading weights.
+
+        After a reboot rdma_ctl can report healthy devices while the first
+        real queue pair is still cold/stale. The bounded performance probe is
+        the existing end-to-end fabric proof and, crucially, repairs that state
+        before an 80 GiB rank has been materialized. Ring does not need this
+        RDMA-specific warmup.
+        """
+
+        enabled = os.environ.get(
+            "OMLX_CLUSTER_WARM_JACCL_BEFORE_LOAD",
+            "1",
+        ).strip().lower() in {"1", "true", "on", "yes"}
+        if not enabled or not self.deployment.backend.startswith("jaccl"):
+            return None
+        result = run_cluster_performance_probe(
+            self.deployment,
+            timeout=min(60.0, self.load_timeout),
+            python_executable=self.python_executable,
+            cwd=self.cwd,
+        )
+        logger.info(
+            "Warmed %s fabric before model load: ranks=%s",
+            self.deployment.backend,
+            result.get("world_size"),
+        )
+        return result
+
     def start(self) -> dict[str, Any]:
         if self.process is not None:
             raise RuntimeError("distributed job is already started")
@@ -2381,6 +2410,8 @@ class DistributedJobSupervisor:
                 self.deployment,
                 python_executable=self.python_executable,
             )
+        self._phase = "fabric_warmup"
+        self._warm_selected_fabric()
         # A deployment ID and plan hash are stable across reloads. Remove the
         # prior launch's gate before any rank can mistake it for this launch's
         # release signal.
