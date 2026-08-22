@@ -217,6 +217,14 @@ def progressive_sharded_load(
             )
         _eval_values(mx_module, fixed)
         mx_module.clear_cache()
+        # ``flat`` still pins every pre-shard layer array. The strategy below
+        # swaps module parameters for sharded slices, but an array this
+        # snapshot keeps alive can never be released: each materialized layer
+        # would stay resident in full alongside its shard, so a TP=2 rank
+        # grows toward ~1.5x the whole model instead of its half (observed: a
+        # rank killed at 163 GiB against an 84 GiB plan). Drop the snapshot
+        # — and the pre-shard fixed list — before any sharding begins.
+        del flat, fixed
         strategy = apply_tensor_strategy(
             model,
             tensor_group,

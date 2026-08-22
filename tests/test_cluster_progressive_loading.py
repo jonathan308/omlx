@@ -406,3 +406,91 @@ def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
         )
 
     assert calls == [("tokenizer", {"trust_remote_code": False})]
+
+
+def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
+    """The layer-snapshot list must not survive into the sharding pass.
+
+    Regression: ``flat`` pinned every pre-shard array for the whole strategy
+    run, so each materialized layer stayed resident in full next to its
+    shard — a TP=2 rank grew toward ~1.5x the whole model until the load
+    watchdog killed it (163 GiB against an 84 GiB plan), and a 128 GB node
+    ran out of memory entirely. The pre-shard arrays must be unreachable the
+    moment the strategy starts swapping in sharded slices.
+    """
+    import gc
+    import weakref
+
+    class Arr:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeModel:
+        model_type = "native_test"
+
+        def __init__(self):
+            self.params = {
+                "embed.weight": Arr("embed"),
+                "model.layers.0.weight": Arr("layer-0"),
+                "model.layers.1.weight": Arr("layer-1"),
+            }
+            self.shard = lambda group: None
+
+        def parameters(self):
+            return self.params
+
+    model = FakeModel()
+    originals = {
+        key: weakref.ref(value)
+        for key, value in model.params.items()
+        if ".layers." in key
+    }
+    embed_ref = weakref.ref(model.params["embed.weight"])
+
+    def fake_strategy(shard_model, group, *, mx_module, progress=None):
+        for key in list(shard_model.params):
+            if ".layers." in key:
+                shard_model.params[key] = Arr(key + " shard")
+        gc.collect()
+        # Checked *inside* the strategy: after this point a pinned original
+        # would sit next to its materialized shard for the rest of the load.
+        assert all(ref() is None for ref in originals.values())
+        return "native"
+
+    monkeypatch.setattr(
+        "omlx.cluster.progressive_loading.apply_tensor_strategy", fake_strategy
+    )
+
+    class FakeMX:
+        cpu = object()
+        distributed = SimpleNamespace(all_sum=lambda value, stream=None: value)
+
+        def array(self, value):
+            return value
+
+        def eval(self, *values):
+            pass
+
+        def clear_cache(self):
+            pass
+
+    fake_utils = SimpleNamespace(
+        _download=lambda repo, allow_patterns=None: repo,
+        load_config=lambda path: {},
+        load_tokenizer=lambda path, config, eos_token_ids=None: "tokenizer",
+        load_model=lambda path, **kwargs: (model, {}),
+        tree_flatten=lambda params: list(params.items()),
+    )
+
+    loaded, tokenizer = progressive_sharded_load(
+        "fake-repo",
+        tensor_group=SimpleNamespace(),
+        utils_module=fake_utils,
+        mx_module=FakeMX(),
+    )
+
+    assert loaded is model
+    assert tokenizer == "tokenizer"
+    gc.collect()
+    assert all(ref() is None for ref in originals.values())
+    assert embed_ref() is not None
