@@ -27,6 +27,15 @@ _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
 _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
     os.environ.get("OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", "16384")
 )
+# Real TP4/4 layer-20 ABBA: BM32 is 1.113x stock at M=1024/top6 (6144
+# routes), but regresses at 3072 and 12288 routes. Keep the evidenced island
+# separate from the existing large-route crossover.
+_DEEPSEEK_MXFP4_MID_BLOCK_MIN_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_MXFP4_MID_BLOCK_MIN_ROUTES", "6144")
+)
+_DEEPSEEK_MXFP4_MID_BLOCK_MAX_ROUTES = int(
+    os.environ.get("OMLX_DEEPSEEK_MXFP4_MID_BLOCK_MAX_ROUTES", "8192")
+)
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
@@ -160,6 +169,15 @@ def _build_mxfp4_blocks(indices: mx.array, num_experts: int, bm: int):
 
 def _block_config(num_routes: int, native_kind: str) -> tuple[int, int]:
     if native_kind == "mxfp4":
+        if (
+            _DEEPSEEK_MXFP4_MID_BLOCK_MIN_ROUTES
+            <= num_routes
+            < _DEEPSEEK_MXFP4_MID_BLOCK_MAX_ROUTES
+        ):
+            return (
+                _DEEPSEEK_MXFP4_LARGE_BLOCK_BM,
+                _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT,
+            )
         large_block_min_routes = _DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES
     elif native_kind == "affine":
         large_block_min_routes = _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES
