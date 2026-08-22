@@ -32,8 +32,16 @@ from omlx.cluster.inference_worker import (
     build_parser,
 )
 from omlx.cluster.planner import PipelineAssignment
+from omlx.cluster.telemetry import _RankSynchronousTimeBudget
 
 GiB = 1024**3
+
+
+def test_rank_synchronous_time_budget_allows_one_model_step_per_round():
+    budget = _RankSynchronousTimeBudget()
+
+    assert list(budget) == [None]
+    assert list(budget) == [None]
 
 
 def test_collective_trace_records_order_and_restores_mlx_functions(

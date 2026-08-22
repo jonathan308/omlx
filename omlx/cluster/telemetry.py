@@ -815,6 +815,32 @@ class _TelemetryQueue:
         return self._queue.put(item, *args, **kwargs)
 
 
+class _RankSynchronousTimeBudget:
+    """Yield exactly one model step before the next rank-control round.
+
+    MLX-LM's distributed ``TimeBudget`` runs up to 25 ``BatchGenerator.next``
+    calls before ranks exchange their cancellation list. On heterogeneous Macs,
+    the faster worker can cross the prompt/decode boundary while rank zero is
+    still finishing the prior step. The resulting collectives have different
+    shapes (for example ``[1, 1, 4096]`` versus ``[1, 7, 4096]``), which looks
+    like an RDMA completion loss but is actually rank schedule divergence.
+
+    One step per outer round makes rank zero's existing request and cancellation
+    broadcasts the schedule boundary. It also admits newly queued continuous-
+    batch requests every token instead of only after a 25-step burst.
+    """
+
+    def __iter__(self) -> "_RankSynchronousTimeBudget":
+        self._pending = True
+        return self
+
+    def __next__(self) -> None:
+        if not getattr(self, "_pending", False):
+            raise StopIteration
+        self._pending = False
+        return None
+
+
 @contextmanager
 def install_server_telemetry(
     marker: MarkerWriter,
@@ -852,6 +878,7 @@ def install_server_telemetry(
     original_batch_generator = mlx_server.BatchGenerator
     original_prompt_cache = mlx_server.LRUPromptCache
     original_generation_context = mlx_server.GenerationContext
+    original_time_budget = mlx_server.TimeBudget
     cancellation_state = threading.local()
     marker_path = getattr(marker, "path", None)
     marker_payload = getattr(marker, "payload", None)
@@ -1297,6 +1324,8 @@ def install_server_telemetry(
     mlx_server.ResponseGenerator = TelemetryResponseGenerator
     mlx_server.LRUPromptCache = TelemetryPromptCache
     mlx_server.GenerationContext = CoordinatedGenerationContext
+    if world_size > 1:
+        mlx_server.TimeBudget = _RankSynchronousTimeBudget
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
     # Started here rather than by the caller: this block is exactly the span
@@ -1311,6 +1340,7 @@ def install_server_telemetry(
         mlx_server.BatchGenerator = original_batch_generator
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
+        mlx_server.TimeBudget = original_time_budget
         mlx_server.stream_generate = original_stream_generate
         if ssd_store is not None:
             # Snapshots are process-lifetime; a hard crash skips this and the
