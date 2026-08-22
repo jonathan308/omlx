@@ -607,3 +607,337 @@ component.switchAllToHeadless().then(() => {
     assert result["rolesAfter"] == ["headless", "headless"]
     assert result["replans"] == 1, "the click re-runs the plan"
     assert result["label"] == "31.0 GiB"
+
+
+# --- Execution strategy picker, catalogue recommendation, naming fixes -------
+
+
+def test_strategy_picker_renders_between_models_and_roles():
+    template = _read(TEMPLATE)
+
+    assert "data-cluster-v2-strategy-picker" in template
+    # Same segmented-control pattern as the role picker (neutral-900 active).
+    picker = template.split("data-cluster-v2-strategy-picker", 1)[1].split(
+        "data-cluster-v2-node-roles", 1
+    )[0]
+    assert "bg-neutral-900 text-white" in picker
+    assert ':data-cluster-v2-strategy="option.key"' in picker
+    # Green "Recommended" pill, exactly one at a time.
+    assert "data-cluster-v2-strategy-recommended" in picker
+    assert (
+        "bg-green-50 border-green-200 text-green-700" in picker
+    )
+    assert "recommendedStrategy() === option.key" in picker
+    # Disabled options explain themselves.
+    assert ":disabled=\"option.disabled\"" in picker
+    assert ":title=\"option.disabledReason\"" in picker
+
+
+def test_tensor_parallel_size_threaded_through_plan_and_activation():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+const bodies = [];
+component.apiFetch = async (url, options) => {
+  bodies.push({
+    url,
+    body: options && options.body ? JSON.parse(options.body) : null,
+  });
+  if (url.endsWith('/plan')) {
+    return { assignments: [], placement_signature: 'a'.repeat(16) };
+  }
+  return {};
+};
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+
+(async () => {
+  component.planStrategy = 'tensor';
+  await component.runPlan();
+  component.plan = { assignments: [], placement_signature: 'a'.repeat(16) };
+  await component.activatePlan();
+  component.planStrategy = 'auto';
+  await component.runPlan();
+  component.planStrategy = 'pipeline';
+  await component.runPlan();
+  process.stdout.write(JSON.stringify({
+    bodies: bodies.map((entry) => ({
+      url: entry.url,
+      tp: entry.body ? entry.body.tensor_parallel_size : null,
+    })),
+    stepHint: component.wizardSteps()[3].hint,
+  }));
+})();
+""",
+    )
+
+    plans = [b["tp"] for b in result["bodies"] if b["url"].endswith("/plan")]
+    deploys = [
+        b["tp"]
+        for b in result["bodies"]
+        if b["url"].endswith("/deployments") and b["tp"] is not None
+    ]
+    # tensor → TP == len(planNodes()) == 2; auto/pipeline → pipeline-only.
+    assert plans == [2, 1, 1], plans
+    assert deploys == [2], deploys
+    # Step-4 hint is strategy-aware only for tensor.
+    assert result["stepHint"] == "Layers per Mac"
+
+
+def test_strategy_picker_disables_tensor_on_a_single_mac():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', friendly_name: 'Solo', caps: { ram_gb: 128 }, addrs: [] },
+  paired: [],
+  discovered: [],
+};
+const options = component.strategyOptions();
+component.setPlanStrategy('tensor');
+process.stdout.write(JSON.stringify({
+  keys: options.map((option) => option.key),
+  tensor: options.find((option) => option.key === 'tensor'),
+  afterPick: component.planStrategy,
+  recommended: component.recommendedStrategy(),
+}));
+""",
+    )
+
+    assert result["keys"] == ["auto", "tensor", "pipeline"]
+    assert result["tensor"]["disabled"] is True
+    assert result["tensor"]["disabledReason"] == "Tensor parallelism needs 2+ Macs"
+    assert result["afterPick"] == "auto", "a disabled option cannot be picked"
+    # No catalogue call ever fired on a one-Mac setup → no badge, no errors.
+    assert result["recommended"] == ""
+
+
+def test_catalogue_drives_the_recommendation_badge_and_capability_locks():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+let catalogueCalls = 0;
+component.apiFetch = async (url) => {
+  if (url.endsWith('/catalogue')) {
+    catalogueCalls += 1;
+    return {
+      models: [{
+        model_path: '/models/m',
+        strategy: 'tensor',
+        tensor_parallel_size: 2,
+        supports_pipeline: false,
+        supports_tensor_parallel: true,
+      }],
+    };
+  }
+  return {};
+};
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+component.planStrategy = 'pipeline';
+
+(async () => {
+  await component.loadCatalogue();
+  const options = component.strategyOptions();
+  process.stdout.write(JSON.stringify({
+    catalogueCalls,
+    recommended: component.recommendedStrategy(),
+    pipeline: options.find((option) => option.key === 'pipeline'),
+    afterNormalize: component.planStrategy,
+  }));
+})();
+""",
+    )
+
+    assert result["catalogueCalls"] == 1
+    assert result["recommended"] == "tensor"
+    assert result["pipeline"]["disabled"] is True
+    assert "pipeline" in result["pipeline"]["disabledReason"].lower()
+    # The current pick was invalidated by the catalogue — fell back to auto.
+    assert result["afterNormalize"] == "auto"
+
+
+def test_catalogue_failure_falls_back_to_the_fast_transport_heuristic():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', caps: { ram_gb: 128, jaccl: true }, addrs: [] },
+  paired: [
+    { node_id: 'node-b', caps: { ram_gb: 128, jaccl: true }, addrs: [], paired: true },
+  ],
+  discovered: [],
+};
+component.apiFetch = async (url) => {
+  if (url.endsWith('/catalogue')) throw new Error('catalogue down');
+  return {};
+};
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+
+const slow = clusterV2Wizard();
+slow.devicesPayload = {
+  self: { node_id: 'node-c', caps: { ram_gb: 128 }, addrs: [] },
+  paired: [
+    { node_id: 'node-d', caps: { ram_gb: 128 }, addrs: [], paired: true },
+  ],
+  discovered: [],
+};
+slow.apiFetch = async () => { throw new Error('catalogue down'); };
+slow.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+slow.selectedModelPath = '/models/m';
+
+(async () => {
+  await component.loadCatalogue();
+  await slow.loadCatalogue();
+  process.stdout.write(JSON.stringify({
+    fastRecommended: component.recommendedStrategy(),
+    fastFailed: component.catalogueFailed,
+    slowRecommended: slow.recommendedStrategy(),
+  }));
+})();
+""",
+    )
+
+    assert result["fastFailed"] is True
+    # Every member on jaccl → tensor; any member off it → auto.
+    assert result["fastRecommended"] == "tensor"
+    assert result["slowRecommended"] == "auto"
+
+
+def test_benchmark_body_satisfies_the_autoconfigure_contract():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+let benchBody = null;
+component.apiFetch = async (url, options) => {
+  if (url.endsWith('/autoconfigure')) {
+    benchBody = JSON.parse(options.body);
+  }
+  return {};
+};
+
+(async () => {
+  await component.runBenchmark();
+  process.stdout.write(JSON.stringify({ benchBody }));
+})();
+""",
+    )
+
+    body = result["benchBody"]
+    # Exactly one of model_path / model_size_bytes — the 16 GiB placeholder,
+    # not a model path (the probe measurements are what matter).
+    assert body["model_size_bytes"] == 16 * 1024**3
+    assert "model_path" not in body
+    assert body["measure_performance"] is True
+
+
+def test_display_model_name_strips_hashes_and_unwraps_hub_dirs():
+    result = _run_wizard(
+        """
+const fortyHex = 'a'.repeat(40);
+const names = {
+  displayName: component.displayModelName({
+    display_name: 'Qwen/Qwen3-32B', model_path: '/some/opaque/path',
+  }),
+  snapshotHash: component.displayModelName({
+    model_path: '/cache/hub/models--mlx-community--Llama-3-8B/snapshots/' + fortyHex,
+  }),
+  plainTail: component.displayModelName({ model_path: '/models/llama-3-8b' }),
+  empty: component.displayModelName({ model_path: '' }),
+  shortDelegates: component.shortModelName({ display_name: 'org/name' }),
+};
+process.stdout.write(JSON.stringify(names));
+""",
+    )
+
+    assert result["displayName"] == "Qwen/Qwen3-32B"
+    assert result["snapshotHash"] == "mlx-community/Llama-3-8B"
+    assert result["plainTail"] == "llama-3-8b"
+    assert result["empty"] == "this model"
+    assert result["shortDelegates"] == "org/name"
+
+    javascript = _read(JAVASCRIPT)
+    # filteredModels searches the display name too.
+    filtered = javascript.split("filteredModels() {", 1)[1].split("},", 1)[0]
+    assert "display_name" in filtered
+    # The active-deployment title no longer re-implements name cleanup.
+    template = _read(TEMPLATE)
+    assert "displayModelName(activeDeployment())" in template
+    assert "model_path.split('/').filter(Boolean).pop()" not in template
+
+
+def test_model_presence_counts_only_macs_that_run_the_split():
+    result = _run_wizard(
+        """
+component.devicesPayload = {
+  self: { node_id: 'node-a', caps: { ram_gb: 128 }, addrs: [] },
+  paired: [
+    { node_id: 'node-b', caps: { ram_gb: 64 }, addrs: [], paired: true },
+  ],
+  discovered: [
+    // Unpaired and merely nearby — it never receives layers and must not
+    // inflate the denominator.
+    { node_id: 'node-c', caps: { ram_gb: 32 }, addrs: [], paired: false, state: 'discovered' },
+  ],
+};
+const everywhere = {
+  model_path: '/models/m',
+  locations: [{ node_id: 'node-a' }, { node_id: 'node-b' }],
+};
+const partial = {
+  model_path: '/models/m',
+  locations: [{ node_id: 'node-a' }],
+};
+process.stdout.write(JSON.stringify({
+  allDevices: component.allDevices().length,
+  full: component.modelPresenceLabel(everywhere),
+  partial: component.modelPresenceLabel(partial),
+}));
+""",
+    )
+
+    assert result["allDevices"] == 3, "the unpaired Mac still renders as a card"
+    assert result["full"] == "on every Mac"
+    assert result["partial"] == "on 1 of 2 Macs — copied at activation"
+
+
+def test_beacon_row_is_an_amber_warning_not_a_red_failure():
+    result = _run_wizard(
+        """
+component.checks.started = true;
+component.discoveryHealth = { multicast_rx_within_5s: false };
+const row = component.checkRows().find((item) => item.key === 'multicast');
+process.stdout.write(JSON.stringify({
+  status: row.status,
+  label: row.label,
+  blocking: component.checksBlockingPass() === false,
+}));
+""",
+    )
+
+    assert result["status"] == "warn"
+    assert result["label"] == "Local network permission (discovery only)"
+
+    javascript = _read(JAVASCRIPT)
+    template = _read(TEMPLATE)
+    # The dead 'unknown' branch and stale stub comments are gone; the amber
+    # row reuses the toast warning tone.
+    assert "'unknown'" not in javascript
+    assert "STUB" not in javascript
+    assert "row.status === 'warn'" in template
+    assert "triangle-alert" in template
+    assert "text-amber-800 bg-amber-50 border border-amber-200" in template
+
+
+def test_split_bar_has_a_tensor_variant_and_width_transitions():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-split-bar-tensor" in template
+    assert "planIsTensor()" in template
+    assert "tensorShareLabel()" in template
+    assert template.count("transition-[width] duration-700 ease-out") >= 2
+    # The contiguous-range bar is untouched for pipeline plans.
+    assert "assignment.layer_count / Math.max(planTotalLayers(), 1)" in template
+    # planIsTensor keys off the plan payload, not the picker.
+    body = javascript.split("planIsTensor() {", 1)[1].split("},", 1)[0]
+    assert "tensor_parallel_size" in body
