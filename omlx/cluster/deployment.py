@@ -80,6 +80,10 @@ _RANK_ENV_DEFAULTS = (
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
     ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
+    # Weighted row shards require padding every rank to the largest shard for
+    # all_gather. The first 3:5/30K live gate was slower, so retain the exact
+    # implementation only as an operator A/B and ship equal row counts.
+    ("OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"),
     # Below 2K pooled entries the fixed top-k exchange can cost more than the
     # saved score work; the threshold turns the split on where context taper
     # begins instead of perturbing short-prompt performance.

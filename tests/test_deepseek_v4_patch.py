@@ -2378,6 +2378,7 @@ class TestIndexerFallbackTiling:
     ):
         _mx, dm = self._reduce_and_ref()
         monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
 
         group = SimpleNamespace(size=lambda: 2)
 
@@ -2390,6 +2391,9 @@ class TestIndexerFallbackTiling:
             (384, 1024),
         )
         assert dm._weighted_row_ranges(5, (3, 5)) == ((0, 1), (1, 5))
+
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", False)
+        assert dm._indexer_row_ranges(5, group) == ((0, 3), (3, 5))
 
     def test_tensor_prefill_row_gather_removes_uneven_padding(
         self, applied_patch, monkeypatch
@@ -2420,6 +2424,7 @@ class TestIndexerFallbackTiling:
     ):
         mx, dm = self._reduce_and_ref()
         monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
         first = mx.array([[[1], [2], [3]]], dtype=mx.uint32)
         second = mx.array([[[4], [5], [6], [7], [8]]], dtype=mx.uint32)
         first_padded = mx.concatenate(

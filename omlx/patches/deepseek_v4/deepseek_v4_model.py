@@ -786,6 +786,11 @@ _DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED = False
 _DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
     "OMLX_DSV4_INDEXER_ROW_TP", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS = os.getenv(
+    # Default-off: the first live 3:5/30K gate lost 3.1% because padding the
+    # all-gather to the larger 640-row shard outweighed the score imbalance.
+    "OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = os.getenv(
     "OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl"
 ).strip().lower()
@@ -937,7 +942,11 @@ def _indexer_row_ranges(
 ) -> Tuple[Tuple[int, int], ...]:
     """Use qualified TP compute weights, otherwise preserve equal splitting."""
 
-    weights = _tp_partition_weights(group)
+    weights = (
+        _tp_partition_weights(group)
+        if _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS
+        else None
+    )
     if weights is None:
         return _balanced_row_ranges(length, int(group.size()))
     return _weighted_row_ranges(length, weights)
