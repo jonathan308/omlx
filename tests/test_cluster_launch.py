@@ -94,6 +94,8 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
         collective_port=32120,
         python_executable="/opt/omlx/bin/python",
         cwd=Path("/opt/omlx"),
+        control_host="10.0.0.1",
+        control_port=32140,
     )
 
     assert argv[0] == "/opt/omlx/bin/python"
@@ -101,6 +103,9 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv[argv.index("--backend") + 1] == "ring"
     assert argv[argv.index("--starting-port") + 1] == "32120"
     assert argv[argv.index("--port") + 1] == "32100"
+    assert argv[argv.index("--control-host") + 1] == "10.0.0.1"
+    assert argv[argv.index("--control-port") + 1] == "32140"
+    assert argv[argv.index("--control-token") + 1] == deployment.plan_hash
     assert argv[argv.index("--plan-hash") + 1] == deployment.plan_hash
     assert argv[argv.index("--connections-per-ip") + 1] == "2"
     assert argv[argv.index("--execution-profile") + 1] == "balanced"

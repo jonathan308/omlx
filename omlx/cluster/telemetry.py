@@ -773,6 +773,7 @@ def install_server_telemetry(
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 64,
     prefill_step_size: int = 2048,
+    control_plane: Any | None = None,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
