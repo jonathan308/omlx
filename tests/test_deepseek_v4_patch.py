@@ -1337,7 +1337,13 @@ def test_pooled_mask_trims_batch_cache_physical_tail(applied_patch):
         axis=-1,
     )
 
-    extended = dsv4._extend_mask(local, pooled, 128 + 25)
+    extended = dsv4._extend_mask(
+        local,
+        pooled,
+        128 + 25,
+        local_width=128,
+        pooled_width=25,
+    )
     mx.eval(extended)
 
     assert extended.shape == (1, 1, 8, 153)
@@ -1353,7 +1359,27 @@ def test_pooled_mask_rejects_missing_validity_columns(applied_patch):
             mx.ones((1, 1, 2, 4), dtype=mx.bool_),
             mx.ones((1, 2, 2), dtype=mx.bool_),
             7,
+            local_width=4,
+            pooled_width=3,
         )
+
+
+def test_pooled_mask_keeps_rotating_local_suffix(applied_patch):
+    mx = pytest.importorskip("mlx.core")
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+    local = mx.array([[[[False, False, True, False, True, True]]]])
+    pooled = mx.ones((1, 1, 2), dtype=mx.bool_)
+    extended = dsv4._extend_mask(
+        local,
+        pooled,
+        6,
+        local_width=4,
+        pooled_width=2,
+    )
+    mx.eval(extended)
+
+    assert extended.tolist() == [[[[True, False, True, True, True, True]]]]
 
 
 class TestDeepseekV4CompressedNativeAttention:

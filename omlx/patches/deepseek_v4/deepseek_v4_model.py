@@ -623,16 +623,32 @@ def _dspark_ring_mm(
     )[:, None]
 
 
-def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int):
+def _extend_mask(
+    mask: Optional[mx.array],
+    pool_mask: Optional[mx.array],
+    N: int,
+    *,
+    local_width: Optional[int] = None,
+    pooled_width: Optional[int] = None,
+):
     if mask is None:
         return None
 
     if mask.ndim == 2:
         mask = mask[None, None]
     B, H, L, S = mask.shape
-    pooled_width = N - S
-    if pooled_width < 0:
-        raise ValueError("pooled attention mask is wider than the KV sequence")
+    local_width = S if local_width is None else int(local_width)
+    pooled_width = N - local_width if pooled_width is None else int(pooled_width)
+    if local_width < 0 or pooled_width < 0 or local_width + pooled_width != N:
+        raise ValueError("logical local/pooled widths do not match the KV sequence")
+    if S > local_width:
+        # RotatingKVCache retains the newest local window. A causal mask built
+        # from the absolute prompt can therefore be wider than the physical
+        # local KV view after restoring a prefix; keep the matching suffix.
+        mask = mask[..., S - local_width :]
+        S = local_width
+    elif S < local_width:
+        raise ValueError("local attention mask is shorter than local KV")
 
     if pool_mask is not None:
         mask_width = int(pool_mask.shape[-1])
@@ -2418,9 +2434,17 @@ class CompressedAttention(nn.Module):
                 _standard_mask=_standard_mask,
             )
         if out is None:
+            local_width = int(kv.shape[2])
+            pooled_width = int(pooled.shape[1])
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            mask = _extend_mask(
+                mask,
+                pooled_mask,
+                kv.shape[2],
+                local_width=local_width,
+                pooled_width=pooled_width,
+            )
             if _exact_decode_required(self, B, L):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
@@ -2699,8 +2723,16 @@ class SparseCompressedAttention(nn.Module):
                         self.compress_ratio,
                     )
                 if out is None:
+                    local_width = int(kv.shape[2])
+                    pooled_width = int(pooled.shape[1])
                     full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-                    mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                    mask = _extend_mask(
+                        mask,
+                        pmask,
+                        full_kv.shape[2],
+                        local_width=local_width,
+                        pooled_width=pooled_width,
+                    )
                     out = scaled_dot_product_attention(
                         q,
                         full_kv,
