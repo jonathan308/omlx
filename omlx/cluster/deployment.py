@@ -8,6 +8,7 @@ import binascii
 import ipaddress
 import json
 import math
+import os
 import re
 import zlib
 from dataclasses import dataclass, field
@@ -43,6 +44,39 @@ _RDMA_DEVICE = re.compile(r"^rdma_[A-Za-z0-9_.-]+$")
 _NODE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_MODEL_ID_BYTES = 16 * 1024
 _MAX_PLAN_BYTES = 256 * 1024
+
+# Rank-environment defaults carried by the mlx launch hostfile. Each value
+# yields to the coordinator's own environment: an operator who pinned a knob
+# keeps their value, and everyone else gets the tuned default.
+#
+# MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER bound how much work lands in
+# one Metal command buffer. An unbounded buffer overruns the GPU driver's
+# ~10 s execution timeout (kIOGPUCommandBufferCallbackErrorTimeout), which the
+# driver answers with SIGABRT and stranded wired memory — the crash class
+# ThunderMLX root-caused to missing caps.
+#
+# JACCL_PROGRESS_TIMEOUT_MS / JACCL_TIMEOUT_ACTION pair with the ProgressGuard
+# and emergency-teardown symbols compiled into the serving wheel's libjaccl
+# (``progress_timeout_ms()`` and the ``teardown-exit`` action calling
+# ``emergency_teardown()``): an RDMA polling loop that sees no completion for
+# 30 s unwinds and exits instead of spinning forever with memory wired. The
+# wheel ships compiled defaults; pinning them here keeps the posture explicit
+# and identical across every rank.
+_RANK_ENV_DEFAULTS = (
+    ("MLX_METAL_FAST_SYNCH", "1"),
+    ("MLX_MAX_OPS_PER_BUFFER", "16"),
+    ("MLX_MAX_MB_PER_BUFFER", "512"),
+    ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),
+    ("JACCL_TIMEOUT_ACTION", "teardown-exit"),
+)
+
+
+def _hostfile_envs() -> list[str]:
+    return [
+        f"{name}={os.environ.get(name) or default}"
+        for name, default in _RANK_ENV_DEFAULTS
+    ]
+
 
 RDMAPath = str | tuple[str, ...] | None
 
@@ -411,7 +445,7 @@ class ClusterDeployment:
     def hostfile_dict(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "envs": ["MLX_METAL_FAST_SYNCH=1"],
+            "envs": _hostfile_envs(),
             "hosts": [
                 {
                     "ssh": host.ssh,
