@@ -60,6 +60,85 @@ def _emit_event(payload: dict[str, Any]) -> None:
     )
 
 
+@contextmanager
+def _trace_collectives(
+    mx: Any,
+    group: Any,
+    *,
+    state_dir: str | Path,
+    deployment_id: str,
+) -> Any:
+    """Record rank-local distributed call order without changing execution.
+
+    This is an operator-only diagnostic for the hardest failure class: both
+    ranks are alive, but one constructs a different collective graph and the
+    peer eventually reports a lost completion.  JACCL can only report the
+    native operation that timed out; this trace adds the Python call sequence,
+    tensor shape, thread, and call site needed to distinguish a transport loss
+    from rank-state divergence.  It is disabled by default and restores every
+    MLX function on exit.
+    """
+
+    enabled = os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0").strip().lower()
+    if enabled not in {"1", "true", "on", "yes"}:
+        yield None
+        return
+
+    rank = int(group.rank())
+    path = (
+        Path(state_dir).expanduser()
+        / f"{deployment_id}-collectives-rank-{rank}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    names = ("all_sum", "all_gather", "send", "recv_like")
+    originals = {
+        name: getattr(mx.distributed, name)
+        for name in names
+        if hasattr(mx.distributed, name)
+    }
+    lock = threading.Lock()
+    sequence = 0
+    started = time.monotonic()
+
+    def wrap(name: str, original: Any) -> Any:
+        @wraps(original)
+        def traced(*args: Any, **kwargs: Any) -> Any:
+            nonlocal sequence
+            value = args[0] if args else kwargs.get("value")
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", None)
+            caller = sys._getframe(1)
+            with lock:
+                sequence += 1
+                record = {
+                    "seq": sequence,
+                    "rank": rank,
+                    "op": name,
+                    "shape": list(shape) if shape is not None else None,
+                    "dtype": str(dtype) if dtype is not None else None,
+                    "thread": threading.current_thread().name,
+                    "caller": (
+                        f"{Path(caller.f_code.co_filename).name}:"
+                        f"{caller.f_lineno}:{caller.f_code.co_name}"
+                    ),
+                    "elapsed_seconds": time.monotonic() - started,
+                }
+                with path.open("a", encoding="utf-8") as trace:
+                    trace.write(json.dumps(record, sort_keys=True) + "\n")
+            return original(*args, **kwargs)
+
+        return traced
+
+    path.write_text("", encoding="utf-8")
+    for name, original in originals.items():
+        setattr(mx.distributed, name, wrap(name, original))
+    try:
+        yield path
+    finally:
+        for name, original in originals.items():
+            setattr(mx.distributed, name, original)
+
+
 def _wait_for_serve_release(
     state_dir: str | Path,
     deployment_id: str,
@@ -1624,6 +1703,12 @@ def run_worker(args: argparse.Namespace) -> int:
                 )
                 with (
                     control_context as control_plane,
+                    _trace_collectives(
+                        mx,
+                        group,
+                        state_dir=args.state_dir,
+                        deployment_id=args.deployment_id,
+                    ),
                     install_server_telemetry(
                         marker,
                         execution=execution,

@@ -72,6 +72,10 @@ _RANK_ENV_DEFAULTS = (
     # was neutral below 8 KiB and 3-6% slower at 40-512 KiB. Keep the switch
     # visible for kernel iteration, but ship the measured generic path.
     ("JACCL_TWO_RANK_SMALL_ALLREDUCE", "0"),
+    # Rank-local JSONL tracing identifies collective-order divergence without
+    # changing JACCL execution. It is intentionally operator-only because one
+    # line per tensor operation is too expensive for normal inference.
+    ("OMLX_CLUSTER_TRACE_COLLECTIVES", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.

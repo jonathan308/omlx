@@ -95,6 +95,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "JACCL_PROGRESS_TIMEOUT_MS",
         "JACCL_TIMEOUT_ACTION",
         "JACCL_TWO_RANK_SMALL_ALLREDUCE",
+        "OMLX_CLUSTER_TRACE_COLLECTIVES",
         "OMLX_DSV4_INDEXER_ROW_TP",
         "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
@@ -113,6 +114,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "JACCL_PROGRESS_TIMEOUT_MS=30000" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
     assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" in envs
+    assert "OMLX_CLUSTER_TRACE_COLLECTIVES=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
@@ -123,6 +125,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "32")
     monkeypatch.setenv("JACCL_PROGRESS_TIMEOUT_MS", "60000")
     monkeypatch.setenv("JACCL_TWO_RANK_SMALL_ALLREDUCE", "1")
+    monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
     deployment = _deployment()
@@ -134,6 +137,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "JACCL_PROGRESS_TIMEOUT_MS=60000" in envs
     assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=1" in envs
     assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" not in envs
+    assert "OMLX_CLUSTER_TRACE_COLLECTIVES=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" not in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs

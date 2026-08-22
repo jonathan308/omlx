@@ -23,6 +23,7 @@ from omlx.cluster.inference_worker import (
     _execution_settings,
     _install_distributed_model_protocol,
     _server_arguments,
+    _trace_collectives,
     _wait_for_serve_release,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
@@ -33,6 +34,44 @@ from omlx.cluster.inference_worker import (
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_collective_trace_records_order_and_restores_mlx_functions(
+    tmp_path, monkeypatch
+):
+    class Distributed:
+        def all_sum(self, value, **_kwargs):
+            return ("sum", value)
+
+        def all_gather(self, value, **_kwargs):
+            return ("gather", value)
+
+    distributed = Distributed()
+    mx = SimpleNamespace(distributed=distributed)
+    group = SimpleNamespace(rank=lambda: 1)
+    value = SimpleNamespace(shape=(2, 4096), dtype="bfloat16")
+    original_sum = distributed.all_sum.__func__
+    monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
+
+    with _trace_collectives(
+        mx,
+        group,
+        state_dir=tmp_path,
+        deployment_id="trace-test",
+    ) as path:
+        assert distributed.all_sum(value) == ("sum", value)
+        assert distributed.all_gather(value) == ("gather", value)
+
+    assert distributed.all_sum.__func__ is original_sum
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(item["seq"], item["op"]) for item in records] == [
+        (1, "all_sum"),
+        (2, "all_gather"),
+    ]
+    assert records[0]["rank"] == 1
+    assert records[0]["shape"] == [2, 4096]
+    assert records[0]["dtype"] == "bfloat16"
+    assert "test_collective_trace_records_order" in records[0]["caller"]
 
 
 def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
