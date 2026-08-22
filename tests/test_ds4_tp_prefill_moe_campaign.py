@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import itertools
+
+import pytest
+
+from benchmarks.bench_ds4_tp_prefill_moe_campaign import (
+    ExpertBlock,
+    Shape,
+    bf16,
+    bf16_bits,
+    deterministic_expert_map,
+    materialization_ledger,
+    analysis_report,
+    reference_top6_scalar,
+    roofline,
+    sorted_route_top6_scalar,
+    synthetic_routes,
+    validate_expert_map,
+)
+
+
+def test_expert_map_is_stable_prefix_addressed_and_complete():
+    routes = (2, 0, 2, 1, 0, 2, 1, 0)
+    order, blocks = deterministic_expert_map(routes, experts=4, bm=2)
+
+    assert order == (1, 4, 7, 3, 6, 0, 2, 5)
+    assert blocks == (
+        ExpertBlock(0, 0, 2),
+        ExpertBlock(2, 0, 1),
+        ExpertBlock(3, 1, 2),
+        ExpertBlock(5, 2, 2),
+        ExpertBlock(7, 2, 1),
+    )
+    validate_expert_map(routes, order, blocks, experts=4, bm=2)
+
+
+def test_expert_map_rejects_atomic_completion_order():
+    routes = (0, 1, 0, 1)
+    order, blocks = deterministic_expert_map(routes, experts=2, bm=2)
+
+    with pytest.raises(ValueError, match="stable"):
+        validate_expert_map(
+            routes,
+            (2, 0, 1, 3),
+            blocks,
+            experts=2,
+            bm=2,
+        )
+
+
+def test_m1024_contract_has_one_full_bm32_block_per_expert():
+    shape = Shape()
+    routes = synthetic_routes(shape)
+    order, blocks = deterministic_expert_map(routes, shape.experts, shape.bm)
+
+    assert len(order) == 6144
+    assert len(blocks) == 256
+    assert {block.rows for block in blocks} == {24}
+    assert tuple(block.expert for block in blocks) == tuple(range(256))
+
+
+def test_sorted_down_reduction_restores_original_top6_slot_order():
+    values = (0.101, -3.75, 12.125, 0.007, 2.5, -0.333)
+    scores = (0.51, 0.125, 0.0625, 0.03125, 0.2, 0.07125)
+    expected = reference_top6_scalar(values, scores)
+
+    for order in itertools.permutations(range(6)):
+        assert sorted_route_top6_scalar(order, values, scores) == expected
+
+
+def test_bfloat16_slot_order_is_not_replaceable_by_unordered_atomics():
+    # A deliberately cancellation-heavy row. BF16 additions in a different
+    # completion order do not preserve the current MLX slot-order result.
+    weighted = (256.0, 1.0, -256.0, 0.5, 0.5, 0.5)
+    slot_order = 0.0
+    for value in weighted:
+        slot_order = bf16(slot_order + bf16(value))
+    completion_order = 0.0
+    for index in (0, 2, 1, 3, 4, 5):
+        completion_order = bf16(completion_order + bf16(weighted[index]))
+
+    assert bf16_bits(slot_order) != bf16_bits(completion_order)
+
+
+def test_materialization_and_roofline_contract_for_tp4_4_m1024():
+    ledger = materialization_ledger(Shape())
+    assert ledger["current_mib"]["sorted_route_input"] == 48.0
+    assert ledger["current_mib"]["gate_up_pair"] == 24.0
+    assert ledger["current_mib"]["activated_mid"] == 12.0
+    assert ledger["current_mib"]["sorted_down_routes"] == 48.0
+    assert ledger["phase_ab_target_mib"]["bounded_down_tile_scratch"] == 0.375
+    assert ledger["phase_ab_removed_core_persistent_mib"] == 84.0
+
+    model = roofline(Shape(), moe_runtime_fraction=0.5)
+    assert model["phase_a_infinite_e2e_ceiling"] == pytest.approx(1.5)
+    assert model["phase_ab_infinite_e2e_ceiling"] == pytest.approx(2.0)
+    assert 1.0 < model["phase_a_shape_e2e_ceiling"] < 1.5
+    assert model["phase_a_shape_e2e_ceiling"] < model["phase_ab_shape_e2e_ceiling"]
+    assert model["phase_ab_shape_e2e_ceiling"] < 2.0
+
+    report = analysis_report(Shape(), moe_runtime_fraction=0.5)
+    assert report["phase_b_contract"]["route_score_stage"] == (
+        "after_fp16_down_store_and_bf16_cast"
+    )
+    assert report["phase_b_contract"]["active_experts_per_slot"] == [256] * 6
+    assert report["phase_b_contract"][
+        "per_slot_down_weight_read_amplification"
+    ] == 6.0
