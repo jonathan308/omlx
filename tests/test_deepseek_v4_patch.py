@@ -2373,6 +2373,24 @@ class TestIndexerFallbackTiling:
         assert dm._balanced_row_ranges(5, 2) == ((0, 3), (3, 5))
         assert mx.array_equal(reconstructed, full).item()
 
+    def test_tensor_prefill_uses_qualified_weighted_row_ranges(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+
+        group = SimpleNamespace(size=lambda: 2)
+
+        assert dm._weighted_row_ranges(1024, (3, 5)) == (
+            (0, 384),
+            (384, 1024),
+        )
+        assert dm._indexer_row_ranges(1024, group) == (
+            (0, 384),
+            (384, 1024),
+        )
+        assert dm._weighted_row_ranges(5, (3, 5)) == ((0, 1), (1, 5))
+
     def test_tensor_prefill_row_gather_removes_uneven_padding(
         self, applied_patch, monkeypatch
     ):
@@ -2396,6 +2414,29 @@ class TestIndexerFallbackTiling:
         assert gathered.tolist() == [
             [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
         ]
+
+    def test_tensor_prefill_weighted_row_gather_preserves_sequence_order(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        first = mx.array([[[1], [2], [3]]], dtype=mx.uint32)
+        second = mx.array([[[4], [5], [6], [7], [8]]], dtype=mx.uint32)
+        first_padded = mx.concatenate(
+            [first.swapaxes(0, 1), mx.zeros((2, 1, 1), dtype=mx.uint32)],
+            axis=0,
+        )
+        wire = mx.concatenate([first_padded, second.swapaxes(0, 1)], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        gathered = dm._gather_indexer_rows(first, 8, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
 
     def test_tensor_prefill_equal_row_gather_reuses_collective_output(
         self, applied_patch, monkeypatch

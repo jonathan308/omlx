@@ -906,6 +906,43 @@ def _balanced_row_ranges(length: int, size: int) -> Tuple[Tuple[int, int], ...]:
     return tuple(ranges)
 
 
+def _weighted_row_ranges(
+    length: int,
+    weights: Tuple[int, ...],
+) -> Tuple[Tuple[int, int], ...]:
+    """Contiguous row ranges proportional to a qualified TP partition.
+
+    Cumulative integer boundaries keep every row exactly once and preserve
+    sequence order without a floating-point or host-specific tie break.  The
+    signed 3:5 DS4 placement therefore gives 384/640 rows of an M=1024 indexer
+    score build to the M3/M5 ranks instead of repeating the old 512/512 split.
+    """
+
+    if length < 0 or not weights or any(weight < 1 for weight in weights):
+        raise ValueError("row length and TP weights must be valid")
+    total = sum(weights)
+    ranges = []
+    prefix = 0
+    for weight in weights:
+        start = length * prefix // total
+        prefix += weight
+        stop = length * prefix // total
+        ranges.append((start, stop))
+    return tuple(ranges)
+
+
+def _indexer_row_ranges(
+    length: int,
+    group: mx.distributed.Group,
+) -> Tuple[Tuple[int, int], ...]:
+    """Use qualified TP compute weights, otherwise preserve equal splitting."""
+
+    weights = _tp_partition_weights(group)
+    if weights is None:
+        return _balanced_row_ranges(length, int(group.size()))
+    return _weighted_row_ranges(length, weights)
+
+
 def _gather_indexer_rows(
     local_indices: mx.array,
     total_rows: int,
@@ -914,7 +951,7 @@ def _gather_indexer_rows(
     """Reassemble uneven row shards after exact per-row top-k selection."""
 
     size = int(group.size())
-    ranges = _balanced_row_ranges(total_rows, size)
+    ranges = _indexer_row_ranges(total_rows, group)
     max_rows = max(stop - start for start, stop in ranges)
     rows_first = local_indices.swapaxes(0, 1)
     if rows_first.shape[0] < max_rows:
@@ -1885,7 +1922,7 @@ class Indexer(nn.Module):
         )
         query_offset = offset
         if row_sharded:
-            ranges = _balanced_row_ranges(L, int(row_group.size()))
+            ranges = _indexer_row_ranges(L, row_group)
             start, stop = ranges[int(row_group.rank())]
             x = x[:, start:stop]
             q_residual = q_residual[:, start:stop]
