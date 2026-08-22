@@ -59,6 +59,51 @@ def _emit_event(payload: dict[str, Any]) -> None:
     )
 
 
+def _wait_for_serve_release(
+    state_dir: str | Path,
+    deployment_id: str,
+    plan_hash: str,
+    world_size: int,
+    *,
+    timeout: float = 120.0,
+    clock: Any = time.monotonic,
+    sleep: Any = time.sleep,
+) -> None:
+    """Wait for the supervisor to confirm that every rank finished loading.
+
+    Ranks cannot use a JACCL collective as this barrier: the first Mac may be
+    fully wired while a smaller peer is still materializing layers, and an
+    early all-reduce then times out and destroys an otherwise healthy load.
+    Every rank publishes ``rank_ready`` first; the supervisor observes all of
+    them and atomically writes this local release marker on every host.
+    """
+
+    path = (
+        Path(state_dir).expanduser()
+        / f"{deployment_id}-serve.json"
+    )
+    deadline = float(clock()) + max(0.0, float(timeout))
+    while True:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == 1
+            and payload.get("deployment_id") == deployment_id
+            and payload.get("plan_hash") == plan_hash
+            and payload.get("world_size") == world_size
+        ):
+            return
+        remaining = deadline - float(clock())
+        if remaining <= 0:
+            raise TimeoutError(
+                "supervisor did not release all loaded ranks into serving"
+            )
+        sleep(min(0.05, remaining))
+
+
 def _cross_thread_generation_stream(mx: Any) -> Any:
     """Create the one MLX stream used by both rank loading and generation.
 
@@ -1559,6 +1604,12 @@ def run_worker(args: argparse.Namespace) -> int:
                             "optimizations": optimizations,
                         }
                     )
+                _wait_for_serve_release(
+                    args.state_dir,
+                    args.deployment_id,
+                    plan_hash,
+                    world_size,
+                )
                 with (
                     install_server_telemetry(
                         marker,

@@ -175,6 +175,88 @@ def _launcher_log_path(state_dir: str | Path, deployment_id: str) -> Path:
     return Path(state_dir).expanduser() / f"{deployment_id}-launcher.log"
 
 
+def _serve_release_path(state_dir: str | Path, deployment_id: str) -> Path:
+    """Coordinator-owned gate that releases loaded ranks into serving."""
+
+    return Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
+
+
+_REMOTE_SERVE_MARKER_SCRIPT = (
+    "import json,os,pathlib,sys;"
+    "p=pathlib.Path(sys.argv[1]).expanduser();"
+    "raw=sys.argv[2];"
+    "p.parent.mkdir(parents=True,exist_ok=True);"
+    "tmp=p.with_name(p.name+'.tmp');"
+    "tmp.write_text(raw,encoding='utf-8');"
+    "os.chmod(tmp,0o600);"
+    "os.replace(tmp,p)"
+)
+
+_REMOTE_CLEAR_SERVE_MARKER_SCRIPT = (
+    "import pathlib,sys;"
+    "pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
+)
+
+
+def _set_serve_release(
+    deployment: ClusterDeployment,
+    state_dir: str | Path,
+    payload: dict[str, Any] | None,
+    *,
+    runner: "SSHRunner" = subprocess.run,
+) -> None:
+    """Atomically publish or clear the post-load serve gate on every rank."""
+
+    filename = f"{deployment.deployment_id}-serve.json"
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if payload is not None
+        else None
+    )
+    local_path = _serve_release_path(state_dir, deployment.deployment_id)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if encoded is None:
+        local_path.unlink(missing_ok=True)
+    else:
+        temporary = local_path.with_name(local_path.name + ".tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+        os.replace(temporary, local_path)
+
+    remote_root = str(state_dir).rstrip("/") or "."
+    remote_path = f"{remote_root}/{filename}"
+    for host in deployment.hosts:
+        if host.ssh in _LOOPBACK_SSH_TARGETS:
+            continue
+        script = (
+            _REMOTE_CLEAR_SERVE_MARKER_SCRIPT
+            if encoded is None
+            else _REMOTE_SERVE_MARKER_SCRIPT
+        )
+        arguments = [remote_path] if encoded is None else [remote_path, encoded]
+        command = " ".join(
+            ["python3", "-c", shlex.quote(script)]
+            + [shlex.quote(item) for item in arguments]
+        )
+        completed = _run_cluster_ssh(
+            host.ssh,
+            command,
+            timeout=15.0,
+            runner=runner,
+        )
+        _raise_for_ssh_transport_failure(host.ssh, completed)
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "remote marker update failed"
+            raise DistributedLaunchError(
+                f"Could not update serve gate on {host.ssh}: {detail}"
+            )
+
+
 def _write_launch_manifest(
     state_dir: str | Path,
     deployment: ClusterDeployment,
@@ -2259,6 +2341,10 @@ class DistributedJobSupervisor:
                 self.deployment,
                 python_executable=self.python_executable,
             )
+        # A deployment ID and plan hash are stable across reloads. Remove the
+        # prior launch's gate before any rank can mistake it for this launch's
+        # release signal.
+        _set_serve_release(self.deployment, self.state_dir, None)
 
         self._temporary = tempfile.TemporaryDirectory(prefix="omlx-cluster-launch-")
         hostfile = Path(self._temporary.name) / "hostfile.json"
@@ -2303,6 +2389,17 @@ class DistributedJobSupervisor:
             self._open_launcher_log()
             self._start_readers()
             event = self._wait_for_ready()
+            _set_serve_release(
+                self.deployment,
+                self.state_dir,
+                {
+                    "schema_version": 1,
+                    "deployment_id": self.deployment.deployment_id,
+                    "plan_hash": self.deployment.plan_hash,
+                    "world_size": self.deployment.world_size,
+                    "released_at": time.time(),
+                },
+            )
             self._wait_for_listener()
             self._phase = "ready"
             self.ready_event = event
@@ -2629,6 +2726,8 @@ class DistributedJobSupervisor:
         self.failure_event = None
         self._phase = "stopped"
         self._remove_launch_manifest()
+        with suppress(Exception):
+            _set_serve_release(self.deployment, self.state_dir, None)
         if self._temporary is not None:
             self._temporary.cleanup()
             self._temporary = None

@@ -23,6 +23,7 @@ from omlx.cluster.inference_worker import (
     _execution_settings,
     _install_distributed_model_protocol,
     _server_arguments,
+    _wait_for_serve_release,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
     _watch_launcher_parent,
@@ -32,6 +33,48 @@ from omlx.cluster.inference_worker import (
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_worker_waits_for_matching_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    plan_hash = "a" * 64
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": plan_hash,
+                "world_size": 2,
+            }
+        )
+    )
+
+    _wait_for_serve_release(tmp_path, deployment_id, plan_hash, 2, timeout=0)
+
+
+def test_worker_rejects_stale_supervisor_serve_release(tmp_path):
+    deployment_id = "cluster-test"
+    marker = tmp_path / f"{deployment_id}-serve.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": deployment_id,
+                "plan_hash": "old",
+                "world_size": 2,
+            }
+        )
+    )
+
+    with pytest.raises(TimeoutError, match="did not release"):
+        _wait_for_serve_release(
+            tmp_path,
+            deployment_id,
+            "new",
+            2,
+            timeout=0,
+        )
 
 
 def test_distributed_mtp_pins_one_signed_depth_on_every_rank(tmp_path, monkeypatch):
@@ -718,6 +761,11 @@ def _run_rank(
         lambda _model: assignment_honored,
     )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(
+        inference_worker,
+        "_wait_for_serve_release",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         inference_worker, "_start_launcher_watchdog", lambda _m, _pid, **_kw: None
     )
