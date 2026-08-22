@@ -724,6 +724,16 @@ class RuntimeTelemetry:
             },
             "last_request": current,
         }
+        try:
+            from omlx.patches.mlx_lm_mtp.batch_generator import (
+                mtp_runtime_stats_snapshot,
+            )
+
+            mtp_stats = mtp_runtime_stats_snapshot()
+        except Exception:
+            mtp_stats = None
+        if mtp_stats is not None:
+            result["mtp"] = mtp_stats
         if self._execution is not None:
             result["execution"] = self._execution.to_dict()
         if self._assignment is not None:

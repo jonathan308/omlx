@@ -316,6 +316,66 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             )
         result["stage"] = validated_stage
 
+    mtp = value.get("mtp")
+    if mtp is not None:
+        if not isinstance(mtp, dict):
+            raise ValueError("runtime MTP metrics are invalid")
+        validated_mtp: dict[str, Any] = {}
+        for key in (
+            "sequences",
+            "tokens",
+            "cycles",
+            "accepted_draft_tokens",
+            "drafted_tokens",
+            "zero_depth_cycles",
+        ):
+            validated_mtp[key] = _nonnegative_int(
+                mtp.get(key), f"MTP metrics {key}"
+            )
+        if validated_mtp["accepted_draft_tokens"] > validated_mtp["drafted_tokens"]:
+            raise ValueError("runtime MTP accepted count exceeds drafted count")
+        for key in ("acceptance_ratio", "tokens_per_cycle"):
+            validated_mtp[key] = _nonnegative_float(
+                mtp.get(key), f"MTP metrics {key}"
+            )
+        if validated_mtp["acceptance_ratio"] > 1:
+            raise ValueError("runtime MTP acceptance ratio is out of range")
+        depth_drafted = mtp.get("depth_drafted")
+        depth_accepted = mtp.get("depth_accepted")
+        if (
+            not isinstance(depth_drafted, list)
+            or not isinstance(depth_accepted, list)
+            or len(depth_drafted) != len(depth_accepted)
+            or len(depth_drafted) > 8
+        ):
+            raise ValueError("runtime MTP depth metrics are invalid")
+        validated_mtp["depth_drafted"] = [
+            _nonnegative_int(item, "MTP depth drafted") for item in depth_drafted
+        ]
+        validated_mtp["depth_accepted"] = [
+            _nonnegative_int(item, "MTP depth accepted") for item in depth_accepted
+        ]
+        if any(
+            accepted > drafted
+            for accepted, drafted in zip(
+                validated_mtp["depth_accepted"],
+                validated_mtp["depth_drafted"],
+            )
+        ):
+            raise ValueError("runtime MTP depth accepted count exceeds drafted count")
+        timing = mtp.get("timing_ms")
+        if not isinstance(timing, dict):
+            raise ValueError("runtime MTP timing metrics are invalid")
+        validated_mtp["timing_ms"] = {
+            key: _nonnegative_float(timing.get(key), f"MTP timing {key}")
+            for key in ("backbone", "mtp_head", "sampling", "cache_ops")
+        }
+        finish_reason = mtp.get("last_finish_reason")
+        if not isinstance(finish_reason, str):
+            raise ValueError("runtime MTP finish reason is invalid")
+        validated_mtp["last_finish_reason"] = finish_reason[:64]
+        result["mtp"] = validated_mtp
+
     current = value.get("last_request")
     if current is None:
         result["last_request"] = None

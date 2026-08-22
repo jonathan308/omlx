@@ -657,6 +657,8 @@
   "modal.model_settings.qwen_ane_tune_throughput": "Prompt tok/s",
   "modal.model_settings.lightning_mtp": "Lightning MTP",
   "modal.model_settings.lightning_mtp_hint": "使用模型內建的 MTP 頭，每步產生多個 token。解碼速度最快可達約 1.5 倍。（Qwen 3.5/3.6、DeepSeek-V4、GLM-5.2）",
+  "modal.model_settings.mtp_draft_depth": "Maximum draft depth",
+  "modal.model_settings.mtp_draft_depth_hint": "Maximum speculative tokens per verification cycle (1–8). The runtime adapts down when deeper drafts stop paying off.",
   "modal.model_settings.mtp_conflict": "請先停用 DFlash 和 TurboQuant KV — 它們修補了 MTP 依賴的相同路徑。",
   "modal.model_settings.mtp_conflict_dflash": "請先停用 DFlash。",
   "modal.model_settings.mtplx_import": "匯入 MTP 側掛權重",

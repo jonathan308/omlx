@@ -249,6 +249,66 @@ def test_runtime_markers_reject_impossible_prefill_progress(tmp_path):
     assert "prefill progress exceeds" in result["warnings"][0]
 
 
+def test_runtime_markers_validate_mtp_cycle_economics(tmp_path):
+    metrics = _metrics()
+    metrics["mtp"] = {
+        "sequences": 3,
+        "tokens": 360,
+        "cycles": 120,
+        "accepted_draft_tokens": 240,
+        "drafted_tokens": 300,
+        "zero_depth_cycles": 2,
+        "acceptance_ratio": 0.8,
+        "tokens_per_cycle": 3.0,
+        "depth_drafted": [120, 100, 80],
+        "depth_accepted": [115, 85, 40],
+        "timing_ms": {
+            "backbone": 2_400.0,
+            "mtp_head": 600.0,
+            "sampling": 60.0,
+            "cache_ops": 30.0,
+        },
+        "last_finish_reason": "length",
+    }
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(assignments=_assignments(), metrics=metrics))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["metrics"]["mtp"] == metrics["mtp"]
+
+
+def test_runtime_markers_reject_impossible_mtp_acceptance(tmp_path):
+    metrics = _metrics()
+    metrics["mtp"] = {
+        "sequences": 1,
+        "tokens": 20,
+        "cycles": 10,
+        "accepted_draft_tokens": 11,
+        "drafted_tokens": 10,
+        "zero_depth_cycles": 0,
+        "acceptance_ratio": 1.1,
+        "tokens_per_cycle": 2.0,
+        "depth_drafted": [10],
+        "depth_accepted": [11],
+        "timing_ms": {
+            "backbone": 1.0,
+            "mtp_head": 1.0,
+            "sampling": 1.0,
+            "cache_ops": 1.0,
+        },
+        "last_finish_reason": "length",
+    }
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "accepted count exceeds drafted" in result["warnings"][0]
+
+
 def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics(
     tmp_path,
 ):

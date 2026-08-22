@@ -121,6 +121,8 @@ def test_model_settings_feature_labels_use_i18n_keys():
     assert "{{ t('modal.model_settings.reasoning_parser') }}" in modal_html
     assert "{{ t('modal.model_settings.specprefill') }}" in modal_html
     assert "{{ t('modal.model_settings.dflash') }}" in modal_html
+    assert "{{ t('modal.model_settings.mtp_draft_depth') }}" in modal_html
+    assert "{{ t('modal.model_settings.mtp_draft_depth_hint') }}" in modal_html
     assert "{{ t('status.active_models.dflash_label') }}" in status_html
 
     assert ">Reasoning Parser</label>" not in modal_html
@@ -136,6 +138,8 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.reasoning_parser",
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
+        "modal.model_settings.mtp_draft_depth",
+        "modal.model_settings.mtp_draft_depth_hint",
         "status.active_models.dflash_label",
         "modal.model_settings.qwen_ane",
         "modal.model_settings.qwen_ane_hint",
@@ -200,6 +204,17 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     assert 'placeholder="0.53"' in html
     assert 'placeholder="0.5"' in html
     assert "measured optimum" not in html
+
+
+def test_mtp_draft_depth_is_wired_through_dashboard():
+    html = _model_settings_template()
+    script = _dashboard_script()
+
+    assert 'x-model.number="modelSettings.mtp_num_draft_tokens"' in html
+    assert 'min="1" max="8" step="1"' in html
+    assert "'mtp_num_draft_tokens'" in script
+    assert "mtp_num_draft_tokens: s.mtp_num_draft_tokens ?? 3" in script
+    assert "mtp_num_draft_tokens: this.modelSettings.mtp_enabled" in script
 
 
 def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():

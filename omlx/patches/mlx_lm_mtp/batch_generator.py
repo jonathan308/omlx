@@ -72,6 +72,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -84,6 +85,82 @@ from . import cache_rollback as _rollback_mod
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
+
+_MTP_RUNTIME_LOCK = threading.Lock()
+_MTP_RUNTIME_TOTALS: Dict[str, Any] = {
+    "sequences": 0,
+    "tokens": 0,
+    "cycles": 0,
+    "accepted_draft_tokens": 0,
+    "drafted_tokens": 0,
+    "zero_depth_cycles": 0,
+    "depth_drafted": [],
+    "depth_accepted": [],
+    "timing_ms": {
+        "backbone": 0.0,
+        "mtp_head": 0.0,
+        "sampling": 0.0,
+        "cache_ops": 0.0,
+    },
+    "last_finish_reason": "",
+}
+
+
+def mtp_runtime_stats_snapshot() -> Dict[str, Any] | None:
+    """Return bounded process-local MTP economics for cluster telemetry."""
+
+    with _MTP_RUNTIME_LOCK:
+        sequences = int(_MTP_RUNTIME_TOTALS["sequences"])
+        if sequences <= 0:
+            return None
+        cycles = int(_MTP_RUNTIME_TOTALS["cycles"])
+        drafted = int(_MTP_RUNTIME_TOTALS["drafted_tokens"])
+        tokens = int(_MTP_RUNTIME_TOTALS["tokens"])
+        return {
+            **{
+                key: value
+                for key, value in _MTP_RUNTIME_TOTALS.items()
+                if key not in {"depth_drafted", "depth_accepted", "timing_ms"}
+            },
+            "acceptance_ratio": (
+                int(_MTP_RUNTIME_TOTALS["accepted_draft_tokens"]) / drafted
+                if drafted
+                else 0.0
+            ),
+            "tokens_per_cycle": tokens / cycles if cycles else 0.0,
+            "depth_drafted": list(_MTP_RUNTIME_TOTALS["depth_drafted"]),
+            "depth_accepted": list(_MTP_RUNTIME_TOTALS["depth_accepted"]),
+            "timing_ms": dict(_MTP_RUNTIME_TOTALS["timing_ms"]),
+        }
+
+
+def _record_mtp_runtime_stats(stats: "_MtpStats", finish_reason: str) -> None:
+    total_emits = (
+        stats.init_emits + stats.draft_emits + stats.bonus_emits + stats.verify_emits
+    )
+    total_drafted = sum(stats.depth_drafted) or stats.cycles
+    with _MTP_RUNTIME_LOCK:
+        _MTP_RUNTIME_TOTALS["sequences"] += 1
+        _MTP_RUNTIME_TOTALS["tokens"] += total_emits
+        _MTP_RUNTIME_TOTALS["cycles"] += stats.cycles
+        _MTP_RUNTIME_TOTALS["accepted_draft_tokens"] += stats.accepts
+        _MTP_RUNTIME_TOTALS["drafted_tokens"] += total_drafted
+        _MTP_RUNTIME_TOTALS["zero_depth_cycles"] += stats.zero_cycles
+        for key, values in (
+            ("depth_drafted", stats.depth_drafted),
+            ("depth_accepted", stats.depth_accepted),
+        ):
+            totals = _MTP_RUNTIME_TOTALS[key]
+            if len(totals) < len(values):
+                totals.extend([0] * (len(values) - len(totals)))
+            for index, value in enumerate(values):
+                totals[index] += int(value)
+        timing = _MTP_RUNTIME_TOTALS["timing_ms"]
+        timing["backbone"] += stats.backbone_ms
+        timing["mtp_head"] += stats.mtp_head_ms
+        timing["sampling"] += stats.sample_ms
+        timing["cache_ops"] += stats.cache_ops_ms
+        _MTP_RUNTIME_TOTALS["last_finish_reason"] = str(finish_reason)[:64]
 
 
 def _set_verify_qmm_armed(flag: bool) -> None:
@@ -2830,6 +2907,7 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
+    _record_mtp_runtime_stats(stats, finish_reason)
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
         "emits[init=%d,draft=%d,bonus=%d,verify=%d] "

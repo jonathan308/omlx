@@ -73,6 +73,35 @@ def test_telemetry_calculates_ttft_prefill_and_decode_rates():
     assert marker.updates[-1][0] == "ready"
 
 
+def test_telemetry_publishes_structured_mtp_economics(monkeypatch):
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    expected = {
+        "sequences": 1,
+        "tokens": 120,
+        "cycles": 40,
+        "accepted_draft_tokens": 80,
+        "drafted_tokens": 100,
+        "zero_depth_cycles": 0,
+        "acceptance_ratio": 0.8,
+        "tokens_per_cycle": 3.0,
+        "depth_drafted": [40, 35, 25],
+        "depth_accepted": [38, 30, 12],
+        "timing_ms": {
+            "backbone": 800.0,
+            "mtp_head": 200.0,
+            "sampling": 20.0,
+            "cache_ops": 10.0,
+        },
+        "last_finish_reason": "length",
+    }
+    monkeypatch.setattr(batch_generator, "mtp_runtime_stats_snapshot", lambda: expected)
+
+    snapshot = RuntimeTelemetry(_Marker(), clock=_Clock()).snapshot()
+
+    assert snapshot["mtp"] == expected
+
+
 def test_aggregate_decode_tps_uses_decode_time_not_uptime():
     """Idle uptime must not dilute the aggregate decode rate.
 

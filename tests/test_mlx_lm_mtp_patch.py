@@ -69,6 +69,58 @@ class TestCacheRollback:
         assert pool._undo_chain is False
 
 
+def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    before = bg.mtp_runtime_stats_snapshot() or {
+        "sequences": 0,
+        "tokens": 0,
+        "cycles": 0,
+        "accepted_draft_tokens": 0,
+        "drafted_tokens": 0,
+        "zero_depth_cycles": 0,
+        "depth_drafted": [],
+        "depth_accepted": [],
+        "timing_ms": {
+            "backbone": 0.0,
+            "mtp_head": 0.0,
+            "sampling": 0.0,
+            "cache_ops": 0.0,
+        },
+    }
+    stats = bg._MtpStats(
+        cycles=2,
+        accepts=3,
+        init_emits=2,
+        draft_emits=3,
+        bonus_emits=1,
+        verify_emits=1,
+        depth_drafted=[2, 2],
+        depth_accepted=[2, 1],
+        zero_cycles=1,
+        backbone_ms=4.0,
+        mtp_head_ms=2.0,
+        sample_ms=1.0,
+        cache_ops_ms=0.5,
+    )
+
+    bg._record_mtp_runtime_stats(stats, "length")
+    after = bg.mtp_runtime_stats_snapshot()
+
+    assert after is not None
+    assert after["sequences"] - before["sequences"] == 1
+    assert after["tokens"] - before["tokens"] == 7
+    assert after["cycles"] - before["cycles"] == 2
+    assert after["accepted_draft_tokens"] - before["accepted_draft_tokens"] == 3
+    assert after["drafted_tokens"] - before["drafted_tokens"] == 4
+    assert after["zero_depth_cycles"] - before["zero_depth_cycles"] == 1
+    assert after["last_finish_reason"] == "length"
+    assert after["acceptance_ratio"] == (
+        after["accepted_draft_tokens"] / after["drafted_tokens"]
+    )
+    assert after["tokens_per_cycle"] == after["tokens"] / after["cycles"]
+
+
 class TestMtpBoundaryCommit:
     @staticmethod
     def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):

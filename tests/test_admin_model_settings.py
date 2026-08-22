@@ -4,6 +4,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 import omlx.server  # noqa: F401 - ensure server module is imported first
 from omlx.admin import routes as admin_routes
@@ -192,6 +193,41 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
             ModelSettings(),
             admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
         )
+
+
+@pytest.mark.asyncio
+async def test_mtp_draft_depth_change_reloads_active_mtp_engine():
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings(mtp_enabled=True, mtp_num_draft_tokens=3)
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=5),
+    )
+
+    assert settings.mtp_num_draft_tokens == 5
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")
+
+
+def test_mtp_draft_depth_api_bounds():
+    assert (
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=1).mtp_num_draft_tokens
+        == 1
+    )
+    assert (
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=8).mtp_num_draft_tokens
+        == 8
+    )
+    with pytest.raises(ValidationError):
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=0)
+    with pytest.raises(ValidationError):
+        admin_routes.ModelSettingsRequest(mtp_num_draft_tokens=9)
 
 
 def test_guided_grammar_disabled_sentinel_from_older_clients_is_unset():
