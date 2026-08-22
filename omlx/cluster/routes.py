@@ -3536,7 +3536,13 @@ async def _activate_and_report(
                 )
             canary = await engine.generate(
                 "__omlx_cluster_readiness__",
-                max_tokens=1,
+                # A one-token GenerationBatch still pipelines and then
+                # discards a successor graph. That terminal-only boundary can
+                # leave a peer inside its final JACCL all-reduce even though
+                # rank zero already produced a valid response. Four tokens
+                # exercise sustained synchronized decode and make readiness a
+                # stronger, representative proof.
+                max_tokens=4,
                 temperature=0.0,
                 top_p=1.0,
                 top_k=0,
