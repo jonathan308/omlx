@@ -38,7 +38,11 @@ class Projection:
     def checkpoint_bytes(self) -> int:
         value = self.rows * HIDDEN * (1 if self.storage == "mxfp8" else 2)
         if self.storage == "mxfp8":
-            value += (self.rows // 128) * (HIDDEN // 128)
+            # This released MLX checkpoint is already packed MXFP8: uint32
+            # codes hold four values and one uint8 E8M0 scale is stored per
+            # output row/input group-32. There is no compact 128x128 F8 scale
+            # grid to expand at runtime.
+            value += self.rows * (HIDDEN // 32)
         return value
 
     @property
@@ -203,9 +207,21 @@ def audit_checkpoint(model: Path) -> dict[str, Any]:
     checked = 0
     for layer, ratio in enumerate(LAYER_RATIOS):
         for spec in projections(ratio):
-            entries = [("weight", (spec.rows, HIDDEN), "F8_E4M3" if spec.storage == "mxfp8" else "BF16")]
+            entries = [
+                (
+                    "weight",
+                    (
+                        (spec.rows, HIDDEN // 4)
+                        if spec.storage == "mxfp8"
+                        else (spec.rows, HIDDEN)
+                    ),
+                    "U32" if spec.storage == "mxfp8" else "BF16",
+                )
+            ]
             if spec.storage == "mxfp8":
-                entries.append(("scale", (spec.rows // 128, HIDDEN // 128), "F8_E8M0"))
+                entries.append(
+                    ("scales", (spec.rows, HIDDEN // 32), "U8")
+                )
             for suffix, shape, dtype in entries:
                 key = _tensor_key(layer, spec.name, suffix)
                 filename = index.get(key)
@@ -278,8 +294,8 @@ def run_stock_probe(model: Path, layer: int, rows: int, cycles: int) -> dict[str
 
     def load_quant(name: str):
         weight = load(_tensor_key(layer, name)).view(mx.uint32)
-        scale = load(_tensor_key(layer, name, "scale"))
-        return weight, mx.repeat(mx.repeat(scale, 4, -1), 128, 0)
+        scale = load(_tensor_key(layer, name, "scales"))
+        return weight, scale
 
     q_a = load_quant("wq_a")
     raw_kv = load_quant("wkv")

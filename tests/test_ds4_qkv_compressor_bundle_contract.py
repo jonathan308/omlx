@@ -26,10 +26,10 @@ def test_real_ds4_layer_schedule_and_projection_extents():
 
 def test_checkpoint_and_runtime_byte_ledger_is_exact():
     ledger = byte_ledger()
-    assert ledger["per_layer"]["0"]["checkpoint_bytes"] == 6_291_840
-    assert ledger["per_layer"]["4"]["checkpoint_bytes"] == 27_263_360
-    assert ledger["per_layer"]["128"]["checkpoint_bytes"] == 14_680_448
-    assert ledger["all_layers_checkpoint_bytes"] == 878_723_200
+    assert ledger["per_layer"]["0"]["checkpoint_bytes"] == 6_488_064
+    assert ledger["per_layer"]["4"]["checkpoint_bytes"] == 27_459_584
+    assert ledger["per_layer"]["128"]["checkpoint_bytes"] == 14_876_672
+    assert ledger["all_layers_checkpoint_bytes"] == 887_160_832
     assert ledger["all_layers_runtime_bytes"] == 887_160_832
 
 
@@ -63,4 +63,3 @@ def test_symbol_remains_outside_production_until_gate_passes():
         if NATIVE_B1_SYMBOL in path.read_text():
             hits.append(path)
     assert hits == []
-

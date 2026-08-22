@@ -12,17 +12,16 @@ layers, and 20 ratio-128 layers.
 
 | projection | local rows | ratio-4 rows | ratio-128 rows | oMLX storage |
 |---|---:|---:|---:|---|
-| `wq_a` | 1024 | 1024 | 1024 | MXFP8 + expanded E8M0 scales |
-| raw `wkv` | 512 | 512 | 512 | MXFP8 + expanded E8M0 scales |
+| `wq_a` | 1024 | 1024 | 1024 | packed MXFP8 U32 + group-32 U8 scales |
+| raw `wkv` | 512 | 512 | 512 | packed MXFP8 U32 + group-32 U8 scales |
 | compressor `wkv` / `wgate` | - | 1024 each | 512 each | BF16 |
 | index-compressor `wkv` / `wgate` | - | 256 each | - | BF16 |
 
-The source checkpoint bytes are 6,291,840 per local layer, 27,263,360 per
-ratio-4 layer, and 14,680,448 per ratio-128 layer: 878,723,200 bytes (838.0
-MiB) over all layers. oMLX expands the two MXFP8 scale grids from checkpoint
-128x128 blocks to one byte per output-row/input-group32, making the runtime
-footprint 887,160,832 bytes (846.0625 MiB). APE and norm tensors are not
-projection weights; all APE tensors add another 5,672,960 checkpoint bytes.
+The released MLX checkpoint already stores the runtime packed layout. Source
+and runtime bytes are 6,488,064 per local layer, 27,459,584 per ratio-4 layer,
+and 14,876,672 per ratio-128 layer: 887,160,832 bytes (846.0625 MiB) over all
+layers. APE and norm tensors are not projection weights; all APE tensors add
+another 5,672,960 checkpoint bytes.
 
 The current path launches 210 projection kernels per model pass and rank:
 `2*2 + 21*6 + 20*4`. A full bundle is 43 dispatches, saving 167 (79.5%). TP2
