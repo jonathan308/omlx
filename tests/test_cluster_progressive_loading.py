@@ -639,6 +639,7 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
 
         def __init__(self):
             self.evaluated = []
+            self.cache_limits = []
 
         def array(self, value):
             return value
@@ -650,6 +651,10 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
 
         def clear_cache(self):
             pass
+
+        def set_cache_limit(self, value):
+            self.cache_limits.append(value)
+            return 1234
 
     fake_utils = SimpleNamespace(
         _download=lambda repo, allow_patterns=None: repo,
@@ -677,3 +682,4 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
     assert fake_mx.evaluated[:1] == ["embed"]
     assert "head shard" in fake_mx.evaluated
     assert "mtp shard" in fake_mx.evaluated
+    assert fake_mx.cache_limits == [0, 1234]

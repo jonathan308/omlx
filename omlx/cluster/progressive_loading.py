@@ -196,6 +196,18 @@ def progressive_sharded_load(
             progress=progress,
         )
     elif tensor_group is not None:
+        # Tensor loading repeatedly materializes one full layer and replaces
+        # it with a local shard. MLX's default free-buffer cache can retain the
+        # discarded full-layer allocations: on a 128 GB rank we observed
+        # 48.4 GB active weights plus ~34 GB cached buffers at layer 22, with
+        # no free pages left for layer 23. Disable only the *free* cache during
+        # this one-shot transformation; active arrays remain untouched, and
+        # the runtime cache limit is restored before inference begins.
+        set_cache_limit = getattr(mx_module, "set_cache_limit", None)
+        previous_cache_limit = (
+            int(set_cache_limit(0)) if callable(set_cache_limit) else None
+        )
+        mx_module.clear_cache()
         # Materialize replicated fixed weights first. Keep a standalone output
         # head lazy until the tensor strategy has had a chance to row-shard it;
         # otherwise a rank briefly allocates the full head before retaining
@@ -250,6 +262,8 @@ def progressive_sharded_load(
         ]
         _eval_values(mx_module, sharded_fixed)
         mx_module.clear_cache()
+        if previous_cache_limit is not None:
+            set_cache_limit(previous_cache_limit)
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})
 
