@@ -89,8 +89,8 @@ def _deepseek_v4_adaptive_prefill(
     active = bool(enabled and is_ds4 and not pipeline_parallel and base > step)
     if active:
         reason = (
-            f"DS4 uses {base}-token chunks through {after} tokens, then "
-            f"{step}-token chunks to avoid measured long-context taper"
+            f"DS4 uses {base}-token chunks for short prompts and "
+            f"{step}-token chunks from the start above {after} tokens"
         )
     elif not enabled:
         reason = "DS4 adaptive prefill is disabled by the operator"
@@ -1036,10 +1036,21 @@ def install_runtime_optimizations(
             tokens_array = mx.array(tokens)
 
         chunk_index = 0
+        prompt_lengths = getattr(instance, "_omlx_total_prompt_lengths", {})
+        long_request = bool(
+            adaptive_prefill_active
+            and isinstance(prompt_lengths, dict)
+            and any(
+                int(prompt_lengths.get(uid, 0) or 0) > adaptive_prefill_after
+                for uid in instance.uids
+            )
+        )
         while tokens_array.shape[1] > 0:
             chunk_index += 1
             if adaptive_prefill_active:
-                if processed_tokens < adaptive_prefill_after:
+                if long_request:
+                    width = adaptive_prefill_step
+                elif processed_tokens < adaptive_prefill_after:
                     width = min(
                         adaptive_prefill_base,
                         adaptive_prefill_after - processed_tokens,

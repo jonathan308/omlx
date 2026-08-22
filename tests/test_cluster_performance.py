@@ -801,6 +801,50 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
     assert clears == [True, True, True]
 
 
+def test_ds4_long_request_uses_1k_from_its_first_outer_chunk(monkeypatch):
+    class Cache:
+        state = mx.array([0])
+
+    class Attention:
+        dspark = True
+
+    class Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+            self.calls = []
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            self.calls.append(value.shape[1])
+
+    class Batch:
+        uids = [7]
+        prefill_step_size = 2048
+        _omlx_total_prompt_lengths = {7: 14_000}
+
+        def __init__(self, model):
+            self.model = model
+            self.tokens = [[]]
+            self.prompt_cache = [Cache()]
+
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    model = Model()
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        mlx_generate.PromptProcessingBatch.prompt(
+            Batch(model),
+            [list(range(2048))],
+        )
+
+    assert model.calls == [1024, 1024]
+
+
 def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):
     class Cache:
         state = mx.array([0])

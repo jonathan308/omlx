@@ -1033,23 +1033,41 @@ def install_server_telemetry(
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
             telemetry.bind_pending_uid(uids)
-            if ssd_store is not None:
-                segments = kwargs.get("segments")
-                all_tokens = kwargs.get("all_tokens")
-                if isinstance(segments, list):
-                    for index, uid in enumerate(uids):
-                        prefix = (
-                            list(all_tokens[index])
-                            if isinstance(all_tokens, list)
-                            and index < len(all_tokens)
-                            and all_tokens[index]
-                            else []
-                        )
-                        body = [
-                            token for segment in segments[index] for token in segment
-                        ]
-                        self._omlx_tokens[uid] = prefix + body
+            segments = kwargs.get("segments")
+            all_tokens = kwargs.get("all_tokens")
+            if isinstance(segments, list):
+                for index, uid in enumerate(uids):
+                    prefix = (
+                        list(all_tokens[index])
+                        if isinstance(all_tokens, list)
+                        and index < len(all_tokens)
+                        and all_tokens[index]
+                        else []
+                    )
+                    body = [
+                        token for segment in segments[index] for token in segment
+                    ]
+                    self._omlx_tokens[uid] = prefix + body
             return uids
+
+        def _make_batch(self, n: int) -> Any:
+            batch = super()._make_batch(n)
+            totals = {
+                uid: len(self._omlx_tokens[uid])
+                for uid in batch.uids
+                if uid in self._omlx_tokens
+            }
+            if totals:
+                existing = dict(
+                    getattr(
+                        self._prompt_batch,
+                        "_omlx_total_prompt_lengths",
+                        {},
+                    )
+                )
+                existing.update(totals)
+                self._prompt_batch._omlx_total_prompt_lengths = existing
+            return batch
 
         def remove(self, uids: Any) -> Any:
             telemetry.cancel_uids(uids)

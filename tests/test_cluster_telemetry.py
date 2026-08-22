@@ -426,9 +426,13 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
     class FakeBatchGenerator:
         def __init__(self):
             self.removed = []
+            self._prompt_batch = SimpleNamespace()
 
         def insert_segments(self, *args, **kwargs):
             return (73,)
+
+        def _make_batch(self, _n):
+            return SimpleNamespace(uids=[73])
 
         def next(self):
             return (
@@ -478,7 +482,12 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
             )
         )
         batch = mlx_server.BatchGenerator()
-        assert batch.insert_segments() == (73,)
+        assert batch.insert_segments(
+            segments=[[[1, 2, 3, 4]]],
+            all_tokens=[list(range(6000))],
+        ) == (73,)
+        batch._make_batch(1)
+        assert batch._prompt_batch._omlx_total_prompt_lengths == {73: 6004}
         batch.next()
         progress = telemetry.snapshot()["last_request"]["prefill_progress"]
         assert progress["processed"] == 2
