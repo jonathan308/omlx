@@ -88,6 +88,14 @@ _RANK_ENV_DEFAULTS = (
     # measured fastest rank computes the exact top-k once and broadcasts only
     # 512 int32 indices; ``off`` restores replicated indexer work.
     ("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"),
+    # Owned top-k decisions can use the reliable TCP control plane instead of
+    # a tensor reduction. Keep JACCL as the measured default until the live
+    # two-Mac A/B promotes the fixed-size control packet.
+    ("OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl"),
+    # Full routed-MoE decode fusion is bit-exact and available for explicit
+    # A/B. It remains off until its end-to-end gate clears on both Macs.
+    ("OMLX_DSV4_FULL_MOE_DECODE", "0"),
+    ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1"),
     # Large standalone output projections are exact row shards. The default
     # threshold avoids adding a collective to small models where it cannot
     # repay its latency, while keeping every rank on the same decision.
