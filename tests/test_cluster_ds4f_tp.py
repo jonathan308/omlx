@@ -346,7 +346,7 @@ def test_ds4f_moe_override_reconstructs_routed_banks_exactly(dsv4, monkeypatch):
 @pytest.mark.parametrize(
     "outer, override, intermediate, message",
     (
-        (None, "2,2", 128, "requires a signed unequal outer"),
+        (None, "2,2", 128, "requires either a signed unequal outer"),
         ((3, 1), "4", 128, "one positive weight per TP rank"),
         ((3, 1), "2,0", 128, "one positive weight per TP rank"),
         ((3, 1), "3,3", 128, "must sum"),
@@ -391,6 +391,21 @@ def test_real_ds4f_equal_outer_accepts_three_five_non_moe_split(
     assert dsv4._validated_ds4_non_moe_tp_weights(
         args, _FakeGroup(0, 2), None
     ) == (3, 5)
+
+
+def test_real_ds4f_equal_plan_accepts_explicit_four_four_moe_with_non_moe_split(
+    dsv4, monkeypatch
+):
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
+    args = SimpleNamespace(
+        num_attention_heads=64,
+        o_groups=8,
+        moe_intermediate_size=2048,
+    )
+    assert dsv4._validated_ds4_moe_tp_weights(
+        args, _FakeGroup(0, 2), None
+    ) == (4, 4)
 
 
 @pytest.mark.parametrize(

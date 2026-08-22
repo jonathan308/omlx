@@ -152,17 +152,25 @@ def _validated_ds4_moe_tp_weights(
             "per TP rank"
         )
     if outer_weights is None:
-        raise ValueError(
-            "OMLX_TP_MOE_SHARD_WEIGHTS requires a signed unequal outer "
-            "OMLX_TP_SHARD_WEIGHTS plan"
-        )
-    if sum(weights) != sum(outer_weights):
+        # A conservative signed-equal plan may still qualify a mixed layout by
+        # declaring the non-routed split explicitly. In that form the plan's
+        # 4:4 weight budget safely covers the routed 4:4 banks, while the small
+        # attention/shared shift remains inside the existing tolerance.
+        if not os.environ.get("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "").strip():
+            raise ValueError(
+                "OMLX_TP_MOE_SHARD_WEIGHTS requires either a signed unequal "
+                "outer plan or OMLX_TP_NON_MOE_SHARD_WEIGHTS"
+            )
+        expected_total = int(args.num_attention_heads) // int(args.o_groups)
+    else:
+        expected_total = sum(outer_weights)
+    if sum(weights) != expected_total:
         raise ValueError(
             "OMLX_TP_MOE_SHARD_WEIGHTS must sum to the signed outer TP weights"
         )
 
     intermediate = int(getattr(args, "moe_intermediate_size", 0) or 0)
-    total = sum(weights)
+    total = expected_total
     if intermediate <= 0 or intermediate % total:
         raise ValueError(
             "routed MoE intermediate size is not divisible by the override sum"
