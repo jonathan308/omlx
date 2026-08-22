@@ -23,8 +23,7 @@
 //     POST   /admin/api/cluster/models          — per-node model inventory
 //     POST   /admin/api/cluster/catalogue       — model fit across nodes
 //     POST   /admin/api/cluster/peer-probe      — SSH reachability / versions / RDMA
-//     POST   /admin/api/cluster/autoconfigure   — benchmark probe (measure_performance)
-//     POST   /admin/api/cluster/plan            — signed shard plan
+//     POST   /admin/api/cluster/autoconfigure   — signed, launch-ready proposal
 //     POST   /admin/api/cluster/stage           — start a resumable job copying
 //           the model to plan members that lack it (auto-staging: the wizard
 //           runs this as phase 1 of activation when /models shows the model is
@@ -61,7 +60,6 @@ function clusterV2Wizard() {
         catalogue: '/admin/api/cluster/catalogue',
         peerProbe: '/admin/api/cluster/peer-probe',
         autoconfigure: '/admin/api/cluster/autoconfigure',
-        plan: '/admin/api/cluster/plan',
         stage: '/admin/api/cluster/stage',
         stageJob: (id) =>
             `/admin/api/cluster/stage/${encodeURIComponent(id)}`,
@@ -221,8 +219,8 @@ function clusterV2Wizard() {
         selectedModelPath: '',
         modelSearch: '',
         // Execution strategy for the split: 'auto' | 'tensor' | 'pipeline'.
-        // 'tensor' threads tensor_parallel_size = planNodes().length into both
-        // /plan and /deployments; anything else plans pipeline-only (TP=1).
+        // The server resolves its TP degree, host order and backend together;
+        // the client never reconstructs those decisions after preview.
         planStrategy: 'auto',
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
@@ -231,6 +229,10 @@ function clusterV2Wizard() {
         catalogueLoading: false,
         catalogueFailed: false,
         plan: null,
+        // Complete /autoconfigure response. Its activation object is the only
+        // payload allowed through staging and deployment.
+        planProposal: null,
+        planRequestRevision: 0,
         planLoading: false,
         planError: '',
         // Explicit per-node role picks (node_id → 'workstation' | 'headless').
@@ -246,6 +248,7 @@ function clusterV2Wizard() {
         // activatePlan first POSTs /stage and polls the job at 1 Hz; on
         // completion the same request body goes to /deployments.
         stagingJob: null, // last /stage snapshot; null = idle
+        stagingActivation: null, // exact server proposal frozen for this job
         stagingError: '', // job-level or POST-level failure, shown inline
         // Dedicated 1 Hz poller — NOT tick(), which early-returns when the
         // tab is hidden; activation must survive a tab switch.
@@ -1137,29 +1140,26 @@ function clusterV2Wizard() {
 
         async runBenchmark() {
             if (this.checks.benchmarkRunning) return;
+            if (!this.selectedModelPath) {
+                this.checks.benchmark = {
+                    ok: false,
+                    error:
+                        'Choose a downloaded model first. Calibration measures that real model on this exact cluster.',
+                };
+                return;
+            }
             this.checks.benchmarkRunning = true;
             try {
-                const result = await this.apiFetch(
-                    CLUSTER_V2_API.autoconfigure,
-                    {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            nodes: this.planNodes(),
-                            hosts: this.deploymentHosts(),
-                            // The autoconfigure contract demands exactly one
-                            // of model_path / model_size_bytes. The wizard has
-                            // no model picked at benchmark time, so a 16 GiB
-                            // placeholder satisfies the contract — the probe
-                            // measurements (compute + link speeds) are what
-                            // actually matter here.
-                            model_size_bytes: 16 * 1024 ** 3,
-                            measure_performance: true,
-                            preflight: false,
-                            detect_transports: true,
-                        }),
-                    },
-                );
-                this.checks.benchmark = { ok: true, result };
+                // "Run again" means a fresh probe: do not feed the previous
+                // activation's profiles back into autoconfigure.
+                this.planProposal = null;
+                const proposal = await this.runPlan();
+                if (!proposal) {
+                    this.checks.benchmark = {
+                        ok: false,
+                        error: this.planError || 'Calibration failed',
+                    };
+                }
             } catch (error) {
                 this.checks.benchmark = {
                     ok: false,
@@ -1315,13 +1315,17 @@ function clusterV2Wizard() {
                         ? bench.ok
                             ? 'pass'
                             : 'fail'
+                        : !this.selectedModelPath
+                        ? 'skipped'
                         : 'pending',
                     detail: bench
                         ? bench.ok
                             ? 'Measured compute and link speeds shape the layer split.'
                             : bench.error
-                        : 'Optional but recommended — run it once so the split matches real speeds.',
-                    fix: 'Benchmark failures are usually a sleeping peer. Wake the other Mac and press Run benchmark again.',
+                        : !this.selectedModelPath
+                        ? 'Runs automatically after you choose a model.'
+                        : 'Measuring the selected model so the split matches real speeds.',
+                    fix: 'Calibration requires a selected model and awake peers. Choose the model, wake every Mac, then run it again.',
                 });
             }
 
@@ -1615,6 +1619,9 @@ function clusterV2Wizard() {
         async selectModel(model) {
             if (!model || this.planLoading) return;
             this.selectedModelPath = model.model_path;
+            this.plan = null;
+            this.planProposal = null;
+            this.checks.benchmark = null;
             this.normalizePlanStrategy();
             await this.runPlan();
         },
@@ -1622,14 +1629,6 @@ function clusterV2Wizard() {
         // =====================================================================
         // Execution strategy — auto / tensor / pipeline, server-recommended
         // =====================================================================
-        // Tensor parallelism must span every node (routes.py rejects TP !=
-        // len(nodes)), so the size is always the full pool.
-        planTensorParallelSize() {
-            return this.planStrategy === 'tensor'
-                ? this.planNodes().length
-                : 1;
-        },
-
         catalogueEntryForModel() {
             if (!Array.isArray(this.catalogueModels)) return null;
             const model = this.selectedModel();
@@ -1717,7 +1716,7 @@ function clusterV2Wizard() {
             const option = this.strategyOptions().find(
                 (item) => item.key === key,
             );
-            if (!option || option.disabled) return;
+            if (!option || option.disabled || this.planLoading) return;
             if (this.planStrategy === key) return;
             this.planStrategy = key;
             if (this.selectedModelPath) this.runPlan();
@@ -1829,20 +1828,38 @@ function clusterV2Wizard() {
         },
 
         async runPlan() {
-            if (!this.selectedModelPath) return;
+            if (!this.selectedModelPath || this.planLoading) return null;
+            const revision = ++this.planRequestRevision;
+            const previousActivation = this.planProposal?.activation;
             this.planLoading = true;
             this.planError = '';
             this.planFitFailure = null;
             this.plan = null;
+            this.planProposal = null;
             try {
                 const model = this.selectedModel();
+                const priorPerformance = new Map(
+                    (previousActivation?.nodes || [])
+                        .filter((node) => node?.node_id && node?.performance)
+                        .map((node) => [node.node_id, node.performance]),
+                );
+                const nodes = this.planNodes().map((node) => ({
+                    ...node,
+                    ...(priorPerformance.has(node.node_id)
+                        ? { performance: priorPerformance.get(node.node_id) }
+                        : {}),
+                }));
                 const body = {
                     model_path: this.selectedModelPath,
-                    nodes: this.planNodes(),
+                    nodes,
+                    hosts: this.deploymentHosts(),
                     execution_profile: 'balanced',
-                    // 'tensor' spans every node (routes.py requires TP ==
-                    // len(nodes)); 'auto'/'pipeline' plan pipeline-only.
-                    tensor_parallel_size: this.planTensorParallelSize(),
+                    prefer: 'speed',
+                    strategy: this.planStrategy,
+                    detect_transports: true,
+                    preflight: true,
+                    auto_tune: true,
+                    measure_performance: true,
                 };
                 if (
                     model?.model_source &&
@@ -1850,16 +1867,67 @@ function clusterV2Wizard() {
                 ) {
                     body.model_source = model.model_source;
                 }
-                this.plan = await this.apiFetch(CLUSTER_V2_API.plan, {
-                    method: 'POST',
-                    body: JSON.stringify(body),
-                });
+                const sourceLocation = (model?.locations || []).find(
+                    (location) => location?.ssh === model?.model_source,
+                );
+                const sourcePython =
+                    sourceLocation?.python_executable ||
+                    model?.python_executable;
+                if (sourcePython) body.model_source_python = sourcePython;
+
+                const proposal = await this.apiFetch(
+                    CLUSTER_V2_API.autoconfigure,
+                    {
+                        method: 'POST',
+                        body: JSON.stringify(body),
+                    },
+                );
+                if (revision !== this.planRequestRevision) return null;
+                if (
+                    !proposal?.plan ||
+                    !proposal?.activation ||
+                    typeof proposal.activation !== 'object'
+                ) {
+                    throw new Error(
+                        'Automatic setup did not return a signed activation proposal.',
+                    );
+                }
+                if (
+                    proposal.activation.approved_placement !==
+                    proposal.plan.placement_signature
+                ) {
+                    throw new Error(
+                        'Automatic setup returned a plan and activation with different signatures.',
+                    );
+                }
+                this.planProposal = proposal;
+                this.plan = proposal.plan;
+                const probe = proposal.performance_probe;
+                this.checks.benchmark =
+                    probe?.ok === true
+                        ? { ok: true, result: probe }
+                        : {
+                              ok: false,
+                              result: probe || null,
+                              error:
+                                  probe?.reason ||
+                                  'The server did not complete performance calibration.',
+                          };
+                return proposal;
             } catch (error) {
+                if (revision !== this.planRequestRevision) return null;
                 this.planError =
                     error?.message || 'Could not build the layer split';
                 this.planFitFailure = this.parseFitFailure(this.planError);
+                this.checks.benchmark = {
+                    ok: false,
+                    error: this.planError,
+                };
+                return null;
             } finally {
-                this.planLoading = false;
+                if (revision === this.planRequestRevision) {
+                    this.planLoading = false;
+                }
             }
         },
 
@@ -1885,6 +1953,12 @@ function clusterV2Wizard() {
         },
 
         resolvedBackend() {
+            const serverBackend =
+                this.planProposal?.activation?.backend ||
+                this.planProposal?.backend;
+            if (['jaccl', 'jaccl-ring', 'ring'].includes(serverBackend)) {
+                return serverBackend;
+            }
             const members = [this.selfDevice(), ...this.pairedDevices()].filter(
                 Boolean,
             );
@@ -1895,7 +1969,7 @@ function clusterV2Wizard() {
         },
 
         backendLabel() {
-            return this.resolvedBackend() === 'jaccl'
+            return this.resolvedBackend().startsWith('jaccl')
                 ? 'JACCL · Thunderbolt RDMA'
                 : 'TCP ring';
         },
@@ -1929,30 +2003,14 @@ function clusterV2Wizard() {
             return hosts.filter((host) => host.ips.length || host.ssh);
         },
 
-        // The single source of the activation payload. POST /stage takes
-        // {activation, parallel} where activation is this exact object, and
-        // POST /deployments takes it verbatim — one builder, so the signed
-        // placement check can never drift between stage and activate.
+        // The server-produced activation is immutable client input from here
+        // onward. Rebuilding any of its nodes, host order, backend, profiles or
+        // TP degree in the browser would invalidate the signed preview.
         activationRequestBody() {
-            const model = this.selectedModel();
-            const body = {
-                model_path: this.selectedModelPath,
-                backend: this.resolvedBackend(),
-                nodes: this.planNodes(),
-                hosts: this.deploymentHosts(),
-                approved_placement: this.plan.placement_signature,
-                execution_profile: 'balanced',
-                // Must match what was planned — the signed placement
-                // covers tensor_parallel_size, so a mismatch 409s.
-                tensor_parallel_size: this.planTensorParallelSize(),
-            };
-            if (
-                model?.model_source &&
-                model.model_source !== '127.0.0.1'
-            ) {
-                body.model_source = model.model_source;
-            }
-            return body;
+            const activation = this.planProposal?.activation;
+            return activation && typeof activation === 'object'
+                ? activation
+                : null;
         },
 
         // =====================================================================
@@ -1979,7 +2037,11 @@ function clusterV2Wizard() {
                     .filter((loc) => (loc.estimated_size || 0) >= full)
                     .map((loc) => loc.node_id),
             );
-            return this.planNodes().filter(
+            const activationNodes = this.activationRequestBody()?.nodes;
+            const members = Array.isArray(activationNodes)
+                ? activationNodes
+                : [];
+            return members.filter(
                 (node) => !holders.has(node.node_id),
             );
         },
@@ -1989,26 +2051,28 @@ function clusterV2Wizard() {
         },
 
         async activatePlan() {
-            if (!this.plan || this.activateBusy) return;
+            const activation = this.activationRequestBody();
+            if (!this.plan || !activation || this.activateBusy) return;
             this.activateBusy = true;
             if (this.needsStaging()) {
                 // Phase 1 returns after the POST; the 1 Hz poller owns the
                 // flow from here and chains into phase 2 on completion.
-                await this.stageModelToPeers();
+                await this.stageModelToPeers(activation);
                 return;
             }
             // Every plan Mac already has the model — today's direct path.
-            await this.postActivation();
+            await this.postActivation(activation);
         },
 
-        async stageModelToPeers() {
+        async stageModelToPeers(activation) {
             this.stagingError = '';
+            this.stagingActivation = activation;
             let job;
             try {
                 job = await this.apiFetch(CLUSTER_V2_API.stage, {
                     method: 'POST',
                     body: JSON.stringify({
-                        activation: this.activationRequestBody(),
+                        activation,
                         parallel: 4,
                     }),
                 });
@@ -2022,14 +2086,16 @@ function clusterV2Wizard() {
                         'The plan changed since you reviewed it — rebuilding it now.',
                     );
                     this.activateBusy = false;
+                    this.stagingActivation = null;
                     await this.runPlan();
                 } else if (error?.status === 404) {
                     // A server older than /stage: degrade to the pre-staging
                     // behavior instead of bricking activation — the
                     // activation preflight reports whatever is still missing.
                     this.notify('warning', t('cluster.v2.staging.unsupported'));
-                    await this.postActivation();
+                    await this.postActivation(activation);
                 } else {
+                    this.stagingActivation = null;
                     this.failStaging(
                         error?.message || t('cluster.v2.staging.failed'),
                     );
@@ -2071,7 +2137,7 @@ function clusterV2Wizard() {
             this.stagingJob = snapshot;
             if (snapshot.status === 'completed') {
                 this.stopStagingPoll();
-                await this.postActivation(); // phase 2
+                await this.postActivation(this.stagingActivation); // phase 2
             } else if (snapshot.status === 'failed') {
                 // Other nodes may still have completed; per-node errors stay
                 // visible in stagingJob.nodes next to the banner. Pressing
@@ -2102,6 +2168,7 @@ function clusterV2Wizard() {
         dismissStaging() {
             this.stopStagingPoll();
             this.stagingJob = null;
+            this.stagingActivation = null;
             this.stagingError = '';
             this.activateBusy = false;
         },
@@ -2156,11 +2223,16 @@ function clusterV2Wizard() {
         },
 
         // Phase 2 — the pre-staging activation path, unchanged.
-        async postActivation() {
+        async postActivation(activation = this.activationRequestBody()) {
+            if (!activation) {
+                this.activateBusy = false;
+                this.notify('error', 'The signed activation proposal is missing.');
+                return;
+            }
             try {
                 await this.apiFetch(CLUSTER_V2_API.deployments, {
                     method: 'POST',
-                    body: JSON.stringify(this.activationRequestBody()),
+                    body: JSON.stringify(activation),
                 });
                 this.notify(
                     'success',
@@ -2168,7 +2240,9 @@ function clusterV2Wizard() {
                 );
                 this.stage = null;
                 this.plan = null;
+                this.planProposal = null;
                 this.stagingJob = null;
+                this.stagingActivation = null;
                 await this.refreshDeployments();
                 await this.refreshRuntime();
             } catch (error) {
@@ -2177,6 +2251,7 @@ function clusterV2Wizard() {
                         'warning',
                         'The plan changed since you reviewed it — rebuilding it now.',
                     );
+                    this.stagingActivation = null;
                     await this.runPlan();
                 } else {
                     this.notify(

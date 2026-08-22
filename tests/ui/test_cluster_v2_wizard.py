@@ -71,7 +71,6 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/catalogue",
     "/admin/api/cluster/peer-probe",
     "/admin/api/cluster/autoconfigure",
-    "/admin/api/cluster/plan",
     "/admin/api/cluster/node-roles",
     "/admin/api/cluster/stage",
     "/admin/api/cluster/runtime",
@@ -177,7 +176,7 @@ def test_wizard_consumes_only_contract_endpoints():
         "/api/cluster/pair/approve",
         "/api/cluster/pair/deny",
         "/api/cluster/pair/join",
-        "/admin/api/cluster/plan",
+        "/admin/api/cluster/autoconfigure",
         "/admin/api/cluster/runtime",
         "/admin/api/cluster/deployments",
     ):
@@ -799,19 +798,42 @@ def test_strategy_picker_renders_between_models_and_roles():
     assert ":title=\"option.disabledReason\"" in picker
 
 
-def test_tensor_parallel_size_threaded_through_plan_and_activation():
+def test_every_strategy_uses_server_autoconfigure_and_its_tp_choice():
     result = _run_wizard(
         _WIZARD_TWO_MACS
         + """
 const bodies = [];
+function proposalFor(strategy) {
+  const tp = strategy === 'pipeline' ? 1 : 2;
+  const signature = (strategy === 'tensor' ? 'a' : strategy === 'auto' ? 'b' : 'c').repeat(16);
+  const nodes = [
+    { node_id: 'node-a', capacity_bytes: 256 * 1024 ** 3,
+      performance: { node_id: 'node-a', rank: 0, marker: strategy + '-a' } },
+    { node_id: 'node-b', capacity_bytes: 128 * 1024 ** 3,
+      performance: { node_id: 'node-b', rank: 1, marker: strategy + '-b' } },
+  ];
+  const hosts = [
+    { node_id: 'node-a', ssh: '127.0.0.1', ips: ['10.0.0.1'], rdma: [] },
+    { node_id: 'node-b', ssh: 'worker', ips: ['10.0.0.2'], rdma: [] },
+  ];
+  return {
+    backend: strategy === 'pipeline' ? 'ring' : 'jaccl',
+    performance_probe: { ok: true, status: 'applied_before_staging' },
+    plan: { assignments: [], tensor_parallel_size: tp, placement_signature: signature },
+    activation: {
+      model_path: '/models/m', backend: strategy === 'pipeline' ? 'ring' : 'jaccl',
+      nodes, hosts, tensor_parallel_size: tp, approved_placement: signature,
+      server_strategy_marker: strategy,
+    },
+  };
+}
 component.apiFetch = async (url, options) => {
+  const body = options && options.body ? JSON.parse(options.body) : null;
   bodies.push({
     url,
-    body: options && options.body ? JSON.parse(options.body) : null,
+    body,
   });
-  if (url.endsWith('/plan')) {
-    return { assignments: [], placement_signature: 'a'.repeat(16) };
-  }
+  if (url.endsWith('/autoconfigure')) return proposalFor(body.strategy);
   return {};
 };
 component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
@@ -820,7 +842,6 @@ component.selectedModelPath = '/models/m';
 (async () => {
   component.planStrategy = 'tensor';
   await component.runPlan();
-  component.plan = { assignments: [], placement_signature: 'a'.repeat(16) };
   await component.activatePlan();
   component.planStrategy = 'auto';
   await component.runPlan();
@@ -829,7 +850,9 @@ component.selectedModelPath = '/models/m';
   process.stdout.write(JSON.stringify({
     bodies: bodies.map((entry) => ({
       url: entry.url,
+      strategy: entry.body ? entry.body.strategy : null,
       tp: entry.body ? entry.body.tensor_parallel_size : null,
+      marker: entry.body ? entry.body.server_strategy_marker : null,
     })),
     stepHint: component.wizardSteps()[3].hint,
   }));
@@ -837,15 +860,23 @@ component.selectedModelPath = '/models/m';
 """,
     )
 
-    plans = [b["tp"] for b in result["bodies"] if b["url"].endswith("/plan")]
-    deploys = [
-        b["tp"]
-        for b in result["bodies"]
-        if b["url"].endswith("/deployments") and b["tp"] is not None
+    proposals = [
+        b for b in result["bodies"] if b["url"].endswith("/autoconfigure")
     ]
-    # tensor → TP == len(planNodes()) == 2; auto/pipeline → pipeline-only.
-    assert plans == [2, 1, 1], plans
-    assert deploys == [2], deploys
+    deploys = [
+        b
+        for b in result["bodies"]
+        if b["url"].endswith("/deployments") and b["marker"] is not None
+    ]
+    assert [item["strategy"] for item in proposals] == ["tensor", "auto", "pipeline"]
+    assert all(item.get("tp") is None for item in proposals), (
+        "the browser must not choose a TP degree"
+    )
+    assert len(deploys) == 1
+    assert deploys[0]["url"] == "/admin/api/cluster/deployments"
+    assert deploys[0].get("strategy") is None
+    assert deploys[0]["tp"] == 2
+    assert deploys[0]["marker"] == "tensor"
     # Step-4 hint is strategy-aware only for tensor.
     assert result["stepHint"] == "Layers per Mac"
 
@@ -969,31 +1000,69 @@ slow.selectedModelPath = '/models/m';
     assert result["slowRecommended"] == "auto"
 
 
-def test_benchmark_body_satisfies_the_autoconfigure_contract():
+def test_calibration_requires_a_real_model_and_performance_probe_success():
     result = _run_wizard(
         _WIZARD_TWO_MACS
         + """
-let benchBody = null;
+const proposal = JSON.parse(
+  require('fs').readFileSync(
+    %s,
+    'utf8',
+  ),
+);
+const bodies = [];
+let probeOk = false;
 component.apiFetch = async (url, options) => {
   if (url.endsWith('/autoconfigure')) {
-    benchBody = JSON.parse(options.body);
+    bodies.push(JSON.parse(options.body));
+    return {
+      ...proposal,
+      performance_probe: probeOk
+        ? { ok: true, status: 'applied_before_staging' }
+        : { ok: false, status: 'memory_fallback', reason: 'probe unavailable' },
+    };
   }
-  return {};
+  return { deployments: [] };
 };
 
 (async () => {
+  // The checks step precedes model selection: it must not fake calibration
+  // with a placeholder model size.
   await component.runBenchmark();
-  process.stdout.write(JSON.stringify({ benchBody }));
+  const withoutModel = { calls: bodies.length, ...component.checks.benchmark };
+  component.modelOptions = [{
+    model_path: '/models/m', id: 'm', model_source: 'worker.example',
+    locations: [{
+      ssh: 'worker.example', python_executable: '/peer/venv/bin/python',
+    }],
+  }];
+  component.selectedModelPath = '/models/m';
+  await component.runBenchmark();
+  const failedProbe = { ...component.checks.benchmark };
+  probeOk = true;
+  await component.runBenchmark();
+  const passedProbe = { ...component.checks.benchmark };
+  process.stdout.write(JSON.stringify({
+    withoutModel, failedProbe, passedProbe, bodies,
+  }));
 })();
-""",
+""" % json.dumps(str(FIXTURES / "autoconfigure_proposal.json")),
     )
 
-    body = result["benchBody"]
-    # Exactly one of model_path / model_size_bytes — the 16 GiB placeholder,
-    # not a model path (the probe measurements are what matter).
-    assert body["model_size_bytes"] == 16 * 1024**3
-    assert "model_path" not in body
-    assert body["measure_performance"] is True
+    assert result["withoutModel"]["calls"] == 0
+    assert result["withoutModel"]["ok"] is False
+    assert "Choose a downloaded model" in result["withoutModel"]["error"]
+    assert len(result["bodies"]) == 2
+    for body in result["bodies"]:
+        assert body["model_path"] == "/models/m"
+        assert "model_size_bytes" not in body
+        assert body["model_source"] == "worker.example"
+        assert body["model_source_python"] == "/peer/venv/bin/python"
+        assert body["measure_performance"] is True
+        assert body["strategy"] == "auto"
+    assert result["failedProbe"]["ok"] is False
+    assert result["failedProbe"]["error"] == "probe unavailable"
+    assert result["passedProbe"]["ok"] is True
 
 
 def test_display_model_name_strips_hashes_and_unwraps_hub_dirs():
@@ -1129,6 +1198,17 @@ global.clearInterval = () => {};
 global.setTimeout = () => 0;
 """
 
+_WIZARD_SIGNED_PROPOSAL = """
+const signedProposal = JSON.parse(
+  require('fs').readFileSync(
+    %s,
+    'utf8',
+  ),
+);
+component.planProposal = signedProposal;
+component.plan = signedProposal.plan;
+""" % json.dumps(str(FIXTURES / "autoconfigure_proposal.json"))
+
 # Two Macs, model complete on node-a only (estimated_size proxy: a holder is
 # a location whose size matches the largest location).
 _WIZARD_PARTIAL_MODEL = """
@@ -1139,8 +1219,7 @@ component.modelOptions = [{
   ],
 }];
 component.selectedModelPath = '/models/m';
-component.plan = { assignments: [], placement_signature: 'b'.repeat(16) };
-"""
+""" + _WIZARD_SIGNED_PROPOSAL
 
 
 def _stage_node(node_id, rank, status, files_total=0, files_completed=0,
@@ -1205,7 +1284,9 @@ component.apiFetch = async (url, options) => {
     after: {
       stage: component.stage,
       plan: component.plan,
+      planProposal: component.planProposal,
       stagingJob: component.stagingJob,
+      stagingActivation: component.stagingActivation,
       timer: component.stagingTimer,
       busy: component.activateBusy,
     },
@@ -1240,13 +1321,27 @@ component.apiFetch = async (url, options) => {
     # The staging activation payload is byte-identical to the activation body
     # (one shared builder), plus parallel as an int.
     assert result["stageBody"]["activation"] == result["deployBody"]
+    expected_activation = _fixtures()["autoconfigure_proposal.json"]["activation"]
+    assert result["deployBody"] == expected_activation
+    assert result["deployBody"]["backend"] == "ring"
+    assert result["deployBody"]["tensor_parallel_size"] == 2
+    assert [host["node_id"] for host in result["deployBody"]["hosts"]] == [
+        "node-a",
+        "node-b",
+    ]
+    assert [node["performance"]["rank"] for node in result["deployBody"]["nodes"]] == [
+        0,
+        1,
+    ]
     assert result["stageBody"]["parallel"] == 4
     assert result["deployBody"]["approved_placement"] == "b" * 16
     # Phase 2 finished: wizard back to its post-activation state.
     assert result["after"] == {
         "stage": None,
         "plan": None,
+        "planProposal": None,
         "stagingJob": None,
+        "stagingActivation": None,
         "timer": None,
         "busy": False,
     }
@@ -1256,6 +1351,7 @@ def test_staging_is_skipped_when_every_mac_has_the_model():
     result = _run_wizard(
         _WIZARD_TWO_MACS
         + _WIZARD_TIMER_STUBS
+        + _WIZARD_SIGNED_PROPOSAL
         + """
 component.modelOptions = [{
   model_path: '/models/m', id: 'm', model_source: '127.0.0.1',
@@ -1265,7 +1361,6 @@ component.modelOptions = [{
   ],
 }];
 component.selectedModelPath = '/models/m';
-component.plan = { assignments: [], placement_signature: 'b'.repeat(16) };
 const calls = [];
 component.apiFetch = async (url, options) => {
   calls.push({
@@ -1307,8 +1402,11 @@ component.apiFetch = async (url, options) => {
     error.status = 409;
     throw error;
   }
-  if (url.endsWith('/plan')) {
-    return { assignments: [], placement_signature: 'c'.repeat(16) };
+  if (url.endsWith('/autoconfigure')) {
+    const refreshed = JSON.parse(JSON.stringify(signedProposal));
+    refreshed.plan.placement_signature = 'c'.repeat(16);
+    refreshed.activation.approved_placement = 'c'.repeat(16);
+    return refreshed;
   }
   return {};
 };
@@ -1331,7 +1429,7 @@ component.apiFetch = async (url, options) => {
     # warning toast, then a fresh signed plan.
     assert result["calls"] == [
         "/admin/api/cluster/stage",
-        "/admin/api/cluster/plan",
+        "/admin/api/cluster/autoconfigure",
     ]
     assert result["signature"] == "c" * 16
     assert result["stagingError"] == ""
