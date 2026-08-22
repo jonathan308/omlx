@@ -1168,6 +1168,35 @@ class TestCacheMaterialization:
         assert len(calls) == 1
         assert calls[0] == (leaf_a.arr, leaf_b.arr, leaf_c.arr)
 
+    def test_helper_can_defer_exact_arrays_and_restores_after_exception(
+        self, applied_patch, monkeypatch
+    ):
+        import mlx.core as mx
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Leaf:
+            def __init__(self, arr):
+                self.arr = arr
+
+        leaf = Leaf(mx.array([7], dtype=mx.int32))
+        calls = []
+        monkeypatch.setattr(dsv4.mx, "eval", lambda *arrays: calls.append(arrays))
+
+        captured = None
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            with dsv4._defer_cache_materialization() as captured:
+                dsv4._materialize_cache_arrays([leaf])
+                raise RuntimeError("synthetic failure")
+
+        assert captured == [leaf.arr]
+        assert calls == []
+
+        # The thread-local capture is strictly scoped: a later decode-style
+        # call immediately restores the stock materialization barrier.
+        dsv4._materialize_cache_arrays([leaf])
+        assert calls == [(leaf.arr,)]
+
     def test_model_call_materializes_cache_after_layer_loop(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         source = inspect.getsource(dsv4.DeepseekV4Model.__call__)

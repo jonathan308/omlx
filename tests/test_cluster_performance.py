@@ -846,6 +846,268 @@ def test_ds4_long_request_uses_1k_from_its_first_outer_chunk(monkeypatch):
     assert model.calls == [1024, 1024]
 
 
+class _AsyncDS4Cache:
+    def __init__(self):
+        self.state = mx.array([0], dtype=mx.int32)
+
+
+class _AsyncDS4Model:
+    def __init__(self, dsv4, events, *, fail_on=None):
+        self.model = SimpleNamespace(
+            layers=[SimpleNamespace(attn=SimpleNamespace(dspark=True))]
+        )
+        self._dsv4 = dsv4
+        self._events = events
+        self._fail_on = fail_on
+        self._calls = 0
+        self.labels = {}
+
+    def __call__(self, value, cache=None, skip_lm_head=False):
+        assert skip_lm_head is True
+        self._calls += 1
+        current = mx.array([self._calls], dtype=mx.int32)
+        cache[0].state = current
+        self.labels[id(current)] = self._calls
+        self._events.append(("model", self._calls, int(value.shape[1])))
+        self._dsv4._materialize_cache_arrays(cache)
+        if self._calls == self._fail_on:
+            raise RuntimeError("synthetic async prefill failure")
+
+
+class _AsyncDS4Batch:
+    uids = [7]
+    prefill_step_size = 2048
+    _omlx_total_prompt_lengths = {7: 14_000}
+
+    def __init__(self, model):
+        self.model = model
+        self.tokens = [[]]
+        self.prompt_cache = [_AsyncDS4Cache()]
+
+
+class _SingleRankGroup:
+    @staticmethod
+    def rank():
+        return 0
+
+    @staticmethod
+    def size():
+        return 1
+
+
+def _async_ds4_module():
+    import sys
+
+    from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+
+    apply_deepseek_v4_patch()
+    return sys.modules["mlx_lm.models.deepseek_v4"]
+
+
+def test_ds4_tp2_depth_two_prefill_queues_current_then_completes_previous(
+    monkeypatch,
+):
+    dsv4 = _async_ds4_module()
+    events = []
+    model = _AsyncDS4Model(dsv4, events)
+    batch = _AsyncDS4Batch(model)
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", raising=False)
+
+    def record(kind, arrays):
+        events.append((kind, tuple(model.labels[id(value)] for value in arrays)))
+
+    monkeypatch.setattr(mx, "async_eval", lambda *arrays: record("async", arrays))
+    monkeypatch.setattr(mx, "eval", lambda *arrays: record("eval", arrays))
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(("clear",)))
+
+    original_prompt = mlx_generate.PromptProcessingBatch.prompt
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        item = capabilities["deepseek_v4_prefill_async"]
+        assert item["enabled"] is True
+        assert item["active"] is True
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(2048))])
+
+    assert events == [
+        ("model", 1, 1024),
+        ("async", (1,)),
+        ("model", 2, 1024),
+        ("async", (2,)),
+        ("eval", (1,)),
+        ("eval", (2,)),
+        ("clear",),
+    ]
+    assert model.labels[id(batch.prompt_cache[0].state)] == 2
+    assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+
+
+def test_ds4_tp2_depth_two_prefill_drains_previous_and_partial_on_error(
+    monkeypatch,
+):
+    dsv4 = _async_ds4_module()
+    events = []
+    model = _AsyncDS4Model(dsv4, events, fail_on=2)
+    batch = _AsyncDS4Batch(model)
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", raising=False)
+
+    def record(kind, arrays):
+        events.append((kind, tuple(model.labels[id(value)] for value in arrays)))
+
+    monkeypatch.setattr(mx, "async_eval", lambda *arrays: record("async", arrays))
+    monkeypatch.setattr(mx, "eval", lambda *arrays: record("eval", arrays))
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(("clear",)))
+
+    original_prompt = mlx_generate.PromptProcessingBatch.prompt
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        with pytest.raises(RuntimeError, match="synthetic async prefill failure"):
+            mlx_generate.PromptProcessingBatch.prompt(
+                batch,
+                [list(range(2048))],
+            )
+
+    assert events == [
+        ("model", 1, 1024),
+        ("async", (1,)),
+        ("model", 2, 1024),
+        ("eval", (1,)),
+        ("eval", (2,)),
+    ]
+    assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+
+
+def test_ds4_tp2_depth_two_prefill_keeps_one_chunk_fairness_slice_sync(
+    monkeypatch,
+):
+    dsv4 = _async_ds4_module()
+    events = []
+    model = _AsyncDS4Model(dsv4, events)
+    batch = _AsyncDS4Batch(model)
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", raising=False)
+    monkeypatch.setattr(mx, "async_eval", lambda *_arrays: events.append(("async",)))
+    monkeypatch.setattr(mx, "eval", lambda *_arrays: events.append(("eval",)))
+    monkeypatch.setattr(mx, "clear_cache", lambda: events.append(("clear",)))
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["deepseek_v4_prefill_async"]["active"] is True
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(1024))])
+
+    assert [event for event in events if event[0] == "model"] == [
+        ("model", 1, 1024)
+    ]
+    assert not any(event[0] == "async" for event in events)
+
+
+def test_ds4_tp2_prefill_async_is_default_off_and_rejects_other_depths(
+    monkeypatch,
+):
+    dsv4 = _async_ds4_module()
+    model = _AsyncDS4Model(dsv4, [])
+    monkeypatch.delenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", raising=False)
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        item = capabilities["deepseek_v4_prefill_async"]
+        assert item["enabled"] is False
+        assert item["active"] is False
+        assert "disabled by the operator" in item["reason"]
+
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "1")
+    with pytest.raises(ValueError, match="must be 0 or 2"):
+        with install_runtime_optimizations(
+            model,
+            _Group(),
+            execution_profile("balanced"),
+            batchable=True,
+            pipeline_parallel=False,
+        ):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("settings", "mtp", "clear_every", "reason"),
+    [
+        (
+            replace(execution_profile("balanced"), async_overlap=False),
+            False,
+            "0",
+            "async",
+        ),
+        (execution_profile("balanced"), True, "0", "MTP"),
+        (execution_profile("balanced"), False, "2", "clear-cache cadence 0"),
+    ],
+)
+def test_ds4_tp2_prefill_async_static_safety_gates(
+    monkeypatch, settings, mtp, clear_every, reason
+):
+    dsv4 = _async_ds4_module()
+    model = _AsyncDS4Model(dsv4, [])
+    model._omlx_mtp_decode_enabled = mtp
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", clear_every)
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        settings,
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        item = capabilities["deepseek_v4_prefill_async"]
+        assert item["enabled"] is True
+        assert item["active"] is False
+        assert reason in item["reason"]
+
+
+@pytest.mark.parametrize(
+    ("group", "pipeline_parallel"),
+    [(_SingleRankGroup(), False), (_Group(), True)],
+)
+def test_ds4_prefill_async_requires_pure_tp2(
+    monkeypatch, group, pipeline_parallel
+):
+    dsv4 = _async_ds4_module()
+    model = _AsyncDS4Model(dsv4, [])
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", raising=False)
+
+    with install_runtime_optimizations(
+        model,
+        group,
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=pipeline_parallel,
+    ) as capabilities:
+        item = capabilities["deepseek_v4_prefill_async"]
+        assert item["enabled"] is True
+        assert item["active"] is False
+        assert "requires pure TP2" in item["reason"]
+
+
 def _outer_prefill_batch(
     *,
     generation_uids=(),

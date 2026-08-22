@@ -7,6 +7,7 @@ import importlib
 import inspect
 import math
 import os
+import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ _DSV4_ADAPTIVE_PREFILL_AFTER_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER"
 _DSV4_ADAPTIVE_PREFILL_STEP_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_STEP"
 _DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
 _DSV4_PREFILL_YIELD_ENV = "OMLX_DSV4_PREFILL_YIELD"
+_DSV4_PREFILL_ASYNC_DEPTH_ENV = "OMLX_DSV4_PREFILL_ASYNC_DEPTH"
 
 
 def _capability(
@@ -63,6 +65,33 @@ def _positive_env_int(name: str, default: int) -> int:
     if value < 1:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _deepseek_v4_prefill_async_depth() -> int:
+    """Return the only validated DS4 TP prefill graph depths: off or two."""
+
+    raw = os.environ.get(_DSV4_PREFILL_ASYNC_DEPTH_ENV, "0").strip()
+    try:
+        depth = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_DSV4_PREFILL_ASYNC_DEPTH_ENV} must be 0 or 2"
+        ) from exc
+    if depth not in {0, 2}:
+        raise ValueError(f"{_DSV4_PREFILL_ASYNC_DEPTH_ENV} must be 0 or 2")
+    return depth
+
+
+def _mtp_decode_enabled(model: Any) -> bool:
+    return any(
+        bool(getattr(candidate, "_omlx_mtp_decode_enabled", False))
+        for candidate in (
+            model,
+            getattr(model, "language_model", None),
+            getattr(model, "_language_model", None),
+        )
+        if candidate is not None
+    )
 
 
 def _deepseek_v4_adaptive_prefill(
@@ -767,6 +796,7 @@ def install_runtime_optimizations(
     skip_logits_supported, skip_logits_reason = _supports_prefill_logits_skip(model)
     skip_logits_active = prompt_supported and skip_logits_supported
     prefill_clear_every = _prefill_clear_cache_every()
+    prefill_async_depth = _deepseek_v4_prefill_async_depth()
     (
         indexer_row_parallel_enabled,
         indexer_row_parallel_active,
@@ -860,6 +890,57 @@ def install_runtime_optimizations(
         and skip_logits_active
         and callable(getattr(mlx_generate.BatchGenerator, "next", None))
     )
+    dsv4_module = sys.modules.get("mlx_lm.models.deepseek_v4")
+    defer_dsv4_cache_materialization = getattr(
+        dsv4_module,
+        "_defer_cache_materialization",
+        None,
+    )
+    mtp_decode_enabled = _mtp_decode_enabled(model)
+    prefill_async_active = bool(
+        prefill_async_depth == 2
+        and execution.async_overlap
+        and not pipeline_parallel
+        and world_size == 2
+        and adaptive_prefill_active
+        and adaptive_prefill_step == 1024
+        and skip_logits_active
+        and not mtp_decode_enabled
+        and prefill_clear_every == 0
+        and callable(defer_dsv4_cache_materialization)
+    )
+    if prefill_async_active:
+        prefill_async_reason = (
+            "pure TP2 may queue two lossless 1K DS4 cache graphs for one "
+            "long unpadded row; one-chunk live-decode fairness slices stay "
+            "synchronous"
+        )
+    elif prefill_async_depth == 0:
+        prefill_async_reason = (
+            "DS4 TP prefill graph overlap is disabled by the operator"
+        )
+    elif not execution.async_overlap:
+        prefill_async_reason = "execution async overlap is disabled"
+    elif pipeline_parallel or world_size != 2:
+        prefill_async_reason = "depth-two DS4 prefill overlap requires pure TP2"
+    elif not adaptive_prefill_active:
+        prefill_async_reason = adaptive_prefill_reason
+    elif adaptive_prefill_step != 1024:
+        prefill_async_reason = (
+            "depth-two DS4 prefill overlap requires 1024-token chunks"
+        )
+    elif not skip_logits_active:
+        prefill_async_reason = skip_logits_reason
+    elif mtp_decode_enabled:
+        prefill_async_reason = "depth-two DS4 prefill overlap is not validated with MTP"
+    elif prefill_clear_every != 0:
+        prefill_async_reason = (
+            "depth-two DS4 prefill overlap requires clear-cache cadence 0"
+        )
+    else:
+        prefill_async_reason = (
+            "DeepSeek V4 cache-materialization capture is unavailable"
+        )
     batching_enabled = execution.pipeline_microbatch_size > 1
     batching_active = batching_enabled and batchable
     capabilities = {
@@ -1013,6 +1094,11 @@ def install_runtime_optimizations(
                     )
                 )
             ),
+        ),
+        "deepseek_v4_prefill_async": _capability(
+            enabled=prefill_async_depth == 2,
+            active=prefill_async_active,
+            reason=prefill_async_reason,
         ),
     }
     if not sampling_active and not skip_logits_active:
@@ -1253,33 +1339,95 @@ def install_runtime_optimizations(
                 for uid in instance.uids
             )
         )
-        while tokens_array.shape[1] > 0:
-            chunk_index += 1
-            if adaptive_prefill_active:
-                if long_request:
-                    width = adaptive_prefill_step
-                elif processed_tokens < adaptive_prefill_after:
-                    width = min(
-                        adaptive_prefill_base,
-                        adaptive_prefill_after - processed_tokens,
-                    )
+        async_this_prompt = bool(
+            prefill_async_active
+            and len(tokens) == 1
+            and max_padding == 0
+            and long_request
+            and math.ceil(
+                int(tokens_array.shape[1]) / adaptive_prefill_step
+            )
+            >= 2
+        )
+        pending_async_cache_arrays: tuple[Any, ...] | None = None
+
+        def drain_async_cache_arrays() -> None:
+            nonlocal pending_async_cache_arrays
+            pending = pending_async_cache_arrays
+            pending_async_cache_arrays = None
+            if pending:
+                mx.eval(*pending)
+
+        try:
+            while tokens_array.shape[1] > 0:
+                chunk_index += 1
+                if adaptive_prefill_active:
+                    if long_request:
+                        width = adaptive_prefill_step
+                    elif processed_tokens < adaptive_prefill_after:
+                        width = min(
+                            adaptive_prefill_base,
+                            adaptive_prefill_after - processed_tokens,
+                        )
+                    else:
+                        width = adaptive_prefill_step
                 else:
-                    width = adaptive_prefill_step
-            else:
-                width = instance.prefill_step_size
-            width = min(width, tokens_array.shape[1])
-            instance.model(
-                tokens_array[:, :width],
-                cache=instance.prompt_cache,
-                skip_lm_head=True,
-            )
-            mx.eval([cache.state for cache in instance.prompt_cache])
-            tokens_array = tokens_array[:, width:]
-            processed_tokens += width
-            finish_prefill_chunk(
-                chunk_index,
-                final=tokens_array.shape[1] == 0 and max_padding == 0,
-            )
+                    width = instance.prefill_step_size
+                width = min(width, tokens_array.shape[1])
+
+                if async_this_prompt:
+                    captured_cache_arrays: list[Any] = []
+                    try:
+                        with defer_dsv4_cache_materialization() as captured:
+                            captured_cache_arrays = captured
+                            instance.model(
+                                tokens_array[:, :width],
+                                cache=instance.prompt_cache,
+                                skip_lm_head=True,
+                            )
+                    except BaseException:
+                        # If the forward failed after updating its cache, make
+                        # both the previous graph and that partial current
+                        # graph safe, in dependency order, before control
+                        # escapes the prompt loop.
+                        drain_async_cache_arrays()
+                        if captured_cache_arrays:
+                            mx.eval(*captured_cache_arrays)
+                        raise
+                    current_cache_arrays = tuple(captured_cache_arrays)
+                    if not current_cache_arrays:
+                        raise RuntimeError(
+                            "DeepSeek V4 async prefill captured no cache arrays"
+                        )
+                    previous_cache_arrays = pending_async_cache_arrays
+                    pending_async_cache_arrays = current_cache_arrays
+                    # Keep at most the previous and current 1K graphs alive:
+                    # queue the current work first, then complete the prior
+                    # graph to expose command-buffer overlap without allowing
+                    # an unbounded lazy cache chain.
+                    mx.async_eval(*current_cache_arrays)
+                    if previous_cache_arrays:
+                        mx.eval(*previous_cache_arrays)
+                else:
+                    instance.model(
+                        tokens_array[:, :width],
+                        cache=instance.prompt_cache,
+                        skip_lm_head=True,
+                    )
+                    mx.eval([cache.state for cache in instance.prompt_cache])
+
+                tokens_array = tokens_array[:, width:]
+                processed_tokens += width
+                final_chunk = tokens_array.shape[1] == 0 and max_padding == 0
+                if async_this_prompt and final_chunk:
+                    # ``finish_prefill_chunk`` may clear the allocator. Never
+                    # let it race the final in-flight cache graph.
+                    drain_async_cache_arrays()
+                finish_prefill_chunk(chunk_index, final=final_chunk)
+        finally:
+            # Cancellation, a model exception, or an mx.eval failure must not
+            # leak an in-flight cache graph into decode or the next request.
+            drain_async_cache_arrays()
 
         if max_padding > 0:
             for cache in instance.prompt_cache:

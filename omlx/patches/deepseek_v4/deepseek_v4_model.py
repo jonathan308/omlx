@@ -3,6 +3,8 @@
 import logging
 import math
 import os
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -67,6 +69,15 @@ _DEEPSEEK_V4_EXACT_DECODE = (
     os.environ.get("OMLX_DSV4_EXACT_DECODE", "0").strip().lower()
     in ("1", "true", "on")
 )
+
+# ``DeepseekV4Model.__call__`` normally materializes every cache update before
+# returning.  That barrier is the conservative default for decode and for all
+# non-cluster callers.  The distributed TP prefill A/B may temporarily capture
+# those exact arrays instead, queue them with ``mx.async_eval``, and complete
+# them at its own bounded depth-two boundary.  Thread-local state is required:
+# model loading and unrelated engines can execute on other threads while one
+# generation thread owns the experiment.
+_CACHE_MATERIALIZATION_CAPTURE = threading.local()
 
 
 def _exact_decode_required(attention: Any, batch: int, length: int) -> bool:
@@ -304,6 +315,30 @@ def _is_dspark_model(config: Any) -> bool:
     )
 
 
+@contextmanager
+def _defer_cache_materialization():
+    """Capture one forward's cache arrays instead of evaluating them.
+
+    The yielded list belongs to the caller and remains valid after the context
+    exits.  Nested use restores the prior capture target, and exceptions cannot
+    leave later decode calls in deferred mode.
+    """
+
+    previous = getattr(_CACHE_MATERIALIZATION_CAPTURE, "arrays", None)
+    captured = []
+    _CACHE_MATERIALIZATION_CAPTURE.arrays = captured
+    try:
+        yield captured
+    finally:
+        if previous is None:
+            try:
+                del _CACHE_MATERIALIZATION_CAPTURE.arrays
+            except AttributeError:
+                pass
+        else:
+            _CACHE_MATERIALIZATION_CAPTURE.arrays = previous
+
+
 def _materialize_cache_arrays(cache: Optional[Any]) -> None:
     """Detach DeepSeek-V4 cache update graphs from prior decode steps."""
     if cache is None:
@@ -321,8 +356,14 @@ def _materialize_cache_arrays(cache: Optional[Any]) -> None:
                 if isinstance(value, mx.array):
                     cache_arrays.append(value)
 
-    if cache_arrays:
-        mx.eval(*cache_arrays)
+    if not cache_arrays:
+        return
+
+    captured = getattr(_CACHE_MATERIALIZATION_CAPTURE, "arrays", None)
+    if captured is not None:
+        captured.extend(cache_arrays)
+        return
+    mx.eval(*cache_arrays)
 
 
 @dataclass
