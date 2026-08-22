@@ -228,6 +228,32 @@ def test_a_marker_response_without_the_peer_clock_is_rejected(tmp_path):
     assert "peer clock" in error
 
 
+def test_a_missing_remote_marker_is_reported_without_a_traceback():
+    from omlx.cluster.liveness import (
+        _REMOTE_MARKER_MISSING,
+        read_remote_marker,
+    )
+
+    fake = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=(
+            b'{"marker":null,"process_live":false,"peer_now":1.0,'
+            b'"missing":true}'
+        ),
+        stderr=b"",
+    )
+
+    marker, live, peer_now, error = read_remote_marker(
+        "studio.local", "/tmp/missing.json", runner=lambda *a, **k: fake
+    )
+
+    assert marker is None
+    assert live is False
+    assert peer_now == 1.0
+    assert error == _REMOTE_MARKER_MISSING
+
+
 def test_the_watchdog_reports_once_and_stops(tmp_path):
     """It ends the wait; it does not thrash trying to repair a collective."""
 

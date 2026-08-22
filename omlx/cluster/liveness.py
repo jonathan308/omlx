@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STALE_AFTER = 45.0
 _DEFAULT_PROBE_TIMEOUT = 5.0
 _MAX_REMOTE_MARKER_BYTES = 256 * 1024
+_REMOTE_MARKER_MISSING = "runtime marker is missing"
 
 _LOOPBACK_TARGETS = {"127.0.0.1", "localhost", "::1"}
 
@@ -173,7 +174,9 @@ _REMOTE_MARKER_SCRIPT = (
     "import json,os,sys,time;"
     "from pathlib import Path;"
     "p=Path(sys.argv[1]).expanduser();"
-    "d=json.loads(p.read_text());"
+    "\nif not p.is_file():"
+    "\n print(json.dumps({'marker':None,'process_live':False,'peer_now':time.time(),'missing':True},separators=(',',':'))); raise SystemExit(0)"
+    "\nd=json.loads(p.read_text());"
     "pid=d.get('pid');"
     "live=None;"
     "\nif isinstance(pid,int) and not isinstance(pid,bool) and pid>0:"
@@ -239,15 +242,17 @@ def read_remote_marker(
     marker = payload.get("marker")
     process_live = payload.get("process_live")
     peer_now = payload.get("peer_now")
-    if not isinstance(marker, dict):
-        return None, None, None, "runtime marker response did not contain a marker"
-    if process_live not in (True, False, None):
-        process_live = None
     if isinstance(peer_now, bool) or not isinstance(peer_now, (int, float)):
         # The script above always emits it; a payload without it is malformed,
         # and quietly substituting the local clock would revive the cross-Mac
         # comparison this field exists to remove.
         return None, None, None, "runtime marker response did not carry the peer clock"
+    if not isinstance(marker, dict):
+        if payload.get("missing") is True:
+            return None, False, float(peer_now), _REMOTE_MARKER_MISSING
+        return None, None, None, "runtime marker response did not contain a marker"
+    if process_live not in (True, False, None):
+        process_live = None
     return marker, process_live, float(peer_now), ""
 
 

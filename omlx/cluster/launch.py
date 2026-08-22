@@ -33,6 +33,7 @@ from omlx.utils import hardware
 from .deployment import ClusterDeployment, validate_ssh_target
 from .liveness import (
     _LOOPBACK_TARGETS,
+    _REMOTE_MARKER_MISSING,
     marker_owner_is_live,
     read_marker,
     read_remote_marker,
@@ -303,6 +304,63 @@ def _kill_remote_pid(
     return "gone" in completed.stdout and "alive" not in completed.stdout
 
 
+_REMOTE_WORKER_SCAN_SCRIPT = (
+    "import json,shlex,subprocess,sys;"
+    "dep=sys.argv[1];"
+    "r=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,check=False);"
+    "p=[];"
+    "\nfor line in r.stdout.splitlines():"
+    "\n s=line.strip(); fields=s.split(None,1)"
+    "\n if len(fields)!=2 or not fields[0].isdigit(): continue"
+    "\n try: args=shlex.split(fields[1])"
+    "\n except ValueError: continue"
+    "\n if 'omlx.cluster.inference_worker' not in args: continue"
+    "\n try: i=args.index('--deployment-id')"
+    "\n except ValueError: continue"
+    "\n if i+1<len(args) and args[i+1]==dep: p.append(int(fields[0]))"
+    "\nprint(json.dumps({'returncode':r.returncode,'pids':p},separators=(',',':')))"
+)
+
+
+def _remote_deployment_worker_pids(
+    ssh_target: str,
+    deployment_id: str,
+    *,
+    runner: SSHRunner = subprocess.run,
+) -> tuple[list[int] | None, str]:
+    """Find rank workers when their crash removed the only runtime marker."""
+
+    command = " ".join(
+        (
+            "python3",
+            "-c",
+            shlex.quote(_REMOTE_WORKER_SCAN_SCRIPT),
+            shlex.quote(deployment_id),
+        )
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=10.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        return None, str(exc)
+    if len(completed.stdout.encode()) > _REMOTE_OUTPUT_LIMIT:
+        return None, "remote worker scan response was too large"
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"remote worker scan response was invalid: {exc}"
+    if payload.get("returncode") != 0 or not isinstance(payload.get("pids"), list):
+        return None, "remote worker process table could not be read"
+    pids = payload["pids"]
+    if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids):
+        return None, "remote worker scan returned an invalid pid"
+    return pids, ""
+
+
 def _rank_marker_matches(
     marker: dict[str, Any] | None,
     *,
@@ -386,6 +444,30 @@ def _sweep_rank_processes(
             f"{remote_root}/{filename}",
         )
         if error:
+            if error == _REMOTE_MARKER_MISSING:
+                pids, scan_error = _remote_deployment_worker_pids(
+                    ssh_target,
+                    deployment_id,
+                    runner=runner,
+                )
+                if scan_error:
+                    failures.append(
+                        f"rank {rank} ({node_id}) marker is missing and "
+                        f"worker scan failed: {scan_error}"
+                    )
+                    continue
+                for pid in pids or ():
+                    if not _kill_remote_pid(
+                        ssh_target,
+                        pid,
+                        grace=kill_grace,
+                        runner=runner,
+                    ):
+                        failures.append(
+                            f"remote rank {rank} ({node_id}) pid {pid} "
+                            "could not be killed after marker loss"
+                        )
+                continue
             failures.append(f"rank {rank} ({node_id}) marker unreadable: {error}")
             continue
         if not _rank_marker_matches(

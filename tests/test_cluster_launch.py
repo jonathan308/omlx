@@ -1978,6 +1978,65 @@ def test_teardown_sweep_kills_live_remote_rank_over_ssh(tmp_path, monkeypatch):
     assert "kill -KILL 535353" in command
 
 
+def test_teardown_sweep_accepts_missing_remote_marker_after_empty_process_scan(
+    tmp_path, monkeypatch
+):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (
+            None,
+            False,
+            0.0,
+            launch._REMOTE_MARKER_MISSING,
+        ),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_a, **_k: ([], ""),
+    )
+
+    assert supervisor._sweep_rank_leftovers(kill_grace=0.01) == []
+
+
+def test_teardown_sweep_kills_markerless_remote_worker(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (
+            None,
+            False,
+            0.0,
+            launch._REMOTE_MARKER_MISSING,
+        ),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_a, **_k: ([535353], ""),
+    )
+    killed = []
+    monkeypatch.setattr(
+        launch,
+        "_kill_remote_pid",
+        lambda target, pid, **_kw: killed.append((target, pid)) or True,
+    )
+
+    assert supervisor._sweep_rank_leftovers(kill_grace=0.01) == []
+    assert killed == [("user@studio.local", 535353)]
+
+
 def test_teardown_sweep_ignores_foreign_deployment_markers(tmp_path, monkeypatch):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
