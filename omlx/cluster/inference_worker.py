@@ -1732,7 +1732,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         control_plane=control_plane,
                     ),
                     _bind_generation_thread_stream(
-                        ResponseGenerator,
+                        mlx_server.ResponseGenerator,
                         mx,
                         generation_stream,
                     ),

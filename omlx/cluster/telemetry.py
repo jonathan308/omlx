@@ -878,7 +878,6 @@ def install_server_telemetry(
     original_batch_generator = mlx_server.BatchGenerator
     original_prompt_cache = mlx_server.LRUPromptCache
     original_generation_context = mlx_server.GenerationContext
-    original_time_budget = mlx_server.TimeBudget
     cancellation_state = threading.local()
     marker_path = getattr(marker, "path", None)
     marker_payload = getattr(marker, "payload", None)
@@ -1224,6 +1223,14 @@ def install_server_telemetry(
             self.__dict__["_omlx_local_should_stop"] = bool(value)
 
     class TelemetryResponseGenerator(original):
+        def _generate(self) -> Any:
+            # Set on the instance from inside the generation thread. Replacing
+            # mlx_lm.server.TimeBudget globally is insufficient when a rank has
+            # already bound the original class object; this guarantees the same
+            # one-step schedule on every process before its first request.
+            self._time_budget = _RankSynchronousTimeBudget()
+            return super()._generate()
+
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
@@ -1397,8 +1404,6 @@ def install_server_telemetry(
     mlx_server.ResponseGenerator = TelemetryResponseGenerator
     mlx_server.LRUPromptCache = TelemetryPromptCache
     mlx_server.GenerationContext = CoordinatedGenerationContext
-    if world_size > 1:
-        mlx_server.TimeBudget = _RankSynchronousTimeBudget
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
     # Started here rather than by the caller: this block is exactly the span
@@ -1413,7 +1418,6 @@ def install_server_telemetry(
         mlx_server.BatchGenerator = original_batch_generator
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
-        mlx_server.TimeBudget = original_time_budget
         mlx_server.stream_generate = original_stream_generate
         if ssd_store is not None:
             # Snapshots are process-lifetime; a hard crash skips this and the
