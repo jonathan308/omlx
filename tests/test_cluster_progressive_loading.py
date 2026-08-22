@@ -93,9 +93,21 @@ def test_fixed_phase_is_visible_before_large_fixed_weights_materialize():
 
 
 def test_tensor_registry_includes_missing_exo_architectures():
-    assert {"qwen3_next", "nemotron_h"} <= registered_model_types()
+    assert {
+        "gemma4",
+        "gemma4_text",
+        "gemma4_unified",
+        "kimi_k25",
+        "nemotron_h",
+        "qwen3_moe",
+        "qwen3_next",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    } <= registered_model_types()
     assert supports_model_type("qwen3_next") is True
     assert supports_model_type("nemotron_h") is True
+    assert supports_model_type("qwen3_vl_moe") is True
+    assert supports_model_type("gemma4_unified") is True
     assert supports_model_type("llama", native_shard=True) is True
     assert supports_model_type("unknown") is False
 
@@ -109,6 +121,101 @@ def test_planner_and_loader_apply_the_same_native_tensor_proof():
     assert _supports_tensor_parallel({"model_type": "iquestloopcoder"}) is False
     # Explicit adapters remain available even without a native Model.shard.
     assert _supports_tensor_parallel({"model_type": "qwen3_next"}) is True
+    assert _supports_tensor_parallel({"model_type": "qwen3_moe"}) is True
+    assert _supports_tensor_parallel({"model_type": "qwen3_vl"}) is True
+    assert _supports_tensor_parallel({"model_type": "gemma4"}) is True
+    assert _supports_tensor_parallel({"model_type": "kimi_k25"}) is True
+    # Capability discovery follows the same official remapping MLX-LM uses
+    # when it loads a checkpoint (kimi_k2 -> deepseek_v3).
+    assert _supports_tensor_parallel({"model_type": "kimi_k2"}) is True
+
+
+@pytest.mark.parametrize(
+    "model_type, strategy, delegate_owner",
+    [
+        ("qwen3_vl", "qwen3_vl", "language_model"),
+        ("kimi_k25", "kimi_k25", "outer"),
+    ],
+)
+def test_audited_wrapper_delegates_shard_one_layer_at_a_time(
+    model_type,
+    strategy,
+    delegate_owner,
+):
+    mx = _FakeMX()
+    calls = []
+
+    class Layer:
+        def __init__(self, name):
+            self.name = name
+            if model_type == "qwen3_vl":
+                self.self_attn = SimpleNamespace(n_heads=4, n_kv_heads=2)
+            else:
+                self.self_attn = SimpleNamespace(num_heads=4)
+
+        def parameters(self):
+            return self.name
+
+    owner = SimpleNamespace(layers=[Layer("zero"), Layer("one")])
+
+    def shard(_group):
+        assert len(owner.layers) == 1
+        calls.append(owner.layers[0].name)
+
+    language_model = SimpleNamespace(model=owner)
+    if delegate_owner == "language_model":
+        language_model.shard = shard
+    model = SimpleNamespace(
+        model_type=model_type,
+        language_model=language_model,
+    )
+    if delegate_owner == "outer":
+        model.shard = shard
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    progress = []
+
+    assert (
+        apply_tensor_strategy(
+            model,
+            group,
+            mx_module=mx,
+            progress=progress.append,
+        )
+        == strategy
+    )
+    assert calls == ["zero", "one"]
+    assert [layer.name for layer in owner.layers] == ["zero", "one"]
+    assert [event["layers_loaded"] for event in progress] == [1, 2]
+
+
+def test_audited_wrapper_rejects_bad_heads_before_mutating_any_layer():
+    mx = _FakeMX()
+    calls = []
+
+    class Layer:
+        def __init__(self, name, heads):
+            self.name = name
+            self.self_attn = SimpleNamespace(n_heads=heads, n_kv_heads=2)
+
+        def parameters(self):
+            return self.name
+
+    owner = SimpleNamespace(layers=[Layer("good", 4), Layer("bad", 3)])
+    language_model = SimpleNamespace(
+        model=owner,
+        shard=lambda _group: calls.append(owner.layers[0].name),
+    )
+    model = SimpleNamespace(model_type="qwen3_vl", language_model=language_model)
+
+    with pytest.raises(ValueError, match="attention heads"):
+        apply_tensor_strategy(
+            model,
+            SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+            mx_module=mx,
+        )
+
+    assert calls == []
+    assert [layer.name for layer in owner.layers] == ["good", "bad"]
 
 
 def test_qwen_next_moe_inplace_shards_are_wrapped_with_an_all_sum(monkeypatch):
@@ -272,6 +379,54 @@ def test_native_tensor_strategy_skips_read_only_forwarding_layer_property():
     assert [layer.name for layer in model.layers] == ["zero", "one"]
 
 
+def test_native_tensor_strategy_shards_declared_auxiliary_blocks_progressively():
+    mx = _FakeMX()
+    calls = []
+    progress = []
+
+    class Layer:
+        def __init__(self, name):
+            self.name = name
+
+        def parameters(self):
+            return self.name
+
+    class Auxiliary:
+        def __init__(self, name):
+            self.block = Layer(name)
+
+        def parameters(self):
+            return f"{self.block.name}-owner"
+
+    class Model:
+        model_type = "native_test"
+
+        def __init__(self):
+            self.model = SimpleNamespace(layers=[Layer("main-0"), Layer("main-1")])
+            self.mtp = [Auxiliary("mtp-0"), Auxiliary("mtp-1")]
+
+        def shard(self, group):
+            for layer in self.model.layers:
+                calls.append(layer.name)
+
+        def _omlx_tensor_auxiliary_modules(self):
+            return self.mtp
+
+    model = Model()
+    strategy = apply_tensor_strategy(
+        model,
+        SimpleNamespace(),
+        mx_module=mx,
+        progress=progress.append,
+    )
+
+    assert strategy == "native"
+    assert calls == ["main-0", "main-1", "mtp-0", "mtp-1"]
+    assert [layer.name for layer in model.model.layers] == ["main-0", "main-1"]
+    auxiliary = [event for event in progress if event["phase"].startswith("tensor_aux")]
+    assert [event["modules_loaded"] for event in auxiliary] == [1, 2]
+
+
 def test_native_tensor_strategy_refuses_fixed_weight_mutation_outside_layer_loop():
     mx = _FakeMX()
 
@@ -431,6 +586,8 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
         def __init__(self):
             self.params = {
                 "embed.weight": Arr("embed"),
+                "lm_head.weight": Arr("head"),
+                "mtp.0.weight": Arr("mtp"),
                 "model.layers.0.weight": Arr("layer-0"),
                 "model.layers.1.weight": Arr("layer-1"),
             }
@@ -446,15 +603,26 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
         if ".layers." in key
     }
     embed_ref = weakref.ref(model.params["embed.weight"])
+    head_ref = weakref.ref(model.params["lm_head.weight"])
+    mtp_ref = weakref.ref(model.params["mtp.0.weight"])
 
     def fake_strategy(shard_model, group, *, mx_module, progress=None):
+        # A large output projection must remain lazy until it can be sliced;
+        # evaluating it in the replicated fixed phase causes the avoidable
+        # full-head memory spike this loader is designed to prevent.
+        assert "head" not in mx_module.evaluated
+        assert "mtp" not in mx_module.evaluated
         for key in list(shard_model.params):
             if ".layers." in key:
                 shard_model.params[key] = Arr(key + " shard")
+        shard_model.params["lm_head.weight"] = Arr("head shard")
+        shard_model.params["mtp.0.weight"] = Arr("mtp shard")
         gc.collect()
         # Checked *inside* the strategy: after this point a pinned original
         # would sit next to its materialized shard for the rest of the load.
         assert all(ref() is None for ref in originals.values())
+        assert head_ref() is None
+        assert mtp_ref() is None
         return "native"
 
     monkeypatch.setattr(
@@ -465,11 +633,16 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
         cpu = object()
         distributed = SimpleNamespace(all_sum=lambda value, stream=None: value)
 
+        def __init__(self):
+            self.evaluated = []
+
         def array(self, value):
             return value
 
         def eval(self, *values):
-            pass
+            self.evaluated.extend(
+                value.name for value in values if isinstance(value, Arr)
+            )
 
         def clear_cache(self):
             pass
@@ -482,11 +655,12 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
         tree_flatten=lambda params: list(params.items()),
     )
 
+    fake_mx = FakeMX()
     loaded, tokenizer = progressive_sharded_load(
         "fake-repo",
         tensor_group=SimpleNamespace(),
         utils_module=fake_utils,
-        mx_module=FakeMX(),
+        mx_module=fake_mx,
     )
 
     assert loaded is model
@@ -494,3 +668,8 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
     gc.collect()
     assert all(ref() is None for ref in originals.values())
     assert embed_ref() is not None
+    assert head_ref() is None
+    assert mtp_ref() is None
+    assert fake_mx.evaluated[:1] == ["embed"]
+    assert "head shard" in fake_mx.evaluated
+    assert "mtp shard" in fake_mx.evaluated

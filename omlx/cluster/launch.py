@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
+_LAUNCH_LOG_MAX_BYTES = 16 * 1024 * 1024
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
@@ -165,6 +166,12 @@ def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
         Path(state_dir).expanduser()
         / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
     )
+
+
+def _launcher_log_path(state_dir: str | Path, deployment_id: str) -> Path:
+    """Private, durable output from every rank relayed by ``mlx.launch``."""
+
+    return Path(state_dir).expanduser() / f"{deployment_id}-launcher.log"
 
 
 def _write_launch_manifest(
@@ -2088,6 +2095,7 @@ class DistributedJobStatus:
     world_size: int
     plan_hash: str
     stderr_tail: tuple[str, ...]
+    launcher_log_path: str | None = None
     failure_reason: str | None = None
     ranks: tuple[dict[str, Any], ...] = ()
 
@@ -2101,6 +2109,7 @@ class DistributedJobStatus:
             "world_size": self.world_size,
             "plan_hash": self.plan_hash,
             "stderr_tail": list(self.stderr_tail),
+            "launcher_log_path": self.launcher_log_path,
             "failure_reason": self.failure_reason,
             "ranks": [dict(rank) for rank in self.ranks],
         }
@@ -2141,6 +2150,8 @@ class DistributedJobSupervisor:
         self._stderr = deque(maxlen=_LOG_HISTORY)
         self._condition = threading.Condition()
         self._readers: list[threading.Thread] = []
+        self._launcher_log: Any | None = None
+        self._launcher_log_bytes = 0
 
     @property
     def endpoint(self) -> str | None:
@@ -2207,6 +2218,7 @@ class DistributedJobSupervisor:
                 start_new_session=True,
             )
             self._write_launch_manifest()
+            self._open_launcher_log()
             self._start_readers()
             event = self._wait_for_ready()
             self._wait_for_listener()
@@ -2242,6 +2254,64 @@ class DistributedJobSupervisor:
             reader.start()
             self._readers.append(reader)
 
+    def _open_launcher_log(self, *, rotate_existing: bool = True) -> None:
+        """Open a bounded mode-0600 transcript without making launch depend on it."""
+
+        path = _launcher_log_path(
+            self.state_dir,
+            self.deployment.deployment_id,
+        )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if rotate_existing and path.exists():
+                os.replace(path, path.with_name(path.name + ".1"))
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            self._launcher_log = os.fdopen(descriptor, "ab", buffering=0)
+            self._launcher_log_bytes = path.stat().st_size
+        except OSError as exc:
+            self._launcher_log = None
+            self._launcher_log_bytes = 0
+            logger.warning("Could not open the distributed launcher log: %s", exc)
+
+    def _append_launcher_log(self, stream_name: str, line: str) -> None:
+        stream = self._launcher_log
+        if stream is None:
+            return
+        payload = f"[{stream_name}] {line}\n".encode("utf-8", errors="replace")
+        try:
+            if self._launcher_log_bytes + len(payload) > _LAUNCH_LOG_MAX_BYTES:
+                stream.close()
+                self._launcher_log = None
+                path = _launcher_log_path(
+                    self.state_dir,
+                    self.deployment.deployment_id,
+                )
+                os.replace(path, path.with_name(path.name + ".1"))
+                self._open_launcher_log(rotate_existing=False)
+                stream = self._launcher_log
+                if stream is None:
+                    return
+            stream.write(payload)
+            self._launcher_log_bytes += len(payload)
+        except OSError as exc:
+            with suppress(OSError):
+                stream.close()
+            self._launcher_log = None
+            self._launcher_log_bytes = 0
+            logger.warning("Could not persist distributed launcher output: %s", exc)
+
+    def _close_launcher_log(self) -> None:
+        stream = self._launcher_log
+        self._launcher_log = None
+        self._launcher_log_bytes = 0
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
+
     def _drain(
         self,
         stream: Any,
@@ -2252,6 +2322,10 @@ class DistributedJobSupervisor:
             line = raw_line.rstrip("\r\n")[:_LOG_LINE_LIMIT]
             with self._condition:
                 destination.append(line)
+                self._append_launcher_log(
+                    "stdout" if parse_events else "stderr",
+                    line,
+                )
                 if parse_events and line.startswith(_EVENT_PREFIX):
                     try:
                         event = json.loads(line.removeprefix(_EVENT_PREFIX))
@@ -2460,6 +2534,7 @@ class DistributedJobSupervisor:
         for reader in self._readers:
             reader.join(timeout=0.5)
         self._readers.clear()
+        self._close_launcher_log()
         if process is not None:
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
@@ -2703,6 +2778,20 @@ class DistributedJobSupervisor:
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
             stderr_tail=tuple(self._stderr)[-20:],
+            launcher_log_path=(
+                str(
+                    _launcher_log_path(
+                        self.state_dir,
+                        self.deployment.deployment_id,
+                    )
+                )
+                if self._launcher_log is not None
+                or _launcher_log_path(
+                    self.state_dir,
+                    self.deployment.deployment_id,
+                ).exists()
+                else None
+            ),
             failure_reason=self._failure_reason(),
             ranks=tuple(
                 dict(self.rank_ready_events[rank])

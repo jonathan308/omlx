@@ -21,7 +21,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from .deployment import decode_worker_contract, decode_worker_path_map
+from .deployment import (
+    decode_worker_contract,
+    decode_worker_path_map,
+    decode_worker_speculation,
+)
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -434,6 +438,110 @@ def _distributed_model_type(model_path: str | Path) -> str:
     return str(model_type or "").strip().lower()
 
 
+def _configure_distributed_mtp(
+    model_path: str | Path,
+    *,
+    enabled: bool,
+    depth: int | None,
+    tensor_parallel_size: int,
+) -> int | None:
+    """Validate and install the rank-identical speculative depth contract."""
+
+    if not enabled:
+        return None
+    if tensor_parallel_size < 2:
+        raise RuntimeError("distributed MTP currently requires pure tensor parallelism")
+    model_type = _distributed_model_type(model_path)
+    if not model_type.startswith("deepseek_v4"):
+        raise RuntimeError(
+            "distributed MTP is not validated for model type "
+            f"{model_type or 'unknown'!r}"
+        )
+    # The single-node adaptive controller selects depth from local wall time.
+    # Heterogeneous ranks can therefore choose different verify widths and
+    # enter a different collective sequence. Keep the signed depth identical
+    # until depth selection itself is a coordinated distributed decision.
+    fixed_depth = depth or 3
+    os.environ["OMLX_MTP_FIXED_DEPTH"] = str(fixed_depth)
+    return fixed_depth
+
+
+def _configure_tensor_shard_weights(
+    assignments: Sequence[PipelineAssignment],
+    *,
+    rank: int,
+    tensor_parallel_size: int,
+) -> tuple[int, ...]:
+    """Publish this rank's signed asymmetric TP partition to model adapters."""
+
+    if tensor_parallel_size < 2:
+        os.environ.pop("OMLX_TP_SHARD_WEIGHTS", None)
+        return (1,)
+    stage = rank // tensor_parallel_size
+    start = stage * tensor_parallel_size
+    group = sorted(
+        assignments[start : start + tensor_parallel_size],
+        key=lambda item: item.tensor_parallel_rank,
+    )
+    if (
+        len(group) != tensor_parallel_size
+        or [item.tensor_parallel_rank for item in group]
+        != list(range(tensor_parallel_size))
+        or len({(item.start_layer, item.end_layer) for item in group}) != 1
+    ):
+        raise RuntimeError("tensor-parallel shard-weight group is inconsistent")
+    weights = tuple(int(item.tensor_parallel_shard_weight) for item in group)
+    if any(weight < 1 for weight in weights):
+        raise RuntimeError("tensor-parallel shard weights must be positive")
+    # The plan is the admission/memory contract, so it wins over a stale shell
+    # value. A different runtime split could retain more weights than approved.
+    os.environ["OMLX_TP_SHARD_WEIGHTS"] = ",".join(map(str, weights))
+    return weights
+
+
+def _configure_indexer_decode_owner(
+    profiles: Sequence[Any],
+    *,
+    rank: int,
+    tensor_parallel_size: int,
+) -> int | None:
+    """Choose the fastest measured TP member for DS4 decode top-k work."""
+
+    requested = os.environ.get(
+        "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"
+    ).strip().lower()
+    if requested in {"false", "no", "off", "disabled"}:
+        os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = "off"
+        return None
+    if tensor_parallel_size < 2:
+        os.environ.pop("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", None)
+        return None
+    if requested != "auto":
+        try:
+            owner = int(requested)
+        except ValueError as exc:
+            raise RuntimeError(
+                "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK must be auto, off, or a rank"
+            ) from exc
+        if not 0 <= owner < tensor_parallel_size:
+            raise RuntimeError(
+                "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK is outside the TP group"
+            )
+        os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = str(owner)
+        return owner
+    stage = rank // tensor_parallel_size
+    start = stage * tensor_parallel_size
+    group = list(profiles[start : start + tensor_parallel_size])
+    owner = 0
+    if len(group) == tensor_parallel_size:
+        owner = max(
+            range(tensor_parallel_size),
+            key=lambda item: group[item].decode_weight_bytes_per_second,
+        )
+    os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = str(owner)
+    return owner
+
+
 def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) -> str:
     """Install the normal oMLX model protocol on this distributed rank."""
 
@@ -816,6 +924,7 @@ def _runtime_assignment(
         "headroom_bytes": assignment.headroom_bytes,
         "tensor_parallel_rank": assignment.tensor_parallel_rank,
         "tensor_parallel_size": assignment.tensor_parallel_size,
+        "tensor_parallel_shard_weight": assignment.tensor_parallel_shard_weight,
         "sharded_weight_bytes": assignment.sharded_weight_bytes,
     }
     if assignment.predicted_stage_seconds is not None:
@@ -1141,6 +1250,7 @@ def run_worker(args: argparse.Namespace) -> int:
     plan_hash, assignments, performance_profiles, tensor_parallel_size = (
         decode_worker_contract(args.plan)
     )
+    mtp_enabled, mtp_num_draft_tokens = decode_worker_speculation(args.plan)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
     group = mx.distributed.init(backend=init_backend, strict=True)
@@ -1153,6 +1263,16 @@ def run_worker(args: argparse.Namespace) -> int:
         )
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
+    tensor_shard_weights = _configure_tensor_shard_weights(
+        assignments,
+        rank=rank,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    indexer_decode_owner = _configure_indexer_decode_owner(
+        performance_profiles,
+        rank=rank,
+        tensor_parallel_size=tensor_parallel_size,
+    )
 
     # Cluster v2: a deployment may give each node its own absolute model path.
     # The rank's path comes from the signed contract's path_map; nodes without
@@ -1162,6 +1282,12 @@ def run_worker(args: argparse.Namespace) -> int:
         rank_model_path = path_map.get(assignments[rank].node_id)
         if rank_model_path and rank_model_path != args.model:
             args.model = rank_model_path
+    mtp_fixed_depth = _configure_distributed_mtp(
+        args.model,
+        enabled=mtp_enabled,
+        depth=mtp_num_draft_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+    )
 
     marker = RuntimeMarker(
         state_dir=args.state_dir,
@@ -1177,6 +1303,10 @@ def run_worker(args: argparse.Namespace) -> int:
         "loading",
         load_stage="initializing",
         launcher_parent_pid=launcher_parent_pid,
+        mtp_enabled=mtp_enabled,
+        mtp_fixed_depth=mtp_fixed_depth,
+        tensor_parallel_shard_weights=list(tensor_shard_weights),
+        indexer_decode_owner_rank=indexer_decode_owner,
     )
     marker.start_heartbeat()
     _install_signal_handlers()
@@ -1251,7 +1381,13 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        maybe_apply_pre_load_patches(
+            args.model,
+            model_settings=SimpleNamespace(
+                mtp_enabled=mtp_enabled,
+                mtp_num_draft_tokens=mtp_num_draft_tokens,
+            ),
+        )
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1360,6 +1496,10 @@ def run_worker(args: argparse.Namespace) -> int:
                         profile.to_dict() for profile in performance_profiles
                     ],
                     optimizations=optimizations,
+                    mtp_enabled=mtp_enabled,
+                    mtp_fixed_depth=mtp_fixed_depth,
+                    tensor_parallel_shard_weights=list(tensor_shard_weights),
+                    indexer_decode_owner_rank=indexer_decode_owner,
                     output_protocol=protocol or None,
                 )
                 _emit_event(

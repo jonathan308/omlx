@@ -11,6 +11,7 @@ from omlx.cluster.deployment import (
     ClusterHost,
     _assignment_from_dict,
     decode_worker_plan,
+    decode_worker_speculation,
 )
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -93,6 +94,11 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "MLX_MAX_MB_PER_BUFFER",
         "JACCL_PROGRESS_TIMEOUT_MS",
         "JACCL_TIMEOUT_ACTION",
+        "JACCL_TWO_RANK_SMALL_ALLREDUCE",
+        "OMLX_DSV4_INDEXER_ROW_TP",
+        "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
+        "OMLX_CLUSTER_VOCAB_PARALLEL",
+        "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
     deployment = _deployment()
@@ -106,11 +112,19 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_PROGRESS_TIMEOUT_MS=30000" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=1" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
+    assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
+    assert "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES=268435456" in envs
 
 
 def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("MLX_MAX_OPS_PER_BUFFER", "32")
     monkeypatch.setenv("JACCL_PROGRESS_TIMEOUT_MS", "60000")
+    monkeypatch.setenv("JACCL_TWO_RANK_SMALL_ALLREDUCE", "0")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
     deployment = _deployment()
 
     envs = deployment.hostfile_dict()["envs"]
@@ -118,6 +132,12 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "MLX_MAX_OPS_PER_BUFFER=32" in envs
     assert "MLX_MAX_OPS_PER_BUFFER=16" not in envs
     assert "JACCL_PROGRESS_TIMEOUT_MS=60000" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" in envs
+    assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=1" not in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=0" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP=1" not in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs
+    assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" not in envs
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs
     assert "JACCL_TIMEOUT_ACTION=teardown-exit" in envs
@@ -141,6 +161,45 @@ def test_deployment_round_trip_preserves_the_selected_context():
     assert restored.to_dict()["target_context_tokens"] == 262144
 
 
+def test_deployment_carries_mtp_settings_to_every_rank():
+    deployment = _deployment()
+    deployment = ClusterDeployment(
+        deployment_id=deployment.deployment_id,
+        model=deployment.model,
+        backend=deployment.backend,
+        hosts=deployment.hosts,
+        assignments=deployment.assignments,
+        plan_hash=deployment.plan_hash,
+        mtp_enabled=True,
+        mtp_num_draft_tokens=5,
+    )
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+
+    assert restored.mtp_enabled is True
+    assert restored.mtp_num_draft_tokens == 5
+    assert decode_worker_speculation(deployment.encode_worker_plan()) == (True, 5)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("mtp_enabled", "false", "mtp_enabled must be a boolean"),
+        (
+            "mtp_num_draft_tokens",
+            "5",
+            "mtp_num_draft_tokens must be between 1 and 8",
+        ),
+    ],
+)
+def test_deployment_rejects_coerced_mtp_settings(field, value, message):
+    payload = _deployment().to_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        ClusterDeployment.from_dict(payload)
+
+
 def test_deployment_round_trip_preserves_tensor_parallel_size():
     """Tensor parallel size must survive to_dict/from_dict and worker plan encoding."""
     from omlx.cluster.planner import PipelineAssignment
@@ -157,6 +216,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
             capacity_bytes=256 * GIB,
             tensor_parallel_rank=0,
             tensor_parallel_size=2,
+            tensor_parallel_shard_weight=5,
             sharded_weight_bytes=4 * GIB,
         ),
         PipelineAssignment(
@@ -170,6 +230,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
             capacity_bytes=256 * GIB,
             tensor_parallel_rank=1,
             tensor_parallel_size=2,
+            tensor_parallel_shard_weight=3,
             sharded_weight_bytes=4 * GIB,
         ),
     )
@@ -200,6 +261,9 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
     payload = json.loads(raw)
     assert payload["tensor_parallel_size"] == 2
     assert payload["assignments"][0]["tensor_parallel_rank"] == 0
+    assert [
+        item["tensor_parallel_shard_weight"] for item in payload["assignments"]
+    ] == [5, 3]
     assert payload["assignments"][0]["sharded_weight_bytes"] == 4 * GIB
 
 

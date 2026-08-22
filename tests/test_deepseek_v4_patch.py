@@ -2211,6 +2211,130 @@ class TestIndexerFallbackTiling:
         ref = (mx.maximum(scores, 0) * 0.125 * weights).sum(axis=1)
         assert float(mx.abs(got - ref).max()) < 1e-5
 
+    def test_tensor_prefill_row_split_matches_full_indexer(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+
+        class Group:
+            def __init__(self, rank):
+                self._rank = rank
+
+            def rank(self):
+                return self._rank
+
+            @staticmethod
+            def size():
+                return 2
+
+        config = dm.ModelArgs(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            num_hash_layers=0,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            head_dim=8,
+            o_groups=1,
+            o_lora_rank=8,
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=3,
+            sliding_window=128,
+            compress_ratios=[4],
+        )
+        indexer = dm.Indexer(config, compress_ratio=4)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL", 0)
+        mx.random.seed(29)
+        indexer.wq_b.weight = mx.random.normal(indexer.wq_b.weight.shape)
+        indexer.weights_proj.weight = mx.random.normal(
+            indexer.weights_proj.weight.shape
+        )
+        pooled = mx.random.normal((1, 7, 8), dtype=mx.bfloat16)
+        monkeypatch.setattr(
+            dm.Compressor,
+            "__call__",
+            lambda self, x, pool_cache, offset: pooled,
+        )
+        x = mx.random.normal((1, 5, 16), dtype=mx.bfloat16)
+        q_residual = mx.random.normal((1, 5, 8), dtype=mx.bfloat16)
+        rope = lambda value, offset: value
+
+        full = indexer(x, q_residual, rope, None, 0)
+        monkeypatch.setattr(
+            dm,
+            "_gather_indexer_rows",
+            lambda local, total_rows, group: local,
+        )
+        indexer.row_sharding_group = Group(0)
+        first = indexer(x, q_residual, rope, None, 0)
+        indexer.row_sharding_group = Group(1)
+        second = indexer(x, q_residual, rope, None, 0)
+        reconstructed = mx.concatenate([first, second], axis=1)
+        mx.eval(full, reconstructed)
+
+        assert dm._balanced_row_ranges(5, 2) == ((0, 3), (3, 5))
+        assert mx.array_equal(reconstructed, full).item()
+
+    def test_tensor_prefill_row_gather_removes_uneven_padding(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        first = mx.array([[[1, 2], [3, 4], [5, 6]]], dtype=mx.uint32)
+        second = mx.array([[[7, 8], [9, 10]]], dtype=mx.uint32)
+        second_padded = mx.concatenate(
+            [second.swapaxes(0, 1), mx.zeros((1, 1, 2), dtype=mx.uint32)],
+            axis=0,
+        )
+        wire = mx.concatenate([first.swapaxes(0, 1), second_padded], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        gathered = dm._gather_indexer_rows(first, 5, group)
+
+        assert gathered.tolist() == [
+            [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+        ]
+
+    def test_tensor_prefill_equal_row_gather_reuses_collective_output(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        first = mx.array([[[1, 2], [3, 4]]], dtype=mx.uint32)
+        second = mx.array([[[5, 6], [7, 8]]], dtype=mx.uint32)
+        wire = mx.concatenate([first.swapaxes(0, 1), second.swapaxes(0, 1)], axis=0)
+        monkeypatch.setattr(
+            mx.distributed,
+            "all_gather",
+            lambda value, group=None: wire,
+        )
+        monkeypatch.setattr(
+            dm.mx,
+            "concatenate",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("equal row shards must not be copied again")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(
+            first,
+            4,
+            SimpleNamespace(size=lambda: 2),
+        )
+
+        assert gathered.tolist() == [[[1, 2], [3, 4], [5, 6], [7, 8]]]
+
     def test_missing_native_warning_fires_once(
         self, applied_patch, caplog, monkeypatch
     ):

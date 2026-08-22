@@ -275,6 +275,71 @@ def test_supervisor_collects_every_rank_ready_event():
     assert status["ranks"][1]["measured_weight_bytes"] == 11
 
 
+def test_supervisor_persists_bounded_launcher_output(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    supervisor._open_launcher_log()
+
+    supervisor._drain(
+        io.StringIO("rank-zero output\n"),
+        supervisor._stdout,
+        True,
+    )
+    supervisor._drain(
+        io.StringIO("native kernel warning\n"),
+        supervisor._stderr,
+        False,
+    )
+
+    log_path = tmp_path / "cluster-test-launcher.log"
+    assert log_path.read_text(encoding="utf-8") == (
+        "[stdout] rank-zero output\n[stderr] native kernel warning\n"
+    )
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+    assert supervisor.status().launcher_log_path == str(log_path)
+
+    monkeypatch.setattr(launch, "_LAUNCH_LOG_MAX_BYTES", log_path.stat().st_size + 1)
+    supervisor._drain(
+        io.StringIO("rotates now\n"),
+        supervisor._stdout,
+        True,
+    )
+    supervisor._close_launcher_log()
+
+    assert (tmp_path / "cluster-test-launcher.log.1").read_text(
+        encoding="utf-8"
+    ).endswith("[stderr] native kernel warning\n")
+    assert log_path.read_text(encoding="utf-8") == "[stdout] rotates now\n"
+
+
+def test_launcher_log_failure_does_not_block_event_parsing(tmp_path, monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    def fail_open(*_args, **_kwargs):
+        raise OSError("read only")
+
+    monkeypatch.setattr(launch.os, "open", fail_open)
+
+    supervisor._open_launcher_log()
+    supervisor._drain(
+        io.StringIO(
+            launch._EVENT_PREFIX
+            + '{"type":"peer_lost","reason":"rank 1 disappeared"}\n'
+        ),
+        supervisor._stdout,
+        True,
+    )
+
+    assert supervisor._launcher_log is None
+    assert supervisor.status().failure_reason == "rank 1 disappeared"
+
+
 def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
     class Launcher:
         pid = 43210

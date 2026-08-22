@@ -167,6 +167,36 @@ class TestMtpBoundaryCommit:
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
 
+    def test_distributed_coordinator_broadcasts_one_verify_packet(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        packets = []
+
+        class Coordinator:
+            is_coordinator = True
+            output_size = 32
+
+            @staticmethod
+            def gather_logits(value):
+                return value
+
+            @staticmethod
+            def sync_packet(packet, length):
+                assert tuple(packet.shape) == (length,)
+                values = [int(value) for value in packet.tolist()]
+                packets.append(values)
+                return values
+
+        monkeypatch.setattr(bg, "_mtp_vocab_coordinator", lambda _batch: Coordinator())
+        _batch, state, _cache = self._run_full_accept_cycle(
+            monkeypatch,
+            emitted=0,
+            drafts=2,
+        )
+
+        assert packets == [[2, 20, 1, 2]]
+        assert [token for token, _lp, _source in state.queue] == [1, 2, 20]
+
 
 class TestQwen35Model:
     @pytest.fixture(autouse=True)

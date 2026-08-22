@@ -11,6 +11,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,20 @@ class DistributedBatchedEngine(BatchedEngine):
         # Our G3/G4 abort-drain / orphan-reap semantics kept on top.
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
+        distributed_mtp = bool(
+            model_settings is not None
+            and getattr(model_settings, "mtp_enabled", False)
+        )
+        distributed_mtp_depth = (
+            getattr(model_settings, "mtp_num_draft_tokens", None)
+            if distributed_mtp
+            else None
+        )
+        deployment = replace(
+            deployment,
+            mtp_enabled=distributed_mtp,
+            mtp_num_draft_tokens=distributed_mtp_depth,
+        )
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -269,6 +284,12 @@ class DistributedBatchedEngine(BatchedEngine):
             ],
         )
         config = await asyncio.to_thread(load_config, metadata_path)
+        if self.deployment.mtp_enabled and not str(
+            config.get("model_type") or ""
+        ).startswith("deepseek_v4"):
+            raise ValueError(
+                "distributed MTP is currently validated only for DeepSeek V4"
+            )
         self._model_type = config.get("model_type")
         self._tokenizer = await asyncio.to_thread(
             load_tokenizer,
@@ -306,7 +327,6 @@ class DistributedBatchedEngine(BatchedEngine):
             for name in (
                 "dflash_enabled",
                 "specprefill_enabled",
-                "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
             )
@@ -316,6 +336,12 @@ class DistributedBatchedEngine(BatchedEngine):
             raise ValueError(
                 "distributed inference cannot be combined with "
                 + ", ".join(incompatible)
+            )
+        if bool(getattr(settings, "mtp_enabled", False)) and (
+            self.deployment.tensor_parallel_size < 2
+        ):
+            raise ValueError(
+                "distributed MTP currently requires pure tensor parallelism"
             )
 
     async def stop(self) -> None:

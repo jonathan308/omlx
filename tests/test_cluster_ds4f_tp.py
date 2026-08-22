@@ -14,8 +14,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
+from omlx.cluster.performance import NodePerformanceProfile
 from omlx.cluster.planner import (
     ModelLayout,
     NodeBudget,
@@ -26,6 +28,8 @@ from omlx.cluster.planner import (
     _kv_fixed_bytes_per_layer,
     _max_context_for_stage,
     _tensor_parallel_divisors,
+    _tensor_parallel_shard_units,
+    _supports_tensor_parallel,
     inspect_safetensors_layout,
     plan_hybrid,
 )
@@ -42,6 +46,7 @@ DS4F_CONFIG = {
     "num_key_value_heads": 1,
     "head_dim": 512,
     "hidden_size": 4096,
+    "moe_intermediate_size": 2048,
     "index_n_heads": 64,
     "index_head_dim": 128,
     "index_topk": 512,
@@ -76,6 +81,8 @@ def test_ds4f_is_kv_replicated_and_kv_heads_do_not_bound_tp():
     # Heads, and heads per o_group (wq_b shards segment-interleaved).
     assert 64 in divisors
     assert 8 in divisors
+    assert _tensor_parallel_shard_units(DS4F_CONFIG) == 8
+    assert _supports_tensor_parallel(DS4F_CONFIG) is True
 
 
 def test_ds4f_variant_model_types_match_the_prefix():
@@ -159,7 +166,7 @@ class _FakeGroup:
         return self._size
 
 
-def _tiny_ds4f(dsv4):
+def _tiny_ds4f(dsv4, *, heads=4):
     """4 heads / 2 o_groups, so TP=2 interleaves: rank r keeps head r of each
     group — [0, 2] and [1, 3] — not the contiguous halves [0, 1] / [2, 3]."""
     args = dsv4.ModelArgs.from_dict(
@@ -170,7 +177,7 @@ def _tiny_ds4f(dsv4):
             "intermediate_size": 16,
             "moe_intermediate_size": 4,
             "num_hidden_layers": 2,
-            "num_attention_heads": 4,
+            "num_attention_heads": heads,
             "num_key_value_heads": 1,
             "n_shared_experts": 1,
             "n_routed_experts": 2,
@@ -185,22 +192,25 @@ def _tiny_ds4f(dsv4):
             "index_head_dim": 4,
             "index_topk": 2,
             "hc_mult": 4,
-            "compress_ratios": [0, 0],
+            "compress_ratios": [0, 4],
         }
     )
     model = dsv4.Model(args)
     for layer in model.model.pipeline_layers:
         # Stamp each sink with its head index and each wq_b row with its
         # global row index, so a shard reveals exactly what it kept.
-        layer.attn.attn_sink = mx.arange(4, dtype=mx.float32)
-        layer.attn.wq_b.weight = mx.arange(16 * 4, dtype=mx.float32).reshape(16, 4)
+        layer.attn.attn_sink = mx.arange(heads, dtype=mx.float32)
+        layer.attn.wq_b.weight = mx.arange(heads * 4 * 4, dtype=mx.float32).reshape(
+            heads * 4, 4
+        )
     return model
 
 
 def test_attn_sink_sharding_matches_wq_b_head_group_order(dsv4):
     for rank in (0, 1):
         model = _tiny_ds4f(dsv4)
-        model.shard(_FakeGroup(rank, 2))
+        group = _FakeGroup(rank, 2)
+        model.shard(group)
         expected_heads = [rank, rank + 2]
         for layer in model.model.pipeline_layers:
             assert layer.attn.n_heads == 2
@@ -218,6 +228,125 @@ def test_attn_sink_sharding_matches_wq_b_head_group_order(dsv4):
                 for head in expected_heads
                 for offset in range(4)
             ]
+        sparse = model.model.pipeline_layers[1].attn
+        assert sparse.indexer.row_sharding_group is group
+
+
+def test_ds4f_unequal_tp_keeps_paired_head_and_mlp_boundaries(dsv4, monkeypatch):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,1")
+    expected = ([0, 1, 2, 4, 5, 6], [3, 7])
+    for rank in (0, 1):
+        model = _tiny_ds4f(dsv4, heads=8)
+        model.shard(_FakeGroup(rank, 2))
+        for layer in model.model.pipeline_layers:
+            assert layer.attn.n_heads == len(expected[rank])
+            assert layer.attn.attn_sink.tolist() == [
+                float(head) for head in expected[rank]
+            ]
+            kept_heads = [
+                int(value) // 4
+                for value in layer.attn.wq_b.weight[:, 0].tolist()
+            ]
+            assert kept_heads == [
+                head * 4 + offset
+                for head in expected[rank]
+                for offset in range(4)
+            ]
+            # Shared and routed MLP pairs use the same 3/1 intermediate split.
+            assert layer.ffn.shared_experts.gate_proj.weight.shape[0] == (
+                3 if rank == 0 else 1
+            )
+            assert layer.ffn.shared_experts.down_proj.weight.shape[1] == (
+                3 if rank == 0 else 1
+            )
+            assert layer.ffn.switch_mlp.gate_proj.weight.shape[1] == (
+                3 if rank == 0 else 1
+            )
+            assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == (
+                3 if rank == 0 else 1
+            )
+
+
+def test_unequal_tp_slices_quantized_values_on_exact_group_boundaries(dsv4):
+    column = nn.QuantizedLinear(
+        128, 128, bias=False, group_size=32, bits=4
+    )
+    row = nn.QuantizedLinear(128, 128, bias=False, group_size=32, bits=4)
+    expected = ((96, 12, 3), (32, 4, 1))
+    for rank in (0, 1):
+        group = _FakeGroup(rank, 2)
+        column_shard = dsv4._asymmetric_shard_parameters(
+            column,
+            "all-to-sharded",
+            group=group,
+            weights=(3, 1),
+        )
+        row_shard = dsv4._asymmetric_shard_parameters(
+            row,
+            "sharded-to-all",
+            group=group,
+            weights=(3, 1),
+        )
+        output_rows, packed_inputs, quant_groups = expected[rank]
+        assert column_shard["weight"].shape[0] == output_rows
+        assert column_shard["scales"].shape[0] == output_rows
+        assert row_shard["weight"].shape[-1] == packed_inputs
+        assert row_shard["scales"].shape[-1] == quant_groups
+
+
+def test_unequal_tp_paired_mlp_sum_matches_the_unsharded_result(dsv4):
+    mx.random.seed(7)
+    gate = nn.Linear(8, 8, bias=False)
+    up = nn.Linear(8, 8, bias=False)
+    down = nn.Linear(8, 8, bias=False)
+    x = mx.random.normal((3, 8))
+    full_gate = gate(x)
+    full = down((full_gate * mx.sigmoid(full_gate)) * up(x))
+    partials = []
+    for rank in (0, 1):
+        group = _FakeGroup(rank, 2)
+        gate_shard = dsv4._asymmetric_shard_parameters(
+            gate, "all-to-sharded", group=group, weights=(3, 1)
+        )["weight"]
+        up_shard = dsv4._asymmetric_shard_parameters(
+            up, "all-to-sharded", group=group, weights=(3, 1)
+        )["weight"]
+        down_shard = dsv4._asymmetric_shard_parameters(
+            down, "sharded-to-all", group=group, weights=(3, 1)
+        )["weight"]
+        local_gate = x @ gate_shard.T
+        local_hidden = (local_gate * mx.sigmoid(local_gate)) * (x @ up_shard.T)
+        partials.append(local_hidden @ down_shard.T)
+    mx.eval(full, *partials)
+    assert mx.allclose(full, partials[0] + partials[1], rtol=1e-5, atol=1e-5).item()
+
+
+def test_decode_non_owner_skips_duplicate_indexer_scoring(dsv4, monkeypatch):
+    group = _FakeGroup(1, 2)
+    expected = mx.arange(512, dtype=mx.uint32).reshape(1, 1, 512)
+    fake = SimpleNamespace(
+        compressor=lambda *_args: mx.zeros((1, 513, 4), dtype=mx.float16),
+        index_topk=512,
+        row_sharding_group=group,
+    )
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "0")
+
+    def all_sum(local, *, group):
+        assert group is fake.row_sharding_group
+        assert not mx.any(local).item()
+        return expected.astype(mx.int32)
+
+    monkeypatch.setattr(mx.distributed, "all_sum", all_sum)
+    result = dsv4.Indexer.__call__(
+        fake,
+        mx.zeros((1, 1, 8)),
+        mx.zeros((1, 1, 4)),
+        None,
+        None,
+        0,
+    )
+
+    assert mx.array_equal(result, expected).item()
 
 
 # --- (d) kv_fixed_bytes_per_layer accounting --------------------------------
@@ -230,6 +359,7 @@ def _ds4f_layout(**overrides):
         "layer_weight_bytes": (GIB,) * 4,
         "tensor_parallel_heads": 64,
         "tensor_parallel_divisors": (64, 8),
+        "tensor_parallel_shard_units": 8,
         "supports_tensor_parallel": True,
         "kv_bytes_per_token_per_layer": 162,
         "kv_replicated_across_tp": True,
@@ -237,6 +367,46 @@ def _ds4f_layout(**overrides):
     }
     fields.update(overrides)
     return ModelLayout(**fields)
+
+
+def _performance(node_id, rank, rate):
+    return NodePerformanceProfile(
+        node_id=node_id,
+        rank=rank,
+        decode_weight_bytes_per_second=rate,
+        prefill_weight_bytes_per_second=rate,
+        collective_latency_seconds=0.00003,
+        collective_bandwidth_bytes_per_second=6.2e9,
+        backend="jaccl",
+        measured_at="2026-08-22T00:00:00+00:00",
+        samples=5,
+    )
+
+
+def test_measured_ds4f_tp_assigns_five_eighths_to_the_faster_mac():
+    layout = _ds4f_layout(layer_weight_bytes=(20 * GIB,) * 4)
+    nodes = [
+        NodeBudget(
+            node_id="m3-ultra",
+            capacity_bytes=128 * GIB,
+            reserve_bytes=2 * GIB,
+            rank=0,
+            performance=_performance("m3-ultra", 0, 100e9),
+        ),
+        NodeBudget(
+            node_id="m5-max",
+            capacity_bytes=128 * GIB,
+            reserve_bytes=2 * GIB,
+            rank=1,
+            performance=_performance("m5-max", 1, 60e9),
+        ),
+    ]
+
+    plan = plan_hybrid(layout, nodes, tensor_parallel_size=2)
+
+    assert [item.tensor_parallel_shard_weight for item in plan.assignments] == [5, 3]
+    assert [item.layer_weight_bytes // GIB for item in plan.assignments] == [50, 30]
+    assert max(item.predicted_stage_seconds for item in plan.assignments) > 0
 
 
 def test_kv_fixed_term_is_reserved_on_top_of_per_token_growth():
@@ -322,8 +492,10 @@ def test_catalogue_reports_tensor_parallel_for_ds4f(tmp_path):
 
     layout = inspect_safetensors_layout(tmp_path)
     assert layout.supports_tensor_parallel is True
+    assert layout.supports_pipeline is True
     assert layout.kv_replicated_across_tp is True
     assert layout.kv_fixed_bytes_per_layer == 128 * 512 * 2
+    assert layout.tensor_parallel_shard_units == 8
     assert 1 not in layout.tensor_parallel_divisors
 
 

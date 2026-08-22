@@ -1870,7 +1870,70 @@ async def cluster_status(route_to: str | None = None):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return status.to_dict() | {"runtime_jobs": read_runtime_markers()}
+    return status.to_dict() | {"runtime_jobs": await cluster_runtime()}
+
+
+def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
+    """Make the coordinator's engine registry authoritative for GUI liveness.
+
+    Rank marker files survive crashes and are deliberately retained for
+    diagnostics. They therefore cannot, by themselves, prove that oMLX still
+    owns a loaded model. Keep markers live while their engine is loading or
+    loaded, but demote every detached marker so a stale file (or a reused PID)
+    cannot resurrect an unloaded model in the cluster tab.
+    """
+
+    loaded_deployments: set[str] = set()
+    loading_deployments: set[str] = set()
+    launchers: list[dict[str, Any]] = []
+
+    get_loaded = getattr(pool, "get_loaded_model_ids", None)
+    loaded_ids = get_loaded() if callable(get_loaded) else []
+    for model_id in loaded_ids:
+        entry = pool.get_entry(model_id)
+        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
+        if not callable(status):
+            continue
+        try:
+            launcher = status() | {"model_id": model_id}
+        except Exception:  # noqa: BLE001
+            continue
+        deployment_id = launcher.get("deployment_id")
+        if isinstance(deployment_id, str) and deployment_id:
+            loaded_deployments.add(deployment_id)
+        launchers.append(launcher)
+
+    get_model_ids = getattr(pool, "get_model_ids", None)
+    if callable(get_model_ids):
+        try:
+            registry = get_cluster_registry()
+            for model_id in get_model_ids():
+                entry = pool.get_entry(model_id)
+                if entry is None or not getattr(entry, "is_loading", False):
+                    continue
+                deployment = registry.get_for_model(entry.model_path)
+                if deployment is not None:
+                    loading_deployments.add(deployment.deployment_id)
+        except (OSError, RuntimeError, ValueError):
+            # Ownership remains fail-closed: an unresolvable loading entry does
+            # not grant a marker permission to advertise a live model.
+            pass
+
+    for job in payload.get("jobs", []):
+        deployment_id = job.get("deployment_id")
+        if deployment_id in loaded_deployments:
+            job["ownership"] = "loaded"
+        elif deployment_id in loading_deployments:
+            job["ownership"] = "loading"
+        else:
+            job["ownership"] = "detached"
+            job["live"] = False
+        for launcher in launchers:
+            if deployment_id == launcher.get("deployment_id"):
+                job["ranks"] = launcher.get("ranks", [])
+                job["endpoint"] = launcher.get("endpoint")
+                break
+    payload["launchers"] = launchers
 
 
 @router.get("/runtime")
@@ -1884,19 +1947,7 @@ async def cluster_runtime():
         pool = _engine_pool()
     except HTTPException:
         return payload
-    launchers: list[dict[str, Any]] = []
-    for model_id in pool.get_loaded_model_ids():
-        entry = pool.get_entry(model_id)
-        status = getattr(getattr(entry, "engine", None), "cluster_status", None)
-        if not callable(status):
-            continue
-        launcher = status() | {"model_id": model_id}
-        launchers.append(launcher)
-        for job in payload.get("jobs", []):
-            if job.get("deployment_id") == launcher.get("deployment_id"):
-                job["ranks"] = launcher.get("ranks", [])
-                job["endpoint"] = launcher.get("endpoint")
-    payload["launchers"] = launchers
+    _reconcile_runtime_ownership(payload, pool)
     return payload
 
 

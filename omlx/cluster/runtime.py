@@ -544,8 +544,21 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
                 "active": active,
                 "reason": reason[:500],
             }
-        optional = capabilities.get("pipeline_prefill_overlap")
-        if optional is not None:
+        for key in (
+            "pipeline_prefill_overlap",
+            "rank_zero_logits",
+            "prefill_logits_skip",
+            "prefill_allocator_reuse",
+            "vocab_parallel_sampling",
+            "sparse_indexer_row_parallel",
+            "sparse_indexer_decode_owner",
+            "sparse_indexer_native_topk",
+            "asymmetric_tensor_parallel",
+            "deepseek_v4_fused_decode_attention",
+        ):
+            optional = capabilities.get(key)
+            if optional is None:
+                continue
             if not isinstance(optional, dict):
                 raise ValueError("runtime optimization capability is invalid")
             enabled = optional.get("enabled")
@@ -557,7 +570,7 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
                 or not isinstance(reason, str)
             ):
                 raise ValueError("runtime optimization capability is invalid")
-            safe_capabilities["pipeline_prefill_overlap"] = {
+            safe_capabilities[key] = {
                 "enabled": enabled,
                 "active": active,
                 "reason": reason[:500],

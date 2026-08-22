@@ -313,6 +313,10 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
             "async_overlap",
             "cache_affinity",
             "pipeline_prefill_overlap",
+            "prefill_logits_skip",
+            "prefill_allocator_reuse",
+            "sparse_indexer_row_parallel",
+            "deepseek_v4_fused_decode_attention",
         )
     }
     payload = _marker(
@@ -334,6 +338,13 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
     assert job["performance_profiles"][1]["node_id"] == "mobile"
     assert job["optimizations"]["sampling_rank_only"]["active"] is False
     assert job["optimizations"]["pipeline_prefill_overlap"]["active"] is True
+    assert job["optimizations"]["prefill_logits_skip"]["active"] is True
+    assert job["optimizations"]["prefill_allocator_reuse"]["active"] is True
+    assert job["optimizations"]["sparse_indexer_row_parallel"]["active"] is True
+    assert (
+        job["optimizations"]["deepseek_v4_fused_decode_attention"]["active"]
+        is True
+    )
 
 
 def test_runtime_markers_ignore_symlinks_and_invalid_json(tmp_path):

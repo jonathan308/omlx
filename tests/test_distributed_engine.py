@@ -265,6 +265,48 @@ def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine._validate_model_settings()
 
 
+def test_distributed_mtp_is_signed_into_a_pure_tensor_deployment():
+    deployment = _deployment()
+    tensor_assignments = tuple(
+        replace(
+            assignment,
+            start_layer=0,
+            end_layer=4,
+            tensor_parallel_rank=assignment.rank,
+            tensor_parallel_size=2,
+        )
+        for assignment in deployment.assignments
+    )
+    engine = DistributedBatchedEngine(
+        replace(
+            deployment,
+            assignments=tensor_assignments,
+            tensor_parallel_size=2,
+        ),
+        model_settings=SimpleNamespace(
+            mtp_enabled=True,
+            mtp_num_draft_tokens=5,
+        ),
+    )
+
+    engine._validate_model_settings()
+    assert engine.deployment.mtp_enabled is True
+    assert engine.deployment.mtp_num_draft_tokens == 5
+
+
+def test_distributed_mtp_refuses_pipeline_parallelism():
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(
+            mtp_enabled=True,
+            mtp_num_draft_tokens=3,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires pure tensor parallelism"):
+        engine._validate_model_settings()
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):

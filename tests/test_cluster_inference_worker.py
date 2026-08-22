@@ -17,6 +17,9 @@ import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
     _cross_thread_generation_stream,
+    _configure_distributed_mtp,
+    _configure_indexer_decode_owner,
+    _configure_tensor_shard_weights,
     _execution_settings,
     _install_distributed_model_protocol,
     _server_arguments,
@@ -29,6 +32,88 @@ from omlx.cluster.inference_worker import (
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_distributed_mtp_pins_one_signed_depth_on_every_rank(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"})
+    )
+    monkeypatch.delenv("OMLX_MTP_FIXED_DEPTH", raising=False)
+
+    fixed = _configure_distributed_mtp(
+        tmp_path,
+        enabled=True,
+        depth=5,
+        tensor_parallel_size=2,
+    )
+
+    assert fixed == 5
+    assert os.environ["OMLX_MTP_FIXED_DEPTH"] == "5"
+
+
+def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+
+    with pytest.raises(RuntimeError, match="not validated"):
+        _configure_distributed_mtp(
+            tmp_path,
+            enabled=True,
+            depth=3,
+            tensor_parallel_size=2,
+        )
+
+
+def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch):
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=f"node-{rank}",
+            rank=rank,
+            start_layer=0,
+            end_layer=4,
+            layer_weight_bytes=50 if rank == 0 else 30,
+            fixed_weight_bytes=10,
+            reserve_bytes=10,
+            capacity_bytes=100,
+            tensor_parallel_rank=rank,
+            tensor_parallel_size=2,
+            tensor_parallel_shard_weight=5 if rank == 0 else 3,
+        )
+        for rank in range(2)
+    )
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "1,1")
+
+    assert _configure_tensor_shard_weights(
+        assignments,
+        rank=1,
+        tensor_parallel_size=2,
+    ) == (5, 3)
+    assert os.environ["OMLX_TP_SHARD_WEIGHTS"] == "5,3"
+
+
+def test_decode_indexer_owner_uses_the_fastest_measured_tp_rank(monkeypatch):
+    profiles = [
+        SimpleNamespace(decode_weight_bytes_per_second=15e9),
+        SimpleNamespace(decode_weight_bytes_per_second=25e9),
+    ]
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto")
+
+    assert _configure_indexer_decode_owner(
+        profiles,
+        rank=0,
+        tensor_parallel_size=2,
+    ) == 1
+    assert os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] == "1"
+
+
+def test_decode_indexer_owner_has_an_operator_rollback(monkeypatch):
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "off")
+
+    assert _configure_indexer_decode_owner(
+        (),
+        rank=0,
+        tensor_parallel_size=2,
+    ) is None
+    assert os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] == "off"
 
 
 def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers(
@@ -596,7 +681,9 @@ def _run_rank(
         pipeline_index, "apply_mlx_lm_pipeline_index_patch", lambda: None
     )
     monkeypatch.setattr(
-        model_loading, "maybe_apply_pre_load_patches", lambda _model: None
+        model_loading,
+        "maybe_apply_pre_load_patches",
+        lambda _model, **_kwargs: None,
     )
     monkeypatch.setattr(
         inference_worker,
@@ -653,6 +740,11 @@ def _run_rank(
         inference_worker,
         "decode_worker_path_map",
         lambda _plan: {},
+    )
+    monkeypatch.setattr(
+        inference_worker,
+        "decode_worker_speculation",
+        lambda _plan: (False, None),
     )
 
     def fake_guard_rank_load(item, *, rank, **kwargs):

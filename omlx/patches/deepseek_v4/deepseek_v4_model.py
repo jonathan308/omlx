@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map_with_path
 
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
@@ -56,6 +56,177 @@ _DEEPSEEK_V4_RING_VERIFY_DISABLED = (
     os.environ.get("OMLX_DSV4_RING", "1").strip().lower()
     in ("0", "false", "off")
 )
+# The exact row-wise decode path exists to make one-token target decoding
+# bit-identical to DSpark's multi-row verification.  It is unnecessary when
+# speculative decoding is disabled and is materially slower on TP-local head
+# counts (24/32/40 on the supported 64-head checkpoint).  The MTP patch marks
+# attention modules that need the consistency contract at model construction;
+# this switch is a startup-time rollback to the legacy always-exact behavior.
+_DEEPSEEK_V4_EXACT_DECODE = (
+    os.environ.get("OMLX_DSV4_EXACT_DECODE", "0").strip().lower()
+    in ("1", "true", "on")
+)
+
+
+def _exact_decode_required(attention: Any, batch: int, length: int) -> bool:
+    return bool(
+        attention.dspark
+        and batch == 1
+        and length == 1
+        and (
+            _DEEPSEEK_V4_EXACT_DECODE
+            or getattr(attention, "_omlx_decode_consistent", False)
+        )
+    )
+
+
+def _tp_partition_weights(
+    group: mx.distributed.Group,
+) -> Optional[Tuple[int, ...]]:
+    """Validated unequal TP weights, or None for MLX's equal split."""
+
+    raw = os.environ.get("OMLX_TP_SHARD_WEIGHTS", "").strip()
+    if not raw:
+        return None
+    try:
+        weights = tuple(int(item.strip()) for item in raw.split(","))
+    except ValueError as exc:
+        raise ValueError("OMLX_TP_SHARD_WEIGHTS must contain integers") from exc
+    if len(weights) != int(group.size()) or any(not 1 <= item <= 4096 for item in weights):
+        raise ValueError(
+            "OMLX_TP_SHARD_WEIGHTS must contain one positive weight per TP rank"
+        )
+    if len(set(weights)) == 1:
+        return None
+    return weights
+
+
+def _validated_ds4_tp_weights(
+    args: Any,
+    group: mx.distributed.Group,
+) -> Optional[Tuple[int, ...]]:
+    weights = _tp_partition_weights(group)
+    if weights is not None:
+        heads_per_group = args.num_attention_heads // args.o_groups
+        if sum(weights) != heads_per_group:
+            raise ValueError(
+                "unequal DS4 TP weights must sum to the heads in each output group"
+            )
+    return weights
+
+
+def _weighted_segment_slice(
+    value: mx.array,
+    *,
+    axis: int,
+    segments: int,
+    rank: int,
+    weights: Tuple[int, ...],
+) -> mx.array:
+    """Slice every fused segment by the same exact integer partition."""
+
+    axis %= value.ndim
+    if segments < 1 or value.shape[axis] % segments:
+        raise ValueError("asymmetric TP segment dimension is not divisible")
+    total = sum(weights)
+    before = sum(weights[:rank])
+    after = before + weights[rank]
+    pieces = []
+    for segment in mx.split(value, segments, axis=axis):
+        length = int(segment.shape[axis])
+        if length * before % total or length * after % total:
+            raise ValueError(
+                "asymmetric TP boundary does not preserve a tensor/quant group"
+            )
+        start = length * before // total
+        stop = length * after // total
+        index = [slice(None)] * value.ndim
+        index[axis] = slice(start, stop)
+        pieces.append(segment[tuple(index)])
+    return mx.contiguous(mx.concatenate(pieces, axis=axis))
+
+
+def _asymmetric_shard_parameters(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Tuple[int, ...],
+    segments: int = 1,
+) -> Dict[str, Any]:
+    """MLX distributed-linear parameter slicing with unequal rank widths."""
+
+    rank = int(group.rank())
+
+    def shard(path: str, value: Any) -> Any:
+        if not isinstance(value, mx.array):
+            return value
+        if sharding == "all-to-sharded":
+            axis = -1 if path.endswith("bias") else max(value.ndim - 2, 0)
+        elif sharding == "sharded-to-all":
+            if path.endswith("bias"):
+                return value
+            axis = -1
+        else:
+            raise ValueError(f"unsupported asymmetric TP sharding {sharding!r}")
+        return _weighted_segment_slice(
+            value,
+            axis=axis,
+            segments=segments,
+            rank=rank,
+            weights=weights,
+        )
+
+    return tree_map_with_path(shard, module.parameters())
+
+
+def _shard_linear_weighted(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Optional[Tuple[int, ...]],
+    segments: int = 1,
+) -> nn.Module:
+    replacement = shard_linear(
+        module,
+        sharding,
+        segments=segments,
+        group=group,
+    )
+    if weights is not None:
+        replacement.update(
+            _asymmetric_shard_parameters(
+                module,
+                sharding,
+                group=group,
+                weights=weights,
+                segments=segments,
+            )
+        )
+    return replacement
+
+
+def _shard_inplace_weighted(
+    module: nn.Module,
+    sharding: str,
+    *,
+    group: mx.distributed.Group,
+    weights: Optional[Tuple[int, ...]],
+    segments: int = 1,
+) -> None:
+    if weights is None:
+        shard_inplace(module, sharding, segments=segments, group=group)
+        return
+    module.update(
+        _asymmetric_shard_parameters(
+            module,
+            sharding,
+            group=group,
+            weights=weights,
+            segments=segments,
+        )
+    )
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -516,6 +687,97 @@ _DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
     "OMLX_DSV4F_M2_MMA_SCORE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+_DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
+    "OMLX_DSV4_INDEXER_ROW_TP", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = max(
+        0, int(os.getenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"))
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = 2048
+
+
+def _indexer_decode_owner_rank(group: Any) -> Optional[int]:
+    """Process-local owner selected from the signed performance profiles."""
+
+    if group is None or int(group.size()) < 2:
+        return None
+    raw = os.getenv("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "").strip().lower()
+    if not raw or raw in {"auto", "false", "no", "off", "disabled"}:
+        return None
+    try:
+        owner = int(raw)
+    except ValueError:
+        return None
+    return owner if 0 <= owner < int(group.size()) else None
+
+
+def _broadcast_indexer_indices(
+    indices: Optional[mx.array],
+    *,
+    shape: Tuple[int, ...],
+    group: Any,
+    owner: int,
+) -> mx.array:
+    """Broadcast a compact owner-computed top-k through the small all-reduce."""
+
+    local = (
+        indices.astype(mx.int32)
+        if int(group.rank()) == owner and indices is not None
+        else mx.zeros(shape, dtype=mx.int32)
+    )
+    return mx.distributed.all_sum(local, group=group).astype(mx.uint32)
+
+
+def _balanced_row_ranges(length: int, size: int) -> Tuple[Tuple[int, int], ...]:
+    """Contiguous query-row ranges with at most one row of skew."""
+
+    base, remainder = divmod(length, size)
+    ranges = []
+    start = 0
+    for rank in range(size):
+        stop = start + base + (1 if rank < remainder else 0)
+        ranges.append((start, stop))
+        start = stop
+    return tuple(ranges)
+
+
+def _gather_indexer_rows(
+    local_indices: mx.array,
+    total_rows: int,
+    group: Any,
+) -> mx.array:
+    """Reassemble uneven row shards after exact per-row top-k selection."""
+
+    size = int(group.size())
+    ranges = _balanced_row_ranges(total_rows, size)
+    max_rows = max(stop - start for start, stop in ranges)
+    rows_first = local_indices.swapaxes(0, 1)
+    if rows_first.shape[0] < max_rows:
+        rows_first = mx.concatenate(
+            [
+                rows_first,
+                mx.zeros(
+                    (max_rows - rows_first.shape[0], *rows_first.shape[1:]),
+                    dtype=rows_first.dtype,
+                ),
+            ],
+            axis=0,
+        )
+    gathered = mx.distributed.all_gather(rows_first, group=group)
+    # The normal prompt chunk divides evenly across TP ranks (512 rows over
+    # two Macs). ``all_gather`` already concatenates those equal row blocks in
+    # rank order, which is the final sequence order. Slicing every block and
+    # concatenating them again only schedules another full top-k-index copy
+    # (1 MiB per ratio-4 layer at L=K=512).
+    if total_rows == max_rows * size and rows_first.shape[0] == max_rows:
+        return gathered.swapaxes(0, 1)
+    parts = [
+        gathered[rank * max_rows : rank * max_rows + (stop - start)]
+        for rank, (start, stop) in enumerate(ranges)
+    ]
+    return mx.concatenate(parts, axis=0).swapaxes(0, 1)
 
 
 def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
@@ -1320,6 +1582,41 @@ def _stable_topk_indices(scores: mx.array, k: int) -> mx.array:
     return mx.sort(indices, axis=-1)
 
 
+def _fp32_topk_indices(scores: mx.array, k: int) -> mx.array:
+    """Deterministic native FP32 top-k with a per-call safe fallback."""
+
+    global _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED
+    global _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED
+
+    if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
+        try:
+            from omlx.custom_kernels.glm_moe_dsa import fast
+
+            if fast.has_symbol("dspark_fp32_topk_indices"):
+                flat = scores.reshape(-1, scores.shape[-1])
+                indices = fast.dspark_fp32_topk_indices(flat, k)
+                return indices.reshape(*scores.shape[:-1], k)
+        except ValueError as exc:
+            # Shape rejection happens before GPU work and may be unique to one
+            # tail. Keep the native path armed for later compatible calls.
+            if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
+                _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native FP32 top-k rejected this shape; stable "
+                    "fallback for this call only (native path stays armed): %s",
+                    exc,
+                )
+        except Exception as exc:
+            _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+            logging.getLogger(__name__).warning(
+                "DSV4 native FP32 top-k failed; stable fallback for the rest "
+                "of this process: %s",
+                exc,
+                exc_info=True,
+            )
+    return _stable_topk_indices(scores, k)
+
+
 class Indexer(nn.Module):
     def __init__(self, config: ModelArgs, compress_ratio: int):
         super().__init__()
@@ -1335,6 +1632,7 @@ class Indexer(nn.Module):
         self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
             config, compress_ratio
         )
+        self.row_sharding_group = None
 
     def __call__(
         self,
@@ -1348,6 +1646,7 @@ class Indexer(nn.Module):
         projected_weights: Optional[mx.array] = None,
     ):
         B, L, _ = x.shape
+        total_rows = L
         if compressor_projection is None:
             pooled = self.compressor(x, pool_cache, offset)
         else:
@@ -1359,16 +1658,63 @@ class Indexer(nn.Module):
         if pooled.shape[1] == 0:
             return None
 
+        # Sparse score/top-k selection is independent for every prompt row,
+        # but TP used to repeat all of it on every rank. Keep pooled-cache
+        # updates replicated, split only the expensive query rows, and gather
+        # the compact uint32 top-k result before sharded attention consumes it.
+        # Decode and DSpark's pre-projected verify rows retain the original path.
+        row_group = self.row_sharding_group
+        k = min(self.index_topk, pooled.shape[1])
+        decode_owner = _indexer_decode_owner_rank(row_group)
+        owner_decode = bool(
+            decode_owner is not None
+            and B == 1
+            and L == 1
+            and pooled.shape[1] > self.index_topk
+            and projected_q is None
+            and projected_weights is None
+            and not is_dspark_verify_armed()
+        )
+        if owner_decode and int(row_group.rank()) != decode_owner:
+            return _broadcast_indexer_indices(
+                None,
+                shape=(B, L, k),
+                group=row_group,
+                owner=decode_owner,
+            )
+        row_sharded = bool(
+            _DEEPSEEK_V4_INDEXER_ROW_TP
+            and row_group is not None
+            and int(row_group.size()) > 1
+            and B == 1
+            and L >= int(row_group.size())
+            and pooled.shape[1] >= _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL
+            and projected_q is None
+            and projected_weights is None
+        )
+        query_offset = offset
+        if row_sharded:
+            ranges = _balanced_row_ranges(L, int(row_group.size()))
+            start, stop = ranges[int(row_group.rank())]
+            x = x[:, start:stop]
+            q_residual = q_residual[:, start:stop]
+            L = stop - start
+            query_offset = offset + start
+
         if projected_q is None:
             q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
             q = q.transpose(0, 2, 1, 3)
-            q = position_rope(q, offset)
+            q = position_rope(q, query_offset)
         else:
             q = projected_q
 
-        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
-        k = min(self.index_topk, pooled.shape[1])
-
+        pmask = (
+            pool_cache.make_mask(total_rows, offset)
+            if pool_cache is not None
+            else None
+        )
+        if row_sharded and pmask is not None:
+            pmask = pmask[..., start:stop, :]
         if native_indexer_shape_eligible(
             query_tokens=L,
             pooled_tokens=pooled.shape[1],
@@ -1414,11 +1760,11 @@ class Indexer(nn.Module):
                     if (
                         pmask is not None
                         and pmask.ndim == 2
-                        and isinstance(offset, int)
+                        and isinstance(query_offset, int)
                         and type(pool_cache).__name__ == "PoolingCache"
                     ):
                         _mask_ratio = int(pool_cache.ratio)
-                        _mask_q_offset = int(offset)
+                        _mask_q_offset = int(query_offset)
                     # v25 from-scratch MMA score kernel: 1.37x over Steel
                     # on the exact M2/DSV4F pairing, bit-exact incl. the
                     # fused pooled-ratio mask (validated across aligned and
@@ -1473,7 +1819,22 @@ class Indexer(nn.Module):
                         # resolves cutoff ties by temporal index.
                         bucketed=False,
                     )[:, 0]
-                    return mx.sort(indices, axis=-1)
+                    indices = mx.sort(indices, axis=-1)
+                    indices = (
+                        _gather_indexer_rows(indices, total_rows, row_group)
+                        if row_sharded
+                        else indices
+                    )
+                    return (
+                        _broadcast_indexer_indices(
+                            indices,
+                            shape=tuple(indices.shape),
+                            group=row_group,
+                            owner=decode_owner,
+                        )
+                        if owner_decode
+                        else indices
+                    )
             except ValueError as exc:
                 # Shape/argument rejection (std::invalid_argument): raised
                 # before any GPU work and per-call -- e.g. a stale extension
@@ -1533,7 +1894,22 @@ class Indexer(nn.Module):
                 scores,
                 mx.finfo(scores.dtype).min,
             )
-        return _stable_topk_indices(scores, k)
+        indices = _fp32_topk_indices(scores, k)
+        indices = (
+            _gather_indexer_rows(indices, total_rows, row_group)
+            if row_sharded
+            else indices
+        )
+        return (
+            _broadcast_indexer_indices(
+                indices,
+                shape=tuple(indices.shape),
+                group=row_group,
+                owner=decode_owner,
+            )
+            if owner_decode
+            else indices
+        )
 
 
 def _batch_indexer_rows(
@@ -1543,9 +1919,6 @@ def _batch_indexer_rows(
     projected_weights: mx.array,
 ) -> List[Optional[mx.array]]:
     """Select each decode row's pooled indices with grouped FP32 GEMMs."""
-    global _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED
-    global _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED
-
     lengths = [int(row.shape[1]) for row in pooled_rows]
     if len(lengths) > 1 and min(lengths) > indexer.index_topk:
         # A ratio-4 boundary makes adjacent verify rows differ by one pooled
@@ -1580,38 +1953,7 @@ def _batch_indexer_rows(
         scores = (scores * weights[..., None]).sum(axis=1)
         valid = mx.arange(max_length)[None] < mx.array(lengths)[:, None]
         scores = mx.where(valid, scores, mx.finfo(scores.dtype).min)
-        indices = None
-        if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
-            try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
-
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(
-                        scores,
-                        indexer.index_topk,
-                    )
-            except ValueError as exc:
-                # Shape/argument rejection (std::invalid_argument): per-call
-                # condition, raised before GPU work. Do NOT latch -- keep
-                # the native path armed for later calls.
-                if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
-                    _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
-                    logging.getLogger(__name__).warning(
-                        "DSV4 native DSpark top-k rejected this shape; "
-                        "stable-sort fallback for this call only (native "
-                        "path stays armed for later calls): %s",
-                        exc,
-                    )
-            except Exception as exc:
-                _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
-                logging.getLogger(__name__).warning(
-                    "DSV4 native DSpark top-k failed; stable-sort fallback "
-                    "for the rest of this process: %s",
-                    exc,
-                    exc_info=True,
-                )
-        if indices is None:
-            indices = _stable_topk_indices(scores, indexer.index_topk)
+        indices = _fp32_topk_indices(scores, indexer.index_topk)
         indices = indices[:, None]
         return [indices[idx : idx + 1] for idx in range(len(lengths))]
 
@@ -1652,35 +1994,7 @@ def _batch_indexer_rows(
         weights = weights * (indexer.n_heads**-0.5)
         scores = (scores * weights[..., None]).sum(axis=1)
         k = min(indexer.index_topk, pooled_length)
-        indices = None
-        if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED and k == 512:
-            try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
-
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(scores, k)
-            except ValueError as exc:
-                # Shape/argument rejection (std::invalid_argument): per-call
-                # condition, raised before GPU work. Do NOT latch -- keep
-                # the native path armed for later calls.
-                if not _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED:
-                    _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = True
-                    logging.getLogger(__name__).warning(
-                        "DSV4 native DSpark top-k rejected this shape; "
-                        "stable-sort fallback for this call only (native "
-                        "path stays armed for later calls): %s",
-                        exc,
-                    )
-            except Exception as exc:
-                _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
-                logging.getLogger(__name__).warning(
-                    "DSV4 native DSpark top-k failed; stable-sort fallback "
-                    "for the rest of this process: %s",
-                    exc,
-                    exc_info=True,
-                )
-        if indices is None:
-            indices = _stable_topk_indices(scores, k)
+        indices = _fp32_topk_indices(scores, k)
         indices = indices[:, None]
         results.extend(indices[idx : idx + 1] for idx in range(stop - start))
         start = stop
@@ -1695,6 +2009,9 @@ class LocalAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        # Set True per model instance by the MTP patch when draft/verify
+        # equality is required.  Ordinary decode can use fused SDPA.
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = 0
         self.hidden_size = config.hidden_size
@@ -1763,7 +2080,7 @@ class LocalAttention(nn.Module):
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        if self.dspark and B == 1 and L == 1:
+        if _exact_decode_required(self, B, L):
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
             out = None
@@ -1803,6 +2120,7 @@ class CompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1918,7 +2236,7 @@ class CompressedAttention(nn.Module):
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
-            and not (self.dspark and B == 1 and L == 1)
+            and not _exact_decode_required(self, B, L)
             and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
@@ -1937,7 +2255,7 @@ class CompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self._omlx_decode_consistent,
                 native_only=True,
                 _standard_mask=_standard_mask,
             )
@@ -1945,7 +2263,7 @@ class CompressedAttention(nn.Module):
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-            if self.dspark and B == 1 and L == 1:
+            if _exact_decode_required(self, B, L):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = scaled_dot_product_attention(
@@ -1972,6 +2290,7 @@ class SparseCompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self._omlx_decode_consistent = False
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -2097,6 +2416,11 @@ class SparseCompressedAttention(nn.Module):
                 use_ring_kernel = bool(
                     not _DEEPSEEK_V4_RING_VERIFY_DISABLED
                     and ring_view is not None
+                    # The physical-ring kernel has an aligned 64-row MMA
+                    # store. TP ranks own fewer query heads, so they must use
+                    # the materialized rowwise path until a tail-safe ring
+                    # kernel is available.
+                    and q.shape[1] == 64
                     and ring_view.source.ndim == 2
                     and ring_view.source.shape[1] == 512
                     and ring_view.indices.ndim == 2
@@ -2138,7 +2462,7 @@ class SparseCompressedAttention(nn.Module):
                             None,
                             self.scale,
                             sinks,
-                            decode_consistent=self.dspark,
+                            decode_consistent=self._omlx_decode_consistent,
                         )
                 finally:
                     set_dspark_verify_armed(True)
@@ -2174,7 +2498,7 @@ class SparseCompressedAttention(nn.Module):
             )[:, None]
 
         if pooled.shape[1] == 0:
-            if self.dspark and B == 1 and L == 1:
+            if _exact_decode_required(self, B, L):
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = None
@@ -2200,7 +2524,7 @@ class SparseCompressedAttention(nn.Module):
                         sinks=sinks,
                     )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            if self.dspark and B == 1 and L == 1:
+            if _exact_decode_required(self, B, L):
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
@@ -2241,7 +2565,7 @@ class SparseCompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self._omlx_decode_consistent,
                 _standard_mask=_standard_mask,
             )
 
@@ -2547,33 +2871,77 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+        shard_weights = _validated_ds4_tp_weights(self.args, group)
         for layer in self.model.layers:
             layer.attn.sharding_group = group
-            layer.attn.wq_b = shard_linear(
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is not None:
+                indexer.row_sharding_group = group
+            layer.attn.wq_b = _shard_linear_weighted(
                 layer.attn.wq_b,
                 "all-to-sharded",
                 segments=self.args.o_groups,
                 group=group,
+                weights=shard_weights,
             )
-            shard_inplace(layer.attn.wo_a, "sharded-to-all", group=group)
+            _shard_inplace_weighted(
+                layer.attn.wo_a,
+                "sharded-to-all",
+                group=group,
+                weights=shard_weights,
+            )
             # wq_b shards segment-interleaved (segments=o_groups): rank r
             # keeps slice r of *every* head group, not the contiguous r-th
             # block of all heads. Slice the sinks the same way or each one
             # gates the wrong head under TP.
             sinks = layer.attn.attn_sink.reshape(self.args.o_groups, -1)
-            layer.attn.attn_sink = mx.split(sinks, N, axis=1)[rank].reshape(-1)
-            layer.attn.n_heads //= N
+            if shard_weights is None:
+                layer.attn.attn_sink = mx.split(sinks, N, axis=1)[rank].reshape(-1)
+                layer.attn.n_heads //= N
+            else:
+                layer.attn.attn_sink = _weighted_segment_slice(
+                    sinks,
+                    axis=1,
+                    segments=1,
+                    rank=rank,
+                    weights=shard_weights,
+                ).reshape(-1)
+                layer.attn.n_heads = self.args.o_groups * shard_weights[rank]
 
             layer.ffn.sharding_group = group
-            shard_inplace(
-                layer.ffn.shared_experts.gate_proj, "all-to-sharded", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.gate_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(
-                layer.ffn.shared_experts.down_proj, "sharded-to-all", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.down_proj,
+                "sharded-to-all",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(
-                layer.ffn.shared_experts.up_proj, "all-to-sharded", group=group
+            _shard_inplace_weighted(
+                layer.ffn.shared_experts.up_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
             )
-            shard_inplace(layer.ffn.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.ffn.switch_mlp.down_proj, "sharded-to-all", group=group)
-            shard_inplace(layer.ffn.switch_mlp.up_proj, "all-to-sharded", group=group)
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.gate_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
+            )
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.down_proj,
+                "sharded-to-all",
+                group=group,
+                weights=shard_weights,
+            )
+            _shard_inplace_weighted(
+                layer.ffn.switch_mlp.up_proj,
+                "all-to-sharded",
+                group=group,
+                weights=shard_weights,
+            )

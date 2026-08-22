@@ -25,11 +25,60 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    _deepseek_v4_fused_decode_capability,
+    _indexer_row_parallel_capability,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
+
+
+def test_deepseek_v4_fused_decode_capability_tracks_mtp_and_rollback(monkeypatch):
+    attention = SimpleNamespace(dspark=True, _omlx_decode_consistent=False)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(attn=attention)])
+    )
+
+    monkeypatch.delenv("OMLX_DSV4_EXACT_DECODE", raising=False)
+    assert _deepseek_v4_fused_decode_capability(model)[:2] == (True, True)
+
+    attention._omlx_decode_consistent = True
+    enabled, active, reason = _deepseek_v4_fused_decode_capability(model)
+    assert enabled is True
+    assert active is False
+    assert "MTP" in reason
+
+    monkeypatch.setenv("OMLX_DSV4_EXACT_DECODE", "1")
+    enabled, active, reason = _deepseek_v4_fused_decode_capability(model)
+    assert enabled is False
+    assert active is False
+    assert "EXACT_DECODE" in reason
+
+
+def test_sparse_indexer_row_parallel_capability_reports_tp_contract(monkeypatch):
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "1")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048")
+    group = object()
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    attn=SimpleNamespace(
+                        indexer=SimpleNamespace(row_sharding_group=group)
+                    )
+                )
+            ]
+        )
+    )
+
+    enabled, active, reason = _indexer_row_parallel_capability(
+        model, world_size=2
+    )
+
+    assert enabled is True
+    assert active is True
+    assert "2048 pooled entries" in reason
 
 
 def _profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
@@ -315,6 +364,20 @@ class _WorkerGroup:
         return 2
 
 
+def test_asymmetric_tensor_capability_reports_the_local_fraction(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+    with install_runtime_optimizations(
+        SimpleNamespace(model=SimpleNamespace()),
+        _WorkerGroup(),
+        execution_profile("balanced"),
+        batchable=False,
+        pipeline_parallel=False,
+    ) as capabilities:
+        item = capabilities["asymmetric_tensor_parallel"]
+        assert item["active"] is True
+        assert "rank 1 holds 5/8" in item["reason"]
+
+
 def test_sampling_rank_optimization_is_capability_gated_and_restored():
     settings = replace(
         execution_profile("balanced"),
@@ -584,6 +647,305 @@ def test_sampling_rank_optimization_keeps_normal_path_for_unvalidated_model():
         assert capabilities["sampling_rank_only"]["active"] is False
         assert capabilities["pipeline_prefill_overlap"]["active"] is False
         assert mx.distributed.all_gather is original_gather
+
+
+def test_tensor_prefill_skips_discarded_vocab_projection(monkeypatch):
+    class Cache:
+        state = mx.array([0])
+
+    class SkipHeadModel:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            self.calls.append((value.shape[1], skip_lm_head))
+            return None if skip_lm_head else mx.zeros((*value.shape, 32))
+
+    class Batch:
+        uids = ["request"]
+        prefill_step_size = 4
+
+        def __init__(self, model):
+            self.model = model
+            self.tokens = [[]]
+            self.prompt_cache = [Cache()]
+
+    monkeypatch.setattr(mx, "clear_cache", lambda: None)
+    model = SkipHeadModel()
+    batch = Batch(model)
+    original_prompt = mlx_generate.PromptProcessingBatch.prompt
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["prefill_logits_skip"]["active"] is True
+        assert capabilities["sampling_rank_only"]["active"] is False
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+
+    assert model.calls == [(4, True), (4, True), (1, True)]
+    assert batch.tokens == [list(range(9))]
+    assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
+
+
+def test_tensor_prefill_reuses_allocator_cache_until_prompt_end(monkeypatch):
+    class Cache:
+        state = mx.array([0])
+
+    class Model:
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            assert skip_lm_head is True
+            return None
+
+    class Batch:
+        uids = ["request"]
+        prefill_step_size = 4
+
+        def __init__(self, model):
+            self.model = model
+            self.tokens = [[]]
+            self.prompt_cache = [Cache()]
+
+    clears = []
+    monkeypatch.delenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", raising=False)
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
+    model = Model()
+    batch = Batch(model)
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["prefill_allocator_reuse"]["active"] is True
+        mlx_generate.PromptProcessingBatch.prompt(batch, [list(range(9))])
+
+    assert clears == [True]
+
+
+def test_prefill_allocator_cache_cadence_is_operator_overridable(monkeypatch):
+    class Cache:
+        state = mx.array([0])
+
+    class Model:
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    class Batch:
+        uids = ["request"]
+        prefill_step_size = 4
+
+        def __init__(self, model):
+            self.model = model
+            self.tokens = [[]]
+            self.prompt_cache = [Cache()]
+
+    clears = []
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY", "2")
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(True))
+    model = Model()
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        mlx_generate.PromptProcessingBatch.prompt(
+            Batch(model),
+            [list(range(9))],
+        )
+
+    # Three chunks: purge after chunk 2 and unconditionally after the final one.
+    assert clears == [True, True]
+
+
+def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch):
+    class Head:
+        _omlx_vocab_parallel = True
+        _omlx_output_dims = 6
+        _omlx_gather_vocab_logits = True
+        weight = mx.zeros((3, 2))
+
+    class Model:
+        def __init__(self):
+            self.lm_head = Head()
+
+        def __call__(self, value, cache=None):
+            assert self.lm_head._omlx_gather_vocab_logits is False
+            return mx.array([[[1.0, 2.0, 3.0]]])
+
+    class Batch:
+        def __init__(self, model):
+            self.model = model
+            self.uids = [1]
+            self.prompt_cache = []
+            self.tokens = [[]]
+            self.samplers = [None]
+            self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+            self.logits_processors = [[]]
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_logprobs = []
+            self._token_context = []
+
+    model = Model()
+    batch = Batch(model)
+    monkeypatch.setattr(
+        mx.distributed,
+        "recv_like",
+        lambda value, source: mx.array([[4.0, 5.0, 9.0]]),
+    )
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["sampling_rank_only"]["active"] is True
+        assert capabilities["vocab_parallel_sampling"]["active"] is True
+        assert capabilities["rank_zero_logits"]["active"] is False
+        mlx_generate.GenerationBatch._step(batch)
+
+    assert batch._next_tokens.tolist() == [5]
+    assert batch._next_logprobs[0].shape == (6,)
+    assert model.lm_head._omlx_gather_vocab_logits is True
+
+
+def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token(
+    monkeypatch,
+):
+    class Head:
+        _omlx_vocab_parallel = True
+        _omlx_output_dims = 6
+        _omlx_gather_vocab_logits = True
+        weight = mx.zeros((3, 2))
+
+    class Model:
+        def __init__(self):
+            self.lm_head = Head()
+
+        def __call__(self, value, cache=None):
+            return mx.array([[[7.0, 8.0, 9.0]]])
+
+    class Batch:
+        def __init__(self, model):
+            self.model = model
+            self.uids = [1]
+            self.prompt_cache = []
+            self.tokens = [[]]
+            self.samplers = [None]
+            self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+            self.logits_processors = [[]]
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_logprobs = []
+            self._token_context = []
+
+    sent = []
+    model = Model()
+    batch = Batch(model)
+    monkeypatch.setattr(
+        mx.distributed,
+        "send",
+        lambda value, destination: sent.append((value.tolist(), destination)) or value,
+    )
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda value, group=None: mx.array([5], dtype=mx.uint32),
+    )
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
+
+    with install_runtime_optimizations(
+        model,
+        _WorkerGroup(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        mlx_generate.GenerationBatch._step(batch)
+
+    assert sent == [([[7.0, 8.0, 9.0]], 0)]
+    assert batch._next_tokens.tolist() == [5]
+    assert batch._next_logprobs[0].shape == (6,)
+
+
+def test_tensor_vocab_sampling_stays_synchronized_for_mtp_model():
+    head = SimpleNamespace(
+        _omlx_vocab_parallel=True,
+        _omlx_output_dims=6,
+        weight=mx.zeros((3, 2)),
+    )
+    model = SimpleNamespace(
+        lm_head=head,
+        _omlx_mtp_decode_enabled=True,
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["sampling_rank_only"]["active"] is False
+        assert capabilities["vocab_parallel_sampling"]["active"] is False
+        assert "MTP" in capabilities["vocab_parallel_sampling"]["reason"]
+
+
+def test_tensor_vocab_sampling_installs_validated_mtp_coordinator():
+    head = SimpleNamespace(
+        _omlx_vocab_parallel=True,
+        _omlx_output_dims=6,
+        _omlx_gather_vocab_logits=True,
+        weight=mx.zeros((3, 2)),
+    )
+    auxiliary = SimpleNamespace(
+        _omlx_vocab_parallel=True,
+        _omlx_output_dims=6,
+        _omlx_gather_vocab_logits=True,
+        weight=mx.zeros((3, 2)),
+    )
+    model = SimpleNamespace(
+        lm_head=head,
+        _omlx_mtp_decode_enabled=True,
+        _omlx_mtp_chain=True,
+        _omlx_distributed_mtp_vocab_ready=True,
+        _omlx_vocab_parallel_aux_heads=(auxiliary,),
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert capabilities["sampling_rank_only"]["active"] is True
+        assert capabilities["vocab_parallel_sampling"]["active"] is True
+        assert "MTP" in capabilities["vocab_parallel_sampling"]["reason"]
+        coordinator = model._omlx_mtp_vocab_coordinator
+        assert coordinator.is_coordinator is True
+        assert coordinator.output_size == 6
+        assert head._omlx_gather_vocab_logits is False
+        assert auxiliary._omlx_gather_vocab_logits is False
+
+    assert not hasattr(model, "_omlx_mtp_vocab_coordinator")
+    assert head._omlx_gather_vocab_logits is True
+    assert auxiliary._omlx_gather_vocab_logits is True
 
 
 def test_non_batchable_model_never_reports_continuous_batching_active():

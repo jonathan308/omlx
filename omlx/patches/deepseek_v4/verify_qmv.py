@@ -572,6 +572,9 @@ def dspark_head_gemv(module, inputs: mx.array) -> mx.array:
     output = output.reshape((*inputs.shape[:-1], output_dims))
     if "bias" in module:
         output = output + module.bias.astype(mx.float32)
+    gather = getattr(module, "_gather_logits", None)
+    if callable(gather):
+        output = gather(output)
     return output
 
 

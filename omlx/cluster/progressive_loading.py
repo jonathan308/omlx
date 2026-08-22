@@ -11,6 +11,8 @@ from typing import Any
 from .tensor_strategies import apply_tensor_strategy, supports_model_type
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
+_LM_HEAD = re.compile(r"(?:^|\.)lm_head(?:\.|$)")
+_MTP = re.compile(r"(?:^|\.)mtp(?:\.|$)")
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -194,11 +196,18 @@ def progressive_sharded_load(
             progress=progress,
         )
     elif tensor_group is not None:
-        # Fixed embeddings/head weights are replicated. Materialize them first;
-        # each strategy then materializes, shards, evaluates and releases one
-        # transformer layer before touching the next.
+        # Materialize replicated fixed weights first. Keep a standalone output
+        # head lazy until the tensor strategy has had a chance to row-shard it;
+        # otherwise a rank briefly allocates the full head before retaining
+        # only its local vocabulary rows.
         flat = utils_module.tree_flatten(model.parameters())
-        fixed = [value for path, value in flat if _layer_index(path) is None]
+        fixed = [
+            value
+            for path, value in flat
+            if _layer_index(path) is None
+            and _LM_HEAD.search(path) is None
+            and _MTP.search(path) is None
+        ]
         layer_count = len(
             {
                 index

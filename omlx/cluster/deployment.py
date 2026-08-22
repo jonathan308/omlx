@@ -68,6 +68,28 @@ _RANK_ENV_DEFAULTS = (
     ("MLX_MAX_MB_PER_BUFFER", "512"),
     ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),
     ("JACCL_TIMEOUT_ACTION", "teardown-exit"),
+    # The custom two-rank mesh path uses one registered buffer for the small
+    # decode/DSpark reductions that otherwise pay the generic chunk scheduler
+    # and a second staging copy. Keep its rollback visible in the signed rank
+    # environment so an operator can A/B with ``=0`` without changing code.
+    ("JACCL_TWO_RANK_SMALL_ALLREDUCE", "1"),
+    # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
+    # rows and exchange only top-k indices instead of redundantly scoring the
+    # full chunk on every GPU. Explicit env keeps live rollback one flag away.
+    ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
+    # Below 2K pooled entries the fixed top-k exchange can cost more than the
+    # saved score work; the threshold turns the split on where context taper
+    # begins instead of perturbing short-prompt performance.
+    ("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"),
+    # Decode has one sparse-indexer row, so row TP cannot divide it. The
+    # measured fastest rank computes the exact top-k once and broadcasts only
+    # 512 int32 indices; ``off`` restores replicated indexer work.
+    ("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"),
+    # Large standalone output projections are exact row shards. The default
+    # threshold avoids adding a collective to small models where it cannot
+    # repay its latency, while keeping every rank on the same decision.
+    ("OMLX_CLUSTER_VOCAB_PARALLEL", "auto"),
+    ("OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES", str(256 * 1024**2)),
 )
 
 
@@ -295,6 +317,9 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             memory_guard_tier=memory_guard_tier,
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
+            tensor_parallel_shard_weight=int(
+                payload.get("tensor_parallel_shard_weight", 1)
+            ),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
             # ``to_dict`` has always emitted these three; nothing read them
             # back, so every decoded assignment claimed a 0-byte KV cache.
@@ -350,6 +375,8 @@ class ClusterDeployment:
     performance_profiles: tuple[NodePerformanceProfile, ...] = ()
     tensor_parallel_size: int = 1
     target_context_tokens: int = 8192
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = None
     # node_id → absolute model path on that node. Empty means every node uses
     # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
@@ -385,6 +412,14 @@ class ClusterDeployment:
             raise ValueError(
                 "target_context_tokens must be between 1 and 1,048,576"
             )
+        if not isinstance(self.mtp_enabled, bool):
+            raise ValueError("mtp_enabled must be a boolean")
+        if self.mtp_num_draft_tokens is not None and (
+            not isinstance(self.mtp_num_draft_tokens, int)
+            or isinstance(self.mtp_num_draft_tokens, bool)
+            or not 1 <= self.mtp_num_draft_tokens <= 8
+        ):
+            raise ValueError("mtp_num_draft_tokens must be between 1 and 8")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
@@ -410,6 +445,20 @@ class ClusterDeployment:
         for rank, (host, assignment) in enumerate(zip(self.hosts, assignments)):
             if host.node_id != assignment.node_id or assignment.rank != rank:
                 raise ValueError("host order must match node IDs and pipeline ranks")
+            if (
+                assignment.tensor_parallel_size != self.tensor_parallel_size
+                or assignment.tensor_parallel_rank
+                != rank % self.tensor_parallel_size
+            ):
+                raise ValueError(
+                    "assignment tensor-parallel coordinates do not match deployment"
+                )
+        for start in range(0, len(assignments), self.tensor_parallel_size):
+            tensor_group = assignments[start : start + self.tensor_parallel_size]
+            if len({(item.start_layer, item.end_layer) for item in tensor_group}) != 1:
+                raise ValueError(
+                    "tensor-parallel group members must hold the same layer range"
+                )
         if self.performance_profiles:
             if len(self.performance_profiles) != len(self.hosts):
                 raise ValueError(
@@ -496,6 +545,8 @@ class ClusterDeployment:
             ],
             "tensor_parallel_size": self.tensor_parallel_size,
             "target_context_tokens": self.target_context_tokens,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
             "path_map": dict(sorted(self.path_map.items())),
         }
 
@@ -524,6 +575,9 @@ class ClusterDeployment:
             for value in (deployment_id, model, backend, plan_hash)
         ):
             raise ValueError("deployment identity fields must be strings")
+        mtp_enabled = payload.get("mtp_enabled", False)
+        if not isinstance(mtp_enabled, bool):
+            raise ValueError("deployment mtp_enabled must be a boolean")
         return cls(
             deployment_id=deployment_id,
             model=model,
@@ -541,6 +595,8 @@ class ClusterDeployment:
             ),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             target_context_tokens=int(payload.get("target_context_tokens", 8192)),
+            mtp_enabled=mtp_enabled,
+            mtp_num_draft_tokens=payload.get("mtp_num_draft_tokens"),
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
@@ -560,6 +616,8 @@ class ClusterDeployment:
                     profile.to_dict() for profile in self.performance_profiles
                 ],
                 "tensor_parallel_size": self.tensor_parallel_size,
+                "mtp_enabled": self.mtp_enabled,
+                "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
                 "path_map": dict(sorted(self.path_map.items())),
             },
             sort_keys=True,
@@ -657,6 +715,25 @@ def decode_worker_path_map(encoded: str) -> dict[str, str]:
 
     payload = _decode_worker_payload(encoded)
     return validate_model_path_map(payload.get("path_map"))
+
+
+def decode_worker_speculation(encoded: str) -> tuple[bool, int | None]:
+    """Validated speculative-decode settings carried to every rank."""
+
+    payload = _decode_worker_payload(encoded)
+    enabled = payload.get("mtp_enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("worker mtp_enabled must be a boolean")
+    raw_depth = payload.get("mtp_num_draft_tokens")
+    if raw_depth is None:
+        return enabled, None
+    if (
+        not isinstance(raw_depth, int)
+        or isinstance(raw_depth, bool)
+        or not 1 <= raw_depth <= 8
+    ):
+        raise ValueError("worker mtp_num_draft_tokens must be between 1 and 8")
+    return enabled, raw_depth
 
 
 def decode_worker_plan(encoded: str) -> tuple[str, tuple[PipelineAssignment, ...]]:

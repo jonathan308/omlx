@@ -318,6 +318,7 @@ def test_link_setup_route_reports_cancelled_native_authorization(monkeypatch):
 
 
 def test_cluster_runtime_route_is_lightweight(monkeypatch):
+    monkeypatch.setattr(routes, "_get_engine_pool", None)
     monkeypatch.setattr(
         routes,
         "read_runtime_markers",
@@ -328,6 +329,111 @@ def test_cluster_runtime_route_is_lightweight(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["jobs"][0]["phase"] == "ready"
+
+
+def test_cluster_runtime_demotes_detached_live_marker(monkeypatch):
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: [],
+        get_model_ids=lambda: [],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "stale-model",
+                    "rank": 0,
+                    "phase": "ready",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is False
+    assert payload["jobs"][0]["ownership"] == "detached"
+    assert payload["launchers"] == []
+
+
+def test_cluster_runtime_keeps_owned_marker_live(monkeypatch):
+    engine = SimpleNamespace(
+        cluster_status=lambda: {
+            "deployment_id": "loaded-model",
+            "endpoint": "http://127.0.0.1:5000",
+            "ranks": [{"rank": 0}],
+        }
+    )
+    entry = SimpleNamespace(engine=engine, is_loading=False)
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: ["public-model"],
+        get_model_ids=lambda: ["public-model"],
+        get_entry=lambda model_id: entry,
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "loaded-model",
+                    "rank": 0,
+                    "phase": "ready",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is True
+    assert payload["jobs"][0]["ownership"] == "loaded"
+    assert payload["jobs"][0]["ranks"] == [{"rank": 0}]
+    assert payload["launchers"][0]["model_id"] == "public-model"
+
+
+def test_cluster_runtime_preserves_inflight_load_marker(monkeypatch):
+    deployment = SimpleNamespace(deployment_id="loading-model")
+    entry = SimpleNamespace(
+        engine=None,
+        is_loading=True,
+        model_path="/models/loading",
+    )
+    pool = SimpleNamespace(
+        get_loaded_model_ids=lambda: [],
+        get_model_ids=lambda: ["public-model"],
+        get_entry=lambda model_id: entry,
+    )
+    registry = SimpleNamespace(get_for_model=lambda model: deployment)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "get_cluster_registry", lambda: registry)
+    monkeypatch.setattr(
+        routes,
+        "read_runtime_markers",
+        lambda: {
+            "jobs": [
+                {
+                    "deployment_id": "loading-model",
+                    "rank": 0,
+                    "phase": "loading",
+                    "live": True,
+                }
+            ],
+            "warnings": [],
+        },
+    )
+
+    payload = _client().get("/admin/api/cluster/runtime").json()
+
+    assert payload["jobs"][0]["live"] is True
+    assert payload["jobs"][0]["ownership"] == "loading"
 
 
 def test_cluster_diagnostics_bundles_and_redacts_local_evidence(monkeypatch):

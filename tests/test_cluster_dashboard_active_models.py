@@ -42,7 +42,16 @@ def _deployment(
         ),
         assignments=tuple(
             PipelineAssignment(
-                node_id, rank, rank * 2, rank * 2 + 2, 10, 10, 8, 128
+                node_id,
+                rank,
+                (rank // tensor_parallel_size) * 2,
+                (rank // tensor_parallel_size) * 2 + 2,
+                10,
+                10,
+                8,
+                128,
+                tensor_parallel_rank=rank % tensor_parallel_size,
+                tensor_parallel_size=tensor_parallel_size,
             )
             for rank, node_id in enumerate(node_ids)
         ),
