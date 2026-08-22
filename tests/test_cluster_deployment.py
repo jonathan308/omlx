@@ -433,3 +433,30 @@ def test_a_plan_carrying_an_unknown_role_refuses_to_launch():
 
     with pytest.raises(ValueError, match="unknown node role"):
         _assignment_from_dict(payload)
+
+
+def test_link_local_zone_ids_are_stripped_from_communication_ips():
+    """macOS announces Thunderbolt addresses as fe80::…%en10; mlx's address
+    parser cannot read the zone and the rank died at startup on it."""
+    host = ClusterHost(
+        "node", "peer.local", ("10.0.0.2", "fe80::23:3ee:ec30:9a92%en10")
+    )
+    assert host.ips == ("10.0.0.2", "fe80::23:3ee:ec30:9a92")
+
+
+def test_hostfile_advertises_routable_addresses_before_link_local():
+    from omlx.cluster.deployment import _hostfile_ips
+
+    host = ClusterHost(
+        "node",
+        "peer.local",
+        ("fe80::1%en4", "10.0.0.2", "fe80::2%en5"),
+    )
+    assert _hostfile_ips(host) == ["10.0.0.2", "fe80::1", "fe80::2"]
+
+
+def test_a_link_local_only_host_keeps_its_zone_free_fallback():
+    from omlx.cluster.deployment import _hostfile_ips
+
+    host = ClusterHost("node", "peer.local", ("fe80::1%en4",))
+    assert _hostfile_ips(host) == ["fe80::1"]
