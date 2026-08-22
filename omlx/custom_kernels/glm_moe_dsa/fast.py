@@ -265,6 +265,16 @@ def dsa_decode_scores(
     *,
     stream=None,
 ) -> mx.array:
+    """Fused M=1-per-row decode indexer scan: relu(q . k) weighted head-sum.
+
+    ``queries`` is [B, H, 1, 128] with H in (32, 64), ``keys`` [B, 1, S, 128]
+    (strides allowed; rows must stay 16B-aligned), ``weights`` [B, H] in the
+    query dtype or — for the 64-head fp32-score configuration — float32. K is
+    streamed exactly once in its native dtype with fp32 accumulation; no
+    [B, H, 1, S] score sheet is materialized. ``fp32_scores=True`` returns
+    fp32 scores that match an fp32 reference reduction to accumulation-order
+    rounding (exactly, when ``weights`` are fp32).
+    """
     if _ext is None:
         raise RuntimeError(
             "dsa_decode_scores requires the native glm_moe_dsa extension"

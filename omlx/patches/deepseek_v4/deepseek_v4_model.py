@@ -227,6 +227,19 @@ def _shard_inplace_weighted(
             segments=segments,
         )
     )
+# Fused decode indexer (glm_moe_dsa.dsa_decode_scores, 64-head instantiation)
+# replaces the DSpark verify indexer score pipeline's fp32 cast of the pooled
+# context, the full-width rowwise GEMM, and the (rows, 64, P) fp32 score
+# sheet with one Metal scan per row that streams K exactly once in its cache
+# dtype and accumulates in fp32. Scores stay fp32 with fp32 head weights, so
+# the downstream dspark_fp32_topk_indices/_stable_topk_indices selection
+# semantics are unchanged. OMLX_DSV4_FUSED_DECODE_INDEXER=0 forces the fp32
+# reference path.
+_DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED = (
+    os.environ.get("OMLX_DSV4_FUSED_DECODE_INDEXER", "1").strip().lower()
+    in ("0", "false", "off")
+)
+_DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = False
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -1858,6 +1871,11 @@ class Indexer(nn.Module):
                     exc_info=True,
                 )
 
+        # NOTE: M=1 decode deliberately keeps the fp32 GEMV path below. The
+        # fused dsa_decode_scores scan was measured slower than mlx's GEMV
+        # for a single row (see _dspark_fused_indexer_scores); the fused
+        # route only pays off for multi-row DSpark verify batches.
+
         weights = (
             self.weights_proj(x) if projected_weights is None else projected_weights
         ).astype(mx.float32) * (self.n_heads**-0.5)
@@ -1912,6 +1930,92 @@ class Indexer(nn.Module):
         )
 
 
+def _dspark_fused_indexer_scores(
+    indexer: "Indexer",
+    pooled_rows: List[mx.array],
+    projected_q: mx.array,
+    projected_weights: mx.array,
+    row_start: int = 0,
+) -> Optional[List[mx.array]]:
+    """Score DSpark verify rows with the fused dsa_decode_scores scan.
+
+    One dispatch per row: K is streamed exactly once in its cache dtype with
+    fp32 accumulation, so neither the fp32 cast of the pooled context nor the
+    (rows, n_heads, P) fp32 score sheet of the reference path exists. Head
+    weights stay fp32 (folded with n_heads**-0.5 * scale), so scores match
+    the reference reduction semantics: relu(q . k) * scale, weighted by
+    projected_weights * n_heads**-0.5, summed over heads.
+
+    Returns one fp32 (1, P_row) score row per pooled row, or None when the
+    fused kernel is opted out, ineligible for these shapes (including the
+    single-row case, where the fused scan measures slower than the reference
+    GEMV), or failed at runtime; the caller then uses the fp32 rowwise-GEMM
+    reference path.
+    """
+    global _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED
+    if (
+        _DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED
+        or _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED
+    ):
+        return None
+    # Single-row calls (M=1 decode, depth-1 verify) stay on the fp32 GEMV
+    # reference: measured at 100K pooled tokens the one-dispatch fused scan
+    # is slightly SLOWER than mlx's GEMV (0.95 ms vs 0.89 ms — the h64 scan
+    # is issue-bound at B=1), while at 2+ rows the fused route wins
+    # (1.2-1.4x at 100K) because the reference pays the fp32 cast and the
+    # (rows, 64, P) score sheet per row.
+    if len(pooled_rows) < 2:
+        return None
+    # The fp32-weight instantiation exists for the 64-head DS4 indexer only;
+    # 32-head DSA models are GLM and route through their own patch.
+    if indexer.n_heads != 64 or getattr(indexer, "head_dim", 128) != 128:
+        return None
+    if projected_q.dtype not in (mx.float16, mx.bfloat16):
+        return None
+    if projected_q.ndim != 4 or projected_q.shape[0] != 1:
+        return None
+    if projected_q.shape[1] != indexer.n_heads:
+        return None
+    if projected_weights.shape[0] != 1:
+        return None
+    for row in pooled_rows:
+        # The native scan requires S >= 1024. It reads K by strides and
+        # re-validates the row layout (contiguous, 16B-aligned rows) itself,
+        # so capacity-backed cache slices are consumed in place.
+        if row.ndim != 3 or row.shape[2] != 128 or row.shape[1] < 1024:
+            return None
+        if row.dtype != projected_q.dtype:
+            return None
+
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    if not fast.has_symbol("dsa_decode_scores"):
+        return None
+    weight_scale = (indexer.n_heads**-0.5) * indexer.scale
+    score_rows: List[mx.array] = []
+    try:
+        for idx, row in enumerate(pooled_rows):
+            q_row = projected_q[0:1, :, row_start + idx : row_start + idx + 1, :]
+            w_row = (
+                projected_weights[0:1, row_start + idx].astype(mx.float32)
+                * weight_scale
+            )
+            scores = fast.dsa_decode_scores(
+                q_row, row[:, None], w_row, fp32_scores=True
+            )
+            score_rows.append(scores.reshape(1, row.shape[1]))
+    except Exception as exc:
+        _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 fused decode indexer failed; fp32 rowwise-GEMM fallback "
+            "for the rest of this process: %s",
+            exc,
+            exc_info=True,
+        )
+        return None
+    return score_rows
+
+
 def _batch_indexer_rows(
     indexer: Indexer,
     pooled_rows: List[mx.array],
@@ -1923,34 +2027,64 @@ def _batch_indexer_rows(
     if len(lengths) > 1 and min(lengths) > indexer.index_topk:
         # A ratio-4 boundary makes adjacent verify rows differ by one pooled
         # token. The score reduction is over the fixed 128-wide head, so
-        # padding N does not alter any valid dot product. Mask the padded tail
-        # before top-k and keep all rows in one native GEMM/top-k dispatch.
+        # padding N does not alter any valid dot product. The fused path
+        # scores each row at its own length and pads the score tail with the
+        # sentinel; the reference path pads the pooled rows instead. Either
+        # way the padded tail is masked before top-k and all rows share one
+        # native top-k dispatch.
         max_length = max(lengths)
-        padded_rows = []
-        for row, length in zip(pooled_rows, lengths):
-            if length < max_length:
-                row = mx.concatenate(
-                    [
-                        row,
-                        mx.zeros(
-                            (row.shape[0], max_length - length, row.shape[2]),
-                            dtype=row.dtype,
-                        ),
-                    ],
-                    axis=1,
-                )
-            padded_rows.append(row)
-        query_batch = projected_q[0].transpose(1, 0, 2)
-        pooled_batch = mx.concatenate(padded_rows, axis=0)
-        scores = rowwise_gemm(
-            query_batch.astype(mx.float32),
-            pooled_batch.astype(mx.float32),
-            True,
+        score_rows = _dspark_fused_indexer_scores(
+            indexer, pooled_rows, projected_q, projected_weights
         )
-        scores = mx.maximum(scores, 0) * indexer.scale
-        weights = projected_weights[0].astype(mx.float32)
-        weights = weights * (indexer.n_heads**-0.5)
-        scores = (scores * weights[..., None]).sum(axis=1)
+        if score_rows is not None:
+            # Per-row fused scores; pad the ±1-token tails with the same
+            # finfo.min sentinel the `valid` mask below writes, so the padded
+            # positions stay excluded from top-k.
+            scores = mx.concatenate(
+                [
+                    row_scores
+                    if row_scores.shape[1] == max_length
+                    else mx.concatenate(
+                        [
+                            row_scores,
+                            mx.full(
+                                (1, max_length - row_scores.shape[1]),
+                                mx.finfo(mx.float32).min,
+                                dtype=mx.float32,
+                            ),
+                        ],
+                        axis=1,
+                    )
+                    for row_scores in score_rows
+                ],
+                axis=0,
+            )
+        else:
+            padded_rows = []
+            for row, length in zip(pooled_rows, lengths):
+                if length < max_length:
+                    row = mx.concatenate(
+                        [
+                            row,
+                            mx.zeros(
+                                (row.shape[0], max_length - length, row.shape[2]),
+                                dtype=row.dtype,
+                            ),
+                        ],
+                        axis=1,
+                    )
+                padded_rows.append(row)
+            query_batch = projected_q[0].transpose(1, 0, 2)
+            pooled_batch = mx.concatenate(padded_rows, axis=0)
+            scores = rowwise_gemm(
+                query_batch.astype(mx.float32),
+                pooled_batch.astype(mx.float32),
+                True,
+            )
+            scores = mx.maximum(scores, 0) * indexer.scale
+            weights = projected_weights[0].astype(mx.float32)
+            weights = weights * (indexer.n_heads**-0.5)
+            scores = (scores * weights[..., None]).sum(axis=1)
         valid = mx.arange(max_length)[None] < mx.array(lengths)[:, None]
         scores = mx.where(valid, scores, mx.finfo(scores.dtype).min)
         indices = _fp32_topk_indices(scores, indexer.index_topk)
@@ -1982,17 +2116,24 @@ def _batch_indexer_rows(
             start = stop
             continue
 
-        query_batch = projected_q[0, :, start:stop].transpose(1, 0, 2)
-        pooled_batch = mx.concatenate(pooled_rows[start:stop], axis=0)
-        scores = rowwise_gemm(
-            query_batch.astype(mx.float32),
-            pooled_batch.astype(mx.float32),
-            True,
+        score_rows = _dspark_fused_indexer_scores(
+            indexer, pooled_rows[start:stop], projected_q, projected_weights, start
         )
-        scores = mx.maximum(scores, 0) * indexer.scale
-        weights = projected_weights[0, start:stop].astype(mx.float32)
-        weights = weights * (indexer.n_heads**-0.5)
-        scores = (scores * weights[..., None]).sum(axis=1)
+        if score_rows is not None:
+            # Equal-length group: rows stack without any score padding.
+            scores = mx.concatenate(score_rows, axis=0)
+        else:
+            query_batch = projected_q[0, :, start:stop].transpose(1, 0, 2)
+            pooled_batch = mx.concatenate(pooled_rows[start:stop], axis=0)
+            scores = rowwise_gemm(
+                query_batch.astype(mx.float32),
+                pooled_batch.astype(mx.float32),
+                True,
+            )
+            scores = mx.maximum(scores, 0) * indexer.scale
+            weights = projected_weights[0, start:stop].astype(mx.float32)
+            weights = weights * (indexer.n_heads**-0.5)
+            scores = (scores * weights[..., None]).sum(axis=1)
         k = min(indexer.index_topk, pooled_length)
         indices = _fp32_topk_indices(scores, k)
         indices = indices[:, None]

@@ -581,11 +581,12 @@ class DSADecodeScoresPrimitive : public Primitive {
       const array& q,
       const array& k,
       const array& w,
+      bool fp32_scores,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
-    if (q.dtype() != k.dtype() || q.dtype() != w.dtype()) {
+    if (q.dtype() != k.dtype()) {
       return true;
     }
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
@@ -597,10 +598,21 @@ class DSADecodeScoresPrimitive : public Primitive {
     if (q.ndim() != 4 || k.ndim() != 4 || w.ndim() != 2) {
       return true;
     }
-    // q [B,32,1,128] contiguous; k [B,1,S,128] with contiguous rows only
-    // (capacity-backed slices allowed); rows must stay 16B-aligned for the
-    // vec4 loads: row stride % 8 elements == 0.
-    if (q.shape(1) != 32 || q.shape(2) != 1 || q.shape(3) != 128) {
+    // q [B,H,1,128] contiguous, H in {32, 64}; k [B,1,S,128] with contiguous
+    // rows only (capacity-backed slices allowed); rows must stay 16B-aligned
+    // for the vec4 loads: row stride % 8 elements == 0.
+    const int heads = q.shape(1);
+    if ((heads != 32 && heads != 64) || q.shape(2) != 1 || q.shape(3) != 128) {
+      return true;
+    }
+    // Weights are either the query dtype (all configs) or fp32. fp32 weights
+    // are instantiated only for the 64-head fp32-score configuration (the
+    // DeepSeek V4 reference decode path keeps its head weights in fp32).
+    if (w.dtype() == float32) {
+      if (!fp32_scores || heads != 64) {
+        return true;
+      }
+    } else if (w.dtype() != q.dtype()) {
       return true;
     }
     if (k.shape(0) != q.shape(0) || k.shape(1) != 1 || k.shape(3) != 128) {
@@ -609,7 +621,7 @@ class DSADecodeScoresPrimitive : public Primitive {
     if (k.strides(3) != 1 || (k.strides(2) % 8) != 0) {
       return true;
     }
-    if (w.shape(0) != q.shape(0) || w.shape(1) != 32) {
+    if (w.shape(0) != q.shape(0) || w.shape(1) != heads) {
       return true;
     }
     return k.shape(2) < 1024;
@@ -645,7 +657,9 @@ class DSADecodeScoresPrimitive : public Primitive {
         "dsa_decode_scores_",
         type_to_name(q),
         fp32_scores_ ? "_of32" : "_osame",
-        "_h32_d128_t",
+        w.dtype() == float32 ? "_wf32" : "_wsame",
+        q.shape(1) == 64 ? "_h64" : "_h32",
+        "_d128_t",
         threads);
 
     OMLXDSADecodeParamsHost params{
@@ -938,11 +952,18 @@ array dsa_decode_scores(
         "query position (q shape [B,H,1,D]).");
   }
 
-  auto final_type = result_type(queries, keys, weights);
+  auto final_type = result_type(queries, keys);
   if (final_type != float16 && final_type != bfloat16) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.dsa_decode_scores] expected float16 or bfloat16 "
-        << "inputs, got " << final_type << ".";
+        << "queries/keys, got " << final_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (weights.dtype() != float16 && weights.dtype() != bfloat16 &&
+      weights.dtype() != float32) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.dsa_decode_scores] expected float16, bfloat16 "
+        << "or float32 weights, got " << weights.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -952,7 +973,11 @@ array dsa_decode_scores(
   // (astype is a no-op on the cache's native dtype; a dtype-mismatched call
   // would still copy, which the row-stride guard then re-checks.)
   auto k = astype(keys, final_type, stream);
-  auto w = astype(weights, final_type, stream);
+  // fp32 weights stay fp32 (the 64-head fp32-score instantiation reads them
+  // directly); 16-bit weights are normalized to the query dtype.
+  auto w = weights.dtype() == float32
+      ? weights
+      : astype(weights, final_type, stream);
   if (w.ndim() == 3) {
     // accept [B, 1, H]
     w = reshape(w, {w.shape(0), w.shape(2)}, stream);
@@ -960,7 +985,8 @@ array dsa_decode_scores(
   w = ensure_row_contiguous(w, stream);
 
   std::vector<array> inputs = {q, k, w};
-  if (DSADecodeScoresPrimitive::unsupported(q, k, w, stream)) {
+  if (DSADecodeScoresPrimitive::unsupported(
+          q, k, w, fp32_scores, stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_decode_scores] unsupported shape/dtype/layout.");
   }
