@@ -963,7 +963,7 @@ def test_ds4_outer_prefill_yields_when_decode_promotes_this_turn():
     )
 
 
-def test_ds4_runtime_caps_only_outer_turn_and_restores_class():
+def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
     class Attention:
         dspark = True
 
@@ -1009,6 +1009,20 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class():
 
     assert observed == [1024]
     assert mlx_generate.BatchGenerator.next is original_next
+
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_YIELD", "0")
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        item = capabilities["deepseek_v4_prefill_yield"]
+        assert item["enabled"] is False
+        assert item["active"] is False
+        assert "disabled by the operator" in item["reason"]
+        assert mlx_generate.BatchGenerator.next is original_next
 
 
 def test_non_ds4_runtime_does_not_patch_outer_scheduler():

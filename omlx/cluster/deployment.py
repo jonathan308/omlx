@@ -90,6 +90,9 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
+    # Yield long prompt work back to live decode after one 1K DS4 kernel call.
+    # The hostfile value keeps both TP ranks on the same scheduler decision.
+    ("OMLX_DSV4_PREFILL_YIELD", "1"),
     # The lossless windowed+sparse prefill kernel is head-count agnostic at
     # the Metal level.  Carry its controls in the hostfile so every TP rank
     # makes the same dispatch decision; coordinator-only environment values

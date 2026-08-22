@@ -21,6 +21,7 @@ _DSV4_ADAPTIVE_PREFILL_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL"
 _DSV4_ADAPTIVE_PREFILL_AFTER_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER"
 _DSV4_ADAPTIVE_PREFILL_STEP_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_STEP"
 _DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
+_DSV4_PREFILL_YIELD_ENV = "OMLX_DSV4_PREFILL_YIELD"
 
 
 def _capability(
@@ -850,8 +851,12 @@ def install_runtime_optimizations(
         and pipeline_parallel
         and execution.prefill_step_size > 1
     )
+    outer_prefill_yield_enabled = os.environ.get(
+        _DSV4_PREFILL_YIELD_ENV, "1"
+    ).strip().lower() in {"1", "true", "on", "yes"}
     outer_prefill_yield_active = bool(
-        adaptive_prefill_active
+        outer_prefill_yield_enabled
+        and adaptive_prefill_active
         and skip_logits_active
         and callable(getattr(mlx_generate.BatchGenerator, "next", None))
     )
@@ -992,16 +997,20 @@ def install_runtime_optimizations(
             reason=adaptive_prefill_reason,
         ),
         "deepseek_v4_prefill_yield": _capability(
-            enabled=adaptive_prefill_enabled,
+            enabled=outer_prefill_yield_enabled,
             active=outer_prefill_yield_active,
             reason=(
                 f"long DS4 outer slices yield after one "
                 f"{adaptive_prefill_step}-token model call while decode is live"
                 if outer_prefill_yield_active
                 else (
-                    adaptive_prefill_reason
-                    if not adaptive_prefill_active
-                    else prompt_reason
+                    "DS4 contended-prefill yielding is disabled by the operator"
+                    if not outer_prefill_yield_enabled
+                    else (
+                        adaptive_prefill_reason
+                        if not adaptive_prefill_active
+                        else prompt_reason
+                    )
                 )
             ),
         ),
