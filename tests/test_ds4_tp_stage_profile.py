@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from benchmarks.bench_ds4_tp_stage_profile import (
+    CATEGORIES,
+    DS4TPShape,
+    TimingRecorder,
+    amdahl_table,
+    modeled_collective_ms,
+    normalize_to_observed_wall,
+    optimization_scenarios,
+    projected_tps,
+    required_group_speedup,
+)
+
+
+def test_three_five_shape_matches_exact_ds4_rank_geometry():
+    m3 = DS4TPShape(rank=0)
+    m5 = DS4TPShape(rank=1)
+
+    assert (m3.local_heads, m3.local_intermediate) == (24, 768)
+    assert (m5.local_heads, m5.local_intermediate) == (40, 1280)
+    assert m3.route_rows == m5.route_rows == 6144
+
+
+def test_collective_model_counts_two_activation_reductions_per_layer():
+    shape = DS4TPShape(rank=1, tokens=1024, prefix_tokens=8192)
+    report = modeled_collective_ms(
+        shape,
+        bandwidth_gbps=6.2,
+        latency_us=30,
+    )
+
+    assert report["activation_all_sum_calls"] == 86
+    assert report["activation_payload_bytes"] == 1024 * 4096 * 2
+    assert report["indexer_all_gather_calls"] == 21
+    assert report["indexer_payload_bytes_per_rank"] == 512 * 512 * 4
+    assert report["total_ms"] == pytest.approx(
+        report["activation_ms"] + report["indexer_ms"]
+    )
+
+
+def test_observed_normalization_preserves_wall_and_builds_amdahl_rows():
+    compute = {
+        "attention_projections": 30,
+        "routed_moe_pair": 30,
+        "routed_moe_down": 15,
+        "indexer": 5,
+        "misc": 20,
+    }
+    result = normalize_to_observed_wall(
+        compute,
+        collective_ms=100,
+        tokens=1024,
+        baseline_tps=628.76,
+        target_tps=1000,
+    )
+
+    assert sum(result["attributed_ms"].values()) == pytest.approx(
+        result["observed_wall_ms"]
+    )
+    assert sum(result["fractions"].values()) == pytest.approx(1.0)
+    names = {row["component"] for row in result["amdahl"]}
+    assert names == set(CATEGORIES) | {
+        "routed_moe_total",
+        "kernel_hotset",
+        "kernel_hotset_plus_collectives",
+    }
+
+
+def test_amdahl_required_speedup_and_impossible_single_component():
+    fractions = {
+        "attention_projections": 0.30,
+        "routed_moe_pair": 0.30,
+        "routed_moe_down": 0.15,
+        "indexer": 0.05,
+        "collectives": 0.10,
+        "misc": 0.10,
+    }
+    rows = {
+        row["component"]: row
+        for row in amdahl_table(
+            fractions,
+            baseline_tps=628.76,
+            target_tps=1000,
+        )
+    }
+
+    assert rows["attention_projections"]["target_possible_alone"] is False
+    assert rows["routed_moe_total"]["target_possible_alone"] is True
+    f = 0.45
+    expected = f / (628.76 / 1000 - (1 - f))
+    assert rows["routed_moe_total"]["required_speedup_for_target"] == pytest.approx(
+        expected
+    )
+
+
+def test_joint_scenarios_solve_the_remaining_target_budget():
+    fractions = {
+        "attention_projections": 0.44,
+        "routed_moe_pair": 0.24,
+        "routed_moe_down": 0.11,
+        "indexer": 0.035,
+        "collectives": 0.075,
+        "misc": 0.10,
+    }
+    required_moe = required_group_speedup(
+        fractions,
+        ("routed_moe_pair", "routed_moe_down"),
+        baseline_tps=628.76,
+        target_tps=1000,
+        fixed_speedups={"attention_projections": 2.0},
+    )
+    speedups = {
+        "attention_projections": 2.0,
+        "routed_moe_pair": required_moe,
+        "routed_moe_down": required_moe,
+    }
+
+    assert required_moe is not None
+    assert projected_tps(fractions, speedups, baseline_tps=628.76) == pytest.approx(
+        1000
+    )
+    scenarios = optimization_scenarios(
+        fractions,
+        baseline_tps=628.76,
+        target_tps=1000,
+    )
+    assert scenarios[0]["projected_tps"] > 1000
+    assert scenarios[-1]["required_group_speedup"] < 2
+
+
+def test_timing_recorder_is_exclusive_and_subtracts_barrier_overhead():
+    ticks = iter((100, 250))
+    recorder = TimingRecorder(
+        synchronize=lambda: None,
+        evaluate=lambda _value: None,
+        clock_ns=lambda: next(ticks),
+        barrier_overhead_ns=50,
+    )
+    recorder.active = True
+
+    result = recorder.call("indexer", lambda: "result")
+
+    assert result == "result"
+    assert recorder.nanoseconds["indexer"] == 100
+    assert recorder.calls["indexer"] == 1
+
+
+def test_timing_recorder_assigns_nested_work_to_the_outer_category():
+    ticks = iter((100, 300))
+    recorder = TimingRecorder(
+        synchronize=lambda: None,
+        evaluate=lambda _value: None,
+        clock_ns=lambda: next(ticks),
+    )
+    recorder.active = True
+
+    def outer():
+        return recorder.call("attention_projections", lambda: "nested")
+
+    assert recorder.call("indexer", outer) == "nested"
+    assert recorder.nanoseconds == {"indexer": 200}
+    assert recorder.calls == {"indexer": 1}
+
+
+def test_invalid_shape_and_fraction_contracts_fail_closed():
+    with pytest.raises(ValueError, match="sum to eight"):
+        DS4TPShape(rank=0, shard_weights=(3, 4))
+    with pytest.raises(ValueError, match="sum to one"):
+        amdahl_table(
+            {category: 0.1 for category in CATEGORIES},
+            baseline_tps=628.76,
+            target_tps=1000,
+        )
+
+
+def test_profiler_is_not_imported_or_dispatched_by_production_code():
+    root = Path(__file__).parents[1]
+    symbol = "bench_ds4_tp_stage_profile"
+    assert all(
+        symbol not in path.read_text() for path in (root / "omlx").rglob("*.py")
+    )
