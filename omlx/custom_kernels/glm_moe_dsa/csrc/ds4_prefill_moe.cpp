@@ -48,8 +48,11 @@ bool row_contiguous(const array& arr) {
 
 class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
  public:
-  explicit DS4Mxfp4PairSwiGLUBlocksPrimitive(Stream stream, bool tail8 = false)
-      : Primitive(stream), tail8_(tail8) {}
+  explicit DS4Mxfp4PairSwiGLUBlocksPrimitive(
+      Stream stream,
+      bool tail8 = false,
+      int intermediate = kIntermediate)
+      : Primitive(stream), tail8_(tail8), intermediate_(intermediate) {}
 
   static bool unsupported(
       const array& x,
@@ -61,7 +64,11 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
       const array& block_count,
       float activation_limit,
       int variant,
+      int intermediate,
       Stream s) {
+    if (intermediate != 768 && intermediate != 1024 && intermediate != 1280) {
+      return true;
+    }
     if (s.device == Device::cpu || x.dtype() != float16 ||
         up_weight.dtype() != uint32 || gate_weight.dtype() != uint32 ||
         up_scales.dtype() != uint8 || gate_scales.dtype() != uint8 ||
@@ -81,9 +88,9 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
     }
     if (x.shape() != Shape{kRoutes, 1, kHidden} ||
         up_weight.shape() !=
-            Shape{kExperts, kIntermediate, kHidden / kValuesPerU32} ||
+            Shape{kExperts, intermediate, kHidden / kValuesPerU32} ||
         up_scales.shape() !=
-            Shape{kExperts, kIntermediate, kHidden / kGroupSize} ||
+            Shape{kExperts, intermediate, kHidden / kGroupSize} ||
         gate_weight.shape() != up_weight.shape() ||
         gate_scales.shape() != up_scales.shape() ||
         block_meta.shape() != Shape{kMaxBlocks, 3} ||
@@ -136,11 +143,11 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
     encoder.set_output_array(out, 7);
     encoder.set_bytes(kMaxBlocks, 8);
     encoder.set_bytes(kRoutes, 9);
-    encoder.set_bytes(kIntermediate, 10);
+    encoder.set_bytes(intermediate_, 10);
     encoder.set_bytes(kHidden, 11);
     encoder.set_bytes(kActivationLimit, 12);
     encoder.dispatch_threadgroups(
-        MTL::Size(kIntermediate / kBN, kMaxBlocks, 1),
+        MTL::Size(intermediate_ / kBN, kMaxBlocks, 1),
         MTL::Size(kWM * kWN * 32, 1, 1));
   }
 
@@ -149,19 +156,23 @@ class DS4Mxfp4PairSwiGLUBlocksPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs =
         static_cast<const DS4Mxfp4PairSwiGLUBlocksPrimitive&>(other);
-    return tail8_ == rhs.tail8_;
+    return tail8_ == rhs.tail8_ && intermediate_ == rhs.intermediate_;
   }
   auto state() const {
-    return std::make_tuple(tail8_);
+    return std::make_tuple(tail8_, intermediate_);
   }
 
  private:
   bool tail8_;
+  int intermediate_;
 };
 
 class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
  public:
-  explicit DS4Mxfp4DownTail8BlocksPrimitive(Stream stream) : Primitive(stream) {}
+  explicit DS4Mxfp4DownTail8BlocksPrimitive(
+      Stream stream,
+      int intermediate = kIntermediate)
+      : Primitive(stream), intermediate_(intermediate) {}
 
   static bool unsupported(
       const array& x,
@@ -170,7 +181,11 @@ class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
       const array& block_meta,
       const array& block_count,
       int variant,
+      int intermediate,
       Stream s) {
+    if (intermediate != 768 && intermediate != 1024 && intermediate != 1280) {
+      return true;
+    }
     if (s.device == Device::cpu || x.dtype() != float16 ||
         weight.dtype() != uint32 || scales.dtype() != uint8 ||
         block_meta.dtype() != int32 || block_count.dtype() != int32) {
@@ -185,11 +200,11 @@ class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
         !row_contiguous(block_count)) {
       return true;
     }
-    if (x.shape() != Shape{kRoutes, 1, kIntermediate} ||
+    if (x.shape() != Shape{kRoutes, 1, intermediate} ||
         weight.shape() !=
-            Shape{kExperts, kHidden, kIntermediate / kValuesPerU32} ||
+            Shape{kExperts, kHidden, intermediate / kValuesPerU32} ||
         scales.shape() !=
-            Shape{kExperts, kHidden, kIntermediate / kGroupSize} ||
+            Shape{kExperts, kHidden, intermediate / kGroupSize} ||
         block_meta.shape() != Shape{kMaxBlocks, 3} ||
         block_count.shape() != Shape{1}) {
       return true;
@@ -234,7 +249,7 @@ class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
     encoder.set_bytes(kMaxBlocks, 6);
     encoder.set_bytes(kRoutes, 7);
     encoder.set_bytes(kHidden, 8);
-    encoder.set_bytes(kIntermediate, 9);
+    encoder.set_bytes(intermediate_, 9);
     encoder.dispatch_threadgroups(
         MTL::Size(kHidden / kBN, kMaxBlocks, 1),
         MTL::Size(kWM * kWN * 32, 1, 1));
@@ -242,12 +257,17 @@ class DS4Mxfp4DownTail8BlocksPrimitive : public Primitive {
 
   DEFINE_NAME(DS4Mxfp4DownTail8Blocks)
   DEFINE_INPUT_OUTPUT_SHAPE()
-  bool is_equivalent(const Primitive& /* other */) const override {
-    return true;
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& rhs =
+        static_cast<const DS4Mxfp4DownTail8BlocksPrimitive&>(other);
+    return intermediate_ == rhs.intermediate_;
   }
   auto state() const {
-    return std::make_tuple(nullptr);
+    return std::make_tuple(intermediate_);
   }
+
+ private:
+  int intermediate_;
 };
 
 } // namespace
@@ -274,6 +294,7 @@ array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
           block_count,
           activation_limit,
           variant,
+          kIntermediate,
           stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels."
@@ -316,6 +337,7 @@ array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
     int variant,
     StreamOrDevice s) {
   auto stream = to_stream(s);
+  const int intermediate = up_weight.ndim() >= 2 ? up_weight.shape(1) : -1;
   if (DS4Mxfp4PairSwiGLUBlocksPrimitive::unsupported(
           x,
           up_weight,
@@ -326,11 +348,13 @@ array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
           block_count,
           activation_limit,
           variant,
+          intermediate,
           stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels."
         "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8] isolated "
-        "symbol requires the fixed M=1024 equal-TP2 phase-A shape.");
+        "symbol requires the fixed M=1024 DS4 TP intermediate widths "
+        "{768,1024,1280}.");
   }
   std::vector<array> inputs = {
       x,
@@ -341,9 +365,10 @@ array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
       block_meta,
       block_count};
   return array(
-      Shape{kRoutes, 1, kIntermediate},
+      Shape{kRoutes, 1, intermediate},
       float16,
-      std::make_shared<DS4Mxfp4PairSwiGLUBlocksPrimitive>(stream, true),
+      std::make_shared<DS4Mxfp4PairSwiGLUBlocksPrimitive>(
+          stream, true, intermediate),
       std::move(inputs));
 }
 
@@ -356,19 +381,28 @@ array deepseek_mxfp4_gather_qmm_blocks_tail8(
     int variant,
     StreamOrDevice s) {
   auto stream = to_stream(s);
+  const int intermediate = x.ndim() >= 3 ? x.shape(2) : -1;
   if (DS4Mxfp4DownTail8BlocksPrimitive::unsupported(
-          x, weight, scales, block_meta, block_count, variant, stream)) {
+          x,
+          weight,
+          scales,
+          block_meta,
+          block_count,
+          variant,
+          intermediate,
+          stream)) {
     throw std::invalid_argument(
         "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_blocks_tail8] "
-        "isolated symbol requires FP16 x [6144,1,1024], MXFP4 down "
-        "[256,4096,128], scales [256,4096,32], block_meta [448,3], "
+        "isolated symbol requires M=1024 DS4 TP intermediate widths "
+        "{768,1024,1280}, matching MXFP4 down/scales, block_meta [448,3], "
         "and variant=2.");
   }
   std::vector<array> inputs = {x, weight, scales, block_meta, block_count};
   return array(
       Shape{kRoutes, 1, kHidden},
       float16,
-      std::make_shared<DS4Mxfp4DownTail8BlocksPrimitive>(stream),
+      std::make_shared<DS4Mxfp4DownTail8BlocksPrimitive>(
+          stream, intermediate),
       std::move(inputs));
 }
 

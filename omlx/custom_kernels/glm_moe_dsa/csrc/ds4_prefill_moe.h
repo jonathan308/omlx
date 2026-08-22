@@ -24,8 +24,9 @@ mx::array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks(
     int variant = 2,
     mx::StreamOrDevice s = {});
 
-// Isolated tail-cull follow-up. The BM32 expert plan and all dtype/arithmetic
-// boundaries stay unchanged; BM8 route microtiles only skip padded-row MMA.
+// Isolated tail-cull follow-up for exact DS4 TP widths 768/1024/1280. The BM32
+// expert plan and all dtype/arithmetic boundaries stay unchanged; BM8 route
+// microtiles only skip padded-row MMA.
 mx::array deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
     const mx::array& x,
     const mx::array& up_weight,

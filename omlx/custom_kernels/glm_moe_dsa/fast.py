@@ -726,7 +726,7 @@ def deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8(
     *,
     stream=None,
 ) -> mx.array:
-    """Isolated M3 DS4 pair/SwiGLU BM8 route-tail probe."""
+    """Isolated M3 DS4 pair/SwiGLU BM8 tail probe for TP widths 768/1024/1280."""
     if _ext is not None and hasattr(
         _ext, "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks_tail8"
     ):
@@ -758,7 +758,7 @@ def deepseek_mxfp4_gather_qmm_blocks_tail8(
     *,
     stream=None,
 ) -> mx.array:
-    """Isolated M3 DS4 down-projection BM8 route-tail probe."""
+    """Isolated M3 DS4 down BM8 tail probe for TP widths 768/1024/1280."""
     if _ext is not None and hasattr(_ext, "deepseek_mxfp4_gather_qmm_blocks_tail8"):
         return _ext.deepseek_mxfp4_gather_qmm_blocks_tail8(
             x,
