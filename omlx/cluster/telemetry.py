@@ -108,6 +108,7 @@ class RuntimeTelemetry:
         self._requests: dict[int, _RequestSample] = {}
         self._uid_to_request: dict[Any, int] = {}
         self._request_to_uid: dict[int, Any] = {}
+        self._request_contexts: dict[int, Any] = {}
         self._pending_uid = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
@@ -322,6 +323,13 @@ class RuntimeTelemetry:
 
         self._pending_uid.request_id = request_id
 
+    def register_context(self, request_id: int, context: Any) -> None:
+        """Retain the server context used by its synchronized cancel path."""
+
+        with self._lock:
+            if request_id in self._requests:
+                self._request_contexts[request_id] = context
+
     def bind_pending_uid(self, uids: Any) -> None:
         """Bind MLX-LM's generated batch UID to the observed queue request."""
 
@@ -369,43 +377,50 @@ class RuntimeTelemetry:
                 self._publish_locked(now, force=True)
 
     def register_batch_generator(self, generator: Any) -> None:
-        """Remember the live BatchGenerator so force-cancel can reach it."""
+        """Remember the live generator for telemetry, never rank-local removal."""
 
         with self._lock:
             self._batch_generator = generator
 
     def force_cancel_all(self, *, reason: str = "coordinator cancel") -> int:
-        """Remove every active uid through MLX-LM's own cancel path.
+        """Request cancellation through MLX-LM's shared server-loop path.
 
-        ``BatchGenerator.remove`` is the same call MLX-LM handlers make on
-        client disconnect: it is processed by the batch loop at a step
-        boundary and shared with peer ranks, so both sides of the pipeline
-        abandon the request together and no collective is severed
-        mid-request. Returns the number of uids handed to the batch loop.
+        Directly calling ``BatchGenerator.remove`` here is rank-local and may
+        run on the heartbeat thread.  Rank zero would discard its UID while
+        peers kept decoding, producing mismatched tensor collectives. Setting
+        the real ``GenerationContext`` stop flag lets the pinned server append
+        the UID at its next prompt/token boundary, broadcast that list, and
+        remove it on every rank together. Process teardown remains the backstop
+        for a rank genuinely wedged inside a collective.
         """
 
         with self._lock:
-            generator = self._batch_generator
-            uids = [
-                uid
-                for request_id, uid in self._request_to_uid.items()
+            contexts = [
+                context
+                for request_id, context in self._request_contexts.items()
                 if request_id in self._requests
             ]
-        if generator is None or not uids:
+        if not contexts:
             return 0
-        try:
-            generator.remove(list(uids))
-        except Exception as exc:
-            # A cancel that failed must be loud but must not kill the rank;
-            # the coordinator falls back to process teardown.
-            logger.warning("Rank-side force-cancel failed: %s", exc)
+        requested = 0
+        for context in contexts:
+            stop = getattr(context, "stop", None)
+            if not callable(stop):
+                continue
+            try:
+                stop()
+            except Exception as exc:
+                logger.warning("Rank-side context cancel failed: %s", exc)
+                continue
+            requested += 1
+        if not requested:
             return 0
         logger.warning(
-            "Force-cancelled %d active rank-side request(s): %s",
-            len(uids),
+            "Requested synchronized cancellation for %d active request(s): %s",
+            requested,
             reason,
         )
-        return len(uids)
+        return requested
 
     def _read_cancel_request(self) -> dict[str, Any] | None:
         path = self._cancel_path
@@ -557,6 +572,7 @@ class RuntimeTelemetry:
         if getattr(self._pending_uid, "request_id", None) == request_id:
             self._pending_uid.request_id = None
         uid = self._request_to_uid.pop(request_id, None)
+        self._request_contexts.pop(request_id, None)
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
@@ -828,6 +844,7 @@ class _TelemetryQueue:
                     cached_tokens=max(0, int(cache_count)),
                 )
                 self._telemetry.mark_pending_uid(self._request_id)
+                self._telemetry.register_context(self._request_id, item)
             elif hasattr(item, "token") and hasattr(item, "finish_reason"):
                 self._telemetry.observe_token(self._request_id)
         return self._queue.put(item, *args, **kwargs)

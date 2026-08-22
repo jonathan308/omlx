@@ -792,6 +792,14 @@ class _BatchGenerator:
         self.removed.append(list(uids))
 
 
+class _GenerationContext:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def _cancel_telemetry(
     tmp_path,
     clock=None,
@@ -812,26 +820,30 @@ def _cancel_telemetry(
     return telemetry
 
 
-def test_force_cancel_all_removes_active_uids_through_the_batch_loop(tmp_path):
+def test_force_cancel_all_marks_context_for_the_shared_batch_loop(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
     generator = _BatchGenerator()
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((73,))
 
     cancelled = telemetry.force_cancel_all(reason="test")
 
     assert cancelled == 1
-    assert generator.removed == [[73]]
-    # remove() routes back through cancel_uids in production; here the
-    # fake does not, so the request is still tracked until it does.
+    assert context.stopped is True
+    assert generator.removed == [], "telemetry must never mutate one rank directly"
+    # The pinned server now broadcasts UID 73, then every rank removes it.
+    generator.remove([73])
     telemetry.cancel_uids([73])
+    assert generator.removed == [[73]]
     assert telemetry._requests == {}
     assert telemetry._requests_cancelled == 1
 
 
-def test_force_cancel_all_without_generator_or_uids_is_a_noop(tmp_path):
+def test_force_cancel_all_without_a_generation_context_is_a_noop(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
 
     assert telemetry.force_cancel_all(reason="test") == 0
@@ -842,16 +854,16 @@ def test_force_cancel_all_without_generator_or_uids_is_a_noop(tmp_path):
     assert generator.removed == []
 
 
-def test_force_cancel_all_survives_a_failing_batch_loop(tmp_path):
+def test_force_cancel_all_survives_a_failing_generation_context(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
 
-    class BrokenGenerator:
-        def remove(self, uids):
+    class BrokenContext:
+        def stop(self):
             raise RuntimeError("wedged")
 
-    telemetry.register_batch_generator(BrokenGenerator())
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    telemetry.register_context(request_id, BrokenContext())
     telemetry.bind_pending_uid((5,))
 
     assert telemetry.force_cancel_all(reason="test") == 0
@@ -868,6 +880,8 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((9,))
 
     cancel_path = tmp_path / "dep-1-cancel.json"
@@ -885,7 +899,8 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
     )
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
-    assert generator.removed == [[9]]
+    assert context.stopped is True
+    assert generator.removed == []
     ack = json.loads(
         (tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8")
     )
@@ -894,7 +909,7 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
 
     # Same epoch is not consumed twice.
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
-    assert generator.removed == [[9]]
+    assert generator.removed == []
 
 
 def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
@@ -931,6 +946,8 @@ def test_cancel_file_from_an_old_plan_or_worker_lifetime_is_ignored(tmp_path):
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((11,))
     cancel_path = tmp_path / "dep-1-cancel.json"
 
@@ -976,7 +993,8 @@ def test_cancel_file_from_an_old_plan_or_worker_lifetime_is_ignored(tmp_path):
         encoding="utf-8",
     )
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
-    assert generator.removed == [[11]]
+    assert context.stopped is True
+    assert generator.removed == []
 
 
 def test_existing_matching_cancel_is_a_startup_watermark_not_durable_state(tmp_path):
@@ -1000,6 +1018,8 @@ def test_existing_matching_cancel_is_a_startup_watermark_not_durable_state(tmp_p
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((12,))
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
@@ -1009,4 +1029,5 @@ def test_existing_matching_cancel_is_a_startup_watermark_not_durable_state(tmp_p
     payload["epoch"] = 4243
     cancel_path.write_text(json.dumps(payload), encoding="utf-8")
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
-    assert generator.removed == [[12]]
+    assert context.stopped is True
+    assert generator.removed == []
