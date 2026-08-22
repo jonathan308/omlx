@@ -615,6 +615,8 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
             "sparse_indexer_native_topk",
             "asymmetric_tensor_parallel",
             "deepseek_v4_fused_decode_attention",
+            "deepseek_v4_adaptive_prefill",
+            "deepseek_v4_prefill_yield",
         ):
             optional = capabilities.get(key)
             if optional is None:

@@ -393,6 +393,8 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
             "prefill_allocator_reuse",
             "sparse_indexer_row_parallel",
             "deepseek_v4_fused_decode_attention",
+            "deepseek_v4_adaptive_prefill",
+            "deepseek_v4_prefill_yield",
         )
     }
     payload = _marker(
@@ -421,6 +423,8 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
         job["optimizations"]["deepseek_v4_fused_decode_attention"]["active"]
         is True
     )
+    assert job["optimizations"]["deepseek_v4_adaptive_prefill"]["active"] is True
+    assert job["optimizations"]["deepseek_v4_prefill_yield"]["active"] is True
 
 
 def test_runtime_markers_ignore_symlinks_and_invalid_json(tmp_path):
