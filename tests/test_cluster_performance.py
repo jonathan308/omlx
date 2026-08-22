@@ -865,6 +865,21 @@ def test_ds4_tensor_prefill_switches_from_2k_to_1k_after_4k(monkeypatch):
     ]
     assert clears == [True, True, True]
 
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "0")
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("throughput"),
+        batchable=True,
+        pipeline_parallel=False,
+    ) as capabilities:
+        assert (
+            capabilities["deepseek_v4_adaptive_prefill"][
+                "shape_warmup_tokens"
+            ]
+            == 0
+        )
+
 
 def test_ds4_long_request_uses_1k_from_its_first_outer_chunk(monkeypatch):
     class Cache:
