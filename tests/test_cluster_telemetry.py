@@ -500,8 +500,12 @@ def test_server_patch_broadcasts_distributed_request_point_to_point(monkeypatch)
             self._is_distributed = True
             self._rank = 0
 
-        def _share_request(self, request):
+        def _share_object(self, _obj):
             raise AssertionError("distributed path must not call MLX-LM all-sum share")
+
+        def _share_request(self, request):
+            shareable = self._share_object(request[1:] if request else None)
+            return None if shareable is None else (request[0], *shareable)
 
     sent = []
     monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
@@ -556,8 +560,14 @@ def test_server_patch_receives_distributed_request_point_to_point(monkeypatch):
             self._is_distributed = True
             self._rank = 1
 
-        def _share_request(self, request):
+        def _share_object(self, _obj):
             raise AssertionError("distributed path must not call MLX-LM all-sum share")
+
+        def _share_request(self, request):
+            from queue import Queue
+
+            shareable = self._share_object(request[1:] if request else None)
+            return None if shareable is None else (Queue(), *shareable)
 
     monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
     monkeypatch.setattr(mx.distributed, "init", lambda: Group())
