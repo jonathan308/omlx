@@ -51,6 +51,9 @@ cannot enter the lossless path without array-equal proof.
 The proposed primitive ABI is frozen by
 `benchmarks/bench_ds4_tp_prefill_moe_campaign.py` as
 `deepseek_mxfp4_gather_qmm_pair_swiglu_blocks`.
+The unbuilt fixed-shape Metal sketch lives in
+`benchmarks/prototypes/ds4_tp_prefill_moe_phase_a.metal`; it is intentionally
+not listed in CMake.
 
 The kernel keeps BM32/BN32/BK32 and the existing Steel MMA K sequence. One
 threadgroup stages X once, loads independent up and gate MXFP4 tiles, and

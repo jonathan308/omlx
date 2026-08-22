@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 
 import pytest
 
@@ -107,3 +108,20 @@ def test_materialization_and_roofline_contract_for_tp4_4_m1024():
     assert report["phase_b_contract"][
         "per_slot_down_weight_read_amplification"
     ] == 6.0
+
+
+def test_isolated_metal_prototype_keeps_shared_x_and_ordered_non_atomic_tail():
+    source = (
+        Path(__file__).parents[1]
+        / "benchmarks/prototypes/ds4_tp_prefill_moe_phase_a.metal"
+    ).read_text()
+
+    assert "prototype_ds4_mxfp4_pair_swiglu_f16_bm32_bn32" in source
+    assert "loader_x.load_safe(x_dims);" in source
+    assert source.count("loader_x.load_safe(x_dims);") == 1
+    assert "mma_up.mma(Xs, Wup);" in source
+    assert "mma_gate.mma(Xs, Wgate);" in source
+    assert "prototype_ds4_moe_top6_post_down_bf16" in source
+    assert "for (int slot = 0; slot < 6; ++slot)" in source
+    assert "route_value * route_score" in source
+    assert "atomic_" not in source
