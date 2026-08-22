@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from functools import lru_cache
@@ -45,6 +46,7 @@ _DEEPSEEK_MXFP4_FULL_DECODE = os.environ.get(
 _DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS = int(
     os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1")
 )
+_DEEPSEEK_MXFP4_FULL_DECODE_LOGGED = False
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -458,6 +460,16 @@ class SwitchGLU(nn.Module):
 
     def __call__(self, x, indices, scores=None) -> mx.array:
         if self._can_use_mxfp4_full_decode(x, indices, scores):
+            global _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED
+            if not _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED:
+                _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "DeepSeek V4 full routed-MoE decode primitive active "
+                    "(tokens=%d, hidden=%d, local_intermediate=%d)",
+                    indices.size // 6,
+                    int(x.shape[-1]),
+                    int(self.up_proj["weight"].shape[1]),
+                )
             return glm_fast.deepseek_mxfp4_full_decode(
                 x,
                 self.up_proj["weight"],
