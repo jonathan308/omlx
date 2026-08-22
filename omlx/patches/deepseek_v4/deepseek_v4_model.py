@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten, tree_map_with_path
 
@@ -736,6 +737,10 @@ _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
 _DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
     "OMLX_DSV4_INDEXER_ROW_TP", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = os.getenv(
+    "OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl"
+).strip().lower()
+_DEEPSEEK_V4_INDEXER_CONTROL_LOGGED = False
 try:
     _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = max(
         0, int(os.getenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "2048"))
@@ -766,7 +771,70 @@ def _broadcast_indexer_indices(
     group: Any,
     owner: int,
 ) -> mx.array:
-    """Broadcast a compact owner-computed top-k through the small all-reduce."""
+    """Broadcast one exact owner-computed top-k decision.
+
+    The shipped path remains JACCL until live A/B promotes the separate control
+    channel.  ``control`` is deliberately explicit: once any rank starts a TCP
+    packet, falling back locally would split the distributed operation order.
+    Prefill row parallelism and DSpark verification never enter this helper's
+    owner-decode call sites, so their collective schedules remain unchanged.
+    """
+
+    # Startup-fixed on purpose. Changing transport between layers would split
+    # the global control/JACCL operation order across ranks.
+    transport = _DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT
+    if transport in {"control", "tcp"}:
+        global _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED
+        from omlx.cluster.control_plane import active_rank_control_plane
+
+        control = active_rank_control_plane()
+        if control is None:
+            raise RuntimeError(
+                "DS4 indexer control transport requires an active rank-control plane"
+            )
+        rank = int(group.rank())
+        size = int(group.size())
+        if int(control.rank) != rank or int(control.world_size) != size:
+            raise RuntimeError(
+                "DS4 indexer control transport does not match its tensor group"
+            )
+        expected_shape = tuple(int(value) for value in shape)
+        count = math.prod(expected_shape)
+        if count < 1:
+            raise RuntimeError("DS4 indexer decision shape is empty")
+        expected_size = count * np.dtype(">u4").itemsize
+        if not _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED:
+            _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED = True
+            logging.getLogger(__name__).info(
+                "deepseek_v4: sparse decode index decisions use the rank-control "
+                "plane (owner=%d, payload=%d bytes)",
+                owner,
+                expected_size,
+            )
+        if rank == owner:
+            if indices is None or tuple(indices.shape) != expected_shape:
+                raise RuntimeError("DS4 indexer owner produced an invalid decision")
+            local = indices.astype(mx.uint32).reshape(-1)
+            # The control plane is host TCP, so this is the intentional graph
+            # boundary: materialize the owner's deterministic top-k before the
+            # peer can consume it.  Only 512 uint32 values cross for DS4 decode.
+            payload = np.asarray(local, dtype=">u4").tobytes()
+        else:
+            local = None
+            payload = None
+        received = control.broadcast_owned_bytes(
+            payload,
+            source_rank=owner,
+            expected_size=expected_size,
+        )
+        if rank == owner:
+            return local.reshape(expected_shape)
+        values = np.frombuffer(received, dtype=">u4").astype(np.uint32)
+        return mx.array(values, dtype=mx.uint32).reshape(expected_shape)
+    if transport not in {"jaccl", "collective", "all_sum"}:
+        raise RuntimeError(
+            "OMLX_DSV4_INDEXER_DECISION_TRANSPORT must be jaccl or control"
+        )
 
     local = (
         indices.astype(mx.int32)

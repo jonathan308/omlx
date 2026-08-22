@@ -6,6 +6,7 @@ from __future__ import annotations
 import pickle
 import socket
 import struct
+import threading
 import time
 import zlib
 from contextlib import AbstractContextManager
@@ -13,10 +14,15 @@ from typing import Any
 
 _HANDSHAKE_MAGIC = b"OC2H"
 _MESSAGE_MAGIC = b"OC2M"
+_OWNED_BYTES_MAGIC = b"OC2B"
 _VERSION = 1
 _HANDSHAKE = struct.Struct("!4sII64s")
 _HEADER = struct.Struct("!4sIIII")
+_OWNED_BYTES_HEADER = struct.Struct("!4sIIIII")
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
+
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_CONTROL_PLANE: "RankControlPlane | None" = None
 
 
 def _recv_exact(stream: socket.socket, size: int) -> bytes:
@@ -27,6 +33,20 @@ def _recv_exact(stream: socket.socket, size: int) -> bytes:
             raise ConnectionError("rank-control peer closed its socket")
         chunks.extend(part)
     return bytes(chunks)
+
+
+def active_rank_control_plane() -> "RankControlPlane | None":
+    """The process's connected rank-control channel, if serving a cluster.
+
+    Distributed rank workers host exactly one model server per process.  The
+    generation thread is created after the control channel connects, but it is
+    a different Python thread, so a ``ContextVar`` or thread-local cannot carry
+    the channel into model code.  A process-scoped reference matches the worker
+    lifetime while keeping ordinary/single-node model imports independent.
+    """
+
+    with _ACTIVE_LOCK:
+        return _ACTIVE_CONTROL_PLANE
 
 
 class RankControlPlane(AbstractContextManager["RankControlPlane"]):
@@ -68,12 +88,20 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self._peers: dict[int, socket.socket] = {}
         self._stream: socket.socket | None = None
         self._sequence = 0
+        # Request/cancellation control and model-owned decisions normally run
+        # on the same generation thread.  Serialize defensively so an
+        # accidental second caller cannot interleave packet headers or consume
+        # the shared sequence twice.
+        self._operation_lock = threading.RLock()
 
     def __enter__(self) -> "RankControlPlane":
+        global _ACTIVE_CONTROL_PLANE
         if self.rank == 0:
             self._accept_workers()
         else:
             self._connect_to_coordinator()
+        with _ACTIVE_LOCK:
+            _ACTIVE_CONTROL_PLANE = self
         return self
 
     def _configure(self, stream: socket.socket) -> None:
@@ -144,44 +172,162 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
     def broadcast_object(self, obj: Any) -> Any:
         """Broadcast one rank-zero-owned Python object in strict sequence."""
 
-        self._sequence += 1
-        if self.rank == 0:
-            payload = pickle.dumps(obj) if obj is not None else b""
-            if len(payload) > _MAX_OBJECT_BYTES:
-                raise RuntimeError("rank-control object exceeds 256 MiB")
-            header = _HEADER.pack(
-                _MESSAGE_MAGIC,
-                _VERSION,
-                self._sequence,
-                len(payload),
-                zlib.crc32(payload),
-            )
-            packet = header + payload
-            for rank in range(1, self.world_size):
-                self._peers[rank].sendall(packet)
-            return obj
+        with self._operation_lock:
+            self._sequence += 1
+            if self.rank == 0:
+                payload = pickle.dumps(obj) if obj is not None else b""
+                if len(payload) > _MAX_OBJECT_BYTES:
+                    raise RuntimeError("rank-control object exceeds 256 MiB")
+                header = _HEADER.pack(
+                    _MESSAGE_MAGIC,
+                    _VERSION,
+                    self._sequence,
+                    len(payload),
+                    zlib.crc32(payload),
+                )
+                packet = header + payload
+                for rank in range(1, self.world_size):
+                    self._peers[rank].sendall(packet)
+                return obj
 
-        stream = self._stream
-        if stream is None:
-            raise RuntimeError("rank-control worker is not connected")
-        magic, version, sequence, size, checksum = _HEADER.unpack(
-            _recv_exact(stream, _HEADER.size)
-        )
-        if magic != _MESSAGE_MAGIC or version != _VERSION:
-            raise RuntimeError("rank-control message header is invalid")
-        if sequence != self._sequence:
-            raise RuntimeError(
-                f"rank-control sequence diverged: expected {self._sequence}, "
-                f"received {sequence}"
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            magic, version, sequence, size, checksum = _HEADER.unpack(
+                _recv_exact(stream, _HEADER.size)
             )
-        if size > _MAX_OBJECT_BYTES:
-            raise RuntimeError("rank-control object has an invalid size")
+            if magic != _MESSAGE_MAGIC or version != _VERSION:
+                raise RuntimeError("rank-control message header is invalid")
+            if sequence != self._sequence:
+                raise RuntimeError(
+                    f"rank-control sequence diverged: expected {self._sequence}, "
+                    f"received {sequence}"
+                )
+            if size > _MAX_OBJECT_BYTES:
+                raise RuntimeError("rank-control object has an invalid size")
+            payload = _recv_exact(stream, size) if size else b""
+            if zlib.crc32(payload) != checksum:
+                raise RuntimeError("rank-control object failed CRC32")
+            return pickle.loads(payload) if payload else None
+
+    def _owned_bytes_packet(
+        self,
+        stream: socket.socket,
+        *,
+        sequence: int,
+        source_rank: int,
+        expected_size: int,
+    ) -> tuple[bytes, bytes]:
+        header = _recv_exact(stream, _OWNED_BYTES_HEADER.size)
+        magic, version, received_sequence, source, size, checksum = (
+            _OWNED_BYTES_HEADER.unpack(header)
+        )
+        if magic != _OWNED_BYTES_MAGIC or version != _VERSION:
+            raise RuntimeError("rank-control owned-bytes header is invalid")
+        if received_sequence != sequence:
+            raise RuntimeError(
+                f"rank-control sequence diverged: expected {sequence}, "
+                f"received {received_sequence}"
+            )
+        if source != source_rank:
+            raise RuntimeError(
+                f"rank-control owned-bytes source diverged: expected {source_rank}, "
+                f"received {source}"
+            )
+        if size != expected_size or size > _MAX_OBJECT_BYTES:
+            raise RuntimeError(
+                f"rank-control owned-bytes size diverged: expected {expected_size}, "
+                f"received {size}"
+            )
         payload = _recv_exact(stream, size) if size else b""
         if zlib.crc32(payload) != checksum:
-            raise RuntimeError("rank-control object failed CRC32")
-        return pickle.loads(payload) if payload else None
+            raise RuntimeError("rank-control owned bytes failed CRC32")
+        return header + payload, payload
+
+    def broadcast_owned_bytes(
+        self,
+        payload: bytes | None,
+        *,
+        source_rank: int,
+        expected_size: int,
+    ) -> bytes:
+        """Broadcast fixed-size bytes owned by any rank in strict sequence.
+
+        Rank zero is the TCP hub.  A nonzero owner sends one framed packet to
+        rank zero, which validates and forwards the exact packet to every other
+        worker.  The source rank never receives its own payload back.  This is
+        the fixed-schedule primitive needed by model decisions such as DS4's
+        decode top-k indices: all ranks call it exactly once, the expected size
+        is known before I/O, and no tensor reduction or pickle is involved.
+        """
+
+        if not 0 <= int(source_rank) < self.world_size:
+            raise ValueError("rank-control owned-bytes source is invalid")
+        if not 0 <= int(expected_size) <= _MAX_OBJECT_BYTES:
+            raise ValueError("rank-control owned-bytes size is invalid")
+        if payload is not None and not isinstance(payload, bytes):
+            raise TypeError("rank-control owned payload must be bytes")
+        if self.rank == source_rank:
+            if payload is None or len(payload) != expected_size:
+                raise RuntimeError(
+                    "rank-control owned source produced an invalid payload"
+                )
+        elif payload is not None:
+            raise RuntimeError("rank-control non-source supplied owned bytes")
+
+        with self._operation_lock:
+            self._sequence += 1
+            sequence = self._sequence
+            if self.rank == source_rank:
+                header = _OWNED_BYTES_HEADER.pack(
+                    _OWNED_BYTES_MAGIC,
+                    _VERSION,
+                    sequence,
+                    source_rank,
+                    expected_size,
+                    zlib.crc32(payload),
+                )
+                packet = header + payload
+            else:
+                packet = b""
+
+            if self.rank == 0:
+                if source_rank == 0:
+                    owned = payload
+                else:
+                    source = self._peers.get(source_rank)
+                    if source is None:
+                        raise RuntimeError("rank-control owned source is not connected")
+                    packet, owned = self._owned_bytes_packet(
+                        source,
+                        sequence=sequence,
+                        source_rank=source_rank,
+                        expected_size=expected_size,
+                    )
+                for rank in range(1, self.world_size):
+                    if rank != source_rank:
+                        self._peers[rank].sendall(packet)
+                return owned
+
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            if self.rank == source_rank:
+                stream.sendall(packet)
+                return payload
+            _packet, owned = self._owned_bytes_packet(
+                stream,
+                sequence=sequence,
+                source_rank=source_rank,
+                expected_size=expected_size,
+            )
+            return owned
 
     def close(self) -> None:
+        global _ACTIVE_CONTROL_PLANE
+        with _ACTIVE_LOCK:
+            if _ACTIVE_CONTROL_PLANE is self:
+                _ACTIVE_CONTROL_PLANE = None
         for stream in self._peers.values():
             try:
                 stream.close()
@@ -205,4 +351,4 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self.close()
 
 
-__all__ = ["RankControlPlane"]
+__all__ = ["RankControlPlane", "active_rank_control_plane"]

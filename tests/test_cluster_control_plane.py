@@ -58,6 +58,56 @@ def test_rank_control_plane_broadcasts_objects_in_sequence():
     assert received == expected
 
 
+def test_rank_control_plane_broadcasts_fixed_bytes_from_nonzero_owner():
+    port = _free_port()
+    token = "b" * 64
+    worker_owned = b"worker-one-index-decision"
+    coordinator_owned = b"rank-zero-follow-up"
+    received = {}
+    failures = []
+
+    def participant(rank):
+        try:
+            with RankControlPlane(
+                rank=rank,
+                world_size=3,
+                host="127.0.0.1",
+                port=port,
+                token=token,
+                connect_timeout=5,
+                io_timeout=5,
+            ) as control:
+                obj = control.broadcast_object(
+                    {"kind": "request"} if rank == 0 else None
+                )
+                from_worker = control.broadcast_owned_bytes(
+                    worker_owned if rank == 1 else None,
+                    source_rank=1,
+                    expected_size=len(worker_owned),
+                )
+                from_coordinator = control.broadcast_owned_bytes(
+                    coordinator_owned if rank == 0 else None,
+                    source_rank=0,
+                    expected_size=len(coordinator_owned),
+                )
+                received[rank] = (obj, from_worker, from_coordinator)
+        except Exception as exc:  # pragma: no cover - relayed to main thread
+            failures.append(exc)
+
+    threads = [threading.Thread(target=participant, args=(rank,)) for rank in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=8)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert received == {
+        rank: ({"kind": "request"}, worker_owned, coordinator_owned)
+        for rank in range(3)
+    }
+
+
 def test_rank_control_plane_rejects_invalid_identity():
     try:
         RankControlPlane(

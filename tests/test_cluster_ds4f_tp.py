@@ -10,6 +10,7 @@ must follow wq_b's segment-interleaved sharding rather than a contiguous split.
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -347,6 +348,84 @@ def test_decode_non_owner_skips_duplicate_indexer_scoring(dsv4, monkeypatch):
     )
 
     assert mx.array_equal(result, expected).item()
+
+
+@pytest.mark.parametrize("rank", (0, 1), ids=("owner", "receiver"))
+def test_decode_indexer_decision_can_use_fixed_control_packet(
+    dsv4, monkeypatch, rank
+):
+    group = _FakeGroup(rank, 2)
+    expected = mx.arange(512, dtype=mx.uint32).reshape(1, 1, 512)
+    packet = struct.pack("!512I", *range(512))
+    calls = []
+
+    class Control:
+        world_size = 2
+
+        def __init__(self, control_rank):
+            self.rank = control_rank
+
+        def broadcast_owned_bytes(
+            self, payload, *, source_rank, expected_size
+        ):
+            calls.append((payload, source_rank, expected_size))
+            assert source_rank == 0
+            assert expected_size == len(packet)
+            if self.rank == source_rank:
+                assert payload == packet
+                return payload
+            assert payload is None
+            return packet
+
+    monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT", "control")
+    from omlx.cluster import control_plane
+
+    monkeypatch.setattr(
+        control_plane,
+        "active_rank_control_plane",
+        lambda: Control(rank),
+    )
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("control decisions must not enter JACCL all_sum")
+        ),
+    )
+
+    result = dsv4._broadcast_indexer_indices(
+        expected if rank == 0 else None,
+        shape=tuple(expected.shape),
+        group=group,
+        owner=0,
+    )
+
+    assert mx.array_equal(result, expected).item()
+    assert len(calls) == 1
+
+
+def test_decode_indexer_control_transport_fails_closed_without_channel(
+    dsv4, monkeypatch
+):
+    monkeypatch.setattr(dsv4, "_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT", "control")
+    from omlx.cluster import control_plane
+
+    monkeypatch.setattr(control_plane, "active_rank_control_plane", lambda: None)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a missing control plane must not fall back mid-schedule")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="active rank-control plane"):
+        dsv4._broadcast_indexer_indices(
+            None,
+            shape=(1, 1, 512),
+            group=_FakeGroup(1, 2),
+            owner=0,
+        )
 
 
 # --- (d) kv_fixed_bytes_per_layer accounting --------------------------------
