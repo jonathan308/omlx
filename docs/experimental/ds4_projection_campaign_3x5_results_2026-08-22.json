@@ -44,7 +44,9 @@
     "stock_variant": "BM64/BN64/BK64/WM2/WN2",
     "compiled_variants": 10,
     "local_device_available": false,
-    "m5_measurement": "pending"
+    "m5_measurement": "O-A variant 0 confirmed exact and promotable",
+    "promoted_default_off_shape": [1, 8, 1024, 2560],
+    "environment": "OMLX_DSV4_NAX_OA_PREFILL"
   },
   "gate": {
     "minimum_projection_bucket_speedup": 1.30,

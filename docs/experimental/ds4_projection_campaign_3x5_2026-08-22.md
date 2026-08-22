@@ -12,8 +12,10 @@ NAX tile sweep: stock MLX hardcodes BM64/BN64/BK64, WM2/WN2 for every M=1024
 MXFP8 projection despite radically different Q-B, O-A, and O-B shapes.
 
 The optional NAX source in this campaign compiles ten exact-arithmetic tile
-variants, including stock as variant 0. It is unmeasured here because the local
-M3 has no TensorOps. It must be run on the M5 before any production work.
+variants, including stock as variant 0. A subsequent M5 confirmation promoted
+one narrow slice: variant 0 for rank-1 O-A with prepared shape
+`[1,8,1024,2560]`. It is wired behind default-off
+`OMLX_DSV4_NAX_OA_PREFILL=1`; every other projection and shape remains stock.
 
 ## Exact shapes
 
@@ -113,3 +115,9 @@ to the same balanced bucket median and require at least 1.30x. If the NAX sweep
 also fails, there is no evidence-backed projection primitive at this gate; the
 next work should be the exact norm/RoPE finalizer as an independent full-layer
 optimization, not further concatenation.
+
+The production-facing dispatch remains deliberately narrower than the sweep:
+BF16, non-training, non-verification, M=1024, 40-head O-A; MXFP8 weight
+`[8,1024,640]`, scales `[8,1024,80]`; NAX artifact and device capability both
+required. All checks happen before the native graph is created. The cluster
+hostfile exports an explicit `0` by default so both ranks share the rollback.

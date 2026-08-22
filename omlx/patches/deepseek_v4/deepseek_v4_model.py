@@ -359,6 +359,84 @@ _DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED = (
     in ("0", "false", "off")
 )
 _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = False
+_DEEPSEEK_V4_NAX_OA_PREFILL = os.getenv(
+    "OMLX_DSV4_NAX_OA_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = False
+
+
+def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
+    """Return true only for the confirmed M5 rank-1 O-A prefill contract."""
+
+    if not _DEEPSEEK_V4_NAX_OA_PREFILL or getattr(attn, "training", False):
+        return False
+    if tuple(prepared.shape) != (1, 8, 1024, 2560):
+        return False
+    if prepared.dtype != mx.bfloat16:
+        return False
+
+    projection = getattr(attn, "wo_a", None)
+    if (
+        projection is None
+        or not callable(getattr(projection, "get", None))
+        or getattr(projection, "group_size", None) != 32
+        or getattr(projection, "bits", None) != 8
+        or getattr(projection, "mode", None) != "mxfp8"
+        or projection.get("biases") is not None
+    ):
+        return False
+    weight = projection.get("weight")
+    scales = projection.get("scales")
+    if (
+        weight is None
+        or scales is None
+        or tuple(weight.shape) != (8, 1024, 640)
+        or tuple(scales.shape) != (8, 1024, 80)
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.uint8
+    ):
+        return False
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return bool(
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_projection_mxfp8_qmm")
+            and glm_fast.ds4_projection_nax_kernels_built()
+            and glm_fast.ds4_projection_nax_device_available()
+        )
+    except Exception:
+        # Capability probing happens before graph construction. An old or
+        # classic-only extension keeps the unchanged stock O-A path.
+        return False
+
+
+def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
+    """Project one prepared O-A tensor, selecting native only before enqueue."""
+
+    if not _can_use_nax_oa_prefill(attn, prepared):
+        return attn.wo_a(prepared)
+
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    global _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED:
+        _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact M5 NAX O-A prefill tile "
+            "(M=1024, heads=40, BM64/BN64/BK64; "
+            "OMLX_DSV4_NAX_OA_PREFILL=0 disables)"
+        )
+    projection = attn.wo_a
+    return glm_fast.ds4_projection_mxfp8_qmm(
+        mx.contiguous(prepared),
+        projection["weight"],
+        projection["scales"],
+        variant=0,
+        use_nax=True,
+        nax_variant=0,
+    )
 
 
 def set_dspark_verify_armed(flag: bool) -> None:
@@ -377,9 +455,6 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
 
     def finish(row: mx.array) -> mx.array:
         return row.transpose(0, 2, 1, 3).flatten(-2)
-
-    def project_a(row: mx.array) -> mx.array:
-        return finish(attn.wo_a(prepare(row)))
 
     if is_dspark_verify_armed():
         prepared = mx.concatenate(
@@ -402,7 +477,8 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
                 axis=1,
             )
         return attn.wo_b(projected)
-    return attn.wo_b(project_a(out))
+    prepared = prepare(out)
+    return attn.wo_b(finish(_project_attention_oa(attn, prepared)))
 
 
 def _batched_m1_attention(

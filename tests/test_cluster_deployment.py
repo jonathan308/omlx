@@ -109,6 +109,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_WSDPA_TOPK",
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
+        "OMLX_DSV4_NAX_OA_PREFILL",
         "OMLX_TP_MOE_SHARD_WEIGHTS",
         "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
@@ -141,6 +142,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TOPK=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
+    assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
     assert "OMLX_TP_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
@@ -158,6 +160,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
     monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
+    monkeypatch.setenv("OMLX_DSV4_NAX_OA_PREFILL", "1")
     monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
     deployment = _deployment()
 
@@ -180,6 +183,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TP=0" in envs
     assert "OMLX_DSV4_WSDPA_TP=1" not in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
+    assert "OMLX_DSV4_NAX_OA_PREFILL=1" in envs
     assert envs.count("OMLX_TP_MOE_SHARD_WEIGHTS=4,4") == 1
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs

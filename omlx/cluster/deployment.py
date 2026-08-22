@@ -120,6 +120,10 @@ _RANK_ENV_DEFAULTS = (
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.
     ("OMLX_DSV4_MOE_TAIL8", "0"),
+    # Exact M=1024 M5 TensorOps O-A projection for the 40-head 5/8 shard.
+    # Default-off until the full TP A/B clears; exporting the value prevents
+    # coordinator/worker capability decisions from diverging.
+    ("OMLX_DSV4_NAX_OA_PREFILL", "0"),
     # Optional routed-MoE-only TP split layered over a signed unequal outer
     # plan. Empty preserves the outer split. One hostfile value is exported to
     # every rank so a mixed plan cannot diverge locally.

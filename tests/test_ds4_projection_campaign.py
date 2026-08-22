@@ -61,7 +61,7 @@ def test_classic_and_nax_sweeps_include_stock_and_nine_alternatives():
     assert "return {64, 64, 64, 2, 2};" in cpp
 
 
-def test_isolated_symbol_is_built_but_not_used_by_model_dispatch():
+def test_symbol_is_built_and_only_reached_through_the_narrow_default_off_gate():
     root = Path(__file__).parents[1]
     cmake = (root / "omlx/custom_kernels/glm_moe_dsa/csrc/CMakeLists.txt").read_text()
     model = (root / "omlx/patches/deepseek_v4/deepseek_v4_model.py").read_text()
@@ -69,5 +69,7 @@ def test_isolated_symbol_is_built_but_not_used_by_model_dispatch():
 
     assert "ds4_projection_qmm.metal" in cmake
     assert "ds4_projection_qmm_nax.metal" in cmake
-    assert "ds4_projection_mxfp8_qmm" not in model
+    assert '"OMLX_DSV4_NAX_OA_PREFILL", "0"' in model
+    assert "_can_use_nax_oa_prefill" in model
+    assert "ds4_projection_mxfp8_qmm" in model
     assert "ds4_projection_mxfp8_qmm" not in switch
