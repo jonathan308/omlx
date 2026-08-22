@@ -46,6 +46,34 @@ _SHARED_OBJECT_HEADER_BYTES = 64
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 
 
+def _python_token_id(value: Any) -> int:
+    """Normalize a generated token to a Python signed-32-bit index.
+
+    MLX samplers may surface a uint32 scalar (or a one-element nested list
+    after ``tolist``). Those are valid model values but some MLX releases
+    reject them as ``array[index]`` objects. The private server indexes the
+    response logprob row after BatchGenerator.next(), so normalize at that
+    queue boundary without touching the device-side token graph.
+    """
+
+    while isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            raise ValueError("generated token must be a scalar")
+        value = value[0]
+    item = getattr(value, "item", None)
+    if callable(item) and not isinstance(value, (int, bool)):
+        value = item()
+    if isinstance(value, bool):
+        raise ValueError("generated token must be an integer")
+    try:
+        token = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("generated token must be an integer") from exc
+    if not 0 <= token <= 2**31 - 1:
+        raise ValueError("generated token is outside signed int32 range")
+    return token
+
+
 class MarkerWriter(Protocol):
     """Small RuntimeMarker surface used by the telemetry observer."""
 
@@ -1157,6 +1185,8 @@ def install_server_telemetry(
             started = time.perf_counter()
             prompt_responses, generation_responses = super().next()
             elapsed = time.perf_counter() - started
+            for response in generation_responses:
+                response.token = _python_token_id(response.token)
             for response in prompt_responses:
                 progress = getattr(response, "progress", None)
                 uid = getattr(response, "uid", None)

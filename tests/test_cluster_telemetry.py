@@ -10,6 +10,7 @@ from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
     RuntimeTelemetry,
     _TelemetryQueue,
+    _python_token_id,
     install_server_telemetry,
 )
 
@@ -37,6 +38,24 @@ class _Queue:
     def put(self, item, *args, **kwargs):
         self.items.append((item, args, kwargs))
         return "queued"
+
+
+def test_generated_token_is_normalized_for_logprob_indexing():
+    class Scalar:
+        def item(self):
+            return 129_279
+
+    assert _python_token_id(Scalar()) == 129_279
+    assert _python_token_id([[42]]) == 42
+
+
+def test_generated_token_normalization_rejects_non_scalar_and_high_bit():
+    import pytest
+
+    with pytest.raises(ValueError, match="scalar"):
+        _python_token_id([1, 2])
+    with pytest.raises(ValueError, match="signed int32"):
+        _python_token_id(2**31)
 
 
 def test_telemetry_calculates_ttft_prefill_and_decode_rates():
