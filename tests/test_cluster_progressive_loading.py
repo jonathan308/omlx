@@ -631,7 +631,11 @@ def test_tensor_load_does_not_pin_pre_sharded_layer_arrays(monkeypatch):
 
     class FakeMX:
         cpu = object()
-        distributed = SimpleNamespace(all_sum=lambda value, stream=None: value)
+        distributed = SimpleNamespace(
+            all_sum=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("launcher rank_ready markers own the load barrier")
+            )
+        )
 
         def __init__(self):
             self.evaluated = []
