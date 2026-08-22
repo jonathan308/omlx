@@ -74,6 +74,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/plan",
     "/admin/api/cluster/node-roles",
     "/admin/api/cluster/stage",
+    "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
 }
 
@@ -177,6 +178,7 @@ def test_wizard_consumes_only_contract_endpoints():
         "/api/cluster/pair/deny",
         "/api/cluster/pair/join",
         "/admin/api/cluster/plan",
+        "/admin/api/cluster/runtime",
         "/admin/api/cluster/deployments",
     ):
         assert endpoint in javascript
@@ -290,20 +292,181 @@ def test_plan_state_renders_the_signed_layer_split_bar():
         } <= set(assignment)
 
 
-def test_active_state_lists_devices_and_deactivates():
+def test_configured_deployment_panel_lists_devices_and_deactivates():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)
     deployments = _fixtures()["deployments_active.json"]
 
     assert "data-cluster-v2-active" in template
     assert "data-cluster-v2-active-device" in template
+    assert "data-cluster-v2-runtime-state" in template
     assert "data-cluster-v2-deactivate" in template
+    assert "configuredDeployment()" in template
+    assert "deploymentStatus().label" in template
     assert "deactivateDeployment" in javascript
     assert re.search(
         r"`/admin/api/cluster/deployments/\$\{encodeURIComponent\(id\)\}`",
         javascript,
     )
     assert deployments["deployments"][0]["deployment_id"]
+    # This is the real ClusterDeployment field, not the stale fixture-only
+    # alias that made the live page render "this model".
+    assert deployments["deployments"][0]["model"].endswith("minimax-m3")
+    assert "model_path" not in deployments["deployments"][0]
+
+
+def test_runtime_residency_separates_configuration_from_observed_workers():
+    fixtures = _fixtures()
+    deployment = fixtures["deployments_active.json"]["deployments"]
+    snapshots = {
+        name: fixtures[name]
+        for name in (
+            "runtime_detached.json",
+            "runtime_loading.json",
+            "runtime_ready.json",
+            "runtime_failed.json",
+        )
+    }
+    result = _run_wizard(
+        f"""
+component.deploymentsPayload = {json.dumps(deployment)};
+component.deploymentsLoaded = true;
+
+const snapshots = {json.dumps(snapshots)};
+const samples = {{}};
+for (const [name, snapshot] of Object.entries(snapshots)) {{
+  component.runtimePayload = snapshot;
+  component.runtimeLoaded = true;
+  component.runtimeError = '';
+  const configured = component.configuredDeployment();
+  const active = component.activeDeployment();
+  const status = component.deploymentStatus();
+  samples[name] = {{
+    runtimeState: component.deploymentRuntimeState(),
+    wizardState: component.wizardState(),
+    configured: configured && configured.deployment_id,
+    active: active && active.deployment_id,
+    modelName: component.displayModelName(configured),
+    label: status.label,
+    eyebrow: status.eyebrow,
+    detail: status.detail,
+    tone: status.tone,
+  }};
+}}
+
+// A clean unload removes the marker entirely; it has the same observed state
+// as a detached ready marker left behind by a reboot.
+component.runtimePayload = {{ jobs: [], launchers: [], warnings: [] }};
+component.runtimeLoaded = true;
+samples.empty = {{
+  runtimeState: component.deploymentRuntimeState(),
+  active: component.activeDeployment(),
+  label: component.deploymentStatus().label,
+}};
+// A launcher record is process-manager metadata, not proof that every rank is
+// alive or that the engine pool still owns the weights.
+component.runtimePayload = {{
+  jobs: [],
+  launchers: [{{
+    deployment_id: component.configuredDeployment().deployment_id,
+    phase: 'ready',
+    returncode: null,
+  }}],
+}};
+samples.launcherOnly = {{
+  runtimeState: component.deploymentRuntimeState(),
+  active: component.activeDeployment(),
+  label: component.deploymentStatus().label,
+}};
+process.stdout.write(JSON.stringify(samples));
+"""
+    )
+
+    detached = result["runtime_detached.json"]
+    assert detached["runtimeState"] == "configured"
+    assert detached["wizardState"] == "active", "management stays reachable"
+    assert detached["configured"] == "minimax-m3-9f2ab41cd0e1"
+    assert detached["active"] is None, "a detached marker is not residency"
+    assert detached["modelName"] == "minimax-m3"
+    assert detached["label"] == "Not loaded"
+    assert "no model weights are resident" in detached["detail"]
+    assert "amber" in detached["tone"]
+
+    assert result["empty"] == {
+        "runtimeState": "configured",
+        "active": None,
+        "label": "Not loaded",
+    }
+    assert result["launcherOnly"] == result["empty"]
+
+    loading = result["runtime_loading.json"]
+    assert loading["runtimeState"] == "loading"
+    assert loading["active"] is None
+    assert loading["label"] == "Loading"
+    assert "blue" in loading["tone"]
+
+    ready = result["runtime_ready.json"]
+    assert ready["runtimeState"] == "ready"
+    assert ready["active"] == ready["configured"]
+    assert ready["label"] == "Ready"
+    assert ready["eyebrow"] == "Cluster running"
+    assert "green" in ready["tone"]
+
+    failed = result["runtime_failed.json"]
+    assert failed["runtimeState"] == "failed"
+    assert failed["active"] is None
+    assert failed["label"] == "Failed"
+    assert failed["eyebrow"] == "Cluster needs attention"
+    assert failed["detail"] == "rank 1 stopped heartbeating"
+    assert "red" in failed["tone"]
+
+
+def test_runtime_poll_failure_revokes_a_previous_ready_snapshot():
+    fixtures = _fixtures()
+    result = _run_wizard(
+        f"""
+component.deploymentsPayload = {json.dumps(fixtures['deployments_active.json']['deployments'])};
+component.runtimePayload = {json.dumps(fixtures['runtime_ready.json'])};
+component.runtimeLoaded = true;
+const before = component.deploymentRuntimeState();
+component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }};
+(async () => {{
+  await component.refreshRuntime();
+  process.stdout.write(JSON.stringify({{
+    before,
+    after: component.deploymentRuntimeState(),
+    active: component.activeDeployment(),
+    loaded: component.runtimeLoaded,
+    payload: component.runtimePayload,
+    label: component.deploymentStatus().label,
+    detail: component.deploymentStatus().detail,
+  }}));
+}})();
+"""
+    )
+
+    assert result["before"] == "ready"
+    assert result["after"] == "unknown"
+    assert result["active"] is None
+    assert result["loaded"] is False
+    assert result["payload"] is None
+    assert result["label"] == "Checking"
+    assert "runtime endpoint down" in result["detail"]
+
+
+def test_one_hertz_tick_polls_runtime_ownership_and_not_just_deployments():
+    javascript = _read(JAVASCRIPT)
+    tick = javascript.split("async tick() {", 1)[1].split("},", 1)[0]
+
+    assert "this.refreshRuntime()" in tick
+    assert "runtime: '/admin/api/cluster/runtime'" in javascript
+    # A registry record keeps the management panel mounted, while only the
+    # runtime selector may return an actually active deployment.
+    state = javascript.split("wizardState() {", 1)[1].split("wizardSteps()", 1)[0]
+    assert "this.configuredDeployment()" in state
+    active = javascript.split("activeDeployment() {", 1)[1].split("},", 1)[0]
+    assert "deploymentRuntimeState" in active
+    assert "=== 'ready'" in active
 
 
 def test_legacy_view_toggle_keeps_v1_reachable_exactly_once():
@@ -862,9 +1025,9 @@ process.stdout.write(JSON.stringify(names));
     # filteredModels searches the display name too.
     filtered = javascript.split("filteredModels() {", 1)[1].split("},", 1)[0]
     assert "display_name" in filtered
-    # The active-deployment title no longer re-implements name cleanup.
+    # The configured-deployment title no longer re-implements name cleanup.
     template = _read(TEMPLATE)
-    assert "displayModelName(activeDeployment())" in template
+    assert "displayModelName(configuredDeployment())" in template
     assert "model_path.split('/').filter(Boolean).pop()" not in template
 
 
@@ -922,9 +1085,12 @@ process.stdout.write(JSON.stringify({
 
     javascript = _read(JAVASCRIPT)
     template = _read(TEMPLATE)
-    # The dead 'unknown' branch and stale stub comments are gone; the amber
-    # row reuses the toast warning tone.
-    assert "'unknown'" not in javascript
+    # The beacon row's old dead 'unknown' branch and stale stub comments are
+    # gone; runtime ownership legitimately has a separate unknown state.
+    check_rows = javascript.split("checkRows() {", 1)[1].split(
+        "checksBlockingPass()", 1
+    )[0]
+    assert "'unknown'" not in check_rows
     assert "STUB" not in javascript
     assert "row.status === 'warn'" in template
     assert "triangle-alert" in template
@@ -1069,6 +1235,7 @@ component.apiFetch = async (url, options) => {
         f"/admin/api/cluster/stage/{job_id}",
         "/admin/api/cluster/deployments",
         "/admin/api/cluster/deployments",  # refreshDeployments() GET
+        "/admin/api/cluster/runtime",  # prove eager activation is resident
     ]
     # The staging activation payload is byte-identical to the activation body
     # (one shared builder), plus parallel as an int.
@@ -1380,6 +1547,7 @@ component.apiFetch = async (url, options) => {
         "/admin/api/cluster/stage",
         "/admin/api/cluster/deployments",
         "/admin/api/cluster/deployments",  # refreshDeployments() GET
+        "/admin/api/cluster/runtime",  # fail closed if residency is absent
     ]
     assert result["stagingError"] == ""
     assert result["busy"] is False

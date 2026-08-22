@@ -820,17 +820,20 @@
             <div class="p-5 sm:p-6">
                 <div class="flex items-start justify-between gap-3">
                     <div>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400">Cluster running</div>
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400"
+                             x-text="deploymentStatus().eyebrow"></div>
                         <h4 class="text-lg font-semibold text-neutral-900 mt-1"
-                            x-text="activeDeployment() ? displayModelName(activeDeployment()) : ''"></h4>
-                        <p class="text-xs text-neutral-500 mt-1">
-                            The model starts across your Macs the next time it loads. If it is already
-                            loaded locally, unload it first so the new split applies.
-                        </p>
+                            x-text="configuredDeployment() ? displayModelName(configuredDeployment()) : ''"></h4>
+                        <p class="text-xs text-neutral-500 mt-1"
+                           x-text="deploymentStatus().detail"></p>
                     </div>
-                    <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-green-50 border border-green-200 text-green-700 self-start">
-                        <span class="w-2 h-2 rounded-full bg-current animate-pulse"></span>
-                        Active
+                    <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border self-start"
+                          :class="deploymentStatus().tone"
+                          :data-runtime-state="deploymentStatus().state"
+                          data-cluster-v2-runtime-state>
+                        <span class="w-2 h-2 rounded-full bg-current"
+                              :class="{ 'animate-pulse': deploymentStatus().pulse }"></span>
+                        <span x-text="deploymentStatus().label"></span>
                     </span>
                 </div>
 

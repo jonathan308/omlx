@@ -66,6 +66,7 @@ function clusterV2Wizard() {
         stageJob: (id) =>
             `/admin/api/cluster/stage/${encodeURIComponent(id)}`,
         nodeRoles: '/admin/api/cluster/node-roles',
+        runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
@@ -168,6 +169,13 @@ function clusterV2Wizard() {
         devicesUnreachable: false,
         deploymentsPayload: [],
         deploymentsLoaded: false,
+        // Deployments are durable configuration. Runtime is the separate,
+        // observed proof that their rank processes are loading or resident.
+        // Keeping these snapshots separate prevents a registry record from
+        // resurrecting an unloaded model after an unload or reboot.
+        runtimePayload: null,
+        runtimeLoaded: false,
+        runtimeError: '',
         discoveryHealth: null,
         discoveryHealthUnsupported: false,
 
@@ -275,6 +283,7 @@ function clusterV2Wizard() {
             if (!this.wizardVisible()) return;
             await this.refreshDevices();
             await this.refreshJoinState();
+            await this.refreshRuntime();
             this.tickCount += 1;
             if (
                 !this.deploymentsLoaded ||
@@ -353,6 +362,22 @@ function clusterV2Wizard() {
                         error?.message || 'Could not refresh deployments',
                     );
                 }
+            }
+        },
+
+        async refreshRuntime() {
+            try {
+                const payload = await this.apiFetch(CLUSTER_V2_API.runtime);
+                this.runtimePayload = payload || { jobs: [], launchers: [] };
+                this.runtimeLoaded = true;
+                this.runtimeError = '';
+            } catch (error) {
+                // Fail closed. A previous ready snapshot must never remain green
+                // when the ownership endpoint can no longer prove residency.
+                this.runtimePayload = null;
+                this.runtimeLoaded = false;
+                this.runtimeError =
+                    error?.message || 'Cluster runtime status is unavailable';
             }
         },
 
@@ -461,10 +486,168 @@ function clusterV2Wizard() {
             return devices;
         },
 
-        activeDeployment() {
+        configuredDeployment() {
             return this.deploymentsPayload.length
                 ? this.deploymentsPayload[0]
                 : null;
+        },
+
+        deploymentRuntimeJobs(deployment = this.configuredDeployment()) {
+            const id = deployment?.deployment_id;
+            const jobs = this.runtimePayload?.jobs;
+            if (!id || !Array.isArray(jobs)) return [];
+            return jobs.filter((job) => job?.deployment_id === id);
+        },
+
+        deploymentRuntimeLauncher(deployment = this.configuredDeployment()) {
+            const id = deployment?.deployment_id;
+            const launchers = this.runtimePayload?.launchers;
+            if (!id || !Array.isArray(launchers)) return null;
+            return (
+                launchers.find((launcher) => launcher?.deployment_id === id) ||
+                null
+            );
+        },
+
+        deploymentRuntimeState(deployment = this.configuredDeployment()) {
+            if (!deployment) return 'none';
+            if (!this.runtimeLoaded) return 'unknown';
+
+            const jobs = this.deploymentRuntimeJobs(deployment);
+            const launcher = this.deploymentRuntimeLauncher(deployment);
+            const terminalPhases = new Set([
+                'failed',
+                'peer_lost',
+                'launcher_lost',
+            ]);
+            if (
+                jobs.some(
+                    (job) =>
+                        terminalPhases.has(job?.phase) ||
+                        (typeof job?.error === 'string' && !!job.error.trim()),
+                ) ||
+                terminalPhases.has(launcher?.phase) ||
+                launcher?.returncode != null ||
+                (typeof launcher?.failure_reason === 'string' &&
+                    !!launcher.failure_reason.trim())
+            ) {
+                return 'failed';
+            }
+
+            // Runtime ownership is reconciled server-side against the engine
+            // pool. Both ownership and a fresh live heartbeat are required;
+            // an old marker with phase=ready is explicitly detached there.
+            if (
+                jobs.some(
+                    (job) =>
+                        job?.ownership === 'loaded' &&
+                        job?.live === true &&
+                        job?.phase === 'ready',
+                )
+            ) {
+                return 'ready';
+            }
+            if (
+                jobs.some(
+                    (job) =>
+                        job?.ownership === 'loading' &&
+                        job?.live === true &&
+                        job?.phase === 'loading',
+                ) ||
+                ['preflight', 'loading'].includes(launcher?.phase)
+            ) {
+                return 'loading';
+            }
+            if (jobs.some((job) => job?.ownership === 'loaded')) {
+                // The pool still claims ownership but there is no fresh ready
+                // marker. Present this as a failure, never as a loaded model.
+                return 'failed';
+            }
+            return 'configured';
+        },
+
+        activeDeployment() {
+            const deployment = this.configuredDeployment();
+            return this.deploymentRuntimeState(deployment) === 'ready'
+                ? deployment
+                : null;
+        },
+
+        deploymentFailureReason(deployment = this.configuredDeployment()) {
+            const job = this.deploymentRuntimeJobs(deployment).find(
+                (item) =>
+                    ['failed', 'peer_lost', 'launcher_lost'].includes(
+                        item?.phase,
+                    ) || item?.error,
+            );
+            if (job?.error) return String(job.error);
+            const launcher = this.deploymentRuntimeLauncher(deployment);
+            if (launcher?.failure_reason) {
+                return String(launcher.failure_reason);
+            }
+            const tail = Array.isArray(launcher?.stderr_tail)
+                ? launcher.stderr_tail.filter(Boolean).slice(-1)[0]
+                : '';
+            return tail
+                ? String(tail)
+                : 'The worker stopped reporting a live ready state.';
+        },
+
+        deploymentStatus(deployment = this.configuredDeployment()) {
+            const state = this.deploymentRuntimeState(deployment);
+            if (state === 'ready') {
+                return {
+                    state,
+                    eyebrow: 'Cluster running',
+                    label: 'Ready',
+                    detail:
+                        'The distributed weights are resident and available through oMLX.',
+                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    pulse: true,
+                };
+            }
+            if (state === 'loading') {
+                return {
+                    state,
+                    eyebrow: 'Starting cluster',
+                    label: 'Loading',
+                    detail:
+                        'oMLX is loading and validating the model across your Macs.',
+                    tone: 'bg-blue-50 border-blue-200 text-blue-700',
+                    pulse: true,
+                };
+            }
+            if (state === 'failed') {
+                return {
+                    state,
+                    eyebrow: 'Cluster needs attention',
+                    label: 'Failed',
+                    detail: this.deploymentFailureReason(deployment),
+                    tone: 'bg-red-50 border-red-200 text-red-700',
+                    pulse: false,
+                };
+            }
+            if (state === 'unknown') {
+                return {
+                    state,
+                    eyebrow: 'Cluster configured',
+                    label: 'Checking',
+                    detail: this.runtimeError
+                        ? `Runtime status unavailable: ${this.runtimeError}`
+                        : 'Checking whether the distributed weights are resident.',
+                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    pulse: true,
+                };
+            }
+            return {
+                state: 'configured',
+                eyebrow: 'Cluster configured',
+                label: 'Not loaded',
+                detail:
+                    'The placement is saved, but no model weights are resident. This is expected after an unload or reboot.',
+                tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                pulse: false,
+            };
         },
 
         // =====================================================================
@@ -473,7 +656,9 @@ function clusterV2Wizard() {
         // =====================================================================
         wizardState() {
             if (this.devicesUnreachable) return 'error';
-            if (this.activeDeployment()) return 'active';
+            // A durable deployment keeps its management panel mounted, but its
+            // badge is driven by deploymentRuntimeState(), not by persistence.
+            if (this.configuredDeployment()) return 'active';
             if (this.stage === 'plan' && this.pairedDevices().length) {
                 return 'plan';
             }
@@ -1389,7 +1574,9 @@ function clusterV2Wizard() {
         displayModelName(model) {
             const display = String(model?.display_name || '').trim();
             if (display) return display;
-            const raw = String(model?.model_path || model?.id || '');
+            const raw = String(
+                model?.model_path || model?.model || model?.id || '',
+            );
             const segments = raw.split('/').filter(Boolean);
             while (
                 segments.length &&
@@ -1977,12 +2164,13 @@ function clusterV2Wizard() {
                 });
                 this.notify(
                     'success',
-                    'Cluster activated. The model starts across your Macs on next load.',
+                    'Cluster activated. The distributed readiness check passed.',
                 );
                 this.stage = null;
                 this.plan = null;
                 this.stagingJob = null;
                 await this.refreshDeployments();
+                await this.refreshRuntime();
             } catch (error) {
                 if (error?.status === 409) {
                     this.notify(
@@ -2016,6 +2204,7 @@ function clusterV2Wizard() {
                 });
                 this.notify('info', 'Cluster deactivated.');
                 await this.refreshDeployments();
+                await this.refreshRuntime();
             } catch (error) {
                 this.notify(
                     'error',
