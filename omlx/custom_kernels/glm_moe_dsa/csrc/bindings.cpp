@@ -41,7 +41,14 @@ NB_MODULE(_ext, m) {
       "causal_q_offset"_a = -1,
       "mask_ratio"_a = 0,
       "mask_q_offset"_a = 0,
-      "stream"_a = nb::none());
+      "stream"_a = nb::none(),
+      "use_nax"_a = false);
+  m.def(
+      "dsa_indexer_nax_kernels_built",
+      &omlx::glm_kernels::dsa_indexer_nax_kernels_built);
+  m.def(
+      "dsa_indexer_nax_runtime_active",
+      &omlx::glm_kernels::dsa_indexer_nax_runtime_active);
   m.def(
       "dsa_indexer_scores_mma",
       &omlx::glm_kernels::dsa_indexer_scores_mma,

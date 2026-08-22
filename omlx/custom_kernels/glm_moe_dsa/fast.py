@@ -98,6 +98,22 @@ def _probe_mma_score(ext) -> bool:
 _EXT_MMA_SCORE = _probe_mma_score(_ext)
 
 
+def _probe_nax_score(ext) -> bool:
+    """True iff the extension exposes the optional DS4 NAX score ABI."""
+    if ext is None:
+        return False
+    fn = getattr(ext, "dsa_indexer_scores", None)
+    doc = getattr(fn, "__doc__", None) or ""
+    return (
+        "use_nax" in doc
+        and getattr(ext, "dsa_indexer_nax_kernels_built", None) is not None
+        and getattr(ext, "dsa_indexer_nax_runtime_active", None) is not None
+    )
+
+
+_EXT_NAX_SCORE = _probe_nax_score(_ext)
+
+
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
@@ -193,6 +209,7 @@ def dsa_indexer_scores(
     causal_q_offset: int = -1,
     mask_ratio: int = 0,
     mask_q_offset: int = 0,
+    use_nax: bool = False,
     *,
     stream=None,
 ) -> mx.array:
@@ -206,12 +223,14 @@ def dsa_indexer_scores(
     (default) is the historical unmasked behavior. On extension builds
     predating the fold kwargs, the historical call signature is kept and
     the same mask is applied in a second pass with identical semantics.
+
+    ``use_nax=True`` is only a preference: rebuilt extensions route the exact
+    BF16 DS4-Flash ratio-4 prefill domain to the optional M5 TensorOps kernel,
+    while every unsupported shape and any library/pipeline load failure stays
+    on this call's Steel implementation. Older extensions ignore the hint.
     """
     if _ext is not None and _EXT_MASK_FOLD:
-        return _ext.dsa_indexer_scores(
-            queries,
-            keys,
-            weights,
+        kwargs = dict(
             causal=causal,
             unused_causal_prefix_topk=unused_causal_prefix_topk,
             skip_causal_future_store=skip_causal_future_store,
@@ -219,6 +238,22 @@ def dsa_indexer_scores(
             mask_ratio=mask_ratio,
             mask_q_offset=mask_q_offset,
             **_native_stream_kwargs(stream),
+        )
+        if _EXT_NAX_SCORE:
+            if use_nax:
+                # Shared detector mirrors mlx metal::is_nax_available() and
+                # also honors OMLX_NAX=0. Keep this import lazy so the generic
+                # GLM kernel wrapper does not load Qwen/NAX plumbing unless a
+                # DS4 caller explicitly requests the optional path.
+                from omlx.custom_kernels.nax import is_nax_available
+
+                use_nax = is_nax_available()
+            kwargs["use_nax"] = bool(use_nax)
+        return _ext.dsa_indexer_scores(
+            queries,
+            keys,
+            weights,
+            **kwargs,
         )
     if _ext is not None:
         # Older build without the mask-fold kwargs: keep the historical
@@ -256,6 +291,16 @@ def dsa_indexer_scores(
             mask[None, None], scores, mx.finfo(scores.dtype).min
         )
     return scores
+
+
+def dsa_indexer_nax_kernels_built() -> bool:
+    """Whether this extension ships the optional macOS-26.2 NAX metallib."""
+    return bool(_EXT_NAX_SCORE and _ext.dsa_indexer_nax_kernels_built())
+
+
+def dsa_indexer_nax_runtime_active() -> bool:
+    """False after a failed NAX library/pipeline lookup demotes to Steel."""
+    return bool(_EXT_NAX_SCORE and _ext.dsa_indexer_nax_runtime_active())
 
 
 def dsa_decode_scores(

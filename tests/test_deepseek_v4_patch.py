@@ -2530,6 +2530,123 @@ class TestIndexerFallbackTiling:
         assert dm._INDEXER_MAX_ELEMS < 2**31
 
 
+class TestDS4NAXIndexerScoreDispatch:
+    @staticmethod
+    def _exact_config(dm):
+        return SimpleNamespace(
+            model_type="deepseek_v4",
+            vocab_size=129280,
+            hidden_size=4096,
+            moe_intermediate_size=2048,
+            num_hidden_layers=43,
+            num_attention_heads=64,
+            n_routed_experts=256,
+            num_experts_per_tok=6,
+            max_position_embeddings=1048576,
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=512,
+        )
+
+    def test_startup_gate_requires_exact_ds4f_ratio4_and_nax(
+        self, applied_patch, monkeypatch
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", True)
+        monkeypatch.setattr(dm, "is_nax_available", lambda: True)
+        assert dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 128)
+
+        monkeypatch.setattr(dm, "is_nax_available", lambda: False)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+        monkeypatch.setattr(dm, "is_nax_available", lambda: True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", False)
+        assert not dm._dsv4f_nax_indexer_score_enabled(cfg, 4)
+
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_INDEXER_SCORE", True)
+        bad = SimpleNamespace(**vars(cfg))
+        bad.index_n_heads = 32
+        assert not dm._dsv4f_nax_indexer_score_enabled(bad, 4)
+
+    @staticmethod
+    def _run_projected_indexer(dm, monkeypatch, *, group=None):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        B, L, H, D, N = 1, 16, 64, 128, 513
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = dm.PoolingCache(4)
+        cache.pooled = pooled
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=False,
+            _nax_indexer_score=True,
+            row_sharding_group=group,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_NAX_SCORE", True)
+        monkeypatch.setattr(fast, "dsa_indexer_nax_kernels_built", lambda: True)
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        seen = []
+
+        def scores(q, k, weights, **kwargs):
+            seen.append(kwargs.get("use_nax"))
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda scores, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, scores.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=2048,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        return out, seen
+
+    def test_single_m5_path_forwards_nax_hint(self, applied_patch, monkeypatch):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        out, seen = self._run_projected_indexer(dm, monkeypatch)
+        assert out.shape == (1, 16, 512)
+        assert seen == [True]
+
+    def test_replicated_tp_rows_stay_on_steel(self, applied_patch, monkeypatch):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+
+        class Group:
+            @staticmethod
+            def size():
+                return 2
+
+            @staticmethod
+            def rank():
+                return 0
+
+        out, seen = self._run_projected_indexer(dm, monkeypatch, group=Group())
+        assert out.shape == (1, 16, 512)
+        assert seen == [False]
+
+
 class TestNativeKernelLatchSemantics:
     """ValueError shape rejections (std::invalid_argument, raised before any
     GPU work) must fall back per-call WITHOUT latching the process-wide

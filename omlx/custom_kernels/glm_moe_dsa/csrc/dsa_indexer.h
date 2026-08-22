@@ -23,7 +23,19 @@ mx::array dsa_indexer_scores(
     // to the mx.where pass it replaces.
     int mask_ratio = 0,
     int mask_q_offset = 0,
-    mx::StreamOrDevice s = {});
+    mx::StreamOrDevice s = {},
+    // Prefer the optional M5/NAX score kernel for its deliberately narrow
+    // DS4-Flash prefill domain (bf16, B=1, H=64, D=128, weights [B,L,H],
+    // non-causal, ratio-4 pooled mask, L>=16). Every other configuration and
+    // any NAX library/pipeline load failure stays on the Steel kernel above.
+    bool use_nax = false);
+
+// Availability diagnostics for the optional, separately compiled NAX
+// metallib. Hardware eligibility is checked by the Python dispatch through
+// the shared mirror of metal::is_nax_available(); these helpers distinguish a
+// source-compatible/stale extension from one that actually ships the kernel.
+bool dsa_indexer_nax_kernels_built();
+bool dsa_indexer_nax_runtime_active();
 
 // v25 M2 from-scratch MMA score kernel (zero-per-head-barrier structure,
 // ~1.37x over the Steel kernel on M2 Ultra, bit-exact). Serves ONLY:

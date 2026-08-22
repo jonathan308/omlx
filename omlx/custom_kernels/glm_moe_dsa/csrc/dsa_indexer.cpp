@@ -2,6 +2,7 @@
 
 #include "kernels/mma_dsa_indexer_score.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/steel/gemm/params.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/ops.h"
 #include "mlx/utils.h"
@@ -39,6 +41,48 @@ struct DSATopKParams {
   bool causal_valid_prefix;
 };
 
+struct NAXDSAScoreParams {
+  int M;
+  int N;
+  int mask_ratio;
+  int mask_q_offset;
+};
+
+constexpr const char* kNAXDSAMetallibName = "omlx_glm_kernels_nax";
+constexpr const char* kNAXDSAKernelName =
+    "nax_dsa_indexer_score_bfloat16_h64_d128_ratio4";
+
+// A missing/stale optional metallib must cost at most one failed pipeline
+// lookup. The same primitive immediately falls through to Steel, and later
+// calls skip the NAX lookup for the rest of the process.
+std::atomic<bool> nax_dsa_runtime_ok{true};
+
+bool dsa_nax_available() {
+  // Exact local mirror of mlx::core::metal::is_nax_available() (the upstream
+  // declaration is intentionally not exported from libmlx): macOS >= 26.2
+  // and applegpu gen >= 17, or >= 18 for p-suffix parts. This second gate
+  // keeps the native ABI safe even when OMLX_NAX=1 overrides Python detection.
+  static bool available = []() {
+    if (!metal::is_available()) {
+      return false;
+    }
+    bool os_ok = false;
+    if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+      os_ok = true;
+    }
+    if (!os_ok) {
+      return false;
+    }
+    auto& d = metal::device(Device::gpu);
+    const auto& arch = d.get_architecture();
+    if (arch.empty()) {
+      return false;
+    }
+    return d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
+  }();
+  return available;
+}
+
 bool row_contiguous(const array& arr) {
   return arr.flags().row_contiguous && arr.strides(-1) == 1 &&
       arr.offset() == 0;
@@ -58,7 +102,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
       bool skip_causal_future_store,
       int causal_q_offset,
       int mask_ratio,
-      int mask_q_offset)
+      int mask_q_offset,
+      bool prefer_nax)
       : Primitive(stream),
         causal_(causal),
         weights_lh_(weights_lh),
@@ -66,7 +111,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_(skip_causal_future_store),
         causal_q_offset_(causal_q_offset),
         mask_ratio_(mask_ratio),
-        mask_q_offset_(mask_q_offset) {}
+        mask_q_offset_(mask_q_offset),
+        prefer_nax_(prefer_nax) {}
 
   static bool unsupported(
       const array& q,
@@ -140,6 +186,51 @@ class DSAIndexerScoresPrimitive : public Primitive {
     const int M = q.shape(2);
     const int N = k.shape(2);
     const int D = q.shape(3);
+
+    // M5/NAX port of ds4-metal's retained prefill score tile. Keep this
+    // dispatch deliberately narrower than the generic Steel primitive: the
+    // exact DS4-Flash call site is bf16/B1/H64/D128/weights-LH, non-causal,
+    // ratio-4 masked, and prefill-sized. Any optional-library or pipeline
+    // failure falls through to the already validated Steel encoding below.
+    const bool nax_shape = prefer_nax_ && q.dtype() == bfloat16 && B == 1 &&
+        H == 64 && D == 128 && M >= 16 && N > 512 && weights_lh_ &&
+        !causal_ && unused_causal_prefix_topk_ == 0 &&
+        !skip_causal_future_store_ && causal_q_offset_ == -1 &&
+        mask_ratio_ == 4 && mask_q_offset_ >= 0;
+    if (nax_shape && dsa_nax_available() &&
+        nax_dsa_runtime_ok.load(std::memory_order_relaxed)) {
+      try {
+        auto lib = d.get_library(kNAXDSAMetallibName, current_binary_dir());
+        auto kernel = d.get_kernel(kNAXDSAKernelName, lib);
+        auto& encoder = metal::get_command_encoder(s);
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_input_array(q, 0);
+        encoder.set_input_array(k, 1);
+        encoder.set_input_array(weights, 2);
+        encoder.set_output_array(out, 3);
+        NAXDSAScoreParams nax_params{
+            /* int M = */ M,
+            /* int N = */ N,
+            /* int mask_ratio = */ mask_ratio_,
+            /* int mask_q_offset = */ mask_q_offset_};
+        encoder.set_bytes(nax_params, 4);
+
+        constexpr int tm = 16;
+        constexpr int tn = 32;
+        constexpr int threads = 128;
+        constexpr size_t q_shared = 2 * 32 * 32 * sizeof(uint16_t);
+        constexpr size_t k_shared = 32 * 128 * sizeof(uint16_t);
+        constexpr size_t dot_shared = 32 * 32 * sizeof(float);
+        encoder.set_threadgroup_memory_length(
+            q_shared + k_shared + dot_shared, 0);
+        encoder.dispatch_threadgroups(
+            MTL::Size((N + tn - 1) / tn, (M + tm - 1) / tm, B),
+            MTL::Size(threads, 1, 1));
+        return;
+      } catch (const std::exception&) {
+        nax_dsa_runtime_ok.store(false, std::memory_order_relaxed);
+      }
+    }
 
     // bm/bn/wm/wn do not enter the per-element K-reduction order (bk=16 and
     // the MMA fragment K-layout are unchanged), so the tile config only
@@ -235,7 +326,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_ == rhs.skip_causal_future_store_ &&
         causal_q_offset_ == rhs.causal_q_offset_ &&
         mask_ratio_ == rhs.mask_ratio_ &&
-        mask_q_offset_ == rhs.mask_q_offset_;
+        mask_q_offset_ == rhs.mask_q_offset_ &&
+        prefer_nax_ == rhs.prefer_nax_;
   }
   auto state() const {
     return std::make_tuple(
@@ -245,7 +337,8 @@ class DSAIndexerScoresPrimitive : public Primitive {
         skip_causal_future_store_,
         causal_q_offset_,
         mask_ratio_,
-        mask_q_offset_);
+        mask_q_offset_,
+        prefer_nax_);
   }
 
  private:
@@ -256,6 +349,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
   int causal_q_offset_;
   int mask_ratio_;
   int mask_q_offset_;
+  bool prefer_nax_;
 };
 
 // ── v25 M2 MMA score kernel (mma_dsa_indexer_score.h) ───────────────────────
@@ -736,6 +830,21 @@ array dsa_topk_indices_impl(
 
 } // namespace
 
+bool dsa_indexer_nax_kernels_built() {
+  static bool built = []() {
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(current_binary_dir()) /
+            (std::string(kNAXDSAMetallibName) + ".metallib"),
+        ec);
+  }();
+  return built;
+}
+
+bool dsa_indexer_nax_runtime_active() {
+  return nax_dsa_runtime_ok.load(std::memory_order_relaxed);
+}
+
 array dsa_indexer_scores(
     const array& queries,
     const array& keys,
@@ -746,7 +855,8 @@ array dsa_indexer_scores(
     int causal_q_offset,
     int mask_ratio,
     int mask_q_offset,
-    StreamOrDevice s) {
+    StreamOrDevice s,
+    bool use_nax) {
   if (queries.ndim() != 4 || keys.ndim() != 4 ||
       (weights.ndim() != 3 && weights.ndim() != 4)) {
     std::ostringstream msg;
@@ -836,7 +946,8 @@ array dsa_indexer_scores(
           skip_causal_future_store,
           causal_q_offset,
           mask_ratio,
-          mask_q_offset),
+          mask_q_offset,
+          use_nax && dsa_indexer_nax_kernels_built()),
       std::move(inputs));
 }
 
