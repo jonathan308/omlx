@@ -3359,6 +3359,26 @@ class TestEnginePoolInUseLease:
         assert entry.pending_unload_reason is None
         pool._unload_engine.assert_awaited_once_with("clustered")
 
+    def test_failed_distributed_runtime_ignores_frozen_rank_activity(self):
+        """A dead rank's final active=1 marker must not block teardown forever."""
+
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("clustered")
+        entry.engine.has_active_requests.return_value = False
+        entry.engine.runtime_failed_reason = "rank 1 exited with code 75"
+        entry.engine.rank_side_active_requests.return_value = 1
+
+        assert pool._entry_has_active_requests(entry) is False
+
+    def test_healthy_distributed_runtime_respects_rank_activity(self):
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("clustered")
+        entry.engine.has_active_requests.return_value = False
+        entry.engine.runtime_failed_reason = None
+        entry.engine.rank_side_active_requests.return_value = 1
+
+        assert pool._entry_has_active_requests(entry) is True
+
     @pytest.mark.asyncio
     async def test_release_engine_keeps_pending_while_scheduler_active(self):
         """A drained lease is not enough if scheduler requests are still active."""

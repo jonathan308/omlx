@@ -1183,6 +1183,19 @@ class EnginePool:
                 return True
         except Exception:
             return True
+        # A terminal distributed-runtime failure makes the rank marker a
+        # historical snapshot.  The worker may have died while its last
+        # telemetry sample still said ``active_requests > 0``; treating that
+        # frozen value as live work makes quiescence-gated unload impossible
+        # and leaves the cluster tab showing a model that no process owns.
+        # Keep respecting coordinator-side generators above, but once they
+        # drain, do not let dead-rank telemetry veto teardown.
+        runtime_failed_reason = getattr(engine, "runtime_failed_reason", None)
+        if (
+            isinstance(runtime_failed_reason, str)
+            and runtime_failed_reason.strip()
+        ):
+            return False
         # Distributed engines: the coordinator counter draining only proves
         # the httpx side closed. Rank-side telemetry reporting active
         # requests means the ranks are still generating and the entry is NOT
