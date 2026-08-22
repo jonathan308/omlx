@@ -5,6 +5,7 @@ Everything is offline: the engine pool, peer liveness, preflight, and model
 layout inspection are doubled, and the registry lives in a tmp_path.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 from omlx.cluster import routes
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.planner import ModelLayout
+from omlx.cluster.performance import NodePerformanceProfile
 from omlx.cluster.registry import configure_cluster_registry
 from omlx.cluster.replan import (
     hosts_from_deployment,
@@ -182,6 +184,30 @@ def test_nodes_from_deployment_round_trip(active_deployment):
     # Split-control preferences are not recoverable from a signed plan.
     assert "max_weight_bytes" not in nodes[0]
     assert "target_weight_bytes" not in nodes[0]
+
+
+def test_nodes_from_deployment_preserves_signed_performance(active_deployment):
+    deployment = ClusterDeployment.from_dict(active_deployment.deployment)
+    profiles = tuple(
+        NodePerformanceProfile(
+            node_id=assignment.node_id,
+            rank=assignment.rank,
+            decode_weight_bytes_per_second=100.0 - 40.0 * assignment.rank,
+            prefill_weight_bytes_per_second=90.0 - 30.0 * assignment.rank,
+            collective_latency_seconds=0.00003,
+            collective_bandwidth_bytes_per_second=6.2e9,
+            backend="ring",
+            measured_at="2026-08-22T00:00:00+00:00",
+            samples=5,
+        )
+        for assignment in deployment.assignments
+    )
+    deployment = replace(deployment, performance_profiles=profiles)
+
+    nodes = nodes_from_deployment(deployment)
+
+    assert nodes[0]["performance"] == profiles[0].to_dict()
+    assert nodes[1]["performance"] == profiles[1].to_dict()
 
 
 def test_hosts_from_deployment_round_trip(active_deployment):
