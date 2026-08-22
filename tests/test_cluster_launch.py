@@ -22,6 +22,7 @@ from omlx.cluster.launch import (
     _install_cluster_ssh_wrapper,
     _local_probe_versions,
     _local_runtime_versions,
+    _set_serve_release,
     build_mlx_launch_argv,
     discover_remote_python_executable,
     discover_remote_system_python,
@@ -50,6 +51,35 @@ def _deployment(model: str = "org/model") -> ClusterDeployment:
         assignments=assignments,
         plan_hash="c" * 64,
     )
+
+
+def test_serve_release_is_atomic_and_mirrored_to_remote(tmp_path):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    deployment = _deployment()
+    payload = {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "plan_hash": deployment.plan_hash,
+        "world_size": deployment.world_size,
+    }
+
+    _set_serve_release(deployment, tmp_path, payload, runner=runner)
+
+    marker = tmp_path / f"{deployment.deployment_id}-serve.json"
+    assert json.loads(marker.read_text()) == payload
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert len(calls) == 1
+    assert "user@studio.local" in calls[0][0]
+
+    _set_serve_release(deployment, tmp_path, None, runner=runner)
+
+    assert not marker.exists()
+    assert len(calls) == 2
 
 
 def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
