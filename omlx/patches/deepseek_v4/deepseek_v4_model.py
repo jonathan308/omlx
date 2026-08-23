@@ -367,6 +367,10 @@ _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL = os.getenv(
     "OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = False
+_DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
+    "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
 
 
 def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
@@ -440,6 +444,105 @@ def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
         variant=0,
         use_nax=True,
         nax_variant=0,
+    )
+
+
+def _attention_output_chain_native_inputs(
+    attn: nn.Module,
+    prepared: mx.array,
+) -> Optional[Tuple[mx.array, mx.array, mx.array, mx.array]]:
+    """Preflight the exact DS4 3:5 M=1024 O-A→BF16→O-B chain."""
+
+    if (
+        not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL
+        or getattr(attn, "training", False)
+        or is_dspark_verify_armed()
+        or prepared.dtype != mx.bfloat16
+        or tuple(prepared.shape) not in (
+            (1, 8, 1024, 1536),
+            (1, 8, 1024, 2560),
+        )
+    ):
+        return None
+    config = getattr(attn, "config", None)
+    try:
+        if config is None or not _dsv4f_exact_config(config, 4):
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    o_a = getattr(attn, "wo_a", None)
+    o_b = getattr(attn, "wo_b", None)
+    if not all(
+        projection is not None
+        and callable(getattr(projection, "get", None))
+        and getattr(projection, "group_size", None) == 32
+        and getattr(projection, "bits", None) == 8
+        and getattr(projection, "mode", None) == "mxfp8"
+        and projection.get("biases") is None
+        for projection in (o_a, o_b)
+    ):
+        return None
+    assert o_a is not None and o_b is not None
+    o_a_weight = o_a.get("weight")
+    o_a_scales = o_a.get("scales")
+    o_b_weight = o_b.get("weight")
+    o_b_scales = o_b.get("scales")
+    k = int(prepared.shape[-1])
+    if (
+        o_a_weight is None
+        or o_a_scales is None
+        or o_b_weight is None
+        or o_b_scales is None
+        or tuple(o_a_weight.shape) != (8, 1024, k // 4)
+        or tuple(o_a_scales.shape) != (8, 1024, k // 32)
+        or tuple(o_b_weight.shape) != (4096, 2048)
+        or tuple(o_b_scales.shape) != (4096, 256)
+        or o_a_weight.dtype != mx.uint32
+        or o_a_scales.dtype != mx.uint8
+        or o_b_weight.dtype != mx.uint32
+        or o_b_scales.dtype != mx.uint8
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not (
+            glm_fast.is_native_available()
+            and glm_fast.has_symbol("ds4_output_projection_chain")
+        ):
+            return None
+    except Exception:
+        return None
+    return o_a_weight, o_a_scales, o_b_weight, o_b_scales
+
+
+def _project_attention_output_chain(
+    attn: nn.Module,
+    prepared: mx.array,
+) -> Optional[mx.array]:
+    native_inputs = _attention_output_chain_native_inputs(attn, prepared)
+    if native_inputs is None:
+        return None
+    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+    global _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED:
+        _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: using exact BF16 O-A/O-B prefill chain "
+            "(M=1024, H=%d, BM64/BK32/BN32; "
+            "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0 disables)",
+            prepared.shape[-1] // 64,
+        )
+    o_a_weight, o_a_scales, o_b_weight, o_b_scales = native_inputs
+    return glm_fast.ds4_output_projection_chain(
+        mx.contiguous(prepared),
+        o_a_weight,
+        o_a_scales,
+        o_b_weight,
+        o_b_scales,
+        variant=2,
     )
 
 
@@ -612,6 +715,9 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
             )
         return attn.wo_b(projected)
     prepared = prepare(out)
+    native_chain = _project_attention_output_chain(attn, prepared)
+    if native_chain is not None:
+        return native_chain
     return attn.wo_b(finish(_project_attention_oa(attn, prepared)))
 
 

@@ -131,6 +131,9 @@ _RANK_ENV_DEFAULTS = (
     # H24/H32/H40 TP shapes. Keep pair selection identical across ranks while
     # the full distributed A/B remains operator-controlled.
     ("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"),
+    # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
+    # Both ranks receive one value; exact shape/config guards decide locally.
+    ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),
     # Exact M5 Max rank-1 5/8 expert-blocked NAX routed-MoE path. The flag is
     # carried to both ranks, while the exact hardware/TP gate activates only
     # on the qualified M5 rank. Default-off until full cold-prefill A/B.

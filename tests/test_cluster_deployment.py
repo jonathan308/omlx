@@ -112,6 +112,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_DSV4_NAX_OA_PREFILL",
         "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
+        "OMLX_DSV4_OUTPUT_CHAIN_PREFILL",
         "OMLX_DSV4_NAX_MOE_BLOCKS",
         "OMLX_TP_MOE_SHARD_WEIGHTS",
         "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
@@ -148,6 +149,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=0" in envs
     assert "OMLX_TP_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS=" in envs
@@ -169,6 +171,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
     monkeypatch.setenv("OMLX_DSV4_NAX_OA_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "1")
+    monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_NAX_MOE_BLOCKS", "1")
     monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
     deployment = _deployment()
@@ -195,6 +198,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=1" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=1" in envs
+    assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=1" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=1" in envs
     assert envs.count("OMLX_TP_MOE_SHARD_WEIGHTS=4,4") == 1
     # Untouched knobs keep their tuned defaults.
