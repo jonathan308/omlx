@@ -166,15 +166,18 @@ def _owned_projection_bank(
         return None
     if rank == owner:
         values = tuple(module(x) for module in modules)
-        if any(value.dtype != x.dtype for value in values):
-            return None
         packed = mx.concatenate(values, axis=-1)
         peer = 1 - owner
         sent = mx.distributed.send(packed, peer)
-        packed = mx.depends(packed, sent)
+        # Post transport immediately. Attaching the send back to its own input
+        # with ``mx.depends`` creates a cyclic dependency on current MLX; the
+        # proven queued-pipeline pattern is to retain the send graph through
+        # async_eval and let the unchanged local values continue independently.
+        mx.async_eval(sent)
     else:
         shape = (*x.shape[:-1], total)
         packed = mx.distributed.recv_like(mx.zeros(shape, dtype=x.dtype), owner)
+        mx.async_eval(packed)
     boundaries = []
     cursor = 0
     for width in widths[:-1]:

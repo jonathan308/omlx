@@ -36,6 +36,9 @@ def _enable(monkeypatch):
     monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
     monkeypatch.setenv("OMLX_DSV4_PROJECTION_OWNER_RANK", "0")
     monkeypatch.setattr(dsv4, "_PROJECTION_OWNER_LOGGED", False)
+    # Unit fakes are ordinary MLX arrays, not communication primitives. Do not
+    # leave background evaluation alive beyond the monkeypatched transport.
+    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
 
 def test_projection_owner_keeps_local_exact_views_and_anchors_send(monkeypatch):
