@@ -141,6 +141,8 @@ NATIVE_SYMBOLS = (
     "ds4_output_oa_interleaved",
     "ds4_output_projection_chain",
     "deepseek_v4_qkv_compressor_bundle_b1",
+    "deepseek_v4_qkv_pair_b1",
+    "deepseek_v4_qkv_compressor128_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
     "deepseek_mxfp4_full_decode",
     "deepseek_affine_gather_qmm_blocks",
@@ -778,6 +780,56 @@ def deepseek_mxfp4_gather_qmm_blocks_tail8(
         )
     raise RuntimeError(
         "deepseek_mxfp4_gather_qmm_blocks_tail8 native kernel is unavailable"
+    )
+
+
+def deepseek_v4_qkv_pair_b1(
+    x: mx.array,
+    wq_a_weight: mx.array,
+    wq_a_scales: mx.array,
+    wkv_weight: mx.array,
+    wkv_scales: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(_ext, "deepseek_v4_qkv_pair_b1"):
+        return _ext.deepseek_v4_qkv_pair_b1(
+            x,
+            wq_a_weight,
+            wq_a_scales,
+            wkv_weight,
+            wkv_scales,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("deepseek_v4_qkv_pair_b1 native kernel is unavailable")
+
+
+def deepseek_v4_qkv_compressor128_bundle_b1(
+    x: mx.array,
+    wq_a_weight: mx.array,
+    wq_a_scales: mx.array,
+    wkv_weight: mx.array,
+    wkv_scales: mx.array,
+    compressor_wkv: mx.array,
+    compressor_wgate: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is not None and hasattr(
+        _ext, "deepseek_v4_qkv_compressor128_bundle_b1"
+    ):
+        return _ext.deepseek_v4_qkv_compressor128_bundle_b1(
+            x,
+            wq_a_weight,
+            wq_a_scales,
+            wkv_weight,
+            wkv_scales,
+            compressor_wkv,
+            compressor_wgate,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_v4_qkv_compressor128_bundle_b1 native kernel is unavailable"
     )
 
 

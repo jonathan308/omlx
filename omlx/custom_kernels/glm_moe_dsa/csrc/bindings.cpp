@@ -309,6 +309,26 @@ NB_MODULE(_ext, m) {
       "block_count"_a,
       "stream"_a = nb::none());
   m.def(
+      "deepseek_v4_qkv_pair_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_pair_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "stream"_a = nb::none());
+  m.def(
+      "deepseek_v4_qkv_compressor128_bundle_b1",
+      &omlx::glm_kernels::deepseek_v4_qkv_compressor128_bundle_b1,
+      "x"_a,
+      "wq_a_weight"_a,
+      "wq_a_scales"_a,
+      "wkv_weight"_a,
+      "wkv_scales"_a,
+      "compressor_wkv"_a,
+      "compressor_wgate"_a,
+      "stream"_a = nb::none());
+  m.def(
       "deepseek_v4_qkv_compressor_bundle_b1",
       &omlx::glm_kernels::deepseek_v4_qkv_compressor_bundle_b1,
       "x"_a,

@@ -129,6 +129,81 @@ class DS4QKVCompressorBundleB1Primitive : public Primitive {
   }
 };
 
+class DS4QKVPairB1Primitive : public Primitive {
+ public:
+  explicit DS4QKVPairB1Primitive(Stream stream) : Primitive(stream) {}
+
+  static bool unsupported(const std::vector<array>& v, Stream s) {
+    if (s.device == Device::cpu || v.size() != 5) return true;
+    for (const auto& x : v) if (!row_contiguous(x)) return true;
+    return v[0].dtype() != bfloat16 || v[0].shape() != Shape{1, kHidden} ||
+        v[1].dtype() != uint32 ||
+        v[1].shape() != Shape{kQRows, kHidden / kMXFP8ValuesPerU32} ||
+        v[2].dtype() != uint8 ||
+        v[2].shape() != Shape{kQRows, kHidden / kGroupSize} ||
+        v[3].dtype() != uint32 ||
+        v[3].shape() != Shape{kKVRows, kHidden / kMXFP8ValuesPerU32} ||
+        v[4].dtype() != uint8 ||
+        v[4].shape() != Shape{kKVRows, kHidden / kGroupSize};
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("DS4QKVPairB1Primitive has no CPU path.");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    auto& s = stream(); auto& d = metal::device(s.device); auto& y = out[0];
+    y.set_data(allocator::malloc(y.nbytes()));
+    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = d.get_kernel("ds4_qkv_bundle_mxfp8_b1", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    for (int i = 0; i < 5; ++i) encoder.set_input_array(in[i], i);
+    encoder.set_output_array(y, 5);
+    encoder.dispatch_threadgroups(
+        MTL::Size(1, kQRows / 8, 2), MTL::Size(32, 2, 1));
+  }
+  DEFINE_NAME(DS4QKVPairB1Primitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive&) const override { return true; }
+  auto state() const { return std::make_tuple(nullptr); }
+};
+
+class DS4QKVCompressor128BundleB1Primitive : public Primitive {
+ public:
+  explicit DS4QKVCompressor128BundleB1Primitive(Stream stream)
+      : Primitive(stream) {}
+
+  static bool unsupported(const std::vector<array>& v, Stream s) {
+    if (s.device == Device::cpu || v.size() != 7) return true;
+    if (DS4QKVPairB1Primitive::unsupported(
+            std::vector<array>(v.begin(), v.begin() + 5), s)) return true;
+    return v[5].dtype() != bfloat16 ||
+        v[5].shape() != Shape{512, kHidden} || !row_contiguous(v[5]) ||
+        v[6].dtype() != bfloat16 ||
+        v[6].shape() != Shape{512, kHidden} || !row_contiguous(v[6]);
+  }
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error(
+        "DS4QKVCompressor128BundleB1Primitive has no CPU path.");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    auto& s = stream(); auto& d = metal::device(s.device); auto& y = out[0];
+    y.set_data(allocator::malloc(y.nbytes()));
+    auto lib = d.get_library("omlx_glm_kernels_decode", current_binary_dir());
+    auto kernel = d.get_kernel("ds4_qkv_bundle128_all_b1", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    for (int i = 0; i < 7; ++i) encoder.set_input_array(in[i], i);
+    encoder.set_output_array(y, 7);
+    encoder.dispatch_threadgroups(MTL::Size(160, 1, 1), MTL::Size(32, 1, 4));
+  }
+  DEFINE_NAME(DS4QKVCompressor128BundleB1Primitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive&) const override { return true; }
+  auto state() const { return std::make_tuple(nullptr); }
+};
+
 } // namespace
 
 array deepseek_v4_qkv_compressor_bundle_b1(
@@ -170,6 +245,37 @@ array deepseek_v4_qkv_compressor_bundle_b1(
       Shape{1, kPackedRows},
       bfloat16,
       std::make_shared<DS4QKVCompressorBundleB1Primitive>(stream),
+      std::move(inputs));
+}
+
+array deepseek_v4_qkv_pair_b1(
+    const array& x, const array& wq_a_weight, const array& wq_a_scales,
+    const array& wkv_weight, const array& wkv_scales, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {
+      x, wq_a_weight, wq_a_scales, wkv_weight, wkv_scales};
+  if (DS4QKVPairB1Primitive::unsupported(inputs, stream)) {
+    throw std::invalid_argument("unsupported DS4 ratio-0 B1 QKV bundle");
+  }
+  return array(
+      Shape{1, kQRows + kKVRows}, bfloat16,
+      std::make_shared<DS4QKVPairB1Primitive>(stream), std::move(inputs));
+}
+
+array deepseek_v4_qkv_compressor128_bundle_b1(
+    const array& x, const array& wq_a_weight, const array& wq_a_scales,
+    const array& wkv_weight, const array& wkv_scales,
+    const array& compressor_wkv, const array& compressor_wgate,
+    StreamOrDevice s) {
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {x, wq_a_weight, wq_a_scales, wkv_weight,
+                               wkv_scales, compressor_wkv, compressor_wgate};
+  if (DS4QKVCompressor128BundleB1Primitive::unsupported(inputs, stream)) {
+    throw std::invalid_argument("unsupported DS4 ratio-128 B1 QKV bundle");
+  }
+  return array(
+      Shape{1, kQRows + kKVRows + 1024}, bfloat16,
+      std::make_shared<DS4QKVCompressor128BundleB1Primitive>(stream),
       std::move(inputs));
 }
 

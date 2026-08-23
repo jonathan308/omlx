@@ -133,16 +133,29 @@ if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
   # B1 kernel cannot perturb the qualified classic prefill metallib's binary or
   # pipeline-cache behavior.
   set(OMLX_GLM_DECODE_AIR
-      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle_decode.air)
+      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle_decode.air
+      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle128_decode.air)
   add_custom_command(
-    OUTPUT ${OMLX_GLM_DECODE_AIR}
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle_decode.air
     COMMAND
       xcrun -sdk macosx metal ${OMLX_GLM_METAL_FLAGS} -c
       ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle_decode.metal
-      ${OMLX_GLM_METAL_INCLUDE_ARGS} -o ${OMLX_GLM_DECODE_AIR}
+      ${OMLX_GLM_METAL_INCLUDE_ARGS} -o
+      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle_decode.air
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle_decode.metal
             ${OMLX_GLM_METAL_HEADERS}
     COMMENT "Building ds4_qkv_bundle_decode.air"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle128_decode.air
+    COMMAND
+      xcrun -sdk macosx metal ${OMLX_GLM_METAL_FLAGS} -c
+      ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle128_decode.metal
+      ${OMLX_GLM_METAL_INCLUDE_ARGS} -o
+      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle128_decode.air
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle128_decode.metal
+            ${OMLX_GLM_METAL_HEADERS}
+    COMMENT "Building ds4_qkv_bundle128_decode.air"
     VERBATIM)
   set(OMLX_GLM_DECODE_METALLIB
       ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_glm_kernels_decode.metallib)
