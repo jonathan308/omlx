@@ -875,7 +875,7 @@ def test_prefill_guard_preserves_ds4f_exact_profile_under_asymmetric_tp(
     from omlx.cluster.prefill_guard import rank_monitor
 
     monkeypatch.setattr(
-        "omlx.memory_monitor.native_indexer_eligible",
+        "omlx.memory_monitor.native_indexer_memory_safe_eligible",
         lambda **_kwargs: True,
     )
     monkeypatch.setattr(
@@ -926,4 +926,63 @@ def test_prefill_guard_preserves_ds4f_exact_profile_under_asymmetric_tp(
     assert rank._num_attention_heads == 40
     assert rank._prefill_memory_profile is not None
     assert rank._prefill_memory_profile.num_attention_heads == 40
-    assert rank.estimate_prefill_peak_bytes(250_000, 1024) < 4 * 1024**3
+    peak = int(rank.estimate_prefill_peak_bytes(250_000, 1024))
+    assert peak < 4 * 1024**3
+
+    from omlx.cluster.prefill_guard import RankPrefillGuard
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    ceiling = 8 * 1024**3
+    guard = RankPrefillGuard(
+        rank,
+        rank=1,
+        ceiling_bytes=ceiling,
+        prefill_step_size=1024,
+    )
+    guard.check(250_000, current_usage_bytes=ceiling - peak - 1)
+    with pytest.raises(PrefillMemoryExceededError):
+        guard.check(250_000, current_usage_bytes=ceiling - peak + 1)
+
+
+def test_prefill_guard_slices_ds4f_profile_to_a_nonzero_pipeline_stage(dsv4):
+    from omlx.cluster.prefill_guard import rank_monitor
+
+    args = dsv4.ModelArgs.from_dict(
+        {
+            "model_type": "deepseek_v4",
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 4,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "n_shared_experts": 1,
+            "n_routed_experts": 2,
+            "num_experts_per_tok": 1,
+            "num_hash_layers": 0,
+            "q_lora_rank": 4,
+            "qk_rope_head_dim": 4,
+            "head_dim": 4,
+            "o_groups": 2,
+            "o_lora_rank": 4,
+            "index_n_heads": 2,
+            "index_head_dim": 4,
+            "index_topk": 2,
+            "hc_mult": 4,
+            "sliding_window": 8,
+            "compress_ratios": [0, 4, 128, 4],
+        }
+    )
+    stage = rank_monitor(
+        dsv4.Model(args),
+        start_layer=1,
+        layer_count=2,
+    )
+
+    assert stage is not None
+    profile = stage._prefill_memory_profile
+    assert profile is not None
+    assert profile.local_layers == 2
+    assert profile.ratio4_layers == 1
+    assert profile.ratio128_layers == 1

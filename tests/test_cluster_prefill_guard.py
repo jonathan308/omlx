@@ -85,15 +85,16 @@ def test_a_tensor_parallel_rank_is_charged_for_its_head_shard():
     )
 
 
-def test_an_asymmetric_tensor_parallel_rank_uses_its_exact_head_share():
+@pytest.mark.parametrize(("weight", "heads"), [(3, 24), (5, 40)])
+def test_an_asymmetric_tensor_parallel_rank_uses_its_exact_head_share(weight, heads):
     rank = rank_monitor(
         _Model(),
         tensor_parallel_size=2,
-        tensor_parallel_shard_weight=5,
+        tensor_parallel_shard_weight=weight,
         tensor_parallel_shard_weight_total=8,
     )
 
-    assert rank._num_attention_heads == 40
+    assert rank._num_attention_heads == heads
 
 
 def test_cached_tokens_are_not_charged_twice():

@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 
 _NATIVE_INDEXER_DISABLED = False
+_NATIVE_INDEXER_PROVEN = False
 
 
 def _operator_disabled() -> bool:
@@ -21,6 +22,26 @@ def disable_native_indexer() -> None:
     """Disable the native indexer after a runtime kernel failure."""
     global _NATIVE_INDEXER_DISABLED
     _NATIVE_INDEXER_DISABLED = True
+
+
+def mark_native_indexer_proven() -> None:
+    """Record that both kernels completed one evaluated runtime probe."""
+
+    global _NATIVE_INDEXER_PROVEN
+    _NATIVE_INDEXER_PROVEN = True
+
+
+def native_indexer_proven() -> bool:
+    """Whether low-memory admission may rely on the native implementation.
+
+    Symbol presence is enough to *attempt* the native route, but not enough to
+    admit a prompt that only fits when its score/top-k buffers stay fused.  A
+    stale metallib or first command-buffer failure can still demote the model
+    to its much larger MLX fallback.  The pre-load probe marks this only after
+    evaluating both kernels successfully.
+    """
+
+    return _NATIVE_INDEXER_PROVEN and native_indexer_available()
 
 
 def native_indexer_disabled() -> bool:
@@ -59,6 +80,27 @@ def native_indexer_eligible(
     remain.
     """
     return native_indexer_available() and native_indexer_shape_eligible(
+        query_tokens=query_tokens,
+        pooled_tokens=pooled_tokens,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        index_topk=index_topk,
+        dtype_supported=dtype_supported,
+    )
+
+
+def native_indexer_memory_safe_eligible(
+    *,
+    query_tokens: int,
+    pooled_tokens: int,
+    n_heads: int,
+    head_dim: int,
+    index_topk: int,
+    dtype_supported: bool,
+) -> bool:
+    """Eligibility for a low-memory estimate, gated on evaluated proof."""
+
+    return native_indexer_proven() and native_indexer_shape_eligible(
         query_tokens=query_tokens,
         pooled_tokens=pooled_tokens,
         n_heads=n_heads,

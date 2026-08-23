@@ -24,7 +24,9 @@ if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
-from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    native_indexer_memory_safe_eligible,
+)
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -1163,7 +1165,7 @@ class _DeepSeekV4PrefillMemoryProfile:
                 * (self.head_dim + self.index_head_dim)
                 * self.dtype_size
             )
-            if native_indexer_eligible(
+            if native_indexer_memory_safe_eligible(
                 query_tokens=query_tokens,
                 pooled_tokens=pooled_tokens,
                 n_heads=self.index_n_heads,
