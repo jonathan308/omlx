@@ -426,12 +426,20 @@ async def lifespan(app: FastAPI):
     # (G8): all teardown used to live in-process, so a SIGKILL/panic of
     # omlx-server stranded loaded ranks with no owner. The launch manifest
     # written at spawn lets this new coordinator finish the teardown.
-    # Best effort: a reaping failure must never block server startup.
+    # The HTTP control plane may still start so the operator can read the
+    # failure, but DistributedJobSupervisor.start treats any retained
+    # manifest/failure as an admission barrier for new ranks.
     try:
         from .cluster.launch import reap_orphaned_launches
 
         orphan_report = await asyncio.to_thread(reap_orphaned_launches)
-        if orphan_report["reaped"] or orphan_report["failures"]:
+        if orphan_report["failures"]:
+            logger.warning(
+                "Orphaned distributed launch recovery report from a previous "
+                "coordinator (failures remain blocked): %s",
+                orphan_report,
+            )
+        elif orphan_report["reaped"]:
             logger.warning(
                 "Reaped orphaned distributed launches from a previous "
                 "coordinator: %s",

@@ -145,7 +145,7 @@ def _wait_for_serve_release(
     plan_hash: str,
     world_size: int,
     *,
-    timeout: float = 120.0,
+    timeout: float = 1800.0,
     clock: Any = time.monotonic,
     sleep: Any = time.sleep,
 ) -> None:
@@ -155,7 +155,10 @@ def _wait_for_serve_release(
     fully wired while a smaller peer is still materializing layers, and an
     early all-reduce then times out and destroys an otherwise healthy load.
     Every rank publishes ``rank_ready`` first; the supervisor observes all of
-    them and atomically writes this local release marker on every host.
+    them and atomically writes this local release marker on every host. The
+    timeout matches the supervisor's default load deadline: asymmetric Macs
+    can finish materializing very large shards minutes apart without the
+    faster rank aborting a healthy load at the old two-minute boundary.
     """
 
     path = (
@@ -1769,19 +1772,6 @@ def run_worker(args: argparse.Namespace) -> int:
                         "headroom_bytes": assignment.headroom_bytes,
                     }
                 )
-                if rank == 0:
-                    _emit_event(
-                        {
-                            "type": "ready",
-                            "protocol_version": 1,
-                            "deployment_id": args.deployment_id,
-                            "plan_hash": plan_hash,
-                            "rank": rank,
-                            "world_size": world_size,
-                            "port": args.port,
-                            "optimizations": optimizations,
-                        }
-                    )
                 _wait_for_serve_release(
                     args.state_dir,
                     args.deployment_id,
@@ -1811,6 +1801,23 @@ def run_worker(args: argparse.Namespace) -> int:
                         "ready",
                         load_stage="ready",
                         prefill_shape_warmup=warmup_report,
+                    )
+                if rank == 0:
+                    # ``ready`` is the supervisor's post-warmup barrier. It
+                    # used to be emitted beside ``rank_ready`` before the
+                    # serve-release gate, causing the listener watchdog to
+                    # mistake a healthy first Metal compile for a hung rank.
+                    _emit_event(
+                        {
+                            "type": "ready",
+                            "protocol_version": 1,
+                            "deployment_id": args.deployment_id,
+                            "plan_hash": plan_hash,
+                            "rank": rank,
+                            "world_size": world_size,
+                            "port": args.port,
+                            "optimizations": optimizations,
+                        }
                     )
                 control_context = (
                     RankControlPlane(

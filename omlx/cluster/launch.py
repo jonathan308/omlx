@@ -53,6 +53,11 @@ _LAUNCH_LOG_MAX_BYTES = 16 * 1024 * 1024
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+_COORDINATOR_INSTANCE_ID = os.urandom(16).hex()
+_REBOOT_REQUIRED_GUIDANCE = (
+    "A distributed rank survived SIGKILL and may be stuck in the macOS "
+    "Metal driver. Reboot this Mac before starting another distributed launch."
+)
 
 
 class DistributedLaunchError(RuntimeError):
@@ -70,6 +75,160 @@ class DistributedTeardownError(DistributedLaunchError):
     were still wired. Callers must treat this as "teardown NOT complete"
     and keep enough state to retry.
     """
+
+
+@dataclass(frozen=True)
+class _LocalProcessState:
+    """One read-only row from the macOS/Linux process table."""
+
+    pid: int
+    ppid: int
+    process_group: int
+    status: str
+    rss_kib: int
+    command: str
+
+    @property
+    def zombie(self) -> bool:
+        # POSIX ps puts the primary state first on both macOS and Linux.
+        # A zombie has already released its address space and Metal objects;
+        # supplementary flags may follow the leading ``Z``.
+        return self.status.upper().startswith("Z")
+
+
+def _read_local_process_table(
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[tuple[_LocalProcessState, ...] | None, str]:
+    """Read process state without signaling or importing a GPU runtime.
+
+    ``kill(pid, 0)`` only proves that a PID is still addressable. In
+    particular, macOS can leave a Metal process in ``?E`` with zero RSS after
+    SIGKILL; treating that as gone admitted another MLX launch into a wedged
+    driver. The headerless ps columns below exist on both Darwin/BSD ps and
+    procps-ng, and are deliberately parsed strictly: an unreadable process
+    table is not evidence of a successful teardown.
+    """
+
+    argv = [
+        "ps",
+        "-axo",
+        "pid=,ppid=,pgid=,stat=,rss=,command=",
+    ]
+    try:
+        completed = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"could not read the local process table: {exc}"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"ps exited {completed.returncode}"
+        return None, f"could not read the local process table: {detail}"
+
+    rows: list[_LocalProcessState] = []
+    for line_number, raw_line in enumerate(completed.stdout.splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split(None, 5)
+        if len(fields) != 6:
+            return None, (
+                "could not verify the local process table: malformed ps row "
+                f"{line_number}"
+            )
+        pid, ppid, process_group, status, rss_kib, command = fields
+        try:
+            numeric = tuple(int(value) for value in (pid, ppid, process_group, rss_kib))
+        except ValueError:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        if numeric[0] <= 0 or numeric[2] < 0 or numeric[3] < 0:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        rows.append(
+            _LocalProcessState(
+                pid=numeric[0],
+                ppid=numeric[1],
+                process_group=numeric[2],
+                status=status,
+                rss_kib=numeric[3],
+                command=command,
+            )
+        )
+    return tuple(rows), ""
+
+
+def _command_deployment_id(command: str) -> str | None:
+    """Return the exact ``--deployment-id`` value in a process argv."""
+
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return None
+    for index, argument in enumerate(arguments):
+        if argument == "--deployment-id" and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if argument.startswith("--deployment-id="):
+            return argument.partition("=")[2]
+    return None
+
+
+def _belongs_to_launch(
+    process: _LocalProcessState,
+    *,
+    deployment_id: str,
+) -> bool:
+    """Verify a process argv before using a stale manifest to signal it."""
+
+    return _command_deployment_id(process.command) == deployment_id and (
+        "mlx._distributed_utils.launch" in process.command
+        or "omlx.cluster.inference_worker" in process.command
+    )
+
+
+def _local_launch_survivors(
+    processes: tuple[_LocalProcessState, ...],
+    *,
+    deployment_id: str,
+    process_group: int | None = None,
+    known_pids: set[int] | None = None,
+) -> tuple[_LocalProcessState, ...]:
+    """Find non-zombie ranks or group members that still make teardown unsafe."""
+
+    return tuple(
+        process
+        for process in processes
+        if not process.zombie
+        and (
+            (known_pids is not None and process.pid in known_pids)
+            or (process_group is not None and process.process_group == process_group)
+            or (
+                "omlx.cluster.inference_worker" in process.command
+                and _command_deployment_id(process.command) == deployment_id
+            )
+        )
+    )
+
+
+def _survivor_description(process: _LocalProcessState) -> str:
+    return (
+        f"pid {process.pid} (ppid {process.ppid}, pgid {process.process_group}, "
+        f"state {process.status!r}, rss {process.rss_kib} KiB) survived SIGKILL"
+    )
+
+
+def _is_macos_exit_wedge(process: _LocalProcessState) -> bool:
+    """Whether ps shows the command-less zero-RSS Metal exit limbo."""
+
+    return "E" in process.status.upper() and process.rss_kib == 0
 
 
 @dataclass(frozen=True)
@@ -276,13 +435,18 @@ def _write_launch_manifest(
     root = Path(state_dir).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment_id": deployment.deployment_id,
         "plan_hash": deployment.plan_hash,
         # start_new_session=True makes the launcher its own group leader.
         "launcher_pid": int(launcher_pid),
         "process_group": int(launcher_pid),
         "coordinator_pid": os.getpid(),
+        # A PID alone is not ownership: after a reboot/restart the kernel can
+        # reuse it for the new server or an unrelated process. This token is
+        # unique to one imported coordinator process and lets the reaper
+        # distinguish its own live manifest from an older launch.
+        "coordinator_instance": _COORDINATOR_INSTANCE_ID,
         "api_port": api_port,
         "started_at": time.time(),
         "hosts": [
@@ -311,21 +475,48 @@ def _read_launch_manifest(path: Path) -> dict[str, Any] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
         return None
     deployment_id = payload.get("deployment_id")
     launcher_pid = payload.get("launcher_pid")
+    process_group = payload.get("process_group", launcher_pid)
     coordinator_pid = payload.get("coordinator_pid")
     hosts = payload.get("hosts")
     if not isinstance(deployment_id, str) or not deployment_id:
         return None
     if not all(
         isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-        for pid in (launcher_pid, coordinator_pid)
+        for pid in (launcher_pid, process_group, coordinator_pid)
     ):
         return None
-    if not isinstance(hosts, list):
+    if process_group != launcher_pid:
         return None
+    if not isinstance(hosts, list) or not hosts:
+        return None
+    if any(
+        not isinstance(host, dict)
+        or not isinstance(host.get("rank"), int)
+        or isinstance(host.get("rank"), bool)
+        or not isinstance(host.get("node_id"), str)
+        or not host.get("node_id")
+        or not isinstance(host.get("ssh"), str)
+        or not host.get("ssh")
+        for host in hosts
+    ):
+        return None
+    if sorted(host["rank"] for host in hosts) != list(range(len(hosts))):
+        return None
+    if payload["schema_version"] == 2:
+        coordinator_instance = payload.get("coordinator_instance")
+        if (
+            not isinstance(coordinator_instance, str)
+            or len(coordinator_instance) != 32
+            or not all(
+                character in "0123456789abcdef"
+                for character in coordinator_instance
+            )
+        ):
+            return None
     return payload
 
 
@@ -466,6 +657,7 @@ def _sweep_rank_processes(
     *,
     state_dir: str | Path,
     plan_hash: str | None = None,
+    process_group: int | None = None,
     kill_grace: float = 3.0,
     runner: SSHRunner = subprocess.run,
 ) -> list[str]:
@@ -476,8 +668,18 @@ def _sweep_rank_processes(
     """
 
     failures: list[str] = []
+    attempted_local_pids: set[int] = set()
+    local_pid_labels: dict[int, str] = {}
     local_root = Path(state_dir).expanduser()
     remote_root = str(state_dir).rstrip("/") or "."
+    initial_processes, initial_process_error = _read_local_process_table()
+    processes_by_pid = (
+        {process.pid: process for process in initial_processes}
+        if initial_processes is not None
+        else {}
+    )
+    if initial_processes is None:
+        failures.append(initial_process_error)
     local_markers: dict[int, dict[str, Any]] = {}
     try:
         for job in read_runtime_markers(local_root).get("jobs", []):
@@ -507,6 +709,29 @@ def _sweep_rank_processes(
             if not marker_owner_is_live(marker):
                 continue
             pid = marker.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                failures.append(f"rank {rank} ({node_id}) marker has an invalid pid")
+                continue
+            process_state = processes_by_pid.get(pid)
+            if process_state is None:
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} is addressable but "
+                    "absent from the process table; refusing an unverified signal"
+                )
+                continue
+            if process_state.zombie:
+                continue
+            if not _belongs_to_launch(
+                process_state,
+                deployment_id=deployment_id,
+            ) and not _is_macos_exit_wedge(process_state):
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} identity changed "
+                    f"(state {process_state.status!r}); refusing to signal a "
+                    "reused PID"
+                )
+                continue
+            attempted_local_pids.add(pid)
             if _kill_local_pid(pid, grace=kill_grace):
                 logger.warning(
                     "Reaped leftover rank %d (%s) pid %d of deployment %s",
@@ -516,9 +741,9 @@ def _sweep_rank_processes(
                     deployment_id,
                 )
             else:
-                failures.append(
-                    f"rank {rank} ({node_id}) pid {pid} survived SIGKILL"
-                )
+                # This timeout is provisional. The final ps snapshot below is
+                # the teardown authority and may observe a late clean exit.
+                local_pid_labels[pid] = f"rank {rank} ({node_id})"
             continue
         # Remote rank: its marker lives on the peer.
         marker, process_live, _, error = read_remote_marker(
@@ -576,6 +801,53 @@ def _sweep_rank_processes(
             failures.append(
                 f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
             )
+
+    # Runtime markers are crash evidence, not the source of truth for process
+    # exit. A rank can lose its marker or escape its launch group while the
+    # coordinator is dying. Find such workers by their exact argv and give
+    # them the same bounded TERM/KILL sequence before the final read-only
+    # audit. This also catches the local half of a launch whose marker was
+    # truncated during a hard reboot.
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return failures
+    markerless = _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+    )
+    for process in markerless:
+        if process.pid in attempted_local_pids:
+            continue
+        attempted_local_pids.add(process.pid)
+        if _kill_local_pid(process.pid, grace=kill_grace):
+            logger.warning(
+                "Reaped markerless local rank pid %d of deployment %s",
+                process.pid,
+                deployment_id,
+            )
+        else:
+            local_pid_labels[process.pid] = "markerless local rank"
+
+    # A signal call succeeding is not teardown evidence. Re-read ps after all
+    # kill attempts and require both the launch group and every exact worker
+    # argv to be absent. ``?E`` and Linux ``D`` remain live; only a leading Z
+    # is already memory-free and safe to ignore.
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return failures
+    survivors = _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+        process_group=process_group,
+        known_pids=attempted_local_pids,
+    )
+    for process in survivors:
+        label = local_pid_labels.get(process.pid, "local launch process")
+        failures.append(f"{label} {_survivor_description(process)}")
+    if survivors:
+        failures.append(_REBOOT_REQUIRED_GUIDANCE)
     return failures
 
 
@@ -588,10 +860,11 @@ def reap_orphaned_launches(
     """Reap jobs whose coordinator died without tearing them down (G8).
 
     Every launch writes a manifest next to the runtime markers. A manifest
-    whose coordinator *and* launcher group are both gone belongs to a
-    crashed predecessor: any rank processes its markers still name are
-    orphans holding unified memory, so kill them and retire the manifest.
-    A manifest with a live coordinator is an active job and is left alone.
+    whose coordinator is gone belongs to a crashed predecessor: verify the
+    launch-group identity, kill it, sweep marker and argv-discovered ranks,
+    and retire the manifest only after a final process-table snapshot proves
+    they exited. A manifest with a live coordinator is left active; malformed
+    or unverifiable manifests remain as launch-admission barriers.
 
     Returns ``{"reaped": [...], "failures": [...], "active": [...]}``.
     """
@@ -609,34 +882,118 @@ def reap_orphaned_launches(
     for path in manifests:
         manifest = _read_launch_manifest(path)
         if manifest is None:
+            report["failures"].append(
+                f"{path.name}: launch manifest is unreadable; refusing to "
+                "assume its ranks exited"
+            )
             continue
         deployment_id = manifest["deployment_id"]
         coordinator_pid = manifest["coordinator_pid"]
         launcher_pid = manifest["launcher_pid"]
-        if _pid_alive(coordinator_pid):
+        process_group = manifest.get("process_group", launcher_pid)
+        coordinator_instance = manifest.get("coordinator_instance")
+        coordinator_pid_reused_by_this_process = (
+            coordinator_pid == os.getpid()
+            and (
+                manifest.get("schema_version") == 1
+                or coordinator_instance != _COORDINATOR_INSTANCE_ID
+            )
+        )
+        if _pid_alive(coordinator_pid) and not coordinator_pid_reused_by_this_process:
             report["active"].append(deployment_id)
             continue
         # The coordinator is gone. Kill the launcher group if it somehow
-        # survived, then sweep rank processes by their marker pids.
-        if _process_group_alive(launcher_pid):
-            with suppress(ProcessLookupError, PermissionError):
-                os.killpg(launcher_pid, signal.SIGKILL)
-        failures = _sweep_rank_processes(
-            deployment_id,
-            manifest.get("hosts", []),
-            state_dir=state_dir,
-            plan_hash=manifest.get("plan_hash"),
-            kill_grace=kill_grace,
-            runner=runner,
+        # survived, then sweep rank processes by their marker pids. A stale
+        # PGID can be reused after reboot, so verify every current member's
+        # argv belongs to this exact deployment before signaling the group.
+        failures: list[str] = []
+        owned_process_group: int | None = None
+        if _process_group_alive(process_group):
+            processes, process_error = _read_local_process_table()
+            if processes is None:
+                failures.append(process_error)
+            else:
+                all_group_members = tuple(
+                    process
+                    for process in processes
+                    if process.process_group == process_group
+                )
+                group_members = tuple(
+                    process
+                    for process in all_group_members
+                    if not process.zombie
+                )
+                foreign_members = tuple(
+                    process
+                    for process in group_members
+                    if not _belongs_to_launch(
+                        process,
+                        deployment_id=deployment_id,
+                    )
+                )
+                if foreign_members:
+                    identities = ", ".join(
+                        f"pid {process.pid} state {process.status!r}"
+                        for process in foreign_members[:4]
+                    )
+                    failures.append(
+                        f"process group {process_group} identity could not be "
+                        f"verified ({identities}); refusing to signal a reused PGID"
+                    )
+                    exit_wedges = tuple(
+                        process
+                        for process in foreign_members
+                        if _is_macos_exit_wedge(process)
+                    )
+                    for process in exit_wedges:
+                        failures.append(_survivor_description(process))
+                    if exit_wedges:
+                        failures.append(_REBOOT_REQUIRED_GUIDANCE)
+                elif not group_members and not all_group_members:
+                    # killpg(0) and ps disagree. Permission or a kernel exit
+                    # transition can cause this; neither is proof of teardown.
+                    failures.append(
+                        f"process group {process_group} is addressable but has "
+                        "no verifiable process-table members"
+                    )
+                elif group_members:
+                    owned_process_group = process_group
+                    try:
+                        os.killpg(process_group, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError) as exc:
+                        failures.append(
+                            f"could not signal process group {process_group}: {exc}"
+                        )
+                    else:
+                        _wait_for_process_group_exit(process_group, 2.0)
+        failures = list(
+            dict.fromkeys(
+                _sweep_rank_processes(
+                    deployment_id,
+                    manifest.get("hosts", []),
+                    state_dir=state_dir,
+                    plan_hash=manifest.get("plan_hash"),
+                    process_group=owned_process_group,
+                    kill_grace=kill_grace,
+                    runner=runner,
+                )
+                + failures
+            )
         )
         if failures:
             report["failures"].extend(
                 f"{deployment_id}: {failure}" for failure in failures
             )
             continue
-        report["reaped"].append(deployment_id)
-        with suppress(OSError):
+        try:
             path.unlink()
+        except OSError as exc:
+            report["failures"].append(
+                f"{deployment_id}: verified process exit but could not retire "
+                f"launch manifest: {exc}"
+            )
+            continue
+        report["reaped"].append(deployment_id)
     return report
 
 
@@ -2459,15 +2816,32 @@ class DistributedJobSupervisor:
             raise RuntimeError("distributed job is already started")
         # A previous coordinator may have died mid-job (G8); reap its
         # leftover ranks before admitting a new launch against the memory
-        # ceiling. Best effort: reaping must never block a launch.
+        # ceiling. This is an admission barrier, not best effort: starting a
+        # second MLX process after an unkillable rank wedges the Metal driver
+        # further and can force data loss in every subsequent request.
         try:
             orphan_report = reap_orphaned_launches(self.state_dir)
-            if orphan_report["reaped"] or orphan_report["failures"]:
+            if orphan_report["reaped"]:
                 logger.warning(
                     "Reaped orphaned distributed launches: %s", orphan_report
                 )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Orphaned-launch reaper failed: %s", exc)
+        except Exception as exc:
+            raise DistributedTeardownError(
+                "Could not verify prior distributed teardown; refusing to "
+                f"start new ranks: {exc}"
+            ) from exc
+        if orphan_report["failures"]:
+            detail = "; ".join(str(item) for item in orphan_report["failures"])
+            raise DistributedTeardownError(
+                "Prior distributed teardown is unverified; refusing to start "
+                f"new ranks: {detail[:_LOG_LINE_LIMIT]}"
+            )
+        if orphan_report["active"]:
+            active = ", ".join(str(item) for item in orphan_report["active"])
+            raise DistributedTeardownError(
+                "Another distributed launch is still active "
+                f"({active}); unload it before starting new ranks"
+            )
         self._phase = "preflight"
         if self.preflight:
             preflight_remote_hosts(
@@ -2527,7 +2901,8 @@ class DistributedJobSupervisor:
             self._write_launch_manifest()
             self._open_launcher_log()
             self._start_readers()
-            event = self._wait_for_ready()
+            load_deadline = time.monotonic() + self.load_timeout
+            ranks = self._wait_for_rank_ready(load_deadline)
             _set_serve_release(
                 self.deployment,
                 self.state_dir,
@@ -2539,6 +2914,11 @@ class DistributedJobSupervisor:
                     "released_at": time.time(),
                 },
             )
+            # Rank zero emits ``ready`` only after every rank crosses the
+            # release gate and finishes any collective shape warmup. The
+            # model-load deadline therefore covers the warmup itself instead
+            # of a short listener watchdog killing healthy ranks mid-compile.
+            event = self._wait_for_ready(load_deadline, ranks=ranks)
             self._wait_for_listener()
             self._phase = "ready"
             self.ready_event = event
@@ -2660,13 +3040,15 @@ class DistributedJobSupervisor:
                             self.failure_event = event
                 self._condition.notify_all()
 
-    def _wait_for_ready(self) -> dict[str, Any]:
-        deadline = time.monotonic() + self.load_timeout
+    def _wait_for_load_condition(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        deadline: float,
+        timeout_message: str,
+    ) -> None:
         with self._condition:
-            while (
-                self.ready_event is None
-                or len(self.rank_ready_events) < self.deployment.world_size
-            ):
+            while not predicate():
                 if self.failure_event is not None:
                     raise DistributedLaunchError(self._failure_detail())
                 process = self.process
@@ -2677,23 +3059,20 @@ class DistributedJobSupervisor:
                     raise DistributedLaunchError(self._exit_detail(returncode))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        f"distributed model did not load within "
-                        f"{self.load_timeout:.1f}s"
-                    )
+                    raise TimeoutError(timeout_message)
                 self._condition.wait(timeout=min(remaining, 0.5))
 
-        event = self.ready_event
-        assert event is not None
-        expected = {
-            "deployment_id": self.deployment.deployment_id,
-            "plan_hash": self.deployment.plan_hash,
-            "world_size": self.deployment.world_size,
-            "port": self.port,
-        }
-        for key, value in expected.items():
-            if event.get(key) != value:
-                raise DistributedLaunchError(f"worker ready event has unexpected {key}")
+    def _wait_for_rank_ready(self, deadline: float) -> list[dict[str, Any]]:
+        """Wait until every rank has loaded weights, before warmup release."""
+
+        self._wait_for_load_condition(
+            lambda: len(self.rank_ready_events) >= self.deployment.world_size,
+            deadline=deadline,
+            timeout_message=(
+                "distributed model did not load on every rank within "
+                f"{self.load_timeout:.1f}s"
+            ),
+        )
         ranks: list[dict[str, Any]] = []
         for rank, assignment in enumerate(self.deployment.assignments):
             rank_event = self.rank_ready_events.get(rank)
@@ -2714,20 +3093,44 @@ class DistributedJobSupervisor:
                         f"rank {rank} ready event has unexpected {key}"
                     )
             ranks.append(dict(rank_event))
+        return ranks
+
+    def _wait_for_ready(
+        self,
+        deadline: float,
+        *,
+        ranks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Wait for rank zero's post-warmup readiness event."""
+
+        self._wait_for_load_condition(
+            lambda: self.ready_event is not None,
+            deadline=deadline,
+            timeout_message=(
+                "distributed post-load warmup did not finish within "
+                f"{self.load_timeout:.1f}s"
+            ),
+        )
+        event = self.ready_event
+        assert event is not None
+        expected = {
+            "deployment_id": self.deployment.deployment_id,
+            "plan_hash": self.deployment.plan_hash,
+            "world_size": self.deployment.world_size,
+            "port": self.port,
+        }
+        for key, value in expected.items():
+            if event.get(key) != value:
+                raise DistributedLaunchError(f"worker ready event has unexpected {key}")
         return dict(event) | {"ranks": ranks}
 
     def _wait_for_listener(self) -> None:
         assert self.port is not None
-        # A qualified distributed prefill-shape warmup runs after rank-ready
-        # (weights resident) but before the HTTP listener.  Its first Metal
-        # pipeline compilation can exceed the historical 15-second listener
-        # grace even though every rank is making healthy progress.  Both ranks
-        # receive the warmup flag through the signed hostfile; mirror that
-        # decision here so disabling it retains the tighter failure bound.
-        warmup_enabled = os.environ.get(
-            "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"
-        ).strip().lower() in {"1", "true", "on", "yes"}
-        default_timeout = 60.0 if warmup_enabled else 15.0
+        # The expensive collective shape warmup has already completed before
+        # ``ready`` is emitted. This deadline now covers only binding the local
+        # HTTP socket, so a tight default catches a genuinely stuck server
+        # without racing Metal pipeline compilation.
+        default_timeout = 15.0
         raw_timeout = os.environ.get("OMLX_CLUSTER_LISTENER_TIMEOUT_SECONDS", "")
         try:
             requested_timeout = (
@@ -2778,7 +3181,12 @@ class DistributedJobSupervisor:
                 self.deployment.deployment_id,
             ).unlink(missing_ok=True)
 
-    def _sweep_rank_leftovers(self, *, kill_grace: float = 3.0) -> list[str]:
+    def _sweep_rank_leftovers(
+        self,
+        *,
+        kill_grace: float = 3.0,
+        process_group: int | None = None,
+    ) -> list[str]:
         """Kill rank processes that outlived the launcher group.
 
         Returns failure descriptions; empty means nothing resident remains.
@@ -2792,6 +3200,7 @@ class DistributedJobSupervisor:
             ],
             state_dir=self.state_dir,
             plan_hash=self.deployment.plan_hash,
+            process_group=process_group,
             kill_grace=kill_grace,
         )
 
@@ -2851,7 +3260,7 @@ class DistributedJobSupervisor:
 
             # A rank that escaped the group (reparented before the kill)
             # survives a verified group exit; sweep it by its marker pid.
-            leftovers = self._sweep_rank_leftovers()
+            leftovers = self._sweep_rank_leftovers(process_group=process_group)
             if not group_gone and not _process_group_alive(process_group):
                 group_gone = True
             if not group_gone or leftovers:
@@ -2861,10 +3270,16 @@ class DistributedJobSupervisor:
                         f"process group {process_group} survived SIGKILL twice"
                     )
                 problems.extend(leftovers)
+                detail = "; ".join(problems)
+                if (
+                    not group_gone
+                    or any("survived SIGKILL" in problem for problem in leftovers)
+                ) and _REBOOT_REQUIRED_GUIDANCE not in detail:
+                    detail += f". {_REBOOT_REQUIRED_GUIDANCE}"
                 raise DistributedTeardownError(
                     f"distributed teardown of "
                     f"{self.deployment.deployment_id} could not be verified: "
-                    + "; ".join(problems)
+                    + detail
                 )
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):

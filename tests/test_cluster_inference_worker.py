@@ -789,6 +789,27 @@ def _even_plan():
     )
 
 
+def _tensor_plan():
+    """Two ranks holding the same full layer span as one TP stage."""
+
+    return tuple(
+        PipelineAssignment(
+            node_id=node_id,
+            rank=rank,
+            start_layer=0,
+            end_layer=60,
+            layer_weight_bytes=30 * GiB,
+            fixed_weight_bytes=GiB,
+            reserve_bytes=8 * GiB,
+            capacity_bytes=400 * GiB,
+            role="headless",
+            tensor_parallel_rank=rank,
+            tensor_parallel_size=2,
+        )
+        for rank, node_id in enumerate(("mbp", "studio"))
+    )
+
+
 class _Group:
     def __init__(self, rank: int, size: int) -> None:
         self._rank, self._size = rank, size
@@ -847,6 +868,8 @@ def _run_rank(
     ceiling: int = 107 * GiB,
     wired_result=(0, None),
     assignment_honored: bool = False,
+    optimizations: dict[str, Any] | None = None,
+    tensor_parallel_size: int = 1,
 ):
     """Drive ``run_worker`` through its real argv, recording what it did.
 
@@ -876,6 +899,7 @@ def _run_rank(
         "build_guard_kwargs": None,
         "marker_while_serving": None,
         "pin_at_load": None,
+        "events": [],
     }
 
     # --- process boundaries: never reached in a test -----------------------
@@ -905,8 +929,20 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "_wait_for_serve_release",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: record["order"].append("serve-release"),
     )
+    monkeypatch.setattr(
+        inference_worker,
+        "_run_prefill_shape_warmup",
+        lambda *_args, tokens, **_kwargs: record["order"].append("shape-warmup")
+        or {"active": True, "tokens": tokens, "elapsed_seconds": 0.01},
+    )
+
+    def fake_emit_event(event):
+        record["events"].append(dict(event))
+        record["order"].append(f"event:{event.get('type')}")
+
+    monkeypatch.setattr(inference_worker, "_emit_event", fake_emit_event)
     monkeypatch.setattr(
         inference_worker, "_start_launcher_watchdog", lambda _m, _pid, **_kw: None
     )
@@ -948,7 +984,7 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_contract",
-        lambda _plan: ("a" * 64, assignments, (), 1),
+        lambda _plan: ("a" * 64, assignments, (), tensor_parallel_size),
     )
     # The fake plan above is not a real encoded contract, so the path_map
     # decoder it feeds must be faked alongside it (empty = legacy behavior).
@@ -994,7 +1030,7 @@ def _run_rank(
 
     @contextlib.contextmanager
     def fake_optimizations(*_args, **_kwargs):
-        yield {"coalesced_batching": {"active": True}}
+        yield optimizations or {"coalesced_batching": {"active": True}}
 
     monkeypatch.setattr(
         inference_worker, "install_runtime_optimizations", fake_optimizations
@@ -1031,6 +1067,31 @@ def _run_rank(
     finally:
         pipeline_patch.clear_assigned_stage()
     return record
+
+
+def test_rank_zero_ready_event_follows_collective_shape_warmup(
+    monkeypatch,
+    tmp_path,
+):
+    record = _run_rank(
+        monkeypatch,
+        tmp_path,
+        rank=0,
+        assignments=_tensor_plan(),
+        tensor_parallel_size=2,
+        optimizations={
+            "deepseek_v4_adaptive_prefill": {
+                "active": True,
+                "shape_warmup_tokens": 1024,
+            }
+        },
+    )
+
+    order = record["order"]
+    assert order.index("event:rank_ready") < order.index("serve-release")
+    assert order.index("serve-release") < order.index("shape-warmup")
+    assert order.index("shape-warmup") < order.index("event:ready")
+    assert order.index("event:ready") < order.index("serve")
 
 
 def test_worker_refuses_excess_resident_weights_before_ready(monkeypatch, tmp_path):
