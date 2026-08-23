@@ -341,14 +341,26 @@ def _dense_fp32_kernel():
     )
 
 
-@lru_cache(maxsize=1)
-def _multi_kernel():
+@lru_cache(maxsize=3)
+def _multi_kernel(results_per_simdgroup: int = 4):
+    if results_per_simdgroup not in (1, 2, 4):
+        raise ValueError("verify grouped QMV result tile must be 1, 2, or 4")
+    source = _MULTI_SOURCE
+    if results_per_simdgroup != 4:
+        source = source.replace(
+            "constexpr int RESULTS_PER_SIMDGROUP = 4;",
+            f"constexpr int RESULTS_PER_SIMDGROUP = {results_per_simdgroup};",
+        ).replace(
+            "constexpr int OUTPUTS_PER_THREADGROUP = 8;",
+            "constexpr int OUTPUTS_PER_THREADGROUP = "
+            f"{2 * results_per_simdgroup};",
+        )
     return mx.fast.metal_kernel(
-        name="omlx_deepseek_verify_multi_qmv_exact",
+        name=f"omlx_deepseek_verify_multi_qmv_exact_r{results_per_simdgroup}",
         input_names=["input", "weight", "scales"],
         output_names=["output"],
         header=_HEADER,
-        source=_MULTI_SOURCE,
+        source=source,
         ensure_row_contiguous=True,
     )
 
@@ -510,7 +522,20 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
     rows = int(inputs.size) // (groups * input_dims)
     output_dims = int(module.scales.shape[1])
     grouped = inputs.reshape(groups, rows, input_dims)
-    (output,) = _multi_kernel()(
+    results_per_simdgroup = 4
+    if groups == 8 and rows == 6 and output_dims == 1024 and input_dims in (
+        1536,
+        2560,
+    ):
+        try:
+            device_name = str(mx.device_info().get("device_name", ""))
+            if device_name == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+            elif device_name == "Apple M5 Max":
+                results_per_simdgroup = 2
+        except Exception:
+            pass
+    (output,) = _multi_kernel(results_per_simdgroup)(
         inputs=[grouped, module.weight, module.scales],
         template=[
             ("T", inputs.dtype),
@@ -519,7 +544,7 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
             ("N", output_dims),
             ("GS", int(module.group_size)),
         ],
-        grid=(32, groups * output_dims // 4, 1),
+        grid=(32, groups * output_dims // results_per_simdgroup, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[(groups, rows, output_dims)],
         output_dtypes=[inputs.dtype],
