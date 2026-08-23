@@ -96,6 +96,9 @@ def summarize_deployment(deployment: ClusterDeployment) -> dict[str, Any]:
         "world_size": deployment.world_size,
         "plan_hash": deployment.plan_hash,
         "target_context_tokens": deployment.target_context_tokens,
+        "mtp_enabled": deployment.mtp_enabled,
+        "mtp_num_draft_tokens": deployment.mtp_num_draft_tokens,
+        "path_map": dict(deployment.path_map),
         "assignments": [
             {
                 "rank": assignment.rank,
@@ -121,6 +124,9 @@ def placement_view(deployment: ClusterDeployment) -> dict[str, Any]:
     """
 
     return {
+        "path_map": dict(deployment.path_map),
+        "mtp_enabled": deployment.mtp_enabled,
+        "mtp_num_draft_tokens": deployment.mtp_num_draft_tokens,
         "assignments": [
             assignment.to_dict() for assignment in deployment.assignments
         ]

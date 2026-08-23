@@ -2684,3 +2684,36 @@ def test_ring_activation_never_probes_for_rdma(monkeypatch):
 
     deployment, _ = routes._create_deployment(_activation_request("ring"))
     assert deployment.hosts[0].rdma == ()
+
+
+def test_activation_persists_mtp_launch_contract(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    request = _activation_request("ring").model_copy(
+        update={"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    )
+
+    deployment, plan = routes._create_deployment(request)
+
+    assert deployment.mtp_enabled is True
+    assert deployment.mtp_num_draft_tokens == 3
+    assert plan["mtp_enabled"] is True
+    assert plan["mtp_num_draft_tokens"] == 3
+
+
+def test_mtp_launch_contract_changes_placement_signature():
+    plan = _fake_plan(["studio", "m5"]).to_dict()
+    legacy_signature = routes._placement_signature(plan)
+
+    assert routes._placement_signature(plan | {"mtp_enabled": False}) == (
+        legacy_signature
+    )
+    assert routes._placement_signature(
+        plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    ) != legacy_signature
+    assert routes._placement_signature(
+        plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 2}
+    ) != routes._placement_signature(
+        plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    )

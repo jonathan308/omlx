@@ -446,6 +446,8 @@ class ClusterPlanRequest(BaseModel):
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
@@ -498,6 +500,8 @@ class ClusterDeploymentRequest(BaseModel):
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -738,6 +742,24 @@ def _placement_signature(plan: dict[str, Any]) -> str:
     path_map = plan.get("path_map")
     if path_map:
         rows = {"rows": rows, "path_map": path_map}
+    # Speculative execution changes both the worker graph and the weights that
+    # must be resident.  It is therefore part of the launch contract, not a
+    # cosmetic generation option.  Keep the legacy signature byte-identical
+    # when MTP is absent/default so existing non-MTP approvals remain valid.
+    mtp_enabled = bool(plan.get("mtp_enabled", False))
+    mtp_num_draft_tokens = plan.get("mtp_num_draft_tokens")
+    if mtp_enabled or mtp_num_draft_tokens is not None:
+        if isinstance(rows, dict):
+            rows = rows | {
+                "mtp_enabled": mtp_enabled,
+                "mtp_num_draft_tokens": mtp_num_draft_tokens,
+            }
+        else:
+            rows = {
+                "rows": rows,
+                "mtp_enabled": mtp_enabled,
+                "mtp_num_draft_tokens": mtp_num_draft_tokens,
+            }
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -802,12 +824,27 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
                 ),
             }
         )
+    settings: dict[str, dict[str, Any]] = {}
+    for field, default in (
+        ("path_map", {}),
+        ("mtp_enabled", False),
+        ("mtp_num_draft_tokens", None),
+    ):
+        before = approved.get(field, default)
+        after = launched.get(field, default)
+        if before != after:
+            settings[field] = {"before": before, "after": after}
     return {
-        "changed": bool(ranks),
-        "reason": "automatic tuning re-planned from the measured link speeds",
+        "changed": bool(ranks or settings),
+        "reason": (
+            "launch settings changed"
+            if settings and not ranks
+            else "automatic tuning re-planned from the measured link speeds"
+        ),
         "approved_signature": _placement_signature(approved),
         "launched_signature": _placement_signature(launched),
         "ranks": ranks,
+        "settings": settings,
     }
 
 
@@ -2785,7 +2822,13 @@ async def cluster_plan(request: ClusterPlanRequest):
     # The signature travels back with the plan so activation can prove it is
     # launching the thing that was shown here, and not a re-plan built from a
     # payload that quietly dropped the reserve, the cap or the role.
-    return _plan_with_signature(plan.to_dict())
+    payload = plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        payload.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+    return _plan_with_signature(payload)
 
 
 class ClusterBackendMemberRequest(BaseModel):
@@ -2916,6 +2959,8 @@ def _create_deployment(
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         path_map=request.path_map,
     )
     plan = _create_cluster_plan(plan_request)
@@ -2976,9 +3021,17 @@ def _create_deployment(
         performance_profiles=_request_performance_profiles(request.nodes),
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
     )
-    return deployment, plan.to_dict()
+    plan_payload = plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        plan_payload.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+    return deployment, plan_payload
 
 
 def _build_performance_plan(
@@ -3646,6 +3699,9 @@ async def _activate_and_report(
             loaded_deployment is not None
             and loaded_deployment.deployment_id == deployment.deployment_id
             and loaded_deployment.plan_hash == deployment.plan_hash
+            and loaded_deployment.mtp_enabled == deployment.mtp_enabled
+            and loaded_deployment.mtp_num_draft_tokens
+            == deployment.mtp_num_draft_tokens
         )
         if not already_loaded:
             await pool.prepare_cluster_reload(model_id)
@@ -3657,6 +3713,9 @@ async def _activate_and_report(
                 active_deployment is None
                 or active_deployment.deployment_id != deployment.deployment_id
                 or active_deployment.plan_hash != deployment.plan_hash
+                or active_deployment.mtp_enabled != deployment.mtp_enabled
+                or active_deployment.mtp_num_draft_tokens
+                != deployment.mtp_num_draft_tokens
             ):
                 raise DistributedLaunchError(
                     "engine pool did not activate the approved distributed plan"
@@ -3827,6 +3886,8 @@ class ClusterReplanRequest(BaseModel):
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool | None = None
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
@@ -3954,6 +4015,20 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             ring_connections_per_ip=request.ring_connections_per_ip,
             tensor_parallel_size=request.tensor_parallel_size,
             target_context_tokens=request.target_context_tokens,
+            mtp_enabled=(
+                request.mtp_enabled
+                if request.mtp_enabled is not None
+                else current.mtp_enabled
+                if current is not None
+                else False
+            ),
+            mtp_num_draft_tokens=(
+                request.mtp_num_draft_tokens
+                if request.mtp_num_draft_tokens is not None
+                else current.mtp_num_draft_tokens
+                if current is not None
+                else None
+            ),
             path_map=path_map,
             # Not consulted by planning; activation re-checks the real one
             # below. Preview callers do not have a signature yet.

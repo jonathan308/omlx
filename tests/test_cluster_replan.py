@@ -250,6 +250,7 @@ def test_replan_preview_derives_current_cluster(active_deployment):
         "path_map": False,
     }
     assert payload["current"]["world_size"] == 2
+    assert payload["current"]["mtp_enabled"] is False
     assert payload["changes"]["changed"] is False
     assert len(payload["steps"]) == 3
     assert payload["plan"]["placement_signature"]
@@ -352,6 +353,44 @@ def test_replan_applied_runs_full_dance(active_deployment):
     assert active_deployment.pool.reloads == 2
     engine = active_deployment.pool.entry.engine
     assert engine.deployment.target_context_tokens == 16384
+
+
+def test_replan_mtp_toggle_is_signed_and_forces_reload(active_deployment):
+    deployment_id = active_deployment.deployment["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "mtp_enabled": True,
+            "mtp_num_draft_tokens": 3,
+        },
+    )
+
+    assert preview.status_code == 200, preview.json()
+    signed_plan = preview.json()["plan"]
+    assert signed_plan["mtp_enabled"] is True
+    assert signed_plan["mtp_num_draft_tokens"] == 3
+    assert preview.json()["changes"]["changed"] is True
+    assert preview.json()["changes"]["settings"] == {
+        "mtp_enabled": {"before": False, "after": True},
+        "mtp_num_draft_tokens": {"before": None, "after": 3},
+    }
+
+    response = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "mtp_enabled": True,
+            "mtp_num_draft_tokens": 3,
+            "approved_placement": signed_plan["placement_signature"],
+        },
+    )
+
+    assert response.status_code == 200, response.json()
+    assert active_deployment.pool.reloads == 2
+    engine = active_deployment.pool.entry.engine
+    assert engine.deployment.mtp_enabled is True
+    assert engine.deployment.mtp_num_draft_tokens == 3
 
 
 def test_replan_rejects_a_stale_approval(active_deployment):
