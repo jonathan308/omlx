@@ -1141,6 +1141,67 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
+_DEEPSEEK_V4_ROUTER_TOPK_DECODE = os.getenv(
+    "OMLX_DSV4_ROUTER_TOPK_DECODE", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED = False
+
+
+@mx.compile
+def _router_native_pre(logits: mx.array, bias: mx.array):
+    scores = mx.sqrt(nn.softplus(logits.astype(mx.float32)))
+    return scores, mx.contiguous(scores + bias)
+
+
+@mx.compile
+def _router_native_post(
+    scores: mx.array,
+    indices: mx.array,
+    routed_scaling_factor: float,
+):
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    return weights * routed_scaling_factor
+
+
+def _native_router_select(
+    logits: mx.array,
+    bias: mx.array,
+    routed_scaling_factor: float,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    if (
+        not _DEEPSEEK_V4_ROUTER_TOPK_DECODE
+        or tuple(logits.shape) != (1, 1, 256)
+        or logits.dtype not in (mx.bfloat16, mx.float16)
+        or bias.shape != (256,)
+        or bias.dtype != mx.float32
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not glm_fast.has_symbol("ds4_router_topk_indices"):
+            return None
+        scores, biased = _router_native_pre(logits, bias)
+        indices = glm_fast.ds4_router_topk_indices(
+            biased.reshape(1, 256)
+        ).reshape(1, 1, 6)
+        weights = _router_native_post(
+            scores,
+            indices,
+            routed_scaling_factor,
+        )
+    except (TypeError, ValueError):
+        return None
+    global _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED
+    if not _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED:
+        _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 exact B1 native router top-6 active"
+        )
+    return indices, weights
+
+
 @mx.compile
 def _expert_select(
     logits: mx.array,
@@ -2096,14 +2157,28 @@ class MoEGate(nn.Module):
                 self.scoring_func,
             )
         else:
-            inds, weights = _expert_select(
-                logits,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
+            native = (
+                _native_router_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.routed_scaling_factor,
+                )
+                if self.top_k == 6
+                and self.norm_topk_prob
+                and self.scoring_func == "sqrtsoftplus"
+                else None
             )
+            if native is None:
+                inds, weights = _expert_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = native
 
         return inds, weights
 

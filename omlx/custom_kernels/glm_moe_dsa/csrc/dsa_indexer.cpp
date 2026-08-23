@@ -652,6 +652,32 @@ class DSparkFP32TopKIndicesPrimitive : public Primitive {
   }
 };
 
+class DS4RouterTopKIndicesPrimitive : public Primitive {
+ public:
+  explicit DS4RouterTopKIndicesPrimitive(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("DS4 router top-k has no CPU path.");
+  }
+  void eval_gpu(const std::vector<array>& in, std::vector<array>& out) override {
+    auto& s = stream();
+    auto& d = metal::device(s.device);
+    auto& y = out[0];
+    y.set_data(allocator::malloc(y.nbytes()));
+    auto lib = d.get_library("omlx_glm_kernels_decode", current_binary_dir());
+    auto kernel = d.get_kernel("ds4_router_topk6_f32", lib);
+    auto& encoder = metal::get_command_encoder(s);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(in[0], 0);
+    encoder.set_output_array(y, 1);
+    encoder.dispatch_threadgroups(
+        MTL::Size(in[0].shape(0), 1, 1), MTL::Size(256, 1, 1));
+  }
+  DEFINE_NAME(DS4RouterTopKIndicesPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive&) const override { return true; }
+  auto state() const { return std::make_tuple(nullptr); }
+};
+
 // ── DC-1: fused decode indexer scan ─────────────────────────────────────────
 // One kernel computes the head-summed indexer scores for a single query position
 // (s == 1) directly into [B,1,1,S] with fp32 accumulation, replacing the decode
@@ -1041,6 +1067,19 @@ array dspark_fp32_topk_indices(
       uint32,
       std::make_shared<DSparkFP32TopKIndicesPrimitive>(stream),
       std::vector<array>{contiguous_scores});
+}
+
+array ds4_router_topk_indices(const array& scores, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu || scores.dtype() != float32 ||
+      scores.ndim() != 2 || scores.shape(1) != 256 ||
+      !scores.flags().row_contiguous) {
+    throw std::invalid_argument("DS4 router top-k requires FP32 [rows,256]");
+  }
+  return array(
+      Shape{scores.shape(0), 6}, uint32,
+      std::make_shared<DS4RouterTopKIndicesPrimitive>(stream),
+      std::vector<array>{scores});
 }
 
 array dsa_decode_scores(

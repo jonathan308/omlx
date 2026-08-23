@@ -79,6 +79,11 @@ NB_MODULE(_ext, m) {
       "topk"_a = 512,
       "stream"_a = nb::none());
   m.def(
+      "ds4_router_topk_indices",
+      &omlx::glm_kernels::ds4_router_topk_indices,
+      "scores"_a,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_decode_scores",
       &omlx::glm_kernels::dsa_decode_scores,
       "queries"_a,

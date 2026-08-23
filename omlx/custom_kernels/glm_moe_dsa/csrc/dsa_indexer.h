@@ -63,6 +63,10 @@ mx::array dspark_fp32_topk_indices(
     int topk = 512,
     mx::StreamOrDevice s = {});
 
+mx::array ds4_router_topk_indices(
+    const mx::array& scores,
+    mx::StreamOrDevice s = {});
+
 // DC-1: fused DECODE indexer scan. One kernel computes the head-summed indexer
 // scores for a single query position (s == 1) directly into [B,1,1,S] with fp32
 // accumulation — replacing the q@k^T -> relu -> *w -> sum chain that materializes

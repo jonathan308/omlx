@@ -11,6 +11,58 @@
 
 using namespace metal;
 
+[[kernel]] void ds4_router_topk6_f32(
+    const device float* scores [[buffer(0)]],
+    device uint* indices [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]) {
+  const device float* src = scores + size_t(row) * 256;
+  device uint* dst = indices + size_t(row) * 6;
+  threadgroup float score0[256];
+  threadgroup int idx0[256];
+  threadgroup float score1[256];
+  threadgroup int idx1[256];
+  float score = src[tid];
+  int idx = int(tid);
+  uint cross_stage = 0;
+  for (uint k = 2; k <= 256; k <<= 1) {
+    for (uint j = k >> 1; j > 0; j >>= 1) {
+      float peer_score;
+      int peer_idx;
+      bool take_peer;
+      const bool lower = (tid & j) == 0;
+      const bool descending = (tid & k) == 0;
+      if (j < 32) {
+        peer_score = simd_shuffle_xor(score, ushort(j));
+        peer_idx = simd_shuffle_xor(idx, ushort(j));
+        take_peer = descending
+            ? (lower ? score < peer_score : score > peer_score)
+            : (lower ? score > peer_score : score < peer_score);
+      } else {
+        threadgroup float* score_tg =
+            (cross_stage & 1u) != 0u ? score1 : score0;
+        threadgroup int* idx_tg =
+            (cross_stage & 1u) != 0u ? idx1 : idx0;
+        score_tg[tid] = score;
+        idx_tg[tid] = idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint other = tid ^ j;
+        peer_score = score_tg[other];
+        peer_idx = idx_tg[other];
+        take_peer = descending
+            ? (lower ? score < peer_score : score > peer_score)
+            : (lower ? score > peer_score : score < peer_score);
+        cross_stage++;
+      }
+      if (take_peer) {
+        score = peer_score;
+        idx = peer_idx;
+      }
+    }
+  }
+  if (tid < 6) dst[tid] = uint(idx);
+}
+
 // Threadgroups [0,96) host two virtual 64-thread MXFP8 groups (four
 // simdgroups split 2+2), covering 1,536 Q-A/KV rows at 16 rows per physical
 // group. Threadgroups [96,256) run the exact four-simdgroup dense body at 16

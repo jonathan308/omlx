@@ -107,6 +107,9 @@ _RANK_ENV_DEFAULTS = (
     # Ratio-0/128 siblings are exact and locally faster on M5, but did not
     # improve whole-model TP2 decode after ratio-4 moved the critical path.
     ("OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"),
+    # Exact 256-way B1 router top-6. Default-off until the full TP2 rate/hash
+    # gate confirms the isolated 2.6% selection win scales across 40 layers.
+    ("OMLX_DSV4_ROUTER_TOPK_DECODE", "0"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),

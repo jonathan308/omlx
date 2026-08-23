@@ -119,6 +119,7 @@ NATIVE_SYMBOLS = (
     "dsa_indexer_scores",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
+    "ds4_router_topk_indices",
     "dspark_exact_mxfp8_qmv_pair",
     "glm_dsa_sparse_mla_attention",
     "glm_dsa_exact_block_attention",
@@ -383,6 +384,15 @@ def dspark_fp32_topk_indices(
     return _ext.dspark_fp32_topk_indices(
         scores,
         topk,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def ds4_router_topk_indices(scores: mx.array, *, stream=None) -> mx.array:
+    if _ext is None or not hasattr(_ext, "ds4_router_topk_indices"):
+        raise RuntimeError("DS4 router top-k kernel is unavailable")
+    return _ext.ds4_router_topk_indices(
+        scores,
         **_native_stream_kwargs(stream),
     )
 
