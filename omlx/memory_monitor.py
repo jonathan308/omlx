@@ -795,7 +795,13 @@ class MemoryMonitor:
         # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
+        if self._prefill_memory_profile is not None:
+            attn = self._prefill_memory_profile.estimate_prefill_transient_bytes(
+                eff_chunk,
+                full_kv_len,
+            )
+        else:
+            attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted in the caller's current-usage
@@ -932,12 +938,23 @@ class _DeepSeekV4PrefillMemoryProfile:
     dtype_size: float
     wsdpa_dtype_supported: bool = False
 
-    def _wsdpa_route_active(self, *, topk: bool = False) -> bool:
+    def _wsdpa_route_active(
+        self,
+        *,
+        query_tokens: int,
+        topk: bool = False,
+    ) -> bool:
         """Match the live WSDPA route without a process-wide head-dim flag."""
         if (
             not self.wsdpa_dtype_supported
-            or self.num_attention_heads != 64
             or self.head_dim != 512
+            or (
+                self.num_attention_heads != 64
+                and not (
+                    self.num_attention_heads in (24, 32, 40)
+                    and query_tokens >= 1024
+                )
+            )
         ):
             return False
         try:
@@ -1094,7 +1111,9 @@ class _DeepSeekV4PrefillMemoryProfile:
         candidates: list[int] = []
 
         if self.local_layers:
-            if query_tokens > 1 and self._wsdpa_route_active():
+            if query_tokens > 1 and self._wsdpa_route_active(
+                query_tokens=query_tokens
+            ):
                 local_attention = self._wsdpa_attention_bytes(
                     query_tokens, local_tokens
                 )
@@ -1112,7 +1131,9 @@ class _DeepSeekV4PrefillMemoryProfile:
             pooled_tokens = kv_len // 128
             attended = local_tokens + pooled_tokens
             projection = 2 * query_tokens * self.head_dim * self.dtype_size
-            if query_tokens > 1 and self._wsdpa_route_active():
+            if query_tokens > 1 and self._wsdpa_route_active(
+                query_tokens=query_tokens
+            ):
                 attention = self._wsdpa_attention_bytes(
                     query_tokens,
                     local_tokens,
@@ -1155,7 +1176,9 @@ class _DeepSeekV4PrefillMemoryProfile:
                 indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
             if pooled_tokens <= self.index_topk:
                 attended = local_tokens + pooled_tokens
-                if query_tokens > 1 and self._wsdpa_route_active():
+                if query_tokens > 1 and self._wsdpa_route_active(
+                    query_tokens=query_tokens
+                ):
                     attention = self._wsdpa_attention_bytes(
                         query_tokens,
                         local_tokens,
@@ -1170,7 +1193,10 @@ class _DeepSeekV4PrefillMemoryProfile:
                         self.dtype_size,
                     )
             else:
-                if query_tokens > 4 and self._wsdpa_route_active(topk=True):
+                if query_tokens > 4 and self._wsdpa_route_active(
+                    query_tokens=query_tokens,
+                    topk=True,
+                ):
                     attention = self._wsdpa_attention_bytes(
                         query_tokens,
                         local_tokens,

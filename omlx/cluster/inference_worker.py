@@ -1795,10 +1795,17 @@ def run_worker(args: argparse.Namespace) -> int:
                             provider.model,
                             rank=rank,
                             node_id=getattr(assignment, "node_id", ""),
+                            start_layer=assignment.start_layer,
                             layer_count=(
                                 assignment.end_layer - assignment.start_layer
                             ),
                             tensor_parallel_size=assignment.tensor_parallel_size,
+                            tensor_parallel_shard_weight=(
+                                tensor_shard_weights[assignment.tensor_parallel_rank]
+                            ),
+                            tensor_parallel_shard_weight_total=sum(
+                                tensor_shard_weights
+                            ),
                             memory_guard_tier=guard_tier,
                             # The attention peak is set by the prefill chunk, so the
                             # guard has to size it from the step this server will

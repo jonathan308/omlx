@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,11 @@ def _kv_cache_replicated_layout(model: Any) -> bool:
 def rank_monitor(
     model: Any,
     *,
+    start_layer: int = 0,
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    tensor_parallel_shard_weight: int = 0,
+    tensor_parallel_shard_weight_total: int = 0,
 ) -> Any | None:
     """A ``MemoryMonitor`` calibrated to the slice this rank actually holds.
 
@@ -106,6 +110,10 @@ def rank_monitor(
     heads = int(getattr(monitor, "_num_attention_heads", 0) or kv_heads)
     dtype_size = float(getattr(monitor, "_dtype_size", 2) or 2)
     kv_override = getattr(monitor, "_kv_bytes_per_token_override", None)
+    prefill_profile = getattr(monitor, "_prefill_memory_profile", None)
+    ane_prefill_transient_bytes = int(
+        getattr(monitor, "_ane_prefill_transient_bytes", 0) or 0
+    )
     # Preserve the sliding-window layer groups ``set_model_info_from_model``
     # classified: re-setting model info below would otherwise drop them and
     # charge a hybrid model's windowed layers as full linear caches.
@@ -123,11 +131,60 @@ def rank_monitor(
     kv_replicated = _kv_cache_replicated_layout(model)
     tp = max(1, int(tensor_parallel_size))
     if tp > 1:
-        heads = max(1, heads // tp)
+        shard_weight = max(0, int(tensor_parallel_shard_weight))
+        shard_total = max(0, int(tensor_parallel_shard_weight_total))
+        if shard_weight and shard_total >= shard_weight:
+            heads = max(1, heads * shard_weight // shard_total)
+        else:
+            heads = max(1, heads // tp)
         if not kv_replicated:
             kv_heads = max(1, kv_heads // tp)
             if kv_override:
                 kv_override = float(kv_override) / tp
+
+    # ``set_model_info`` below used to silently discard DS4's exact hybrid
+    # cache/attention profile. The fallback then priced a 250K prompt as a
+    # dense [heads, 1024, 250K] score matrix on every TP rank even though the
+    # live model uses local + pooled sparse attention. On the 3:5 M3/M5 split
+    # that fabricated roughly 30 GiB of transient memory and rejected a prompt
+    # whose exact-shape estimate is about 1--2 GiB.
+    #
+    # Keep the architecture profile and specialize its query-head count to the
+    # signed rank share. Pipeline stages also need the ratio counts for only
+    # their contiguous layer range; derive them from the same config that made
+    # the profile, failing closed to the generic estimator if it is malformed.
+    if prefill_profile is not None:
+        updates: dict[str, Any] = {"num_attention_heads": heads}
+        if stage_layers != num_layers:
+            config = getattr(model, "args", None) or getattr(model, "config", None)
+
+            def _get(key: str) -> Any:
+                if isinstance(config, dict):
+                    return config.get(key)
+                return getattr(config, key, None)
+
+            ratios = _get("compress_ratios")
+            start = max(0, int(start_layer))
+            if (
+                isinstance(ratios, Sequence)
+                and not isinstance(ratios, (str, bytes))
+                and start + stage_layers <= len(ratios)
+            ):
+                stage_ratios = tuple(ratios[start : start + stage_layers])
+                updates.update(
+                    local_layers=stage_layers,
+                    ratio4_layers=stage_ratios.count(4),
+                    ratio128_layers=stage_ratios.count(128),
+                )
+            else:
+                prefill_profile = None
+        if prefill_profile is not None:
+            try:
+                prefill_profile = replace(prefill_profile, **updates)
+            except (TypeError, ValueError):
+                # Future non-dataclass profiles must explicitly grow a rank
+                # specialization contract before the cluster can trust them.
+                prefill_profile = None
 
     monitor.set_model_info(
         num_layers=num_layers or stage_layers,
@@ -138,6 +195,8 @@ def rank_monitor(
         num_kv_cache_layers=stage_layers,
         kv_bytes_per_token=kv_override,
         rotating_layer_specs=rotating_specs,
+        prefill_memory_profile=prefill_profile,
+        ane_prefill_transient_bytes=ane_prefill_transient_bytes,
     )
     return monitor
 
@@ -315,8 +374,11 @@ def build_guard(
     *,
     rank: int,
     node_id: str = "",
+    start_layer: int = 0,
     layer_count: int = 0,
     tensor_parallel_size: int = 1,
+    tensor_parallel_shard_weight: int = 0,
+    tensor_parallel_shard_weight_total: int = 0,
     memory_guard_tier: str = "balanced",
     prefill_step_size: int = _DEFAULT_PREFILL_STEP,
 ) -> RankPrefillGuard:
@@ -333,8 +395,11 @@ def build_guard(
     return RankPrefillGuard(
         rank_monitor(
             model,
+            start_layer=start_layer,
             layer_count=layer_count,
             tensor_parallel_size=tensor_parallel_size,
+            tensor_parallel_shard_weight=tensor_parallel_shard_weight,
+            tensor_parallel_shard_weight_total=tensor_parallel_shard_weight_total,
         ),
         rank=rank,
         node_id=node_id,

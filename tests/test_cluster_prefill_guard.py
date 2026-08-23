@@ -85,6 +85,17 @@ def test_a_tensor_parallel_rank_is_charged_for_its_head_shard():
     )
 
 
+def test_an_asymmetric_tensor_parallel_rank_uses_its_exact_head_share():
+    rank = rank_monitor(
+        _Model(),
+        tensor_parallel_size=2,
+        tensor_parallel_shard_weight=5,
+        tensor_parallel_shard_weight_total=8,
+    )
+
+    assert rank._num_attention_heads == 40
+
+
 def test_cached_tokens_are_not_charged_twice():
     """Prefix-cache hits are already resident; charging them over-rejects."""
 

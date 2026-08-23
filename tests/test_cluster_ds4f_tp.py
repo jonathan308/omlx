@@ -867,3 +867,63 @@ def test_prefill_guard_keeps_ds4f_kv_whole_under_tp(dsv4):
     assert sharded.estimate_resident_kv_bytes(1000) == single.estimate_resident_kv_bytes(
         1000
     )
+
+
+def test_prefill_guard_preserves_ds4f_exact_profile_under_asymmetric_tp(
+    dsv4, monkeypatch
+):
+    from omlx.cluster.prefill_guard import rank_monitor
+
+    monkeypatch.setattr(
+        "omlx.memory_monitor.native_indexer_eligible",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v4.wsdpa_attention.wsdpa_prefill_route_active",
+        lambda **_kwargs: True,
+    )
+
+    args = dsv4.ModelArgs.from_dict(
+        {
+            "model_type": "deepseek_v4",
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "moe_intermediate_size": 4,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "n_shared_experts": 1,
+            "n_routed_experts": 2,
+            "num_experts_per_tok": 1,
+            "num_hash_layers": 0,
+            "q_lora_rank": 4,
+            "qk_rope_head_dim": 4,
+            "head_dim": 512,
+            "o_groups": 8,
+            "o_lora_rank": 4,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "hc_mult": 4,
+            "sliding_window": 8,
+            "compress_ratios": [0, 4, 128, 4],
+            "torch_dtype": "bfloat16",
+        }
+    )
+    model = dsv4.Model(args)
+    model.dtype = mx.bfloat16
+
+    rank = rank_monitor(
+        model,
+        layer_count=4,
+        tensor_parallel_size=2,
+        tensor_parallel_shard_weight=5,
+        tensor_parallel_shard_weight_total=8,
+    )
+
+    assert rank is not None
+    assert rank._num_attention_heads == 40
+    assert rank._prefill_memory_profile is not None
+    assert rank._prefill_memory_profile.num_attention_heads == 40
+    assert rank.estimate_prefill_peak_bytes(250_000, 1024) < 4 * 1024**3
