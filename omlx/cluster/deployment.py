@@ -94,6 +94,9 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
+    # Shape warmup enters the full distributed graph, so every rank must make
+    # the same decision.  Coordinator-only overrides would cross collectives.
+    ("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
