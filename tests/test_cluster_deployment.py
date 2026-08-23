@@ -118,6 +118,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_B1_SCALAR_OFFSET",
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
+        "OMLX_DSV4_ROUTER_TOPK_DECODE",
         "OMLX_DSV4_NAX_OA_PREFILL",
         "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
         "OMLX_DSV4_ATTN_FINALIZER_VERIFY",
@@ -165,6 +166,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_B1_SCALAR_OFFSET=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
+    assert "OMLX_DSV4_ROUTER_TOPK_DECODE=1" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=0" in envs
@@ -192,6 +194,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_B1_SCALAR_OFFSET", "0")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
+    monkeypatch.setenv("OMLX_DSV4_ROUTER_TOPK_DECODE", "0")
     monkeypatch.setenv("OMLX_DSV4_NAX_OA_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "1")
@@ -223,6 +226,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TP=1" not in envs
     assert "OMLX_DSV4_B1_SCALAR_OFFSET=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
+    assert "OMLX_DSV4_ROUTER_TOPK_DECODE=0" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=1" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=1" in envs
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=1" in envs

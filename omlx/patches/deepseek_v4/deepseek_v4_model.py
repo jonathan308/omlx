@@ -1233,7 +1233,7 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
 
 
 _DEEPSEEK_V4_ROUTER_TOPK_DECODE = os.getenv(
-    "OMLX_DSV4_ROUTER_TOPK_DECODE", "0"
+    "OMLX_DSV4_ROUTER_TOPK_DECODE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_ROUTER_TOPK_DECODE_LOGGED = False
 

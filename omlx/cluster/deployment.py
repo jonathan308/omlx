@@ -119,7 +119,7 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"),
     # Exact 256-way B1 router top-6. Default-off until the full TP2 rate/hash
     # gate confirms the isolated 2.6% selection win scales across 40 layers.
-    ("OMLX_DSV4_ROUTER_TOPK_DECODE", "0"),
+    ("OMLX_DSV4_ROUTER_TOPK_DECODE", "1"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
