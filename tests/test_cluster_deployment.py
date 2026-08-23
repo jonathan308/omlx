@@ -120,6 +120,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_DSV4_NAX_OA_PREFILL",
         "OMLX_DSV4_ATTN_FINALIZER_PREFILL",
+        "OMLX_DSV4_ATTN_FINALIZER_VERIFY",
         "OMLX_DSV4_OUTPUT_CHAIN_PREFILL",
         "OMLX_DSV4_HC_RESIDUAL_OVERLAP",
         "OMLX_DSV4_NAX_MOE_BLOCKS",
@@ -166,6 +167,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" in envs
+    assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=0" in envs
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0" in envs
     assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=0" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=0" in envs

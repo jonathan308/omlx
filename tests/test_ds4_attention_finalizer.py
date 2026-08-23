@@ -56,6 +56,7 @@ def test_symbols_are_built_and_reached_only_through_default_off_pair_gate():
     assert "ds4_attention_finalizer.cpp" in cmake
     assert "ds4_attention_finalizer.metal" in cmake
     assert '"OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"' in model
+    assert '"OMLX_DSV4_ATTN_FINALIZER_VERIFY", "0"' in model
     assert "_attention_finalizer_native_inputs" in model
     for symbol in ("ds4_q_head_rms_rope", "ds4_kv_rms_rope"):
         assert symbol in bindings

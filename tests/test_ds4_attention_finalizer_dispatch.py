@@ -76,6 +76,11 @@ def test_proven_m1024_head_shapes_are_eligible_only_when_enabled(
     assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192) is None
 
 
+def test_h64_is_verify_only_until_single_node_prefill_is_qualified(monkeypatch, dm):
+    attn, q_raw, kv_raw = _eligible_fixture(monkeypatch, dm, heads=64)
+    assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192) is None
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -123,6 +128,22 @@ def test_verification_and_partial_native_capability_fall_back(monkeypatch, dm):
     assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 0) is None
 
 
+@pytest.mark.parametrize("heads", (24, 40, 64))
+def test_m6_verification_route_requires_its_independent_gate(
+    monkeypatch, dm, heads
+):
+    attn, _q_raw, _kv_raw = _eligible_fixture(monkeypatch, dm, heads)
+    q_raw = _Tensor((1, 6, heads, 512), mx.bfloat16)
+    kv_raw = _Tensor((1, 6, 512), mx.bfloat16)
+    monkeypatch.setattr(dm, "_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL", False)
+    monkeypatch.setattr(dm, "_DEEPSEEK_V4_ATTN_FINALIZER_VERIFY", True)
+    monkeypatch.setattr(dm, "is_dspark_verify_armed", lambda: True)
+    assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192)
+
+    monkeypatch.setattr(dm, "_DEEPSEEK_V4_ATTN_FINALIZER_VERIFY", False)
+    assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192) is None
+
+
 def test_pair_preflight_completes_before_either_native_node(monkeypatch, dm, caplog):
     attn, q_raw, kv_raw = _eligible_fixture(monkeypatch, dm, heads=40)
     stock_calls = []
@@ -163,7 +184,7 @@ def test_pair_preflight_completes_before_either_native_node(monkeypatch, dm, cap
     records = [
         record
         for record in caplog.records
-        if "RMSNorm+RoPE prefill finalizers" in record.message
+        if "RMSNorm+RoPE finalizers" in record.message
     ]
     assert len(records) == 1
 
@@ -227,3 +248,8 @@ def test_cluster_hostfile_propagates_explicit_default_and_override(monkeypatch):
     envs = deployment._hostfile_envs()
     assert envs.count("OMLX_DSV4_ATTN_FINALIZER_PREFILL=1") == 1
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" not in envs
+
+    monkeypatch.delenv("OMLX_DSV4_ATTN_FINALIZER_VERIFY", raising=False)
+    assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=0" in deployment._hostfile_envs()
+    monkeypatch.setenv("OMLX_DSV4_ATTN_FINALIZER_VERIFY", "1")
+    assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=1" in deployment._hostfile_envs()

@@ -158,6 +158,7 @@ _RANK_ENV_DEFAULTS = (
     # H24/H32/H40 TP shapes. Keep pair selection identical across ranks while
     # the full distributed A/B remains operator-controlled.
     ("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"),
+    ("OMLX_DSV4_ATTN_FINALIZER_VERIFY", "0"),
     # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
     # Both ranks receive one value; exact shape/config guards decide locally.
     ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),

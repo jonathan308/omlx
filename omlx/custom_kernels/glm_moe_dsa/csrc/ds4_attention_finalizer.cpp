@@ -15,7 +15,6 @@ namespace {
 
 using namespace mlx::core;
 
-constexpr int kTokens = 1024;
 constexpr int kHeadDim = 512;
 
 enum class FinalizerKind { QHead, KV };
@@ -61,10 +60,11 @@ public:
     if (kind_ == FinalizerKind::QHead) {
       const auto &q = inputs[0];
       const auto &freqs = inputs[1];
+      const int tokens = q.shape(1);
       const int heads = q.shape(2);
       auto kernel = device.get_kernel("ds4_q_head_rms_rope_bf16", library);
 
-      array rotated({1, heads, kTokens, kHeadDim}, bfloat16, nullptr, {});
+      array rotated({1, heads, tokens, kHeadDim}, bfloat16, nullptr, {});
       if (return_normalized_) {
         rotated.set_data(allocator::malloc(rotated.nbytes()));
         encoder.add_temporary(rotated);
@@ -81,17 +81,19 @@ public:
       encoder.set_bytes(eps_, 5);
       encoder.set_bytes(heads, 6);
       encoder.set_bytes(write_normalized, 7);
-      encoder.dispatch_threadgroups(MTL::Size(heads / 4, kTokens, 1),
+      encoder.set_bytes(tokens, 8);
+      encoder.dispatch_threadgroups(MTL::Size(heads / 4, tokens, 1),
                                     MTL::Size(512, 1, 1));
       return;
     }
 
     const auto &kv = inputs[0];
+    const int tokens = kv.shape(1);
     const auto &weight = inputs[1];
     const auto &freqs = inputs[2];
     auto kernel = device.get_kernel("ds4_kv_rms_rope_bf16", library);
 
-    array rotated({1, 1, kTokens, kHeadDim}, bfloat16, nullptr, {});
+    array rotated({1, 1, tokens, kHeadDim}, bfloat16, nullptr, {});
     if (return_normalized_) {
       rotated.set_data(allocator::malloc(rotated.nbytes()));
       encoder.add_temporary(rotated);
@@ -108,7 +110,7 @@ public:
     encoder.set_bytes(offset_, 5);
     encoder.set_bytes(eps_, 6);
     encoder.set_bytes(write_normalized, 7);
-    encoder.dispatch_threadgroups(MTL::Size(kTokens, 1, 1),
+    encoder.dispatch_threadgroups(MTL::Size(tokens, 1, 1),
                                   MTL::Size(128, 1, 1));
   }
 
@@ -146,18 +148,22 @@ array ds4_q_head_rms_rope(const array &q, const array &freqs, int offset,
   auto stream = to_stream(s);
   const bool heads_supported =
       q.ndim() == 4 &&
-      (q.shape(2) == 24 || q.shape(2) == 32 || q.shape(2) == 40);
+      (q.shape(2) == 24 || q.shape(2) == 32 || q.shape(2) == 40 ||
+       q.shape(2) == 64);
+  const bool tokens_supported =
+      q.ndim() == 4 && (q.shape(1) == 6 || q.shape(1) == 1024);
   if (!common_supported(q, freqs, offset, stream) || !heads_supported ||
-      q.shape(0) != 1 || q.shape(1) != kTokens || q.shape(3) != kHeadDim) {
+      !tokens_supported || q.shape(0) != 1 || q.shape(3) != kHeadDim) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_q_head_rms_rope] unsupported shape; "
-           "requires BF16 q [1,1024,H,512], H in {24,32,40}, FP32 freqs "
+           "requires BF16 q [1,M,H,512], M in {6,1024}, H in {24,32,40,64}, FP32 freqs "
            "[256], non-negative scalar offset; got "
         << q.shape() << ", " << freqs.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   Shape output_shape =
-      return_normalized ? q.shape() : Shape{1, q.shape(2), kTokens, kHeadDim};
+      return_normalized ? q.shape()
+                        : Shape{1, q.shape(2), q.shape(1), kHeadDim};
   std::vector<array> inputs = {q, freqs};
   return array(
       std::move(output_shape), bfloat16,
@@ -170,19 +176,20 @@ array ds4_kv_rms_rope(const array &kv, const array &weight, const array &freqs,
                       int offset, float eps, bool return_normalized,
                       StreamOrDevice s) {
   auto stream = to_stream(s);
-  if (!common_supported(kv, freqs, offset, stream) ||
-      kv.shape() != Shape{1, kTokens, kHeadDim} ||
+  const bool shape_supported = kv.ndim() == 3 && kv.shape(0) == 1 &&
+      (kv.shape(1) == 6 || kv.shape(1) == 1024) && kv.shape(2) == kHeadDim;
+  if (!common_supported(kv, freqs, offset, stream) || !shape_supported ||
       weight.shape() != Shape{kHeadDim} || weight.dtype() != bfloat16 ||
       !row_contiguous(weight)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_kv_rms_rope] unsupported shape; requires "
-           "BF16 kv [1,1024,512], BF16 weight [512], FP32 freqs [256], "
+           "BF16 kv [1,M,512], M in {6,1024}, BF16 weight [512], FP32 freqs [256], "
            "non-negative scalar offset; got "
         << kv.shape() << ", " << weight.shape() << ", " << freqs.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
   Shape output_shape =
-      return_normalized ? kv.shape() : Shape{1, 1, kTokens, kHeadDim};
+      return_normalized ? kv.shape() : Shape{1, 1, kv.shape(1), kHeadDim};
   std::vector<array> inputs = {kv, weight, freqs};
   return array(std::move(output_shape), bfloat16,
                std::make_shared<DS4AttentionFinalizerPrimitive>(

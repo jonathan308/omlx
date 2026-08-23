@@ -450,6 +450,9 @@ _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = False
 _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL = os.getenv(
     "OMLX_DSV4_ATTN_FINALIZER_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_ATTN_FINALIZER_VERIFY = os.getenv(
+    "OMLX_DSV4_ATTN_FINALIZER_VERIFY", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = False
 _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
     "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
@@ -863,22 +866,34 @@ def _attention_finalizer_native_inputs(
 ) -> Optional[Tuple[mx.array, mx.array, float]]:
     """Preflight both native finalizers before either graph node is created."""
 
+    verify_armed = is_dspark_verify_armed()
+    tokens = int(q_raw.shape[1]) if q_raw.ndim == 4 else -1
+    verify_route = bool(
+        _DEEPSEEK_V4_ATTN_FINALIZER_VERIFY
+        and verify_armed
+        and tokens == 6
+    )
+    prefill_route = bool(
+        _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
+        and not verify_armed
+        and tokens == 1024
+    )
     if (
-        not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
+        not (verify_route or prefill_route)
         or getattr(attn, "training", False)
-        or is_dspark_verify_armed()
         or type(offset) is not int
         or not 0 <= offset <= 0x7FFFFFFF
     ):
         return None
+    supported_heads = (24, 32, 40, 64) if verify_route else (24, 32, 40)
     if (
         q_raw.ndim != 4
         or q_raw.shape[0] != 1
-        or q_raw.shape[1] != 1024
-        or q_raw.shape[2] not in (24, 32, 40)
+        or q_raw.shape[1] not in (6, 1024)
+        or q_raw.shape[2] not in supported_heads
         or q_raw.shape[3] != 512
         or q_raw.dtype != mx.bfloat16
-        or kv_raw.shape != (1, 1024, 512)
+        or kv_raw.shape != (1, q_raw.shape[1], 512)
         or kv_raw.dtype != mx.bfloat16
         or getattr(attn, "head_dim", None) != 512
     ):
@@ -946,9 +961,9 @@ def _finalize_attention_qkv(
     if not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED:
         _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = True
         logging.getLogger(__name__).info(
-            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE prefill "
-            "finalizers (M=1024, H=%d; "
-            "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0 disables)",
+            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE "
+            "finalizers (M=%d, H=%d)",
+            q_raw.shape[1],
             q_raw.shape[2],
         )
 

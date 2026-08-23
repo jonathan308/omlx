@@ -11,7 +11,6 @@
 
 using namespace metal;
 
-constant constexpr uint kTokens = 1024;
 constant constexpr uint kHeadDim = 512;
 constant constexpr uint kPairs = kHeadDim / 2;
 constant constexpr uint kNormReads = 4;
@@ -45,6 +44,7 @@ ds4_q_head_rms_rope_bf16(
     constant float& eps [[buffer(5)]],
     constant uint& heads [[buffer(6)]],
     constant uint& write_normalized [[buffer(7)]],
+    constant uint& tokens [[buffer(8)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -109,7 +109,7 @@ ds4_q_head_rms_rope_bf16(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const size_t output_row = (size_t(head) * kTokens + token) * kHeadDim;
+  const size_t output_row = (size_t(head) * tokens + token) * kHeadDim;
   const uint pair_base = local_lid * 2u;
   for (uint i = 0; i < kNormReads; i += 2u) {
     const uint pair = pair_base + i / 2u;
