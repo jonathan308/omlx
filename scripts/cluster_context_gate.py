@@ -32,6 +32,11 @@ def _arguments() -> argparse.Namespace:
         default=" hello",
         help="Single-token text repeated to build an independent cold prompt",
     )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        help="Deterministic corpus repeated and truncated to the exact token count",
+    )
     parser.add_argument("--completion-tokens", type=int, default=2)
     parser.add_argument("--read-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--output", type=Path, required=True)
@@ -75,6 +80,37 @@ def _exact_prompt(tokenizer_path: Path, target: int, unit: str = " hello") -> st
     return prompt
 
 
+def _exact_corpus_prompt(tokenizer_path: Path, corpus_path: Path, target: int) -> str:
+    if target < 1:
+        raise ValueError("prompt token count must be positive")
+    corpus = corpus_path.read_text(encoding="utf-8")
+    if not corpus:
+        raise RuntimeError(f"prompt corpus is empty: {corpus_path}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=False,
+    )
+    repeats = 1
+    token_ids: list[int] = []
+    while len(token_ids) < target:
+        token_ids = tokenizer.encode(corpus * repeats, add_special_tokens=False)
+        repeats = max(
+            repeats + 1,
+            (repeats * target + len(token_ids) - 1) // max(len(token_ids), 1),
+        )
+    prompt = tokenizer.decode(
+        token_ids[:target],
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+    measured = len(tokenizer.encode(prompt, add_special_tokens=False))
+    if measured != target:
+        raise RuntimeError(
+            f"decoded corpus prompt encoded to {measured} tokens, expected {target}"
+        )
+    return prompt
+
+
 def _write_result(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -96,7 +132,11 @@ def main() -> int:
     _write_result(args.output, result)
     try:
         prompt_started = time.monotonic()
-        prompt = _exact_prompt(args.tokenizer, args.prompt_tokens, args.prompt_unit)
+        prompt = (
+            _exact_corpus_prompt(args.tokenizer, args.prompt_file, args.prompt_tokens)
+            if args.prompt_file is not None
+            else _exact_prompt(args.tokenizer, args.prompt_tokens, args.prompt_unit)
+        )
         result["prompt_build_seconds"] = time.monotonic() - prompt_started
         payload = {
             "model": args.model,
