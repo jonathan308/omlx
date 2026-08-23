@@ -68,13 +68,23 @@ def test_split_residual_branch_is_bit_exact_to_stock_hc_expand():
     assert mx.array_equal(stock, split).item()
 
 
+def test_overlap_helper_uses_persistent_secondary_stream(monkeypatch):
+    monkeypatch.setattr(dm, "_HC_RESIDUAL_STREAM", SimpleNamespace())
+    residual = mx.ones((1, 2, 2, 8), dtype=mx.bfloat16)
+    comb = mx.eye(2, dtype=mx.float32)[None, None]
+    expected = hc.hc_residual_branch(residual, comb)
+    actual = dm._hc_residual_overlap_branch(residual, comb)
+    mx.eval(expected, actual)
+    assert mx.array_equal(expected, actual).item()
+    assert dm._HC_RESIDUAL_STREAM.stream is not None
+
+
 def test_residual_graph_is_created_before_collective_modules():
     source = inspect.getsource(dm.DeepseekV4Block.__call__)
-    attn_branch = source.index("residual_branch = hc_residual_branch")
+    attn_branch = source.index("_hc_residual_overlap_branch")
     attention = source.index("x = self.attn(", attn_branch)
     attn_merge = source.index("hc_merge_branch", attention)
-    ffn_branch = source.index("residual_branch = hc_residual_branch", attn_merge)
+    ffn_branch = source.index("_hc_residual_overlap_branch", attn_merge)
     ffn = source.index("x = self.ffn(", ffn_branch)
     ffn_merge = source.index("hc_merge_branch", ffn)
     assert attn_branch < attention < attn_merge < ffn_branch < ffn < ffn_merge
-
