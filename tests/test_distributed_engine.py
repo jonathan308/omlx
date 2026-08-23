@@ -1300,6 +1300,24 @@ async def test_distributed_chat_does_not_retry_unrelated_404():
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_rank_prefill_rejection_keeps_typed_memory_error_surface():
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    detail = (
+        "Cluster prefill rejected by rank 1: Prefill would require ~131.36 GB "
+        "peak but effective ceiling is 126.00 GB"
+    )
+    engine = _ready_engine(
+        lambda request: httpx.Response(404, json={"error": detail})
+    )
+    try:
+        with pytest.raises(PrefillMemoryExceededError, match="rank 1"):
+            await engine.generate("hello")
+    finally:
+        await engine._client.aclose()
+
+
 def _healthy_supervisor_status():
     return SimpleNamespace(returncode=None, failure_reason=None)
 

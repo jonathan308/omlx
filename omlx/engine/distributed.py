@@ -27,6 +27,7 @@ from ..cluster.liveness import (
     read_marker,
 )
 from ..reasoning_effort import _fallback_candidate, _normalized_input
+from ..exceptions import PrefillMemoryExceededError
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -1638,6 +1639,20 @@ class DistributedBatchedEngine(BatchedEngine):
         if response.status_code < 400:
             return
         detail = cls._backend_error_detail(response)
+        lowered = detail.lower()
+        if (
+            "cluster prefill rejected" in lowered
+            and "prefill would require" in lowered
+        ):
+            # Rank-local admission happens after the coordinator has opened
+            # its private request. Preserve the typed memory surface used by
+            # local engines so JSON/SSE keepalive wrappers emit a complete
+            # OpenAI error body instead of letting a DistributedInferenceError
+            # escape after public response headers were already committed.
+            raise PrefillMemoryExceededError(
+                message=detail,
+                request_id="distributed-prefill",
+            )
         suffix = f": {detail[:500]}" if detail else ""
         raise DistributedInferenceError(
             f"rank-zero backend returned HTTP {response.status_code}{suffix}"
