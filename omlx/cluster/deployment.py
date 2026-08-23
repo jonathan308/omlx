@@ -134,6 +134,9 @@ _RANK_ENV_DEFAULTS = (
     # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
     # Both ranks receive one value; exact shape/config guards decide locally.
     ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),
+    # Split the exact FP32 HyperConnection residual branch so Metal can fill
+    # communication bubbles without changing collective or arithmetic order.
+    ("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"),
     # Exact M5 Max rank-1 5/8 expert-blocked NAX routed-MoE path. The flag is
     # carried to both ranks, while the exact hardware/TP gate activates only
     # on the qualified M5 rank. Default-off until full cold-prefill A/B.

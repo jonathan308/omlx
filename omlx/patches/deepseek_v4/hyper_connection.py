@@ -267,6 +267,30 @@ def hc_expand(x, residual, post, comb):
     return _hc_expand_op(x, residual, post, comb)
 
 
+@mx.compile
+def _hc_residual_branch_op(residual, comb):
+    """Independent FP32 residual branch of the exact HC expansion."""
+
+    return mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))
+
+
+@mx.compile
+def _hc_merge_branch_op(x, post, residual_branch):
+    """Merge after an attention/MoE collective with stock arithmetic order."""
+
+    y = post[..., None] * x[:, :, None, :].astype(mx.float32)
+    y = y + residual_branch
+    return y.astype(x.dtype)
+
+
+def hc_residual_branch(residual, comb):
+    return _hc_residual_branch_op(residual, comb)
+
+
+def hc_merge_branch(x, post, residual_branch):
+    return _hc_merge_branch_op(x, post, residual_branch)
+
+
 class HyperHead(nn.Module):
     def __init__(self, config):
         super().__init__()
