@@ -268,15 +268,43 @@ class RankPrefillGuard:
         ]
         if not rejecting_ranks:
             return
-        if local_error is not None:
-            raise local_error
 
         rejecting = rejecting_ranks[0]
+        # Preserve the rejecting host's actionable estimate. Previously peers
+        # received only "would exceed the host memory limit", hiding whether
+        # the cause was resident usage, KV growth, or a generic-SDPA fallback
+        # estimate. This second collective runs only on rejection, after every
+        # rank agreed to leave, so accepted prefills pay nothing and ordering
+        # remains symmetric. Only the first rejecting rank contributes bytes;
+        # simultaneous rejectors therefore cannot corrupt the payload.
+        max_detail_bytes = 1023
+        detail_payload = [0] * (max_detail_bytes + 1)
+        if rank == rejecting and local_error is not None:
+            encoded = str(local_error).encode("utf-8", errors="replace")[
+                :max_detail_bytes
+            ]
+            detail_payload[0] = len(encoded)
+            detail_payload[1 : 1 + len(encoded)] = encoded
+        agreed_detail = collective_mx.distributed.all_sum(
+            collective_mx.array(detail_payload)
+        ).tolist()
+        detail_len = min(max_detail_bytes, max(0, int(agreed_detail[0])))
+        detail = bytes(
+            max(0, min(255, int(value)))
+            for value in agreed_detail[1 : 1 + detail_len]
+        ).decode("utf-8", errors="replace")
+
+        if local_error is not None:
+            raise local_error
         raise PrefillMemoryExceededError(
             message=(
                 f"Cluster prefill rejected by rank {rejecting}: its local model "
-                "slice would exceed the host memory limit. Reduce context length "
-                "or free memory on that node."
+                "slice would exceed the host memory limit. "
+                + (
+                    f"Rank detail: {detail}"
+                    if detail
+                    else "Reduce context length or free memory on that node."
+                )
             ),
             request_id=request_id,
         )
