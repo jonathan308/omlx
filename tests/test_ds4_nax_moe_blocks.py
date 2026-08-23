@@ -10,6 +10,7 @@ import pytest
 
 from benchmarks.bench_ds4_nax_moe_blocks import (
     MIN_COMPOSED_SPEEDUP,
+    PAIR_SYMBOL,
     SYMBOL,
     route_fixture,
     structural_work_report,
@@ -91,6 +92,8 @@ def test_native_source_keeps_stock_nax_simd_geometry_and_bf16_boundary():
 def test_fast_registry_exposes_isolated_symbol():
     assert SYMBOL in fast.NATIVE_SYMBOLS
     assert callable(getattr(fast, SYMBOL))
+    assert PAIR_SYMBOL in fast.NATIVE_SYMBOLS
+    assert callable(getattr(fast, PAIR_SYMBOL))
 
 
 @pytest.mark.skipif(
@@ -106,6 +109,28 @@ def test_native_symbol_rejects_non_contract_shape_before_gpu_work():
     with pytest.raises(ValueError, match="isolated symbol requires BF16"):
         fast.deepseek_mxfp4_gather_qmm_blocks_nax(
             x, weight, scales, block_meta, block_count
+        )
+
+
+@pytest.mark.skipif(
+    not fast.has_symbol(PAIR_SYMBOL),
+    reason="glm_moe_dsa extension predates the paired NAX MoE symbol",
+)
+def test_paired_native_symbol_rejects_non_contract_shape_before_gpu_work():
+    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+    weight = mx.zeros((1, 1, 4), dtype=mx.uint32)
+    scales = mx.zeros((1, 1, 1), dtype=mx.uint8)
+    block_meta = mx.zeros((1, 3), dtype=mx.int32)
+    block_count = mx.zeros((1,), dtype=mx.int32)
+    with pytest.raises(ValueError, match="requires BF16"):
+        fast.deepseek_mxfp4_gather_qmm_pair_blocks_nax(
+            x,
+            weight,
+            scales,
+            weight,
+            scales,
+            block_meta,
+            block_count,
         )
 
 

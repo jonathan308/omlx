@@ -136,6 +136,7 @@ NATIVE_SYMBOLS = (
     "ds4_q_head_rms_rope",
     "ds4_kv_rms_rope",
     "deepseek_mxfp4_gather_qmm_blocks_nax",
+    "deepseek_mxfp4_gather_qmm_pair_blocks_nax",
     "ds4_projection_mxfp8_qmm",
     "ds4_output_oa_interleaved",
     "ds4_output_projection_chain",
@@ -961,6 +962,36 @@ def deepseek_mxfp4_gather_qmm_blocks_nax(
         )
     raise RuntimeError(
         "deepseek_mxfp4_gather_qmm_blocks_nax native kernel is unavailable"
+    )
+
+
+def deepseek_mxfp4_gather_qmm_pair_blocks_nax(
+    x: mx.array,
+    weight0: mx.array,
+    scales0: mx.array,
+    weight1: mx.array,
+    scales1: mx.array,
+    block_meta: mx.array,
+    block_count: mx.array,
+    *,
+    stream=None,
+) -> mx.array:
+    """Paired BF16 M5/NAX gate+up expert-block projection."""
+    if _ext is not None and hasattr(
+        _ext, "deepseek_mxfp4_gather_qmm_pair_blocks_nax"
+    ):
+        return _ext.deepseek_mxfp4_gather_qmm_pair_blocks_nax(
+            x,
+            weight0,
+            scales0,
+            weight1,
+            scales1,
+            block_meta,
+            block_count,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError(
+        "deepseek_mxfp4_gather_qmm_pair_blocks_nax native kernel is unavailable"
     )
 
 

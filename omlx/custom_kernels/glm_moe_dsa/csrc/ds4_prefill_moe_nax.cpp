@@ -130,6 +130,81 @@ public:
   auto state() const { return std::make_tuple(nullptr); }
 };
 
+class DS4Mxfp4GatherQmmPairBlocksNaxPrimitive : public Primitive {
+public:
+  explicit DS4Mxfp4GatherQmmPairBlocksNaxPrimitive(Stream stream)
+      : Primitive(stream) {}
+
+  static bool unsupported(
+      const array &x, const array &weight0, const array &scales0,
+      const array &weight1, const array &scales1, const array &block_meta,
+      const array &block_count, Stream stream) {
+    return DS4Mxfp4GatherQmmBlocksNaxPrimitive::unsupported(
+               x, weight0, scales0, block_meta, block_count, stream) ||
+        weight1.shape() != weight0.shape() ||
+        scales1.shape() != scales0.shape() || weight1.dtype() != uint32 ||
+        scales1.dtype() != uint8 || !row_contiguous(weight1) ||
+        !row_contiguous(scales1) || x.shape(2) != 4096 ||
+        weight0.shape(1) != 1280;
+  }
+
+  void eval_cpu(const std::vector<array> & /* inputs */,
+                std::vector<array> & /* outputs */) override {
+    throw std::runtime_error(
+        "DS4Mxfp4GatherQmmPairBlocksNaxPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(const std::vector<array> &inputs,
+                std::vector<array> &outputs) override {
+    auto &stream = this->stream();
+    auto &device = metal::device(stream.device);
+    const auto &x = inputs[0];
+    const auto &weight0 = inputs[1];
+    const auto &scales0 = inputs[2];
+    const auto &weight1 = inputs[3];
+    const auto &scales1 = inputs[4];
+    const auto &block_meta = inputs[5];
+    const auto &block_count = inputs[6];
+    auto &output = outputs[0];
+    output.set_data(allocator::malloc(output.nbytes()));
+
+    const int K = x.shape(2);
+    const int N = weight0.shape(1);
+    std::string kernel_name;
+    concatenate(
+        kernel_name,
+        "ds4_mxfp4_gather_qmm_pair_blocks_nax_bfloat16_t_bm",
+        kBlockRows, "_bn", kBlockCols, "_bk", kBlockDepth, "_wm",
+        kWarpRows, "_wn", kWarpCols);
+
+    auto library = device.get_library(kNaxMetallibName, current_binary_dir());
+    auto kernel = device.get_kernel(kernel_name, library);
+    auto &encoder = metal::get_command_encoder(stream);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(x, 0);
+    encoder.set_input_array(weight0, 1);
+    encoder.set_input_array(scales0, 2);
+    encoder.set_input_array(weight1, 3);
+    encoder.set_input_array(scales1, 4);
+    encoder.set_input_array(block_meta, 5);
+    encoder.set_input_array(block_count, 6);
+    encoder.set_output_array(output, 7);
+    encoder.set_bytes(kMaxBlocks, 8);
+    encoder.set_bytes(K, 9);
+    encoder.set_bytes(N, 10);
+    encoder.dispatch_threadgroups(
+        MTL::Size(N / kBlockCols, kMaxBlocks, 1),
+        MTL::Size(32, kWarpCols, kWarpRows));
+  }
+
+  DEFINE_NAME(DS4Mxfp4GatherQmmPairBlocksNaxPrimitive)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive & /* other */) const override {
+    return true;
+  }
+  auto state() const { return std::make_tuple(nullptr); }
+};
+
 } // namespace
 
 array deepseek_mxfp4_gather_qmm_blocks_nax(
@@ -154,6 +229,32 @@ array deepseek_mxfp4_gather_qmm_blocks_nax(
   return array(std::move(output_shape), bfloat16,
                std::make_shared<DS4Mxfp4GatherQmmBlocksNaxPrimitive>(stream),
                std::move(inputs));
+}
+
+array deepseek_mxfp4_gather_qmm_pair_blocks_nax(
+    const array &x, const array &weight0, const array &scales0,
+    const array &weight1, const array &scales1, const array &block_meta,
+    const array &block_count, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (DS4Mxfp4GatherQmmPairBlocksNaxPrimitive::unsupported(
+          x, weight0, scales0, weight1, scales1, block_meta, block_count,
+          stream)) {
+    std::ostringstream msg;
+    msg << "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_pair_blocks_nax] "
+           "requires BF16 x [6144,1,4096], two MXFP4 U32 weights "
+           "[256,1280,512], two U8 scales [256,1280,128], and the BM32 "
+           "block plan; got "
+        << x.shape() << ", " << weight0.shape() << ", " << scales0.shape()
+        << ", " << weight1.shape() << ", " << scales1.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  Shape output_shape = {2, x.shape(0), x.shape(1), weight0.shape(1)};
+  std::vector<array> inputs = {x,       weight0,    scales0, weight1,
+                               scales1, block_meta, block_count};
+  return array(
+      std::move(output_shape), bfloat16,
+      std::make_shared<DS4Mxfp4GatherQmmPairBlocksNaxPrimitive>(stream),
+      std::move(inputs));
 }
 
 } // namespace omlx::glm_kernels

@@ -26,7 +26,6 @@ from benchmarks.bench_ds4_tp_prefill_moe_asymmetric import load_tp_layer
 from omlx.custom_kernels.glm_moe_dsa import fast
 from omlx.patches.deepseek_v4.switch_layers import _build_mxfp4_blocks
 
-
 TOKENS = 1024
 TOPK = 6
 ROUTES = TOKENS * TOPK
@@ -36,7 +35,9 @@ LOCAL_INTERMEDIATE = 1280
 STOCK_BM = 64
 CANDIDATE_BM = 32
 MIN_COMPOSED_SPEEDUP = 1.45
+MIN_PAIR_SPEEDUP_VS_SEPARATE_NAX = 1.02
 SYMBOL = "deepseek_mxfp4_gather_qmm_blocks_nax"
+PAIR_SYMBOL = "deepseek_mxfp4_gather_qmm_pair_blocks_nax"
 
 
 @mx.compile
@@ -199,6 +200,8 @@ def main() -> None:
     args = _parse_args()
     if not fast.has_symbol(SYMBOL):
         raise RuntimeError(f"native symbol {SYMBOL} is unavailable")
+    if not fast.has_symbol(PAIR_SYMBOL):
+        raise RuntimeError(f"native symbol {PAIR_SYMBOL} is unavailable")
     if not fast.ds4_projection_nax_kernels_built():
         raise RuntimeError("optional NAX metallib is unavailable")
     if not fast.ds4_projection_nax_device_available():
@@ -268,6 +271,18 @@ def main() -> None:
         )
 
     def candidate_pair():
+        packed = fast.deepseek_mxfp4_gather_qmm_pair_blocks_nax(
+            sorted_hidden,
+            tensors["up_weight"],
+            tensors["up_scales"],
+            tensors["gate_weight"],
+            tensors["gate_scales"],
+            block_meta,
+            block_count,
+        )
+        return packed[0], packed[1]
+
+    def separate_nax_pair():
         return (
             candidate_projection(
                 sorted_hidden, tensors["up_weight"], tensors["up_scales"]
@@ -346,6 +361,12 @@ def main() -> None:
     all_exact = all(boundary["array_equal"] for boundary in parity.values())
 
     timings = {
+        "paired_vs_separate_nax": _abba(
+            candidate_pair,
+            separate_nax_pair,
+            warmup=args.warmup,
+            cycles=args.cycles,
+        ),
         "pair": _abba(
             candidate_pair,
             stock_pair,
@@ -372,7 +393,12 @@ def main() -> None:
         ),
     }
     composed_speedup = timings["composed_routed_projection"]["speedup"]
-    passed = all_exact and composed_speedup >= args.min_speedup
+    pair_speedup = timings["paired_vs_separate_nax"]["speedup"]
+    passed = (
+        all_exact
+        and composed_speedup >= args.min_speedup
+        and pair_speedup >= MIN_PAIR_SPEEDUP_VS_SEPARATE_NAX
+    )
     report = {
         "device": mx.device_info(),
         "model": str(args.model),
@@ -391,7 +417,7 @@ def main() -> None:
             "block_meta": list(block_meta.shape),
         },
         "kernel": {
-            "symbol": SYMBOL,
+            "symbol": PAIR_SYMBOL,
             "bm": 32,
             "bn": 64,
             "bk": 64,
@@ -407,6 +433,10 @@ def main() -> None:
         "gate": {
             "minimum_composed_speedup": args.min_speedup,
             "composed_speedup": composed_speedup,
+            "minimum_pair_speedup_vs_separate_nax": (
+                MIN_PAIR_SPEEDUP_VS_SEPARATE_NAX
+            ),
+            "pair_speedup_vs_separate_nax": pair_speedup,
             "passed": passed,
             "production_dispatch": False,
         },
