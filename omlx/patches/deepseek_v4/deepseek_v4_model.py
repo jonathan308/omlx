@@ -587,6 +587,58 @@ def _decode_qkv_projection_bundle(
     return tuple(mx.split(packed, boundaries, axis=-1))
 
 
+def _verify_q_a_kv_bank(
+    attn: nn.Module,
+    x: mx.array,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    """One target-row-exact MXFP8 dispatch for DS4 verify Q-A + raw KV."""
+
+    if (
+        not is_dspark_verify_armed()
+        or x.dtype != mx.bfloat16
+        or x.ndim != 3
+        or x.shape[0] != 1
+        or not 2 <= int(x.shape[1]) <= 6
+        or int(x.shape[2]) != 4096
+    ):
+        return None
+    modules = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+    if any(
+        module is None
+        or not callable(getattr(module, "get", None))
+        or getattr(module, "bits", None) != 8
+        or getattr(module, "group_size", None) != 32
+        or getattr(module, "mode", None) != "mxfp8"
+        or module.get("biases") is not None
+        or module.get("weight") is None
+        or module.get("scales") is None
+        for module in modules
+    ):
+        return None
+    q_a, wkv = modules
+    assert q_a is not None and wkv is not None
+    if (
+        tuple(q_a.weight.shape) != (1024, 1024)
+        or tuple(q_a.scales.shape) != (1024, 128)
+        or tuple(wkv.weight.shape) != (512, 1024)
+        or tuple(wkv.scales.shape) != (512, 128)
+    ):
+        return None
+    weight = getattr(attn, "_omlx_verify_q_a_kv_weight", None)
+    scales = getattr(attn, "_omlx_verify_q_a_kv_scales", None)
+    if weight is None or scales is None:
+        weight = mx.concatenate([q_a.weight, wkv.weight], axis=0)
+        scales = mx.concatenate([q_a.scales, wkv.scales], axis=0)
+        mx.eval(weight, scales)
+        object.__setattr__(attn, "_omlx_verify_q_a_kv_weight", weight)
+        object.__setattr__(attn, "_omlx_verify_q_a_kv_scales", scales)
+    from omlx.patches.deepseek_v4.verify_qmv import exact_verify_mxfp8_bank
+
+    packed = exact_verify_mxfp8_bank(weight, scales, x)
+    q_a_out, kv_out = mx.split(packed, (1024,), axis=-1)
+    return q_a_out, kv_out
+
+
 def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
     """Exact M=1024 TP-only gate for scheduling HC beside collectives."""
 
@@ -3299,8 +3351,12 @@ class LocalAttention(nn.Module):
                 self.sharding_group,
             )
         if projection_bank is None:
-            q_a = self.wq_a(x)
-            kv_raw = self.wkv(x)
+            verify_bank = _verify_q_a_kv_bank(self, x)
+            if verify_bank is None:
+                q_a = self.wq_a(x)
+                kv_raw = self.wkv(x)
+            else:
+                q_a, kv_raw = verify_bank
         else:
             q_a, kv_raw = projection_bank
         q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
@@ -3424,8 +3480,12 @@ class CompressedAttention(nn.Module):
                 self.sharding_group,
             )
         if projection_bank is None:
-            q_a = self.wq_a(x)
-            kv_raw = self.wkv(x)
+            verify_bank = _verify_q_a_kv_bank(self, x)
+            if verify_bank is None:
+                q_a = self.wq_a(x)
+                kv_raw = self.wkv(x)
+            else:
+                q_a, kv_raw = verify_bank
             compressor_projection = None
         else:
             q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
@@ -3628,8 +3688,12 @@ class SparseCompressedAttention(nn.Module):
                 self.sharding_group,
             )
         if projection_bank is None:
-            q_a = self.wq_a(x)
-            kv_raw = self.wkv(x)
+            verify_bank = _verify_q_a_kv_bank(self, x)
+            if verify_bank is None:
+                q_a = self.wq_a(x)
+                kv_raw = self.wkv(x)
+            else:
+                q_a, kv_raw = verify_bank
             compressor_projection = None
             index_compressor_projection = None
         else:

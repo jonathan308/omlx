@@ -436,6 +436,50 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
     return output
 
 
+def exact_verify_mxfp8_bank(
+    weight: mx.array,
+    scales: mx.array,
+    inputs: mx.array,
+) -> mx.array:
+    """Apply the prepared DS4 Q-A/raw-KV bank with target-row reductions."""
+
+    input_dims = int(inputs.shape[-1])
+    rows = int(inputs.size) // input_dims
+    output_dims = int(scales.shape[0])
+    if (
+        weight.ndim != 2
+        or scales.ndim != 2
+        or weight.dtype != mx.uint32
+        or scales.dtype != mx.uint8
+        or inputs.dtype not in (mx.bfloat16, mx.float16)
+        or not 2 <= rows <= 6
+        or input_dims != 4096
+        or output_dims != 1536
+        or int(weight.shape[0]) != output_dims
+        or int(weight.shape[1]) * 4 != input_dims
+        or int(scales.shape[1]) * 32 != input_dims
+    ):
+        raise ValueError("DS4 verify MXFP8 bank has an unsupported shape")
+    flat = inputs.reshape(rows, input_dims)
+    results_per_simdgroup = 1
+    (output,) = _kernel(results_per_simdgroup)(
+        inputs=[flat, weight, scales, scales],
+        template=[
+            ("T", inputs.dtype),
+            ("M", rows),
+            ("K", input_dims),
+            ("N", output_dims),
+            ("GS", 32),
+            ("MXFP8", True),
+        ],
+        grid=(32, output_dims // results_per_simdgroup, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, output_dims)],
+        output_dtypes=[inputs.dtype],
+    )
+    return output.reshape((*inputs.shape[:-1], output_dims))
+
+
 def pair_eligible(module_a, module_b, inputs: mx.array) -> bool:
     """Return whether two MXFP8 linears can share the exact native grid."""
     required = ("bits", "group_size", "mode", "weight", "scales")
