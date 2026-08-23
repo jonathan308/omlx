@@ -279,6 +279,14 @@ def maybe_capture(
             drop_ctx(host)
         return
     if ctx is None:
+        # A fresh priming history is valid only when this forward began at
+        # cache offset zero. Prefix-cache/SSD restores intentionally start at
+        # a nonzero offset; folding only their suffix would label a partial
+        # MTP-head history as complete and can corrupt later speculative cache
+        # rollback. Degrade to the established unprimed path until the MTP
+        # head cache itself is part of the persisted snapshot.
+        if offset_after != seq_len:
+            return
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
             return

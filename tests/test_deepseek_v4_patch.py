@@ -104,6 +104,24 @@ def test_b1_cache_offset_uses_host_scalar_without_sync(applied_patch):
     dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = old
 
 
+def test_restored_singleton_merge_preserves_absolute_rotating_offset(applied_patch):
+    import mlx.core as mx
+    from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+
+    cache = RotatingKVCache(max_size=128)
+    cache.keys = mx.zeros((1, 1, 1151, 8), dtype=mx.bfloat16)
+    cache.values = mx.zeros((1, 1, 1151, 0), dtype=mx.bfloat16)
+    cache.offset = 4096
+    cache._idx = 1151
+
+    merged = BatchRotatingKVCache.merge([cache])
+    mx.eval(merged.offset)
+
+    assert merged.offset.tolist() == [4096]
+    assert merged._offset == 4096
+    assert merged.keys.shape[2] == 128
+
+
 class TestUtilsPatch:
     """mlx_lm.utils.load_model + _load_safetensors + SAFETENSORS_DTYPE_FALLBACKS."""
 

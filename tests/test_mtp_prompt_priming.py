@@ -220,7 +220,7 @@ class TestCaptureSkips:
             pass
         assert prompt_priming.prime_ctx_stats(model) is None
 
-    def test_offset_rewind_invalidates_and_restarts(self, model):
+    def test_offset_rewind_invalidates_without_partial_restart(self, model):
         tokens = _tokens(12, seed=4)
         cache = _make_cache(model)
         _chunked_prefill(model, cache, tokens[:8], [8])
@@ -230,8 +230,17 @@ class TestCaptureSkips:
             if hasattr(c, "trim") and type(getattr(c, "offset", None)) is int:
                 c.trim(2)
         _chunked_prefill(model, cache, tokens[8:], [4])
-        # Restarted mid-prompt: only the new chunk's internal pairs.
-        assert prompt_priming.prime_ctx_stats(model) == 3
+        # A nonzero-offset suffix is not a complete head history. Falling back
+        # to unprimed MTP is safe; pretending the suffix began at zero is not.
+        assert prompt_priming.prime_ctx_stats(model) is None
+
+    def test_restored_prefix_does_not_start_partial_priming(self, model):
+        cache = _make_cache(model)
+        tokens = _tokens(12, seed=26)
+        with prompt_priming.suppress_capture():
+            _chunked_prefill(model, cache, tokens[:8], [8])
+        _chunked_prefill(model, cache, tokens[8:], [4])
+        assert prompt_priming.prime_ctx_stats(model) is None
 
     def test_window_cap_disables_long_prompts(self, model, monkeypatch):
         monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
