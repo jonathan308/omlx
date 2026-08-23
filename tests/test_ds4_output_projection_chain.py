@@ -53,17 +53,16 @@ def test_native_chain_owns_one_ephemeral_intermediate_then_o_b():
     assert allocation < temporary < o_a < o_b
 
 
-def test_output_chain_symbols_are_built_but_not_dispatched_by_model():
+def test_output_chain_symbols_are_built_with_default_off_model_seam():
     cmake = (ROOT / "omlx/custom_kernels/glm_moe_dsa/csrc/CMakeLists.txt").read_text()
     bindings = (ROOT / "omlx/custom_kernels/glm_moe_dsa/csrc/bindings.cpp").read_text()
     wrapper = (ROOT / "omlx/custom_kernels/glm_moe_dsa/fast.py").read_text()
     model = (ROOT / "omlx/patches/deepseek_v4/deepseek_v4_model.py").read_text()
     for filename in ("ds4_output_chain.cpp", "ds4_output_chain.metal"):
         assert filename in cmake
-    for symbol in (
-        "ds4_output_oa_interleaved",
-        "ds4_output_projection_chain",
-    ):
+    for symbol in ("ds4_output_oa_interleaved", "ds4_output_projection_chain"):
         assert symbol in bindings
         assert symbol in wrapper
-        assert symbol not in model
+    assert "ds4_output_oa_interleaved" not in model
+    assert "ds4_output_projection_chain" in model
+    assert '"OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"' in model

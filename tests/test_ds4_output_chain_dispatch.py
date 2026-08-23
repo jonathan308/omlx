@@ -80,7 +80,7 @@ def _eligible(monkeypatch, **overrides):
     return dm._attention_output_chain_native_inputs(attn, prepared)
 
 
-@pytest.mark.parametrize("k", (1536, 2560))
+@pytest.mark.parametrize("k", (1536, 2560, 4096))
 def test_signed_3x5_shapes_are_eligible(monkeypatch, k):
     assert _eligible(monkeypatch, k=k) is not None
 

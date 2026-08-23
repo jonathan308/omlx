@@ -37,7 +37,13 @@ from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_p
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .hyper_connection import (
+    HyperConnection,
+    HyperHead,
+    hc_expand,
+    hc_merge_branch,
+    hc_residual_branch,
+)
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 
@@ -371,6 +377,33 @@ _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
     "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
+_DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
+    "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
+    """Exact M=1024 TP-only gate for scheduling HC beside collectives."""
+
+    if (
+        not _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP
+        or getattr(block, "training", False)
+        or is_dspark_verify_armed()
+        or h.ndim != 4
+        or h.shape[0] != 1
+        or h.shape[1] != 1024
+        or h.shape[-1] != 4096
+        or h.dtype != mx.bfloat16
+    ):
+        return False
+    attn_group = getattr(getattr(block, "attn", None), "sharding_group", None)
+    ffn_group = getattr(getattr(block, "ffn", None), "sharding_group", None)
+    return bool(
+        attn_group is not None
+        and ffn_group is not None
+        and int(attn_group.size()) == 2
+        and int(ffn_group.size()) == 2
+    )
 
 
 def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
@@ -461,6 +494,7 @@ def _attention_output_chain_native_inputs(
         or tuple(prepared.shape) not in (
             (1, 8, 1024, 1536),
             (1, 8, 1024, 2560),
+            (1, 8, 1024, 4096),
         )
     ):
         return None
@@ -3440,8 +3474,10 @@ class DeepseekV4Block(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        overlap_hc = _can_overlap_hc_residual(self, h)
         residual = h
         x, post, comb = self.attn_hc(h)
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         attn_input = self.attn_norm(x)
         x = self.attn(
             attn_input,
@@ -3449,13 +3485,22 @@ class DeepseekV4Block(nn.Module):
             cache=cache,
             _standard_mask=_standard_mask,
         )
-        h = hc_expand(x, residual, post, comb)
+        h = (
+            hc_merge_branch(x, post, residual_branch)
+            if residual_branch is not None
+            else hc_expand(x, residual, post, comb)
+        )
 
         residual = h
         x, post, comb = self.ffn_hc(h)
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
-        return hc_expand(x, residual, post, comb)
+        return (
+            hc_merge_branch(x, post, residual_branch)
+            if residual_branch is not None
+            else hc_expand(x, residual, post, comb)
+        )
 
 
 class DeepseekV4Model(PipelineMixin, nn.Module):

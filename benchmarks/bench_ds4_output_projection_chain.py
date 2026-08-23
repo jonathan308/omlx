@@ -18,6 +18,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -50,6 +51,38 @@ VARIANTS = {
     2: {"o_a_bm": 64, "o_b_bm": 32},
     3: {"o_a_bm": 32, "o_b_bm": 64},
 }
+
+
+def _load_single_attention_layer(model: Path, layer: int):
+    """Load the unsliced H64 O-A/O-B banks for the single-node gate."""
+
+    index = json.loads((model / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    prefix = f"layers.{layer}.attn."
+    shards = sorted(
+        {filename for key, filename in index.items() if key.startswith(prefix)}
+    )
+    loaded = {}
+    for shard in shards:
+        loaded.update(mx.load(str(model / shard)))
+
+    def get(name: str, suffix: str = "weight"):
+        return loaded[f"layers.{layer}.attn.{name}.{suffix}"]
+
+    tensors = {
+        "o_a_weight": mx.contiguous(get("wo_a").reshape(O_GROUPS, O_RANK, -1)),
+        "o_a_scales": mx.contiguous(
+            get("wo_a", "scales").reshape(O_GROUPS, O_RANK, -1)
+        ),
+        "o_b_weight": get("wo_b"),
+        "o_b_scales": get("wo_b", "scales"),
+    }
+    _evaluate(tuple(tensors.values()))
+    return tensors, shards, SimpleNamespace(
+        local_heads=64,
+        o_a_input=4096,
+    )
 
 
 def _evaluate(value: Any) -> None:
@@ -109,8 +142,11 @@ def run_rank(
     cycles: int,
     parity_seeds: int,
 ) -> dict[str, Any]:
-    tensors, shards = _load_attention_layer(model, layer, rank)
-    shape = rank_shape(rank)
+    if rank == -1:
+        tensors, shards, shape = _load_single_attention_layer(model, layer)
+    else:
+        tensors, shards = _load_attention_layer(model, layer, rank)
+        shape = rank_shape(rank)
 
     def stock_mid(value: mx.array) -> mx.array:
         projected = _qmm(mx, value, tensors["o_a_weight"], tensors["o_a_scales"])
@@ -268,7 +304,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+", default=[2])
-    parser.add_argument("--ranks", type=int, choices=(0, 1), nargs="+", default=[0, 1])
+    parser.add_argument(
+        "--ranks", type=int, choices=(-1, 0, 1), nargs="+", default=[0, 1]
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--cycles", type=int, default=12)
     parser.add_argument("--parity-seeds", type=int, default=3)

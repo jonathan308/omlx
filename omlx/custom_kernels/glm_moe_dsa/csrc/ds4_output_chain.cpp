@@ -86,7 +86,7 @@ bool unsupported_o_a(const array &x, const array &o_a_weight,
     return true;
   }
   const int K = x.shape(3);
-  return (K != 1536 && K != 2560) ||
+  return (K != 1536 && K != 2560 && K != 4096) ||
          x.shape() != Shape{1, kGroups, kTokens, K} ||
          o_a_weight.shape() != Shape{kGroups, kORank, K / kValuesPerU32} ||
          o_a_scales.shape() != Shape{kGroups, kORank, K / kGroupSize};
@@ -174,7 +174,7 @@ public:
       return true;
     }
     const int K = x.shape(3);
-    if (K != 1536 && K != 2560) {
+    if (K != 1536 && K != 2560 && K != 4096) {
       return true;
     }
     return x.shape() != Shape{1, kGroups, kTokens, K} ||
@@ -276,7 +276,7 @@ mx::array ds4_output_oa_interleaved(const mx::array &x,
   if (unsupported_o_a(x, o_a_weight, o_a_scales, variant, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_output_oa_interleaved] unsupported shape; "
-           "requires BF16 x [1,8,1024,K] with K in {1536,2560} and MXFP8 "
+           "requires BF16 x [1,8,1024,K] with K in {1536,2560,4096} and MXFP8 "
            "O-A [8,1024,K/4]; got "
         << x.shape() << ", " << o_a_weight.shape() << ", " << o_a_scales.shape()
         << ".";
@@ -300,7 +300,7 @@ mx::array ds4_output_projection_chain(const mx::array &x,
           x, o_a_weight, o_a_scales, o_b_weight, o_b_scales, variant, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_output_projection_chain] unsupported "
-           "shape; requires BF16 x [1,8,1024,K] with K in {1536,2560}, "
+           "shape; requires BF16 x [1,8,1024,K] with K in {1536,2560,4096}, "
            "MXFP8 O-A [8,1024,K/4], and MXFP8 O-B [4096,2048]; got "
         << x.shape() << ", " << o_a_weight.shape() << ", " << o_a_scales.shape()
         << ", " << o_b_weight.shape() << ", " << o_b_scales.shape() << ".";
