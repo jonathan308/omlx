@@ -51,13 +51,13 @@ _NAX_STOCK_MIN_ROUTES = int(
     os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
 )
 # Lossless full routed-MoE decode primitive.  The 3:5 TP slices are physically
-# qualified through four coalesced decode rows; other served shapes retain the
-# established B=1 gate until their own parity and throughput gates clear.
+# exact and isolated-kernel faster through four coalesced rows, but the live
+# TP2 B=4 gate regressed aggregate decode.  Keep production at B=1.
 _DEEPSEEK_MXFP4_FULL_DECODE = os.environ.get(
     "OMLX_DSV4_FULL_MOE_DECODE", "1"
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS = int(
-    os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "4")
+    os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1")
 )
 _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED = False
 # Exact M3-family M=1024 prefill route-tail kernels. Default OFF until the
@@ -499,14 +499,8 @@ class SwitchGLU(nn.Module):
         ) or (
             device_name == "Apple M5 Max" and intermediate == 1280
         )
-        qualified_batched_shape = (
-            device_name == "Apple M3 Ultra" and intermediate == 768
-        ) or (
-            device_name == "Apple M5 Max" and intermediate == 1280
-        )
         if (
             not qualified_shape
-            or tokens > (4 if qualified_batched_shape else 1)
             or input_dims <= 0
             or input_dims % 512
             or intermediate <= 0

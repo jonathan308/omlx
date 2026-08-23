@@ -165,7 +165,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TOPK=1" in envs
     assert "OMLX_DSV4_B1_SCALAR_OFFSET=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
-    assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=4" in envs
+    assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_DSV4_ROUTER_TOPK_DECODE=1" in envs
     assert "OMLX_DSV4_NAX_OA_PREFILL=0" in envs
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=0" in envs
