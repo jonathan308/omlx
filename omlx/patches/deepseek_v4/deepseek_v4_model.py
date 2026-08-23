@@ -454,6 +454,85 @@ _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
 _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
     "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_QKV_BUNDLE_DECODE = os.getenv(
+    "OMLX_DSV4_QKV_BUNDLE_DECODE", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = False
+
+
+def _decode_qkv_projection_bundle(
+    attn: nn.Module,
+    x: mx.array,
+) -> Optional[Tuple[mx.array, ...]]:
+    """One exact B1 dispatch for ratio-4 Q/KV/compressor projections."""
+
+    if (
+        not _DEEPSEEK_V4_QKV_BUNDLE_DECODE
+        or getattr(attn, "training", False)
+        or is_dspark_verify_armed()
+        or tuple(x.shape) != (1, 1, 4096)
+        or x.dtype != mx.bfloat16
+    ):
+        return None
+    config = getattr(attn, "config", None)
+    try:
+        if config is None or not _dsv4f_exact_config(config, 4):
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    indexer = getattr(attn, "indexer", None)
+    compressor = getattr(attn, "compressor", None)
+    index_compressor = getattr(indexer, "compressor", None)
+    modules = (
+        getattr(attn, "wq_a", None),
+        getattr(attn, "wkv", None),
+        getattr(compressor, "wkv", None),
+        getattr(compressor, "wgate", None),
+        getattr(index_compressor, "wkv", None),
+        getattr(index_compressor, "wgate", None),
+    )
+    if any(
+        module is None or not callable(getattr(module, "get", None))
+        for module in modules
+    ):
+        return None
+    q_a, wkv, compressor_kv, compressor_gate, index_kv, index_gate = modules
+    if not (
+        getattr(q_a, "group_size", None) == 32
+        and getattr(q_a, "bits", None) == 8
+        and getattr(q_a, "mode", None) == "mxfp8"
+        and getattr(wkv, "group_size", None) == 32
+        and getattr(wkv, "bits", None) == 8
+        and getattr(wkv, "mode", None) == "mxfp8"
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        if not glm_fast.has_symbol("deepseek_v4_qkv_compressor_bundle_b1"):
+            return None
+        packed = glm_fast.deepseek_v4_qkv_compressor_bundle_b1(
+            mx.contiguous(x.reshape(1, 4096)),
+            q_a["weight"],
+            q_a["scales"],
+            wkv["weight"],
+            wkv["scales"],
+            compressor_kv["weight"],
+            compressor_gate["weight"],
+            index_kv["weight"],
+            index_gate["weight"],
+        ).reshape(1, 1, 4096)
+    except (KeyError, TypeError, ValueError):
+        return None
+    boundaries = (1024, 1536, 2560, 3584, 3840)
+    global _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED
+    if not _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED:
+        _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 exact B1 Q/KV/compressor bundle active "
+            "(six projections, one dispatch)"
+        )
+    return tuple(mx.split(packed, boundaries, axis=-1))
 
 
 def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
@@ -3315,18 +3394,20 @@ class SparseCompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        projection_bank = _owned_projection_bank(
-            x,
-            (
-                self.wq_a,
-                self.wkv,
-                self.compressor.wkv,
-                self.compressor.wgate,
-                self.indexer.compressor.wkv,
-                self.indexer.compressor.wgate,
-            ),
-            self.sharding_group,
-        )
+        projection_bank = _decode_qkv_projection_bundle(self, x)
+        if projection_bank is None:
+            projection_bank = _owned_projection_bank(
+                x,
+                (
+                    self.wq_a,
+                    self.wkv,
+                    self.compressor.wkv,
+                    self.compressor.wgate,
+                    self.indexer.compressor.wkv,
+                    self.indexer.compressor.wgate,
+                ),
+                self.sharding_group,
+            )
         if projection_bank is None:
             q_a = self.wq_a(x)
             kv_raw = self.wkv(x)

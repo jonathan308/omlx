@@ -101,6 +101,9 @@ _RANK_ENV_DEFAULTS = (
     # nominates rank 0/M3, but production remains off until the exact live
     # prefill+decode promotion gate clears.
     ("OMLX_DSV4_PROJECTION_OWNER_RANK", "off"),
+    # Exact one-dispatch DS4 B1 ratio-4 Q/KV/compressor bundle. Default-off
+    # until its full distributed decode hash/rate gate clears.
+    ("OMLX_DSV4_QKV_BUNDLE_DECODE", "0"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),

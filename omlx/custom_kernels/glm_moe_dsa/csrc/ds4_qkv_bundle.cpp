@@ -22,7 +22,7 @@ constexpr int kIndexRows = 256;
 constexpr int kPackedRows = 4096;
 constexpr int kMXFP8ValuesPerU32 = 4;
 constexpr int kGroupSize = 32;
-constexpr int kDispatches = 2;
+constexpr int kDispatches = 1;
 
 std::string current_binary_dir() {
   static std::string binary_dir = []() {
@@ -98,30 +98,24 @@ class DS4QKVCompressorBundleB1Primitive : public Primitive {
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto& encoder = metal::get_command_encoder(s);
 
-    auto qkernel = d.get_kernel("ds4_qkv_bundle_mxfp8_b1", lib);
-    encoder.set_compute_pipeline_state(qkernel);
+    auto kernel = d.get_kernel("ds4_qkv_bundle_all_b1", lib);
+    encoder.set_compute_pipeline_state(kernel);
     encoder.set_input_array(inputs[0], 0);
     encoder.set_input_array(inputs[1], 1);
     encoder.set_input_array(inputs[2], 2);
     encoder.set_input_array(inputs[3], 3);
     encoder.set_input_array(inputs[4], 4);
-    encoder.set_output_array(out, 5);
-    encoder.dispatch_threadgroups(
-        MTL::Size(1, kQRows / 8, 2), MTL::Size(32, 2, 1));
-
-    auto dkernel = d.get_kernel("ds4_qkv_bundle_dense_b1", lib);
-    encoder.set_compute_pipeline_state(dkernel);
-    encoder.set_input_array(inputs[0], 0);
-    encoder.set_input_array(inputs[5], 1);
-    encoder.set_input_array(inputs[6], 2);
-    encoder.set_input_array(inputs[7], 3);
-    encoder.set_input_array(inputs[8], 4);
-    encoder.set_output_array(out, 5);
-    // Stock B1 grouped dense geometry: BM4/BN1/SM1/SN32/TM4/TN4,
-    // 16 output rows per 128-thread threadgroup.
+    encoder.set_input_array(inputs[5], 5);
+    encoder.set_input_array(inputs[6], 6);
+    encoder.set_input_array(inputs[7], 7);
+    encoder.set_input_array(inputs[8], 8);
+    encoder.set_output_array(out, 9);
+    constexpr int quantized_rows = kQRows + kKVRows;
     constexpr int dense_rows = 2 * kCompressorRows + 2 * kIndexRows;
+    constexpr int quantized_physical_groups = quantized_rows / 16;
     encoder.dispatch_threadgroups(
-        MTL::Size(dense_rows / 16, 1, 1), MTL::Size(32, 1, 4));
+        MTL::Size(quantized_physical_groups + dense_rows / 16, 1, 1),
+        MTL::Size(32, 1, 4));
   }
 
   DEFINE_NAME(DS4QKVCompressorBundleB1)

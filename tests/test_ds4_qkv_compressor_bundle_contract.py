@@ -9,8 +9,8 @@ from benchmarks.bench_ds4_qkv_compressor_bundle import (
     byte_ledger,
     dispatch_ledger,
     packed_slices,
-    promotion_contract,
     projections,
+    promotion_contract,
 )
 
 
@@ -57,14 +57,21 @@ def test_first_native_abi_stops_before_ape_and_cache_mutation():
     assert contract["parity"]["decode_positions"] == [0, 1, 2, 3]
 
 
-def test_symbol_remains_outside_production_until_gate_passes():
+def test_symbol_has_only_a_default_off_exact_production_seam():
     root = Path(__file__).parents[1]
-    allowed = {root / "omlx/custom_kernels/glm_moe_dsa/fast.py"}
+    model = root / "omlx/patches/deepseek_v4/deepseek_v4_model.py"
+    allowed = {
+        root / "omlx/custom_kernels/glm_moe_dsa/fast.py",
+        model,
+    }
     hits = []
     for path in (root / "omlx").rglob("*.py"):
         if path not in allowed and NATIVE_B1_SYMBOL in path.read_text():
             hits.append(path)
     assert hits == []
+    source = model.read_text()
+    assert '"OMLX_DSV4_QKV_BUNDLE_DECODE", "0"' in source
+    assert "_decode_qkv_projection_bundle(self, x)" in source
 
 
 def test_recorded_b1_gate_is_lossless_but_rejected_on_both_hosts():

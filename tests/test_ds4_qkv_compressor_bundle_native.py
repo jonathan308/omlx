@@ -7,7 +7,6 @@ import pytest
 
 from omlx.custom_kernels.glm_moe_dsa import fast
 
-
 SYMBOL = "deepseek_v4_qkv_compressor_bundle_b1"
 
 
@@ -16,7 +15,7 @@ def test_native_registry_and_wrapper_expose_bundle_only_explicitly():
     assert callable(fast.deepseek_v4_qkv_compressor_bundle_b1)
 
 
-def test_native_source_reports_two_encoded_dispatches_and_fixed_slices():
+def test_native_source_reports_one_heterogeneous_dispatch_and_fixed_slices():
     source = (
         Path(__file__).parents[1]
         / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_qkv_bundle.cpp"
@@ -25,9 +24,11 @@ def test_native_source_reports_two_encoded_dispatches_and_fixed_slices():
         Path(__file__).parents[1]
         / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_qkv_bundle.metal"
     ).read_text()
-    assert "kDispatches = 2" in source
+    assert "kDispatches = 1" in source
     assert "kPackedRows = 4096" in source
-    assert source.count("dispatch_threadgroups") == 2
+    assert source.count("dispatch_threadgroups") == 1
+    assert "ds4_qkv_bundle_all_b1" in metal
+    assert "virtual_group = group_id * 2 + cohort" in metal
     assert "packed_dense_offset = 1536" in metal
     assert "group_row < 1024" in metal
     assert "group_row < 2048" in metal
