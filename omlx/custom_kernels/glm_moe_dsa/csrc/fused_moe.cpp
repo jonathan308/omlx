@@ -1197,11 +1197,20 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     auto& compute_encoder = metal::get_command_encoder(s);
     compute_encoder.add_temporary(activated);
 
+    // The 3:5 TP rank-0 slice has enough independent output rows to keep the
+    // measured M3 Ultra GPU occupied without coarsening two results into each
+    // simdgroup. Keep the established two-row tile on every other GPU/shape.
+    const int result_rows =
+        I == 768 && d.get_architecture() == "applegpu_g15d" ? 1 : 2;
+
     std::string kname;
     concatenate(
         kname,
         "deepseek_mxfp4_pair_swiglu_decode_",
         glm_type_name(x.dtype()));
+    if (result_rows == 1) {
+      concatenate(kname, "_r1");
+    }
     auto kernel = d.get_kernel(kname, lib);
     compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(x, 0);
@@ -1218,13 +1227,17 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     compute_encoder.set_bytes(K, 11);
     compute_encoder.set_bytes(activation_limit_, 12);
     compute_encoder.dispatch_threadgroups(
-        MTL::Size((I + 1) / 2, routes, 1), MTL::Size(32, 1, 1));
+        MTL::Size((I + result_rows - 1) / result_rows, routes, 1),
+        MTL::Size(32, 1, 1));
 
     kname.clear();
     concatenate(
         kname,
         "deepseek_mxfp4_down_score_sum_decode_",
         glm_type_name(x.dtype()));
+    if (result_rows == 1) {
+      concatenate(kname, "_r1");
+    }
     kernel = d.get_kernel(kname, lib);
     compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(activated, 0);
@@ -1238,7 +1251,8 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     compute_encoder.set_bytes(H, 8);
     compute_encoder.set_bytes(I, 9);
     compute_encoder.dispatch_threadgroups(
-        MTL::Size((H + 1) / 2, tokens, 1), MTL::Size(32, 1, 1));
+        MTL::Size((H + result_rows - 1) / result_rows, tokens, 1),
+        MTL::Size(32, 1, 1));
   }
 
   DEFINE_NAME(DeepseekMxfp4FullDecodePrimitive)
