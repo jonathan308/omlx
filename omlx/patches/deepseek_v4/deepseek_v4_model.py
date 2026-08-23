@@ -938,6 +938,8 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
             axis=2,
         )
         from omlx.patches.deepseek_v4.verify_qmv import (
+            eligible as qmv_eligible,
+            exact_verify_qmv,
             exact_verify_multi_qmv,
             multi_eligible,
         )
@@ -952,7 +954,11 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
                 ],
                 axis=1,
             )
-        return attn.wo_b(projected)
+        return (
+            exact_verify_qmv(attn.wo_b, projected)
+            if qmv_eligible(attn.wo_b, projected)
+            else attn.wo_b(projected)
+        )
     prepared = prepare(out)
     native_chain = _project_attention_output_chain(attn, prepared)
     if native_chain is not None:
