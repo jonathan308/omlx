@@ -295,14 +295,26 @@ _DENSE_FP32_SOURCE = _DENSE_SOURCE.replace(
 )
 
 
-@lru_cache(maxsize=1)
-def _kernel():
+@lru_cache(maxsize=3)
+def _kernel(results_per_simdgroup: int = 4):
+    if results_per_simdgroup not in (1, 2, 4):
+        raise ValueError("verify QMV result tile must be 1, 2, or 4")
+    source = _SOURCE
+    if results_per_simdgroup != 4:
+        source = source.replace(
+            "constexpr int RESULTS_PER_SIMDGROUP = 4;",
+            f"constexpr int RESULTS_PER_SIMDGROUP = {results_per_simdgroup};",
+        ).replace(
+            "constexpr int OUTPUTS_PER_THREADGROUP = 8;",
+            "constexpr int OUTPUTS_PER_THREADGROUP = "
+            f"{2 * results_per_simdgroup};",
+        )
     return mx.fast.metal_kernel(
-        name="omlx_deepseek_verify_qmv_exact",
+        name=f"omlx_deepseek_verify_qmv_exact_r{results_per_simdgroup}",
         input_names=["input", "weight", "scales", "biases"],
         output_names=["output"],
         header=_HEADER,
-        source=_SOURCE,
+        source=source,
         ensure_row_contiguous=True,
     )
 
@@ -372,7 +384,18 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
     if biases is None:
         biases = module.scales
 
-    (output,) = _kernel()(
+    results_per_simdgroup = 4
+    if input_dims == 8192 and output_dims == 4096 and rows == 6:
+        try:
+            device_name = str(mx.device_info().get("device_name", ""))
+            if device_name == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+            elif device_name == "Apple M5 Max":
+                results_per_simdgroup = 2
+        except Exception:
+            pass
+
+    (output,) = _kernel(results_per_simdgroup)(
         inputs=[flat, module.weight, module.scales, biases],
         template=[
             ("T", inputs.dtype),
@@ -384,7 +407,7 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
         ],
         # mx.fast uses thread-grid dimensions. This is one (32, 2, 1)
         # threadgroup for each eight output rows.
-        grid=(32, output_dims // 4, 1),
+        grid=(32, output_dims // results_per_simdgroup, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[(rows, output_dims)],
         output_dtypes=[inputs.dtype],
