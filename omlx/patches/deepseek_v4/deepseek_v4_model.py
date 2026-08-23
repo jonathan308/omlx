@@ -150,10 +150,10 @@ def _owned_projection_bank(
     """Compute replicated input projections once and send exact BF16 views.
 
     Rank zero's physical M3 gate executes the full DS4 projection shapes much
-    faster than the M5. Both ranks enter one symmetric all-gather: the owner
-    contributes its original packed arrays, the peer contributes placeholder
-    storage, and both select the owner's gathered batch slice. No reduction or
-    alternate arithmetic is introduced.
+    faster than the M5. Both ranks enter one symmetric all-sum: the owner
+    contributes its original packed arrays and the peer contributes exact
+    zeros. Unlike selecting the owner's own all-gather slice, this collective
+    cannot be optimized away on only one rank.
     """
 
     owner = _projection_owner_rank(group)
@@ -170,9 +170,7 @@ def _owned_projection_bank(
     else:
         shape = (*x.shape[:-1], total)
         packed = mx.zeros(shape, dtype=x.dtype)
-    batch = int(x.shape[0])
-    gathered = mx.distributed.all_gather(packed, group=group)
-    packed = gathered[owner * batch : (owner + 1) * batch]
+    packed = mx.distributed.all_sum(packed, group=group)
     boundaries = []
     cursor = 0
     for width in widths[:-1]:
