@@ -531,7 +531,7 @@ def _project_attention_output_chain(
         _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = True
         logging.getLogger(__name__).info(
             "deepseek_v4: using exact BF16 O-A/O-B prefill chain "
-            "(M=1024, H=%d, BM64/BK32/BN32; "
+            "(M=1024, H=%d, BM64/BK32/BN64; "
             "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0 disables)",
             prepared.shape[-1] // 64,
         )
@@ -542,7 +542,7 @@ def _project_attention_output_chain(
         o_a_scales,
         o_b_weight,
         o_b_scales,
-        variant=2,
+        variant=1,
     )
 
 

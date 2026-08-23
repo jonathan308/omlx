@@ -111,3 +111,8 @@ def test_chain_preflight_precedes_stock_projection_graph():
     native_return = source.index("return native_chain", preflight)
     stock_graph = source.index("_project_attention_oa", native_return)
     assert preflight < native_return < stock_graph
+
+
+def test_production_chain_uses_confirmed_bm64_bk32_bn64_variant():
+    source = inspect.getsource(dm._project_attention_output_chain)
+    assert "variant=1" in source
