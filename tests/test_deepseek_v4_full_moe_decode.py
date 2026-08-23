@@ -129,10 +129,13 @@ def test_deepseek_mxfp4_full_decode_is_bit_exact(
 
 
 @pytest.mark.parametrize("hidden_dims", (768, 1280))
-def test_deepseek_mxfp4_full_decode_is_exact_on_asymmetric_tp_tails(hidden_dims):
+@pytest.mark.parametrize("tokens", (1, 2, 4))
+def test_deepseek_mxfp4_full_decode_is_exact_on_asymmetric_tp_tails(
+    hidden_dims, tokens
+):
     mx = pytest.importorskip("mlx.core")
     fast = _native_fast()
-    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=hidden_dims)
+    args = _fixture(mx.bfloat16, tokens, mx.uint32, hidden_dims=hidden_dims)
 
     reference = _reference(args)
     candidate = fast.deepseek_mxfp4_full_decode(*args, 10.0)
@@ -223,13 +226,28 @@ def test_switchglu_full_decode_default_remains_disabled(monkeypatch):
     assert not switch._can_use_mxfp4_full_decode(None, None, None)
 
 
-def test_switchglu_full_decode_accepts_served_asymmetric_tp_width(monkeypatch):
+@pytest.mark.parametrize(
+    ("device_name", "hidden_dims", "tokens", "expected"),
+    [
+        ("Apple M3 Ultra", 768, 4, True),
+        ("Apple M5 Max", 1280, 4, True),
+        # Preserve the existing single-node M3 path at B=1 only.
+        ("Apple M3 Ultra", 2048, 1, True),
+        ("Apple M3 Ultra", 2048, 2, False),
+        # The distributed serving target is four rows; larger batches fail
+        # closed even if an operator supplies a higher environment maximum.
+        ("Apple M3 Ultra", 768, 5, False),
+    ],
+)
+def test_switchglu_full_decode_accepts_only_physically_qualified_batch_rows(
+    monkeypatch, device_name, hidden_dims, tokens, expected
+):
     mx = pytest.importorskip("mlx.core")
     from omlx.patches.deepseek_v4 import switch_layers
 
-    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=768)
+    args = _fixture(mx.bfloat16, tokens, mx.uint32, hidden_dims=hidden_dims)
     x, up_w, up_s, gate_w, gate_s, down_w, down_s, indices, scores = args
-    switch = switch_layers.SwitchGLU(512, 768, 8)
+    switch = switch_layers.SwitchGLU(512, hidden_dims, 8)
     switch.eval()
     for name, weight, scales in (
         ("up_proj", up_w, up_s),
@@ -252,9 +270,9 @@ def test_switchglu_full_decode_accepts_served_asymmetric_tp_width(monkeypatch):
     monkeypatch.setattr(
         switch_layers.mx,
         "device_info",
-        lambda: {"device_name": "Apple M3 Ultra"},
+        lambda: {"device_name": device_name},
     )
     monkeypatch.setattr(
-        switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 1
+        switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 8
     )
-    assert switch._can_use_mxfp4_full_decode(x, indices, scores)
+    assert switch._can_use_mxfp4_full_decode(x, indices, scores) is expected

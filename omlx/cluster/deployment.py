@@ -142,11 +142,12 @@ _RANK_ENV_DEFAULTS = (
     # measured fastest rank computes the exact top-k once and broadcasts only
     # 512 int32 indices; ``off`` restores replicated indexer work.
     ("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"),
-    # Full routed-MoE decode fusion is isolated-kernel exact and available for
-    # explicit A/B. It remains off because its full-model parity/speed gate has
-    # not cleared on both Macs.
+    # Full routed-MoE decode fusion is bit-exact and faster through B=4 on both
+    # physically served 3:5 slices (M3 Ultra I=768, M5 Max I=1280).  The model
+    # gate keeps unqualified/single-node shapes at B=1 even though both ranks
+    # receive the same maximum, preserving a one-value rollback to B=1.
     ("OMLX_DSV4_FULL_MOE_DECODE", "1"),
-    ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1"),
+    ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "4"),
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.
     ("OMLX_DSV4_MOE_TAIL8", "0"),
