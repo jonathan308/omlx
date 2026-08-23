@@ -484,6 +484,23 @@ class SwitchGLU(nn.Module):
             for p in projections
         ):
             return False
+        up_weight = self.up_proj["weight"]
+        gate_weight = self.gate_proj["weight"]
+        down_weight = self.down_proj["weight"]
+        intermediate = int(up_weight.shape[1])
+        input_dims = int(x.shape[-1])
+        if (
+            input_dims <= 0
+            or input_dims % 512
+            or intermediate <= 0
+            or intermediate % 512
+            or tuple(gate_weight.shape) != tuple(up_weight.shape)
+            or int(up_weight.shape[2]) * 8 != input_dims
+            or int(down_weight.shape[0]) != int(up_weight.shape[0])
+            or int(down_weight.shape[1]) != input_dims
+            or int(down_weight.shape[2]) * 8 != intermediate
+        ):
+            return False
         if not glm_fast.has_symbol("deepseek_mxfp4_full_decode"):
             return False
         activation_limit = getattr(self.activation, "limit", None)

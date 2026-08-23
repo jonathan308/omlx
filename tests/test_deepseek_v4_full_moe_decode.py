@@ -19,13 +19,12 @@ def _native_fast():
     return fast
 
 
-def _fixture(dtype, tokens: int, index_dtype):
+def _fixture(dtype, tokens: int, index_dtype, hidden_dims: int = 512):
     import mlx.core as mx
 
     mx.random.seed(20260822 + tokens)
     experts = 8
     input_dims = 512
-    hidden_dims = 512
     output_dims = 512
 
     def random_weight(shape):
@@ -204,3 +203,35 @@ def test_switchglu_full_decode_default_remains_disabled(monkeypatch):
     monkeypatch.setattr(switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE", False)
     switch = switch_layers.SwitchGLU(16, 16, 8)
     assert not switch._can_use_mxfp4_full_decode(None, None, None)
+
+
+def test_switchglu_full_decode_rejects_unserved_asymmetric_tp_width(monkeypatch):
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=768)
+    x, up_w, up_s, gate_w, gate_s, down_w, down_s, indices, scores = args
+    switch = switch_layers.SwitchGLU(512, 768, 8)
+    switch.eval()
+    for name, weight, scales in (
+        ("up_proj", up_w, up_s),
+        ("gate_proj", gate_w, gate_s),
+        ("down_proj", down_w, down_s),
+    ):
+        projection = getattr(switch, name).to_quantized(
+            group_size=32, bits=4, mode="mxfp4"
+        )
+        projection.weight = weight
+        projection.scales = scales
+        projection.biases = None
+        setattr(switch, name, projection)
+    switch.activation = type(
+        "LimitedActivation",
+        (),
+        {"limit": 10.0, "fp32": False},
+    )()
+    monkeypatch.setattr(switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE", True)
+    monkeypatch.setattr(
+        switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 6
+    )
+    assert not switch._can_use_mxfp4_full_decode(x, indices, scores)
