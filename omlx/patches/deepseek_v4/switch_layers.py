@@ -693,9 +693,6 @@ class SwitchGLU(nn.Module):
                 )
                 block_plan = (block_meta, block_count, block_variant)
 
-        if use_f16_moe:
-            x = x.astype(mx.float16)
-
         use_nax_blocks_prefill = self._can_use_mxfp4_nax_blocks_prefill(
             request_shape,
             indices,
@@ -703,6 +700,9 @@ class SwitchGLU(nn.Module):
             x,
             original_dtype,
         )
+        if use_f16_moe and not use_nax_blocks_prefill:
+            x = x.astype(mx.float16)
+
         nax_block_plan = None
         if use_nax_blocks_prefill:
             nax_block_plan = _build_mxfp4_blocks(

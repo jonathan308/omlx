@@ -158,10 +158,13 @@ def test_every_unqualified_pairing_falls_back_before_candidate_graph(
 def test_preflight_precedes_block_plan_and_all_candidate_invocations():
     source = inspect.getsource(sl.SwitchGLU.__call__)
     preflight = source.index("use_nax_blocks_prefill =")
+    legacy_cast = source.index(
+        "if use_f16_moe and not use_nax_blocks_prefill:", preflight
+    )
     plan = source.index("nax_block_plan = _build_mxfp4_blocks", preflight)
     pair_call = source.index(f"glm_fast.{SYMBOL}", plan)
     down_call = source.rindex(f"glm_fast.{SYMBOL}")
-    assert preflight < plan < pair_call < down_call
+    assert preflight < legacy_cast < plan < pair_call < down_call
     assert "except" not in source[preflight:down_call]
 
 
