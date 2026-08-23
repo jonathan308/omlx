@@ -282,10 +282,12 @@ def test_distributed_mtp_is_signed_into_a_pure_tensor_deployment():
             deployment,
             assignments=tensor_assignments,
             tensor_parallel_size=2,
-        ),
-        model_settings=SimpleNamespace(
             mtp_enabled=True,
             mtp_num_draft_tokens=5,
+        ),
+        model_settings=SimpleNamespace(
+            mtp_enabled=False,
+            mtp_num_draft_tokens=2,
         ),
     )
 
@@ -294,12 +296,25 @@ def test_distributed_mtp_is_signed_into_a_pure_tensor_deployment():
     assert engine.deployment.mtp_num_draft_tokens == 5
 
 
-def test_distributed_mtp_refuses_pipeline_parallelism():
+def test_stale_local_mtp_toggle_cannot_override_signed_disabled_deployment():
     engine = DistributedBatchedEngine(
         _deployment(),
         model_settings=SimpleNamespace(
             mtp_enabled=True,
-            mtp_num_draft_tokens=3,
+            mtp_num_draft_tokens=5,
+        ),
+    )
+
+    assert engine.deployment.mtp_enabled is False
+    assert engine.deployment.mtp_num_draft_tokens is None
+
+
+def test_distributed_mtp_refuses_pipeline_parallelism():
+    engine = DistributedBatchedEngine(
+        replace(_deployment(), mtp_enabled=True, mtp_num_draft_tokens=3),
+        model_settings=SimpleNamespace(
+            mtp_enabled=False,
+            mtp_num_draft_tokens=None,
         ),
     )
 

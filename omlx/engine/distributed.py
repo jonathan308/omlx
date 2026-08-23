@@ -182,20 +182,32 @@ class DistributedBatchedEngine(BatchedEngine):
         # Our G3/G4 abort-drain / orphan-reap semantics kept on top.
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
-        distributed_mtp = bool(
+        # The deployment is the signed, rank-identical launch contract.  A
+        # persisted single-node model toggle may be stale (and is not part of
+        # placement approval), so it must never overwrite the MTP mode or
+        # depth after the cluster plan has been approved.  Workers receive the
+        # deployment fields through their encoded plan.
+        settings_mtp = bool(
             model_settings is not None
             and getattr(model_settings, "mtp_enabled", False)
         )
-        distributed_mtp_depth = (
+        settings_depth = (
             getattr(model_settings, "mtp_num_draft_tokens", None)
-            if distributed_mtp
+            if settings_mtp
             else None
         )
-        deployment = replace(
-            deployment,
-            mtp_enabled=distributed_mtp,
-            mtp_num_draft_tokens=distributed_mtp_depth,
-        )
+        if (settings_mtp, settings_depth) != (
+            deployment.mtp_enabled,
+            deployment.mtp_num_draft_tokens,
+        ):
+            logger.info(
+                "Using signed distributed MTP contract enabled=%s depth=%s "
+                "instead of local model settings enabled=%s depth=%s",
+                deployment.mtp_enabled,
+                deployment.mtp_num_draft_tokens,
+                settings_mtp,
+                settings_depth,
+            )
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -355,9 +367,7 @@ class DistributedBatchedEngine(BatchedEngine):
                 "distributed inference cannot be combined with "
                 + ", ".join(incompatible)
             )
-        if bool(getattr(settings, "mtp_enabled", False)) and (
-            self.deployment.tensor_parallel_size < 2
-        ):
+        if self.deployment.mtp_enabled and self.deployment.tensor_parallel_size < 2:
             raise ValueError(
                 "distributed MTP currently requires pure tensor parallelism"
             )
