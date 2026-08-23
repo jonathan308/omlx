@@ -380,18 +380,6 @@ _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
 _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
     "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
-_HC_RESIDUAL_STREAM = threading.local()
-
-
-def _hc_residual_overlap_branch(residual: mx.array, comb: mx.array) -> mx.array:
-    """Schedule the collective-independent HC branch on a second Metal stream."""
-
-    stream = getattr(_HC_RESIDUAL_STREAM, "stream", None)
-    if stream is None:
-        stream = mx.new_stream(mx.default_device())
-        _HC_RESIDUAL_STREAM.stream = stream
-    with mx.stream(stream):
-        return hc_residual_branch(residual, comb)
 
 
 def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
@@ -3489,9 +3477,7 @@ class DeepseekV4Block(nn.Module):
         overlap_hc = _can_overlap_hc_residual(self, h)
         residual = h
         x, post, comb = self.attn_hc(h)
-        residual_branch = (
-            _hc_residual_overlap_branch(residual, comb) if overlap_hc else None
-        )
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         attn_input = self.attn_norm(x)
         x = self.attn(
             attn_input,
@@ -3507,9 +3493,7 @@ class DeepseekV4Block(nn.Module):
 
         residual = h
         x, post, comb = self.ffn_hc(h)
-        residual_branch = (
-            _hc_residual_overlap_branch(residual, comb) if overlap_hc else None
-        )
+        residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return (
