@@ -1464,7 +1464,10 @@ def test_prefill_allocator_cache_cadence_is_operator_overridable(monkeypatch):
     assert clears == [True, True]
 
 
-def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch):
+@pytest.mark.parametrize("batch_size", (1, 4))
+def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(
+    monkeypatch, batch_size
+):
     class Head:
         _omlx_vocab_parallel = True
         _omlx_output_dims = 6
@@ -1477,31 +1480,52 @@ def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch
 
         def __call__(self, value, cache=None):
             assert self.lm_head._omlx_gather_vocab_logits is False
-            return mx.array([[[1.0, 2.0, 3.0]]])
+            return mx.broadcast_to(
+                mx.array([[[1.0, 2.0, 3.0]]]),
+                (batch_size, 1, 3),
+            )
 
     class Batch:
         def __init__(self, model):
             self.model = model
-            self.uids = [1]
+            self.uids = list(range(batch_size))
             self.prompt_cache = []
-            self.tokens = [[]]
-            self.samplers = [None]
+            self.tokens = [[] for _ in range(batch_size)]
+            self.samplers = [None] * batch_size
             self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
-            self.logits_processors = [[]]
+            self.logits_processors = [[] for _ in range(batch_size)]
             self._current_tokens = None
             self._current_logprobs = []
-            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_tokens = mx.array([3] * batch_size, dtype=mx.uint32)
             self._next_logprobs = []
-            self._token_context = []
+            self._token_context = [None] * batch_size
 
     model = Model()
     batch = Batch(model)
     monkeypatch.setattr(
         mx.distributed,
         "recv_like",
-        lambda value, source: mx.array([[4.0, 5.0, 9.0]]),
+        lambda value, source: mx.broadcast_to(
+            mx.array([[4.0, 5.0, 9.0]]),
+            (batch_size, 3),
+        ),
     )
-    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    token_sends = []
+    monkeypatch.setattr(
+        mx.distributed,
+        "send",
+        lambda value, destination: token_sends.append(
+            (value.tolist(), destination)
+        )
+        or value,
+    )
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rank-zero token decisions must not use all_sum")
+        ),
+    )
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
     with install_runtime_optimizations(
@@ -1516,13 +1540,15 @@ def test_tensor_vocab_sampling_reconstructs_logits_only_on_rank_zero(monkeypatch
         assert capabilities["rank_zero_logits"]["active"] is False
         mlx_generate.GenerationBatch._step(batch)
 
-    assert batch._next_tokens.tolist() == [5]
+    assert batch._next_tokens.tolist() == [5] * batch_size
     assert batch._next_logprobs[0].shape == (6,)
     assert model.lm_head._omlx_gather_vocab_logits is True
+    assert token_sends == [([5] * batch_size, 1)]
 
 
+@pytest.mark.parametrize("batch_size", (1, 4))
 def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token(
-    monkeypatch,
+    monkeypatch, batch_size
 ):
     class Head:
         _omlx_vocab_parallel = True
@@ -1535,22 +1561,25 @@ def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token
             self.lm_head = Head()
 
         def __call__(self, value, cache=None):
-            return mx.array([[[7.0, 8.0, 9.0]]])
+            return mx.broadcast_to(
+                mx.array([[[7.0, 8.0, 9.0]]]),
+                (batch_size, 1, 3),
+            )
 
     class Batch:
         def __init__(self, model):
             self.model = model
-            self.uids = [1]
+            self.uids = list(range(batch_size))
             self.prompt_cache = []
-            self.tokens = [[]]
-            self.samplers = [None]
+            self.tokens = [[] for _ in range(batch_size)]
+            self.samplers = [None] * batch_size
             self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
-            self.logits_processors = [[]]
+            self.logits_processors = [[] for _ in range(batch_size)]
             self._current_tokens = None
             self._current_logprobs = []
-            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_tokens = mx.array([3] * batch_size, dtype=mx.uint32)
             self._next_logprobs = []
-            self._token_context = []
+            self._token_context = [None] * batch_size
 
     sent = []
     model = Model()
@@ -1562,8 +1591,15 @@ def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token
     )
     monkeypatch.setattr(
         mx.distributed,
+        "recv_like",
+        lambda value, source: mx.array([5] * batch_size, dtype=mx.int32),
+    )
+    monkeypatch.setattr(
+        mx.distributed,
         "all_sum",
-        lambda value, group=None: mx.array([5], dtype=mx.int32),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rank-zero token decisions must not use all_sum")
+        ),
     )
     monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
@@ -1576,8 +1612,8 @@ def test_tensor_vocab_sampling_worker_sends_local_shard_and_uses_rank_zero_token
     ):
         mlx_generate.GenerationBatch._step(batch)
 
-    assert sent == [([[7.0, 8.0, 9.0]], 0)]
-    assert batch._next_tokens.tolist() == [5]
+    assert sent == [([[7.0, 8.0, 9.0]] * batch_size, 0)]
+    assert batch._next_tokens.tolist() == [5] * batch_size
     assert batch._next_logprobs[0].shape == (6,)
 
 

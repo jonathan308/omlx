@@ -1042,6 +1042,77 @@ def test_force_cancel_all_marks_context_for_the_shared_batch_loop(tmp_path):
     assert telemetry._requests_cancelled == 1
 
 
+def test_targeted_cancel_stops_only_the_matching_transport_request(tmp_path):
+    import json
+
+    telemetry = _cancel_telemetry(tmp_path)
+    first_queue = _TelemetryQueue(
+        _Queue(), telemetry, transport_request_id="transport-first"
+    )
+    first_context = _GenerationContext()
+    telemetry.mark_pending_uid(first_queue._request_id)
+    telemetry.register_context(first_queue._request_id, first_context)
+    telemetry.bind_pending_uid((71,))
+
+    second_queue = _TelemetryQueue(
+        _Queue(), telemetry, transport_request_id="transport-second"
+    )
+    second_context = _GenerationContext()
+    telemetry.mark_pending_uid(second_queue._request_id)
+    telemetry.register_context(second_queue._request_id, second_context)
+    telemetry.bind_pending_uid((72,))
+
+    (tmp_path / "dep-1-cancel.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "epoch": 42,
+                "scope": "requests",
+                "request_ids": ["transport-first"],
+                "reason": "client disconnected",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert first_context.stopped is True
+    assert second_context.stopped is False
+
+
+def test_private_http_header_is_attached_before_request_sharing(monkeypatch):
+    import mlx_lm.server as mlx_server
+
+    observed = []
+
+    def original_handle(handler, request, stop_words):
+        observed.append((request, stop_words))
+
+    monkeypatch.setattr(mlx_server.APIHandler, "handle_completion", original_handle)
+    with install_server_telemetry(_Marker(), heartbeat_interval=0):
+        handler = object.__new__(mlx_server.APIHandler)
+        handler.headers = {"X-oMLX-Request-ID": "transport-header-owner"}
+        request = SimpleNamespace()
+        handler.handle_completion(request, ["stop"])
+
+    assert observed == [(request, ["stop"])]
+    assert request._omlx_transport_request_id == "transport-header-owner"
+
+
+def test_targeted_cancel_arriving_before_context_registration_is_not_lost(tmp_path):
+    telemetry = _cancel_telemetry(tmp_path)
+
+    assert telemetry.force_cancel_request("transport-early") == 0
+    queue = _TelemetryQueue(
+        _Queue(), telemetry, transport_request_id="transport-early"
+    )
+    context = _GenerationContext()
+    telemetry.register_context(queue._request_id, context)
+
+    assert context.stopped is True
+
+
 def test_force_cancel_all_without_a_generation_context_is_a_noop(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
 

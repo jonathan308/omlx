@@ -38,6 +38,7 @@ _SHARED_OBJECT_HEADER_BYTES = 64
 # serving configurations without letting telemetry grow with an unbounded
 # queue.  ``active_requests`` remains the authoritative total when truncated.
 _MAX_ACTIVE_REQUEST_METRICS = 64
+_MAX_TARGETED_CANCEL_REQUESTS = 256
 
 # How often a rank refreshes its marker with nothing to report.
 #
@@ -51,6 +52,24 @@ _MAX_ACTIVE_REQUEST_METRICS = 64
 # heartbeats can be missed before anything is called stale, and long enough that
 # it never competes with generation for the lock.
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
+_MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+
+
+def _transport_request_id(value: Any) -> str | None:
+    """Validate the private coordinator-to-rank request correlation id."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > _MAX_TRANSPORT_REQUEST_ID_BYTES:
+        return None
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+    )
+    return value if all(character in allowed for character in value) else None
 
 
 def _python_token_id(value: Any) -> int:
@@ -146,6 +165,9 @@ class RuntimeTelemetry:
         self._request_to_uid: dict[int, Any] = {}
         self._request_contexts: dict[int, Any] = {}
         self._request_queues: dict[int, Any] = {}
+        self._transport_to_request: dict[str, int] = {}
+        self._request_to_transport: dict[int, str] = {}
+        self._pending_transport_cancels: set[str] = set()
         self._pending_uid = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
@@ -245,7 +267,7 @@ class RuntimeTelemetry:
                 # and reintroduce the self-kill it exists to prevent.
                 logger.debug("Runtime marker heartbeat failed: %s", exc)
 
-    def begin_request(self) -> int:
+    def begin_request(self, transport_request_id: str | None = None) -> int:
         now = float(self._clock())
         with self._lock:
             self._next_request_id += 1
@@ -255,6 +277,10 @@ class RuntimeTelemetry:
                 started_at=now,
                 updated_at=now,
             )
+            transport_request_id = _transport_request_id(transport_request_id)
+            if transport_request_id is not None:
+                self._transport_to_request[transport_request_id] = request_id
+                self._request_to_transport[request_id] = transport_request_id
             self._publish_locked(now, force=True)
             return request_id
 
@@ -370,9 +396,21 @@ class RuntimeTelemetry:
     def register_context(self, request_id: int, context: Any) -> None:
         """Retain the server context used by its synchronized cancel path."""
 
+        cancel_immediately = False
         with self._lock:
             if request_id in self._requests:
                 self._request_contexts[request_id] = context
+                transport_request_id = self._request_to_transport.get(request_id)
+                if transport_request_id in self._pending_transport_cancels:
+                    self._pending_transport_cancels.discard(transport_request_id)
+                    cancel_immediately = True
+        if cancel_immediately:
+            stop = getattr(context, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception as exc:
+                    logger.warning("Rank-side pending context cancel failed: %s", exc)
 
     def register_response_queue(self, request_id: int, queue: Any) -> None:
         """Retain the raw rank-local queue so shared removal can terminate it."""
@@ -483,6 +521,41 @@ class RuntimeTelemetry:
         )
         return requested
 
+    def force_cancel_request(
+        self,
+        transport_request_id: str,
+        *,
+        reason: str = "coordinator cancel",
+    ) -> int:
+        """Stop exactly one request identified by the private HTTP transport."""
+
+        normalized = _transport_request_id(transport_request_id)
+        if normalized is None:
+            return 0
+        with self._lock:
+            request_id = self._transport_to_request.get(normalized)
+            context = self._request_contexts.get(request_id)
+            active = request_id in self._requests if request_id is not None else False
+        if not active or context is None:
+            with self._lock:
+                if len(self._pending_transport_cancels) < _MAX_TARGETED_CANCEL_REQUESTS:
+                    self._pending_transport_cancels.add(normalized)
+            return 0
+        stop = getattr(context, "stop", None)
+        if not callable(stop):
+            return 0
+        try:
+            stop()
+        except Exception as exc:
+            logger.warning("Rank-side targeted context cancel failed: %s", exc)
+            return 0
+        logger.warning(
+            "Requested synchronized cancellation for request %s: %s",
+            normalized,
+            reason,
+        )
+        return 1
+
     def _read_cancel_request(self) -> dict[str, Any] | None:
         path = self._cancel_path
         if path is None:
@@ -557,9 +630,30 @@ class RuntimeTelemetry:
         if epoch <= self._last_cancel_epoch:
             return 0
         self._last_cancel_epoch = epoch
-        cancelled = self.force_cancel_all(
-            reason=str(payload.get("reason") or "coordinator cancel")
-        )
+        reason = str(payload.get("reason") or "coordinator cancel")
+        if payload.get("scope") == "request":
+            cancelled = self.force_cancel_request(
+                payload.get("request_id"),
+                reason=reason,
+            )
+        elif payload.get("scope") == "requests":
+            request_ids = payload.get("request_ids")
+            if not isinstance(request_ids, list):
+                cancelled = 0
+            else:
+                normalized = []
+                for request_id in request_ids[:_MAX_TARGETED_CANCEL_REQUESTS]:
+                    request_id = _transport_request_id(request_id)
+                    if request_id is not None and request_id not in normalized:
+                        normalized.append(request_id)
+                cancelled = sum(
+                    self.force_cancel_request(request_id, reason=reason)
+                    for request_id in normalized
+                )
+        elif payload.get("scope") == "all":
+            cancelled = self.force_cancel_all(reason=reason)
+        else:
+            cancelled = 0
         self._write_cancel_ack(epoch=epoch, cancelled=cancelled)
         return cancelled
 
@@ -678,6 +772,10 @@ class RuntimeTelemetry:
         uid = self._request_to_uid.pop(request_id, None)
         self._request_contexts.pop(request_id, None)
         self._request_queues.pop(request_id, None)
+        transport_request_id = self._request_to_transport.pop(request_id, None)
+        if transport_request_id is not None:
+            self._transport_to_request.pop(transport_request_id, None)
+            self._pending_transport_cancels.discard(transport_request_id)
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
@@ -954,10 +1052,15 @@ def _finite_metrics(value: Any) -> bool:
 class _TelemetryQueue:
     """Observe MLX-LM's rank-local response queue without changing its API."""
 
-    def __init__(self, queue: Any, telemetry: RuntimeTelemetry) -> None:
+    def __init__(
+        self,
+        queue: Any,
+        telemetry: RuntimeTelemetry,
+        transport_request_id: str | None = None,
+    ) -> None:
         self._queue = queue
         self._telemetry = telemetry
-        self._request_id = telemetry.begin_request()
+        self._request_id = telemetry.begin_request(transport_request_id)
         telemetry.register_response_queue(self._request_id, queue)
         self._finished = False
 
@@ -1023,6 +1126,7 @@ def install_server_telemetry(
     original_batch_generator = mlx_server.BatchGenerator
     original_prompt_cache = mlx_server.LRUPromptCache
     original_generation_context = mlx_server.GenerationContext
+    original_handle_completion = mlx_server.APIHandler.handle_completion
     cancellation_state = threading.local()
     marker_path = getattr(marker, "path", None)
     marker_payload = getattr(marker, "payload", None)
@@ -1634,7 +1738,21 @@ def install_server_telemetry(
             if shared is None:
                 return None
             response_queue, *rest = shared
-            return _TelemetryQueue(response_queue, telemetry), *rest
+            transport_request_id = (
+                _transport_request_id(
+                    getattr(rest[0], "_omlx_transport_request_id", None)
+                )
+                if rest
+                else None
+            )
+            return (
+                _TelemetryQueue(
+                    response_queue,
+                    telemetry,
+                    transport_request_id=transport_request_id,
+                ),
+                *rest,
+            )
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
             tokenized = super()._tokenize(tokenizer, request, args)
@@ -1677,6 +1795,20 @@ def install_server_telemetry(
                 cancellation_state.sequential = previous
 
     original_stream_generate = mlx_server.stream_generate
+
+    def request_correlated_handle_completion(
+        handler: Any,
+        request: Any,
+        stop_words: Any,
+    ) -> Any:
+        """Attach the private coordinator id before ranks share the request."""
+
+        request_id = _transport_request_id(
+            handler.headers.get("X-oMLX-Request-ID")
+        )
+        if request_id is not None:
+            request._omlx_transport_request_id = request_id
+        return original_handle_completion(handler, request, stop_words)
 
     def snapshotting_stream_generate(*args: Any, **kwargs: Any) -> Any:
         """Deposit a snapshot at each prefill boundary before it is overwritten.
@@ -1721,6 +1853,7 @@ def install_server_telemetry(
     mlx_server.ResponseGenerator = TelemetryResponseGenerator
     mlx_server.LRUPromptCache = TelemetryPromptCache
     mlx_server.GenerationContext = CoordinatedGenerationContext
+    mlx_server.APIHandler.handle_completion = request_correlated_handle_completion
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
         # A persistent manifest can already contain useful snapshots before
@@ -1746,6 +1879,7 @@ def install_server_telemetry(
         mlx_server.BatchGenerator = original_batch_generator
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
+        mlx_server.APIHandler.handle_completion = original_handle_completion
         mlx_server.stream_generate = original_stream_generate
         snapshot_writer_closed = True
         if ssd_store is not None:

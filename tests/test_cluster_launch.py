@@ -284,6 +284,37 @@ def test_supervisor_preserves_structured_peer_loss_reason():
     assert "generic launcher noise" not in supervisor._exit_detail(1)
 
 
+def test_supervisor_promotes_jaccl_rank_exit_even_when_launcher_returns_zero():
+    """Native rank death must override mlx.launch's false clean exit."""
+
+    class Launcher:
+        pid = 54320
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.process = Launcher()
+    supervisor._phase = "ready"
+    supervisor._drain(
+        io.StringIO(
+            "[jaccl] all_reduce made no progress for 30001ms; an RDMA "
+            "completion was likely lost.\n"
+            "\x1b[33m[WARN] Node with rank 0 exited with code 75 \x1b[0m\n"
+        ),
+        supervisor._stderr,
+        False,
+    )
+
+    status = supervisor.status()
+    assert status.returncode == 0
+    assert status.phase == "failed"
+    assert status.failure_reason is not None
+    assert "rank 0 exited with code 75" in status.failure_reason
+    assert "all_reduce made no progress for 30001ms" in status.failure_reason
+
+
 def test_supervisor_refreshes_rank_zero_lifetime_lease(tmp_path):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
@@ -2188,7 +2219,10 @@ def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
     ]
     # State is kept so a later stop() retries instead of dropping the job.
     assert supervisor.process is launcher
-    assert supervisor.status().phase == "ready"
+    status = supervisor.status()
+    assert status.phase == "failed"
+    assert status.failure_reason is not None
+    assert "survived SIGKILL" in status.failure_reason
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
 
 

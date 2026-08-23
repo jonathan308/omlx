@@ -897,10 +897,82 @@ async def test_abort_request_flags_and_closes_only_that_request(tmp_path):
     assert engine._request_states[first].aborted is True
     assert engine._request_states[second].aborted is False
     assert closed == [True]
+    marker = json.loads(
+        (tmp_path / "engine-test-cancel.json").read_text(encoding="utf-8")
+    )
+    assert marker["scope"] == "requests"
+    assert marker["request_ids"] == [first]
     assert await engine.abort_request("engine-test-999") is False
 
     await engine._leave_request(first)
     await engine._leave_request(second)
+    await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_private_rank_request_carries_the_targeted_transport_id():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("x-omlx-request-id"))
+        event = {
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "hi"}],
+                _request_id="transport-public-1",
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].finished is True
+    assert seen == ["transport-public-1"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_targeted_cancels_merge_until_rank_ack(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    first = await engine._enter_request("transport-first")
+    second = await engine._enter_request("transport-second")
+    try:
+        assert await engine.abort_request(first, reason="first socket closed") is True
+        assert await engine.abort_request(second, reason="second socket closed") is True
+        payload = json.loads(
+            (tmp_path / "engine-test-cancel.json").read_text(encoding="utf-8")
+        )
+        assert payload["scope"] == "requests"
+        assert set(payload["request_ids"]) == {first, second}
+    finally:
+        await engine._leave_request(first)
+        await engine._leave_request(second)
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_targeted_cancel_never_degrades_to_cancel_all(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+
+    assert (
+        engine._write_rank_cancel_request(
+            reason="bad caller",
+            request_id="invalid\nheader",
+        )
+        is None
+    )
+    assert not (tmp_path / "engine-test-cancel.json").exists()
     await engine._client.aclose()
 
 
@@ -1039,7 +1111,9 @@ async def test_read_timeout_drops_rank_side_cancel_file(tmp_path):
 
     cancel_path = tmp_path / "engine-test-cancel.json"
     payload = json.loads(cancel_path.read_text(encoding="utf-8"))
-    assert payload["scope"] == "all"
+    assert payload["scope"] == "requests"
+    assert len(payload["request_ids"]) == 1
+    assert payload["request_ids"][0].startswith("engine-test-")
     assert "read timeout" in payload["reason"]
 # ---------------------------------------------------------------------------
 # reasoning_effort fallback: the distributed engine cannot render the chat
@@ -1320,6 +1394,26 @@ async def test_rank_prefill_rejection_keeps_typed_memory_error_surface():
 
 def _healthy_supervisor_status():
     return SimpleNamespace(returncode=None, failure_reason=None)
+
+
+def test_runtime_failure_reconciles_supervisor_terminal_state(monkeypatch):
+    """Pool status/release must see a rank death even after a 200 response."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=0,
+            failure_reason=(
+                "rank 0 exited with code 75 after JACCL all_reduce made no progress"
+            ),
+            phase="failed",
+        ),
+    )
+
+    assert engine.runtime_failed_reason is not None
+    assert "rank 0 exited with code 75" in engine.runtime_failed_reason
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,23 @@ logger = logging.getLogger(__name__)
 # per peer, paid once per window) and how long a half-dead cluster can keep
 # answering 200s before requests start failing cleanly (#2708).
 _PEER_HEALTH_TTL = 10.0
+_MAX_TARGETED_CANCEL_REQUESTS = 256
+_MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+
+
+def _valid_transport_request_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > _MAX_TRANSPORT_REQUEST_ID_BYTES:
+        return False
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+    )
+    return all(character in allowed for character in value)
 
 
 def _reasoning_effort_retry_payloads(
@@ -145,6 +162,8 @@ class _DistributedRequestState:
 class DistributedBatchedEngine(BatchedEngine):
     """Keep oMLX's API/tokenizer layer while proxying model work to MLX ranks."""
 
+    supports_request_scoped_abort = True
+
     # The coordinator does not own a local Scheduler: each rank process
     # creates and enforces its own prefill guard from the signed deployment.
     # This marker prevents ProcessMemoryEnforcer from reporting that expected
@@ -236,6 +255,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._orphan_reap_grace = float(orphan_reap_grace)
         self._request_states: dict[str, _DistributedRequestState] = {}
         self._next_request_seq = 0
+        self._last_cancel_epoch = 0
         self._peer_health: tuple[float, bool, str] | None = None
         self._peer_health_lock = asyncio.Lock()
         self._runtime_failed_reason: str | None = None
@@ -244,6 +264,13 @@ class DistributedBatchedEngine(BatchedEngine):
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 
+        if self._runtime_failed_reason is None and self._loaded:
+            status = self._supervisor.status()
+            reason = status.failure_reason
+            if reason is None and status.returncode is not None:
+                reason = f"distributed job exited with code {status.returncode}"
+            if reason:
+                self._mark_runtime_failed(reason)
         return self._runtime_failed_reason
 
     def _mark_runtime_failed(self, reason: str) -> None:
@@ -419,6 +446,11 @@ class DistributedBatchedEngine(BatchedEngine):
             )
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
+            )
+        if status.failure_reason:
+            self._mark_runtime_failed(status.failure_reason)
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
             )
         return client
 
@@ -706,18 +738,26 @@ class DistributedBatchedEngine(BatchedEngine):
             return f"<think>{reasoning_text}</think>{content_text}"
         return content_text
 
-    async def _enter_request(self) -> str:
+    async def _enter_request(self, request_id: str | None = None) -> str:
         async with self._active_lock:
             self._active_requests += 1
             self._next_request_seq += 1
-            request_id = (
-                f"{self.deployment.deployment_id}-{self._next_request_seq}"
-            )
+            if (
+                not _valid_transport_request_id(request_id)
+                or request_id in self._request_states
+            ):
+                request_id = (
+                    f"{self.deployment.deployment_id}-{self._next_request_seq}"
+                )
             self._request_states[request_id] = _DistributedRequestState(
                 request_id,
                 time.monotonic(),
             )
             return request_id
+
+    @staticmethod
+    def _backend_request_headers(request_id: str) -> dict[str, str]:
+        return {"X-oMLX-Request-ID": request_id}
 
     async def _leave_request(self, request_id: str | None = None) -> None:
         async with self._active_lock:
@@ -856,6 +896,14 @@ class DistributedBatchedEngine(BatchedEngine):
         if state is None:
             return False
         state.aborted = True
+        # Closing the private HTTP response is the fast path.  The targeted
+        # marker is the rank-side backstop for a handler stuck in prefill: it
+        # flips only this request's GenerationContext stop flag at a shared
+        # batch boundary, without disturbing concurrent requests.
+        self._write_rank_cancel_request(
+            reason=reason or error_code,
+            request_id=request_id,
+        )
         response = state.response
         if response is not None:
             with suppress(Exception):
@@ -867,8 +915,13 @@ class DistributedBatchedEngine(BatchedEngine):
         )
         return True
 
-    def _write_rank_cancel_request(self, *, reason: str | None) -> Path | None:
-        """Ask rank zero to force-cancel every active request at a step boundary.
+    def _write_rank_cancel_request(
+        self,
+        *,
+        reason: str | None,
+        request_id: str | None = None,
+    ) -> Path | None:
+        """Ask rank zero to cancel request(s) at a shared step boundary.
 
         The rank's telemetry heartbeat consumes this file and cancels through
         ``BatchGenerator.remove`` — MLX-LM's own cancel path, which the batch
@@ -879,14 +932,77 @@ class DistributedBatchedEngine(BatchedEngine):
 
         root = Path(self._supervisor.state_dir).expanduser()
         path = root / f"{self.deployment.deployment_id}-cancel.json"
+        if request_id is not None and not _valid_transport_request_id(request_id):
+            logger.warning("Refusing malformed targeted cancel id")
+            return None
+
+        pending_request_ids: set[str] = set()
+        scope = "all" if request_id is None else "requests"
+        if request_id is not None:
+            pending_request_ids.add(request_id)
+
+        # A deployment has one control marker.  Preserve every unacknowledged
+        # targeted id when concurrent clients disconnect between heartbeat
+        # polls; otherwise the last atomic replace would silently lose the
+        # first request. Replaying an id around the ack race is harmless because
+        # rank telemetry treats a no-longer-active request as a no-op.
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing = None
+        ack_path = path.with_name(path.stem + "-ack.json")
+        try:
+            ack = json.loads(ack_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            ack = None
+        ack_epoch = (
+            int(ack.get("epoch", -1))
+            if isinstance(ack, dict)
+            and ack.get("deployment_id") == self.deployment.deployment_id
+            and ack.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(ack.get("epoch"), int)
+            and not isinstance(ack.get("epoch"), bool)
+            else -1
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("deployment_id") == self.deployment.deployment_id
+            and existing.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(existing.get("epoch"), int)
+            and not isinstance(existing.get("epoch"), bool)
+            and int(existing["epoch"]) > ack_epoch
+        ):
+            if existing.get("scope") == "all":
+                scope = "all"
+            elif scope != "all":
+                candidates = existing.get("request_ids")
+                if existing.get("scope") == "request":
+                    candidates = [existing.get("request_id")]
+                if isinstance(candidates, list):
+                    pending_request_ids.update(
+                        candidate
+                        for candidate in candidates
+                        if _valid_transport_request_id(candidate)
+                    )
+
+        self._last_cancel_epoch = max(
+            int(time.time() * 1000),
+            self._last_cancel_epoch + 1,
+        )
         payload = {
             "schema_version": 1,
             "deployment_id": self.deployment.deployment_id,
             "plan_hash": self.deployment.plan_hash,
-            "epoch": int(time.time() * 1000),
-            "scope": "all",
+            "epoch": self._last_cancel_epoch,
+            "scope": scope,
             "reason": reason or "coordinator abort_all_requests",
         }
+        if scope == "requests":
+            newest = [request_id] if request_id in pending_request_ids else []
+            older = sorted(pending_request_ids.difference(newest))
+            payload["request_ids"] = (newest + older)[
+                :_MAX_TARGETED_CANCEL_REQUESTS
+            ]
         try:
             root.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name(path.name + ".tmp")
@@ -961,6 +1077,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -975,12 +1092,14 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
             response = await client.post(
                 "/v1/chat/completions",
                 json=payload,
+                headers=headers,
                 timeout=self._nonstream_timeout(),
             )
             if response.status_code >= 400:
@@ -989,6 +1108,7 @@ class DistributedBatchedEngine(BatchedEngine):
                     response = await client.post(
                         "/v1/chat/completions",
                         json=retry_payload,
+                        headers=headers,
                         timeout=self._nonstream_timeout(),
                     )
                     if response.status_code < 400:
@@ -1075,6 +1195,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -1099,7 +1220,8 @@ class DistributedBatchedEngine(BatchedEngine):
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
 
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # A client that always sends an unsupported reasoning_effort must
             # never turn this into an unbounded retry loop: `attempts` is
@@ -1110,7 +1232,10 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/chat/completions", json=attempt_payload
+                    "POST",
+                    "/v1/chat/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
                     state = self._request_state(request_id)
                     if state is not None:
@@ -1318,6 +1443,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1331,12 +1457,14 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
             response = await client.post(
                 "/v1/completions",
                 json=payload,
+                headers=headers,
                 timeout=self._nonstream_timeout(),
             )
             if response.status_code >= 400:
@@ -1345,6 +1473,7 @@ class DistributedBatchedEngine(BatchedEngine):
                     response = await client.post(
                         "/v1/completions",
                         json=retry_payload,
+                        headers=headers,
                         timeout=self._nonstream_timeout(),
                     )
                     if response.status_code < 400:
@@ -1404,6 +1533,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1426,7 +1556,8 @@ class DistributedBatchedEngine(BatchedEngine):
         first_token_at: float | None = None
         request_started_at = time.monotonic()
 
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # See stream_chat for the retry-bound rationale.
             attempts = [payload]
@@ -1434,7 +1565,10 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/completions", json=attempt_payload
+                    "POST",
+                    "/v1/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
                     state = self._request_state(request_id)
                     if state is not None:
@@ -1750,7 +1884,8 @@ class DistributedBatchedEngine(BatchedEngine):
         if state is not None:
             state.aborted = True
         self._write_rank_cancel_request(
-            reason=f"read timeout on {request_id}; possible rank stall"
+            reason=f"read timeout on {request_id}; possible rank stall",
+            request_id=request_id,
         )
 
     def get_stats(self) -> dict[str, Any]:

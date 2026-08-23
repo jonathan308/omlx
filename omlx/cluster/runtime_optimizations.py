@@ -1576,43 +1576,36 @@ def install_runtime_optimizations(
         else:
             sampled = mx.zeros((len(instance.uids),), dtype=mx.int32)
 
-        # Pipeline decisions have one owner. A tiny JACCL int32 all_sum can
-        # return an uninitialised high-bit value after the readiness canary
-        # even while large activation collectives remain healthy. Broadcast
-        # the rank-zero token explicitly instead. Materializing the worker's
-        # stage output before recv keeps the activation send ahead of this
-        # decision edge; the explicit eval also gives terminal one-token
-        # requests a shared boundary before GenerationBatch filters the row.
-        if pipeline_parallel:
-            if coordinator:
-                decision = sampled
-                sends = []
-                for target in range(1, world_size):
-                    sends.append(
-                        mx.distributed.send(
-                        decision,
-                        target,
-                    )
-                    )
-                # A transport send's returned array is an execution handle,
-                # not a guaranteed alias of its input on every JACCL build.
-                # Force the sends, but keep rank zero's original sampled value
-                # as its local next token.
-                if sends:
-                    mx.eval(*sends)
-                synchronized = decision
-            else:
-                if logits is not None:
-                    mx.eval(logits)
-                synchronized = mx.distributed.recv_like(
-                    mx.zeros(sampled.shape, dtype=mx.int32),
-                    0,
-                )
-            sampled = synchronized
+        # The sampled token batch has one owner in both pipeline and tensor
+        # parallel modes.  Keep that rank-zero decision off JACCL's tiny
+        # reduction path: after a successful TP vocab-shard send/recv, a
+        # repeated one-element int32 all_sum can lose its completion and tear
+        # down otherwise aligned ranks.  Point-to-point is the operation we
+        # actually mean and preserves the exact token vector for B=1..N.
+        #
+        # Materializing worker output before recv keeps the preceding model or
+        # vocab-shard send ahead of this decision edge.  Rank zero evaluates
+        # every send handle but retains its original decision because a send's
+        # returned array is not guaranteed to alias the input on every JACCL
+        # build.  The explicit boundary also keeps terminal row filtering in
+        # lockstep across ranks.
+        if coordinator:
+            decision = sampled
+            sends = [
+                mx.distributed.send(decision, target)
+                for target in range(1, world_size)
+            ]
+            if sends:
+                mx.eval(*sends)
+            synchronized = decision
         else:
-            # Pure TP reductions carry partial tensor results throughout the
-            # model and retain the proven synchronized sampler ordering.
-            sampled = mx.distributed.all_sum(sampled, group=group)
+            if logits is not None:
+                mx.eval(logits)
+            synchronized = mx.distributed.recv_like(
+                mx.zeros(sampled.shape, dtype=mx.int32),
+                0,
+            )
+        sampled = synchronized
         mx.eval(sampled)
         instance._next_tokens = sampled.astype(mx.uint32)
         instance._next_logprobs = list(logprobs)
