@@ -37,6 +37,7 @@ target_sources(
   omlx_glm_kernel_ops
   PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/ds4_attention_finalizer.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/ds4_output_chain.cpp
   ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_prefill_moe_nax.cpp
   ${CMAKE_CURRENT_LIST_DIR}/ds4_projection_qmm.cpp
@@ -60,6 +61,7 @@ target_link_libraries(omlx_glm_kernel_ops PUBLIC mlx)
 if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
   set(OMLX_GLM_METAL_SOURCES
       ${CMAKE_CURRENT_LIST_DIR}/ds4_attention_finalizer.metal
+      ${CMAKE_CURRENT_LIST_DIR}/ds4_output_chain.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_moe.metal
       ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/dspark_gemm.metal

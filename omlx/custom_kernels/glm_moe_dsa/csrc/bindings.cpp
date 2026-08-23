@@ -6,6 +6,7 @@
 #include "dsa_indexer.h"
 #include "ds4_attention_finalizer.h"
 #include "ds4_prefill_moe_nax.h"
+#include "ds4_output_chain.h"
 #include "ds4_projection_qmm.h"
 #include "ds4_prefill_moe.h"
 #include "ds4_qkv_bundle.h"
@@ -262,6 +263,24 @@ NB_MODULE(_ext, m) {
       "variant"_a = 0,
       "use_nax"_a = false,
       "nax_variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_output_oa_interleaved",
+      &omlx::glm_kernels::ds4_output_oa_interleaved,
+      "x"_a,
+      "o_a_weight"_a,
+      "o_a_scales"_a,
+      "variant"_a = 0,
+      "stream"_a = nb::none());
+  m.def(
+      "ds4_output_projection_chain",
+      &omlx::glm_kernels::ds4_output_projection_chain,
+      "x"_a,
+      "o_a_weight"_a,
+      "o_a_scales"_a,
+      "o_b_weight"_a,
+      "o_b_scales"_a,
+      "variant"_a = 0,
       "stream"_a = nb::none());
   m.def(
       "ds4_projection_nax_kernels_built",

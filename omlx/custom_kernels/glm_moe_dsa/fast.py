@@ -137,6 +137,8 @@ NATIVE_SYMBOLS = (
     "ds4_kv_rms_rope",
     "deepseek_mxfp4_gather_qmm_blocks_nax",
     "ds4_projection_mxfp8_qmm",
+    "ds4_output_oa_interleaved",
+    "ds4_output_projection_chain",
     "deepseek_v4_qkv_compressor_bundle_b1",
     "deepseek_mxfp4_gather_qmm_expert",
     "deepseek_mxfp4_full_decode",
@@ -832,6 +834,50 @@ def ds4_projection_mxfp8_qmm(
             **_native_stream_kwargs(stream),
         )
     raise RuntimeError("ds4_projection_mxfp8_qmm native kernel is unavailable")
+
+
+def ds4_output_projection_chain(
+    x: mx.array,
+    o_a_weight: mx.array,
+    o_a_scales: mx.array,
+    o_b_weight: mx.array,
+    o_b_scales: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Exact DS4 M=1024 O-A -> BF16 -> O-B chain; no production route."""
+    if _ext is not None and hasattr(_ext, "ds4_output_projection_chain"):
+        return _ext.ds4_output_projection_chain(
+            x,
+            o_a_weight,
+            o_a_scales,
+            o_b_weight,
+            o_b_scales,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("ds4_output_projection_chain native kernel is unavailable")
+
+
+def ds4_output_oa_interleaved(
+    x: mx.array,
+    o_a_weight: mx.array,
+    o_a_scales: mx.array,
+    variant: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Expose the exact token-major O-A BF16 boundary for parity gates."""
+    if _ext is not None and hasattr(_ext, "ds4_output_oa_interleaved"):
+        return _ext.ds4_output_oa_interleaved(
+            x,
+            o_a_weight,
+            o_a_scales,
+            variant,
+            **_native_stream_kwargs(stream),
+        )
+    raise RuntimeError("ds4_output_oa_interleaved native kernel is unavailable")
 
 
 def ds4_q_head_rms_rope(
