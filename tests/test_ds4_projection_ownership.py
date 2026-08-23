@@ -36,19 +36,17 @@ def _enable(monkeypatch):
     monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
     monkeypatch.setenv("OMLX_DSV4_PROJECTION_OWNER_RANK", "0")
     monkeypatch.setattr(dsv4, "_PROJECTION_OWNER_LOGGED", False)
-    # Unit fakes are ordinary MLX arrays, not communication primitives. Do not
-    # leave background evaluation alive beyond the monkeypatched transport.
-    monkeypatch.setattr(mx, "async_eval", lambda *_values: None)
 
 
-def test_projection_owner_keeps_local_exact_views_and_anchors_send(monkeypatch):
+def test_projection_owner_keeps_exact_views_from_symmetric_gather(monkeypatch):
     _enable(monkeypatch)
-    sent = []
-    monkeypatch.setattr(
-        mx.distributed,
-        "send",
-        lambda value, peer: sent.append((value, peer)) or mx.zeros_like(value),
-    )
+    gathered = []
+
+    def all_gather(value, *, group):
+        gathered.append((value, group.rank()))
+        return mx.concatenate([value, mx.zeros_like(value)], axis=0)
+
+    monkeypatch.setattr(mx.distributed, "all_gather", all_gather)
     x = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
     first = mx.array([[[1, 2]]], dtype=mx.bfloat16)
     second = mx.array([[[3, 4, 5]]], dtype=mx.bfloat16)
@@ -60,8 +58,8 @@ def test_projection_owner_keeps_local_exact_views_and_anchors_send(monkeypatch):
     )
     mx.eval(*outputs)
 
-    assert sent[0][1] == 1
-    assert tuple(sent[0][0].shape) == (1, 1, 5)
+    assert gathered[0][1] == 0
+    assert tuple(gathered[0][0].shape) == (1, 1, 5)
     assert bool(mx.array_equal(outputs[0], first).item())
     assert bool(mx.array_equal(outputs[1], second).item())
 
@@ -69,13 +67,13 @@ def test_projection_owner_keeps_local_exact_views_and_anchors_send(monkeypatch):
 def test_projection_peer_splits_received_storage_without_computation(monkeypatch):
     _enable(monkeypatch)
     packed = mx.array([[[1, 2, 3, 4, 5]]], dtype=mx.bfloat16)
-    received = []
+    gathered = []
 
-    def recv_like(template, owner):
-        received.append((tuple(template.shape), owner))
-        return packed
+    def all_gather(value, *, group):
+        gathered.append((tuple(value.shape), group.rank()))
+        return mx.concatenate([packed, value], axis=0)
 
-    monkeypatch.setattr(mx.distributed, "recv_like", recv_like)
+    monkeypatch.setattr(mx.distributed, "all_gather", all_gather)
     def fail(_x):
         raise AssertionError("peer computed projection")
 
@@ -88,7 +86,7 @@ def test_projection_peer_splits_received_storage_without_computation(monkeypatch
     outputs = dsv4._owned_projection_bank(x, modules, _Group(1))
     mx.eval(*outputs)
 
-    assert received == [((1, 1, 5), 0)]
+    assert gathered == [((1, 1, 5), 1)]
     assert outputs[0].tolist() == [[[1.0, 2.0]]]
     assert outputs[1].tolist() == [[[3.0, 4.0, 5.0]]]
 

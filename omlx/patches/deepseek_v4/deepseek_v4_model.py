@@ -150,10 +150,10 @@ def _owned_projection_bank(
     """Compute replicated input projections once and send exact BF16 views.
 
     Rank zero's physical M3 gate executes the full DS4 projection shapes much
-    faster than the M5. The owner keeps its original arrays while the peer
-    receives their packed storage bytes; no reduction or alternate arithmetic
-    is introduced. The send handle is attached to the owner's local bank so a
-    later layer cannot overtake its matching peer receive.
+    faster than the M5. Both ranks enter one symmetric all-gather: the owner
+    contributes its original packed arrays, the peer contributes placeholder
+    storage, and both select the owner's gathered batch slice. No reduction or
+    alternate arithmetic is introduced.
     """
 
     owner = _projection_owner_rank(group)
@@ -167,17 +167,12 @@ def _owned_projection_bank(
     if rank == owner:
         values = tuple(module(x) for module in modules)
         packed = mx.concatenate(values, axis=-1)
-        peer = 1 - owner
-        sent = mx.distributed.send(packed, peer)
-        # Post transport immediately. Attaching the send back to its own input
-        # with ``mx.depends`` creates a cyclic dependency on current MLX; the
-        # proven queued-pipeline pattern is to retain the send graph through
-        # async_eval and let the unchanged local values continue independently.
-        mx.async_eval(sent)
     else:
         shape = (*x.shape[:-1], total)
-        packed = mx.distributed.recv_like(mx.zeros(shape, dtype=x.dtype), owner)
-        mx.async_eval(packed)
+        packed = mx.zeros(shape, dtype=x.dtype)
+    batch = int(x.shape[0])
+    gathered = mx.distributed.all_gather(packed, group=group)
+    packed = gathered[owner * batch : (owner + 1) * batch]
     boundaries = []
     cursor = 0
     for width in widths[:-1]:
