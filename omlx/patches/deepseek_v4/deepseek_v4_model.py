@@ -966,6 +966,20 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
     return attn.wo_b(finish(_project_attention_oa(attn, prepared)))
 
 
+def _project_verify_q_b(module: nn.Module, inputs: mx.array) -> mx.array:
+    """Use the one-token reduction order for DSpark's six target rows."""
+
+    if is_dspark_verify_armed():
+        from omlx.patches.deepseek_v4.verify_qmv import (
+            eligible as qmv_eligible,
+            exact_verify_qmv,
+        )
+
+        if qmv_eligible(module, inputs):
+            return exact_verify_qmv(module, inputs)
+    return module(inputs)
+
+
 def _batched_m1_attention(
     queries: mx.array,
     key_rows: List[mx.array],
@@ -3289,7 +3303,7 @@ class LocalAttention(nn.Module):
             kv_raw = self.wkv(x)
         else:
             q_a, kv_raw = projection_bank
-        q_raw = self.wq_b(self.q_norm(q_a))
+        q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
@@ -3416,7 +3430,7 @@ class CompressedAttention(nn.Module):
         else:
             q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
             compressor_projection = (compressed_kv, compressed_gate)
-        q_raw = self.wq_b(self.q_norm(q_a))
+        q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
@@ -3630,7 +3644,7 @@ class SparseCompressedAttention(nn.Module):
             compressor_projection = (compressed_kv, compressed_gate)
             index_compressor_projection = (index_kv, index_gate)
         q_residual = self.q_norm(q_a)
-        q_raw = self.wq_b(q_residual).reshape(
+        q_raw = _project_verify_q_b(self.wq_b, q_residual).reshape(
             B, L, self.n_heads, self.head_dim
         )
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
@@ -3675,7 +3689,9 @@ class SparseCompressedAttention(nn.Module):
                 ]
                 out = _batched_m1_attention(q, key_rows, self.scale, sinks)
             else:
-                index_q = self.indexer.wq_b(q_residual).reshape(
+                index_q = _project_verify_q_b(
+                    self.indexer.wq_b, q_residual
+                ).reshape(
                     B,
                     L,
                     self.indexer.n_heads,

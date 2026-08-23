@@ -394,6 +394,12 @@ def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
                 results_per_simdgroup = 2
         except Exception:
             pass
+    elif input_dims == 1024 and rows == 6 and output_dims in (12288, 20480):
+        try:
+            if str(mx.device_info().get("device_name", "")) == "Apple M3 Ultra":
+                results_per_simdgroup = 1
+        except Exception:
+            pass
 
     (output,) = _kernel(results_per_simdgroup)(
         inputs=[flat, module.weight, module.scales, biases],
