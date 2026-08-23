@@ -1091,6 +1091,26 @@ def _healthy_supervisor_status():
     return SimpleNamespace(returncode=None, failure_reason=None)
 
 
+def test_runtime_failure_reconciles_supervisor_terminal_state(monkeypatch):
+    """Pool status/release must see a rank death even after a 200 response."""
+
+    engine = _ready_engine(lambda request: httpx.Response(200))
+    monkeypatch.setattr(
+        engine._supervisor,
+        "status",
+        lambda: SimpleNamespace(
+            returncode=0,
+            failure_reason=(
+                "rank 0 exited with code 75 after JACCL all_reduce made no progress"
+            ),
+            phase="failed",
+        ),
+    )
+
+    assert engine.runtime_failed_reason is not None
+    assert "rank 0 exited with code 75" in engine.runtime_failed_reason
+
+
 @pytest.mark.asyncio
 async def test_preflight_rejects_an_unhealthy_rank_before_streaming(monkeypatch):
     # The 200 commits before a streaming body runs, so preflight is the last

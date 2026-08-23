@@ -357,6 +357,11 @@ class DistributedBatchedEngine(BatchedEngine):
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
             )
+        if status.failure_reason:
+            self._mark_runtime_failed(status.failure_reason)
+            raise DistributedInferenceError(
+                f"distributed cluster failure: {status.failure_reason}"
+            )
         return client
 
     def _read_timeout_error(self, *, stream: bool) -> DistributedInferenceError:
