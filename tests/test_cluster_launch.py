@@ -1790,8 +1790,8 @@ def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
     rank0 = _prompt_cache_ssd_dir(args, rank=0)
     rank1 = _prompt_cache_ssd_dir(args, rank=1)
     assert rank0 is not None and rank1 is not None
-    assert rank0.endswith(f"{args.deployment_id}-rank-0")
-    assert rank1.endswith(f"{args.deployment_id}-rank-1")
+    assert rank0.endswith(f"{args.deployment_id}/{args.plan_hash}/rank-0")
+    assert rank1.endswith(f"{args.deployment_id}/{args.plan_hash}/rank-1")
     assert rank0 != rank1
 
 

@@ -908,7 +908,8 @@ def install_server_telemetry(
     prefill_guard: Any | None = None,
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ssd_cache_dir: str | None = None,
-    ssd_max_entries: int = 64,
+    ssd_max_entries: int = 512,
+    ssd_cache_persistent: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
 ) -> Iterator[RuntimeTelemetry]:
@@ -924,9 +925,9 @@ def install_server_telemetry(
     a chained progress callback) and restore from it on an in-memory miss, so a
     model whose per-layer state cannot be sliced still reuses a long prefix
     instead of recomputing it. The restore boundary is agreed across ranks so a
-    disk write that failed on one rank cannot desync the pipeline. The snapshot
-    directory is process-lifetime: the store starts it clean and this context's
-    teardown removes it.
+    disk write that failed on one rank cannot desync the pipeline. With
+    ``ssd_cache_persistent`` the compact plan-scoped index survives rank
+    restarts; otherwise this context retains the legacy process-lifetime tier.
     """
 
     import mlx.core as mx
@@ -976,7 +977,10 @@ def install_server_telemetry(
         )
 
         ssd_store = SSDPromptSnapshotStore(
-            ssd_cache_dir, step=snapshot_step, max_entries=ssd_max_entries
+            ssd_cache_dir,
+            step=snapshot_step,
+            max_entries=ssd_max_entries,
+            persistent=ssd_cache_persistent,
         )
     try:
         group = mx.distributed.init()
@@ -1303,15 +1307,15 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
+        def _omlx_cache_inventory(self) -> tuple[int, int]:
+            """Combined volatile LRU and durable rank-local snapshot tiers."""
+
+            disk_entries = len(ssd_store) if ssd_store is not None else 0
+            disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
+            return len(self) + disk_entries, self.nbytes + disk_bytes
+
         def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
-            cache, rest = super().fetch_nearest_cache(model, tokens)
-            telemetry.observe_cache_lookup(
-                prompt_tokens=len(tokens),
-                remaining_tokens=len(rest),
-                entries=len(self),
-                nbytes=self.nbytes,
-            )
-            return cache, rest
+            return super().fetch_nearest_cache(model, tokens)
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
@@ -1348,7 +1352,19 @@ def install_server_telemetry(
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            return agree_prompt_cache_plan(cache, tokens, rest)
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+            entries, nbytes = self._omlx_cache_inventory()
+            # Observe the final agreed tier. Recording the volatile lookup
+            # before SSD restore made a real durable hit appear as a miss on
+            # the cluster dashboard even while per-request cached_tokens was
+            # correct.
+            telemetry.observe_cache_lookup(
+                prompt_tokens=len(tokens),
+                remaining_tokens=len(rest),
+                entries=entries,
+                nbytes=nbytes,
+            )
+            return cache, rest
 
         def prefetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
             """Look up once during caught preflight, then hand it to MLX-LM."""
@@ -1375,7 +1391,8 @@ def install_server_telemetry(
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
-            telemetry.observe_cache_state(entries=len(self), nbytes=self.nbytes)
+            entries, nbytes = self._omlx_cache_inventory()
+            telemetry.observe_cache_state(entries=entries, nbytes=nbytes)
             return result
 
     class CoordinatedGenerationContext(original_generation_context):
@@ -1589,7 +1606,7 @@ def install_server_telemetry(
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
         mlx_server.stream_generate = original_stream_generate
-        if ssd_store is not None:
-            # Snapshots are process-lifetime; a hard crash skips this and the
-            # next store on the same directory reclaims the leftovers instead.
+        if ssd_store is not None and not ssd_cache_persistent:
+            # Legacy process-lifetime mode: a hard crash skips this and the
+            # next nonpersistent store reclaims the leftovers instead.
             shutil.rmtree(ssd_store.directory, ignore_errors=True)
