@@ -97,6 +97,10 @@ _RANK_ENV_DEFAULTS = (
     # Shape warmup enters the full distributed graph, so every rank must make
     # the same decision.  Coordinator-only overrides would cross collectives.
     ("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"),
+    # Experimental DS4 replicated-projection ownership. The physical 3:5 gate
+    # nominates rank 0/M3, but production remains off until the exact live
+    # prefill+decode promotion gate clears.
+    ("OMLX_DSV4_PROJECTION_OWNER_RANK", "off"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),

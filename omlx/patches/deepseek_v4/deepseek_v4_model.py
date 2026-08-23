@@ -120,6 +120,80 @@ def _tp_partition_weights(
     return weights
 
 
+_PROJECTION_OWNER_LOGGED = False
+
+
+def _projection_owner_rank(group: Any) -> Optional[int]:
+    """Return the operator-qualified owner of replicated DS4 projections."""
+
+    if group is None or int(group.size()) != 2:
+        return None
+    raw = os.environ.get("OMLX_DSV4_PROJECTION_OWNER_RANK", "off").strip().lower()
+    if raw in {"", "off", "none", "false", "disabled"}:
+        return None
+    try:
+        owner = int(raw)
+    except ValueError:
+        return None
+    # The physical gate is specific to the signed M3:M5 3:5 placement. A
+    # differently ordered or equal cluster must qualify its own owner first.
+    if owner not in (0, 1) or _tp_partition_weights(group) != (3, 5):
+        return None
+    return owner
+
+
+def _owned_projection_bank(
+    x: mx.array,
+    modules: Tuple[Any, ...],
+    group: Any,
+) -> Optional[Tuple[mx.array, ...]]:
+    """Compute replicated input projections once and send exact BF16 views.
+
+    Rank zero's physical M3 gate executes the full DS4 projection shapes much
+    faster than the M5. The owner keeps its original arrays while the peer
+    receives their packed storage bytes; no reduction or alternate arithmetic
+    is introduced. The send handle is attached to the owner's local bank so a
+    later layer cannot overtake its matching peer receive.
+    """
+
+    owner = _projection_owner_rank(group)
+    if owner is None or not modules:
+        return None
+    rank = int(group.rank())
+    widths = tuple(int(module.weight.shape[0]) for module in modules)
+    total = sum(widths)
+    if any(width < 1 for width in widths) or x.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    if rank == owner:
+        values = tuple(module(x) for module in modules)
+        if any(value.dtype != x.dtype for value in values):
+            return None
+        packed = mx.concatenate(values, axis=-1)
+        peer = 1 - owner
+        sent = mx.distributed.send(packed, peer)
+        packed = mx.depends(packed, sent)
+    else:
+        shape = (*x.shape[:-1], total)
+        packed = mx.distributed.recv_like(mx.zeros(shape, dtype=x.dtype), owner)
+    boundaries = []
+    cursor = 0
+    for width in widths[:-1]:
+        cursor += width
+        boundaries.append(cursor)
+    outputs = tuple(mx.split(packed, boundaries, axis=-1))
+    global _PROJECTION_OWNER_LOGGED
+    if not _PROJECTION_OWNER_LOGGED:
+        _PROJECTION_OWNER_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DeepSeek V4 replicated projections owned by rank %d "
+            "(rank=%d packed_width=%d)",
+            owner,
+            rank,
+            total,
+        )
+    return outputs
+
+
 def _validated_ds4_tp_weights(
     args: Any,
     group: mx.distributed.Group,
@@ -2923,9 +2997,18 @@ class LocalAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_raw = self.wq_b(self.q_norm(self.wq_a(x)))
+        projection_bank = _owned_projection_bank(
+            x,
+            (self.wq_a, self.wkv),
+            self.sharding_group,
+        )
+        if projection_bank is None:
+            q_a = self.wq_a(x)
+            kv_raw = self.wkv(x)
+        else:
+            q_a, kv_raw = projection_bank
+        q_raw = self.wq_b(self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
-        kv_raw = self.wkv(x)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
@@ -3032,13 +3115,30 @@ class CompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_raw = self.wq_b(self.q_norm(self.wq_a(x)))
+        projection_bank = _owned_projection_bank(
+            x,
+            (
+                self.wq_a,
+                self.wkv,
+                self.compressor.wkv,
+                self.compressor.wgate,
+            ),
+            self.sharding_group,
+        )
+        if projection_bank is None:
+            q_a = self.wq_a(x)
+            kv_raw = self.wkv(x)
+            compressor_projection = None
+        else:
+            q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
+            compressor_projection = (compressed_kv, compressed_gate)
+        q_raw = self.wq_b(self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
-        kv_raw = self.wkv(x)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and 1 < L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
+            if compressor_projection is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -3063,7 +3163,15 @@ class CompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, pool_cache, offset)
+        pooled = (
+            self.compressor(x, pool_cache, offset)
+            if compressor_projection is None
+            else self.compressor.consume(
+                *compressor_projection,
+                pool_cache,
+                offset,
+            )
+        )
         pooled_mask = None
         if pooled.shape[1] > 0:
             pooled_mask = (
@@ -3207,16 +3315,45 @@ class SparseCompressedAttention(nn.Module):
         offset = local_cache.offset if local_cache is not None else 0
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual = self.q_norm(self.wq_a(x))
+        projection_bank = _owned_projection_bank(
+            x,
+            (
+                self.wq_a,
+                self.wkv,
+                self.compressor.wkv,
+                self.compressor.wgate,
+                self.indexer.compressor.wkv,
+                self.indexer.compressor.wgate,
+            ),
+            self.sharding_group,
+        )
+        if projection_bank is None:
+            q_a = self.wq_a(x)
+            kv_raw = self.wkv(x)
+            compressor_projection = None
+            index_compressor_projection = None
+        else:
+            (
+                q_a,
+                kv_raw,
+                compressed_kv,
+                compressed_gate,
+                index_kv,
+                index_gate,
+            ) = projection_bank
+            compressor_projection = (compressed_kv, compressed_gate)
+            index_compressor_projection = (index_kv, index_gate)
+        q_residual = self.q_norm(q_a)
         q_raw = self.wq_b(q_residual).reshape(
             B, L, self.n_heads, self.head_dim
         )
-        kv_raw = self.wkv(x)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and L <= 6:
-            compressed_kv, compressed_gate = self.compressor.project(x)
-            index_kv, index_gate = self.indexer.compressor.project(x)
+            if compressor_projection is None:
+                compressed_kv, compressed_gate = self.compressor.project(x)
+            if index_compressor_projection is None:
+                index_kv, index_gate = self.indexer.compressor.project(x)
             pooled_rows = _consume_verify_rows(
                 self.compressor,
                 compressed_kv,
@@ -3335,10 +3472,26 @@ class SparseCompressedAttention(nn.Module):
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        pooled = self.compressor(x, comp_cache, offset)
+        pooled = (
+            self.compressor(x, comp_cache, offset)
+            if compressor_projection is None
+            else self.compressor.consume(
+                *compressor_projection,
+                comp_cache,
+                offset,
+            )
+        )
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
         if 0 < pooled.shape[1] <= self.indexer.index_topk:
-            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            index_pooled = (
+                self.indexer.compressor(x, idx_cache, offset)
+                if index_compressor_projection is None
+                else self.indexer.compressor.consume(
+                    *index_compressor_projection,
+                    idx_cache,
+                    offset,
+                )
+            )
             if index_pooled.shape[1] != pooled.shape[1]:
                 raise RuntimeError(
                     "DeepSeek V4 attention/indexer pooling caches diverged"
@@ -3348,7 +3501,14 @@ class SparseCompressedAttention(nn.Module):
                 (B, L, pooled.shape[1]),
             )
         else:
-            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+            topk = self.indexer(
+                x,
+                q_residual,
+                self.rope,
+                idx_cache,
+                offset,
+                compressor_projection=index_compressor_projection,
+            )
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(
