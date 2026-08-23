@@ -801,6 +801,18 @@ class TestDeepSeekV4PrefillMemoryProfile:
         )
         return monitor
 
+    def test_model_introspection_attaches_ds4_profile_to_rank_guard(self):
+        from omlx.memory_monitor import set_model_info_from_model
+
+        config = self._config()
+        config.torch_dtype = "bfloat16"
+        monitor = MemoryMonitor(max_kv_cache_memory=256 * 1024**3)
+
+        set_model_info_from_model(monitor, SimpleNamespace(args=config))
+
+        assert monitor._prefill_memory_profile is not None
+        assert monitor._prefill_memory_profile.wsdpa_dtype_supported is True
+
     @staticmethod
     def _set_wsdpa_route(
         monkeypatch,

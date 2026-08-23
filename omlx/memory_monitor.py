@@ -1548,6 +1548,21 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         # truthy but fail any later numeric comparison (``> 128`` etc.) deep
         # inside MemoryMonitor. Insist on real positive integers before calling.
         if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            declared_dtype = str(
+                _cfg_get(config, "torch_dtype", _cfg_get(config, "dtype", ""))
+                or ""
+            ).lower()
+            model_dtype = str(getattr(model, "dtype", "") or "").lower()
+            wsdpa_dtype_supported = declared_dtype in {
+                "bfloat16",
+                "bf16",
+                "mlx.core.bfloat16",
+            } or model_dtype in {"bfloat16", "bf16", "mlx.core.bfloat16"}
+            prefill_memory_profile = make_prefill_memory_profile(
+                config,
+                compute_dtype_size=dtype_size,
+                wsdpa_dtype_supported=wsdpa_dtype_supported,
+            )
             monitor.set_model_info(
                 num_layers=num_layers,
                 num_kv_heads=num_kv_heads,
@@ -1560,6 +1575,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                prefill_memory_profile=prefill_memory_profile,
                 ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(
