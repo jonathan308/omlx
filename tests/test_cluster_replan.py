@@ -428,6 +428,22 @@ def test_replan_mtp_toggle_is_signed_and_forces_reload(active_deployment):
     assert engine.deployment.mtp_enabled is True
     assert engine.deployment.mtp_num_draft_tokens == 3
 
+    disabled = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "mtp_enabled": False,
+            "mtp_num_draft_tokens": None,
+        },
+    )
+    assert disabled.status_code == 200, disabled.json()
+    assert disabled.json()["plan"].get("mtp_enabled") is None
+    assert disabled.json()["plan"].get("mtp_num_draft_tokens") is None
+    assert disabled.json()["changes"]["settings"] == {
+        "mtp_enabled": {"before": True, "after": False},
+        "mtp_num_draft_tokens": {"before": 3, "after": None},
+    }
+
 
 def test_replan_rejects_a_stale_approval(active_deployment):
     _client().post(

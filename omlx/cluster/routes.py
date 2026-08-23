@@ -4038,7 +4038,7 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             ),
             mtp_num_draft_tokens=(
                 request.mtp_num_draft_tokens
-                if request.mtp_num_draft_tokens is not None
+                if "mtp_num_draft_tokens" in request.model_fields_set
                 else current.mtp_num_draft_tokens
                 if current is not None
                 else None
