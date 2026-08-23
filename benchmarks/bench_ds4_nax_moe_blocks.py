@@ -55,6 +55,27 @@ def synthetic_routes() -> tuple[int, ...]:
     )
 
 
+def route_fixture(name: str) -> tuple[int, ...]:
+    """Deterministic route distributions for boundary/skew safety gates."""
+
+    if name == "synthetic":
+        return synthetic_routes()
+    if name == "ragged":
+        counts = [0, 1, 31, 32, 33] + [25] * 23 + [24] * (EXPERTS - 28)
+    elif name == "skewed":
+        counts = [512] + [23] * 22 + [22] * (EXPERTS - 23)
+    elif name == "max-blocks":
+        # Near the fixed 448-block ABI ceiling: one very hot expert and one
+        # route on every other expert produce 440 BM32 work items.
+        counts = [ROUTES - (EXPERTS - 1)] + [1] * (EXPERTS - 1)
+    else:  # pragma: no cover - argparse constrains this
+        raise ValueError(f"unknown route fixture: {name}")
+    assert len(counts) == EXPERTS and sum(counts) == ROUTES
+    return tuple(
+        expert for expert, count in enumerate(counts) for _ in range(count)
+    )
+
+
 def structural_work_report(
     routes: Sequence[int] | None = None,
     *,
@@ -165,6 +186,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--cycles", type=int, default=8)
     parser.add_argument("--min-speedup", type=float, default=MIN_COMPOSED_SPEEDUP)
+    parser.add_argument(
+        "--route-pattern",
+        choices=("synthetic", "ragged", "skewed", "max-blocks"),
+        default="synthetic",
+    )
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args()
 
@@ -184,7 +210,7 @@ def main() -> None:
 
     mx.random.seed(20260822)
     hidden = mx.random.normal((1, TOKENS, HIDDEN)).astype(mx.bfloat16)
-    route_values = synthetic_routes()
+    route_values = route_fixture(args.route_pattern)
     routes = mx.array(route_values, dtype=mx.uint32).reshape(1, TOKENS, TOPK)
     scores = mx.softmax(mx.random.normal(routes.shape), axis=-1).astype(mx.float32)
     flat_routes = routes.flatten()
@@ -352,6 +378,7 @@ def main() -> None:
         "model": str(args.model),
         "layer": args.layer,
         "rank": 1,
+        "route_pattern": args.route_pattern,
         "shard_weights": [3, 5],
         "shape": {
             "tokens": TOKENS,

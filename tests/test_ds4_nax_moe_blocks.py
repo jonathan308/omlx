@@ -11,6 +11,7 @@ import pytest
 from benchmarks.bench_ds4_nax_moe_blocks import (
     MIN_COMPOSED_SPEEDUP,
     SYMBOL,
+    route_fixture,
     structural_work_report,
 )
 from omlx.custom_kernels.glm_moe_dsa import fast
@@ -29,6 +30,27 @@ def test_uniform_fixture_exposes_stock_global_tile_recomputation():
     assert report["candidate_row_equivalents"] == 8192
     assert report["row_work_ratio"] == 2.5
     assert report["weight_segment_ratio"] == 1.25
+
+
+@pytest.mark.parametrize(
+    ("name", "active", "minimum", "maximum", "blocks"),
+    (
+        ("ragged", 255, 1, 33, 256),
+        ("skewed", 256, 22, 512, 271),
+        ("max-blocks", 256, 1, 5889, 440),
+    ),
+)
+def test_boundary_and_skew_route_fixtures_stay_inside_fixed_block_abi(
+    name, active, minimum, maximum, blocks
+):
+    routes = route_fixture(name)
+    report = structural_work_report(routes)
+    assert len(routes) == 6144
+    assert report["active_experts"] == active
+    assert report["min_routes_per_active_expert"] == minimum
+    assert report["max_routes_per_expert"] == maximum
+    assert report["candidate_expert_blocks"] == blocks
+    assert blocks <= 448
 
 
 def test_gate_requires_lossless_1_45x_composed_speedup():
