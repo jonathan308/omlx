@@ -150,7 +150,7 @@ class DSAIndexerScoresPrimitive : public Primitive {
         return true;
       }
     }
-    if (q.shape(3) != 128 || k.shape(3) != 128) {
+    if (q.shape(3) != k.shape(3) || q.shape(3) < 16 || q.shape(3) > 128) {
       return true;
     }
     if (q.shape(3) % 16 != 0) {
@@ -400,7 +400,8 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     if (weights.shape(1) != q.shape(2) || weights.shape(2) != q.shape(1)) {
       return true;
     }
-    if (q.shape(3) != 128 || k.shape(3) != 128) {
+    if ((q.shape(3) != 48 && q.shape(3) != 128) ||
+        k.shape(3) != q.shape(3)) {
       return true;
     }
     return k.shape(2) < 64;
@@ -428,10 +429,31 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const int B = q.shape(0);
     const int M = q.shape(2);
     const int N = k.shape(2);
+    const int D = q.shape(3);
 
-    const int tiles_m_full = M / kBM;
+    int tile_bm = kBM;
+    int tile_threads = kThreads;
+    const char* interior_name = D == 48
+        ? "mma_dsa_indexer_score_bfloat16_d48_interior"
+        : "mma_dsa_indexer_score_bfloat16_interior";
+    const char* boundary_name = D == 48
+        ? "mma_dsa_indexer_score_bfloat16_d48_boundary"
+        : "mma_dsa_indexer_score_bfloat16_boundary";
+    if (D == 128 && M <= 16) {
+      tile_bm = 16;
+      tile_threads = 64;
+      interior_name = "mma_dsa_indexer_score_bfloat16_bm16_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_bm16_boundary";
+    } else if (D == 128 && M <= 32) {
+      tile_bm = 32;
+      tile_threads = 64;
+      interior_name = "mma_dsa_indexer_score_bfloat16_bm32_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_bm32_boundary";
+    }
+
+    const int tiles_m_full = M / tile_bm;
     const int tiles_n_full = N / kBN;
-    const int tiles_m = (M + kBM - 1) / kBM;
+    const int tiles_m = (M + tile_bm - 1) / tile_bm;
     const int tiles_n = (N + kBN - 1) / kBN;
 
     OMLXMMADSAScoreParamsHost params{
@@ -444,7 +466,7 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const int tg_x = tiles_n << kSwizzleLog;
     const int tg_y =
         (tiles_m + (1 << kSwizzleLog) - 1) >> kSwizzleLog;
-    MTL::Size group_dims = MTL::Size(kThreads, 1, 1);
+    MTL::Size group_dims = MTL::Size(tile_threads, 1, 1);
     MTL::Size grid_dims = MTL::Size(tg_x, tg_y, B);
 
     auto lib = d.get_library("omlx_glm_mma_dsa_v25", []() {
@@ -464,10 +486,10 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     };
 
     if (tiles_m_full > 0 && tiles_n_full > 0) {
-      dispatch("mma_dsa_indexer_score_bfloat16_interior");
+      dispatch(interior_name);
     }
     if (tiles_m > tiles_m_full || tiles_n > tiles_n_full) {
-      dispatch("mma_dsa_indexer_score_bfloat16_boundary");
+      dispatch(boundary_name);
     }
   }
 
@@ -1023,7 +1045,7 @@ array dsa_indexer_scores_mma(
     // causal, weights rank 4, GLM shapes) to dsa_indexer_scores.
     throw std::invalid_argument(
         "[omlx_glm_kernels.dsa_indexer_scores_mma] unsupported shape/dtype "
-        "(kernel serves bf16, H=64, D=128, weights [B, L, H] only).");
+        "(kernel serves bf16, H=64, D in {48,128}, weights [B, L, H] only).");
   }
 
   Shape out_shape{q.shape(0), 1, q.shape(2), k.shape(2)};

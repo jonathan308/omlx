@@ -266,6 +266,24 @@ mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, false>;
 template [[host_name("mma_dsa_indexer_score_bfloat16_boundary")]] [[kernel]]
 decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>)
 mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 128, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_d48_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, false>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_d48_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, true>)
+mma_dsa_indexer_score<bfloat, 64, 64, 2, 2, 64, 48, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm16_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm16_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 16, 64, 1, 2, 64, 128, true>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm32_interior")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, false>)
+mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, false>;
+template [[host_name("mma_dsa_indexer_score_bfloat16_bm32_boundary")]] [[kernel]]
+decltype(mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, true>)
+mma_dsa_indexer_score<bfloat, 32, 64, 1, 2, 64, 128, true>;
 )MMADSA";
 
 } // namespace omlx::glm_kernels

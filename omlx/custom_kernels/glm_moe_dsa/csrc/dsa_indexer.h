@@ -39,7 +39,7 @@ bool dsa_indexer_nax_runtime_active();
 
 // v25 M2 from-scratch MMA score kernel (zero-per-head-barrier structure,
 // ~1.37x over the Steel kernel on M2 Ultra, bit-exact). Serves ONLY:
-// bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal. Callers must
+// bf16, H=64, D in {48,128}, weights rank 3 ([B, L, H]), non-causal. Callers must
 // gate on those and fall back to dsa_indexer_scores otherwise. mask_ratio/
 // mask_q_offset carry the same fused pooled-ratio mask semantics as
 // dsa_indexer_scores.

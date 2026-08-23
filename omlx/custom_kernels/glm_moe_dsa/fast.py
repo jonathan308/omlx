@@ -191,7 +191,7 @@ def dsa_indexer_scores_mma(
 ) -> mx.array:
     """v25 from-scratch MMA indexer scores (qualified on M2/M3/M5).
 
-    Serves ONLY bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal;
+    Serves ONLY bf16, H=64, D in {48, 128}, weights rank 3 ([B, L, H]), non-causal;
     the extension raises on anything else — callers gate and fall back to
     ``dsa_indexer_scores``. Same fused pooled-ratio mask semantics
     (``mask_ratio``/``mask_q_offset``) and bit-exact output vs the Steel
