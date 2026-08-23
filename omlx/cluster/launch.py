@@ -2718,7 +2718,28 @@ class DistributedJobSupervisor:
 
     def _wait_for_listener(self) -> None:
         assert self.port is not None
-        deadline = time.monotonic() + min(15.0, self.load_timeout)
+        # A qualified distributed prefill-shape warmup runs after rank-ready
+        # (weights resident) but before the HTTP listener.  Its first Metal
+        # pipeline compilation can exceed the historical 15-second listener
+        # grace even though every rank is making healthy progress.  Both ranks
+        # receive the warmup flag through the signed hostfile; mirror that
+        # decision here so disabling it retains the tighter failure bound.
+        warmup_enabled = os.environ.get(
+            "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"
+        ).strip().lower() in {"1", "true", "on", "yes"}
+        default_timeout = 60.0 if warmup_enabled else 15.0
+        raw_timeout = os.environ.get("OMLX_CLUSTER_LISTENER_TIMEOUT_SECONDS", "")
+        try:
+            requested_timeout = (
+                float(raw_timeout) if raw_timeout.strip() else default_timeout
+            )
+        except ValueError:
+            requested_timeout = default_timeout
+        listener_timeout = min(
+            max(requested_timeout, 1.0),
+            self.load_timeout,
+        )
+        deadline = time.monotonic() + listener_timeout
         while time.monotonic() < deadline:
             process = self.process
             if process is None or process.poll() is not None:

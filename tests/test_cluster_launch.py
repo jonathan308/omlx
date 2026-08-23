@@ -430,6 +430,44 @@ def test_launcher_log_failure_does_not_block_event_parsing(tmp_path, monkeypatch
     assert supervisor.status().failure_reason == "rank 1 disappeared"
 
 
+def test_listener_grace_tracks_distributed_shape_warmup(monkeypatch):
+    class Launcher:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        load_timeout=120.0,
+    )
+    supervisor.process = Launcher()
+    supervisor.port = 12345
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise OSError("not listening")
+
+    monkeypatch.setattr(launch.socket, "create_connection", unavailable)
+    monkeypatch.setattr(launch.time, "sleep", lambda _seconds: None)
+
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "0")
+    times = iter((0.0, 20.0))
+    monkeypatch.setattr(launch.time, "monotonic", lambda: next(times))
+    with pytest.raises(TimeoutError, match="rank-zero inference endpoint"):
+        supervisor._wait_for_listener()
+    assert attempts == []
+
+    monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1")
+    times = iter((0.0, 20.0, 61.0))
+    monkeypatch.setattr(launch.time, "monotonic", lambda: next(times))
+    with pytest.raises(TimeoutError, match="rank-zero inference endpoint"):
+        supervisor._wait_for_listener()
+    assert len(attempts) == 1
+
+
 def test_supervisor_stop_kills_rank_left_after_launcher_exits(monkeypatch):
     class Launcher:
         pid = 43210
