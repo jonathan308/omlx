@@ -961,6 +961,35 @@ async def test_concurrent_targeted_cancels_merge_until_rank_ack(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stale_pre_restart_cancel_all_never_widens_new_disconnect(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": 9_999_999_999_999,
+                "scope": "all",
+                "reason": "old process",
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_id = await engine._enter_request("transport-new-client")
+    try:
+        assert await engine.abort_request(request_id, reason="socket closed") is True
+        payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+        assert payload["scope"] == "requests"
+        assert payload["request_ids"] == [request_id]
+    finally:
+        await engine._leave_request(request_id)
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_malformed_targeted_cancel_never_degrades_to_cancel_all(tmp_path):
     engine = _ready_engine(lambda request: httpx.Response(200, json={}))
     engine._supervisor.state_dir = str(tmp_path)

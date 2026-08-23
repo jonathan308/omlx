@@ -1079,6 +1079,7 @@ def test_targeted_cancel_stops_only_the_matching_transport_request(tmp_path):
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
     assert first_context.stopped is True
     assert second_context.stopped is False
+    assert telemetry.merge_requested_cancel_uids([]) == [71]
 
 
 def test_private_http_header_is_attached_before_request_sharing(monkeypatch):
@@ -1111,6 +1112,39 @@ def test_targeted_cancel_arriving_before_context_registration_is_not_lost(tmp_pa
     telemetry.register_context(queue._request_id, context)
 
     assert context.stopped is True
+
+
+def test_long_prefill_exposes_cancel_vote_within_one_chunk(tmp_path):
+    """A >25-chunk prompt cannot sit inside MLX-LM's 25-step budget slice."""
+
+    import mlx_lm.server as mlx_server
+
+    with install_server_telemetry(_Marker(), heartbeat_interval=0) as telemetry:
+        request_id = telemetry.begin_request("transport-long-prefill")
+        telemetry.observe_context(
+            request_id,
+            prompt_tokens=59_104,
+            cached_tokens=0,
+        )
+        telemetry.mark_pending_uid(request_id)
+        context = _GenerationContext()
+        telemetry.register_context(request_id, context)
+        telemetry.bind_pending_uid((73,))
+        assert telemetry.force_cancel_request("transport-long-prefill") == 1
+
+        budget = mlx_server.TimeBudget(budget=999, iterations=25)
+        budget._is_distributed = True
+        assert sum(1 for _ in budget) == 1
+        assert telemetry.merge_requested_cancel_uids([]) == [73]
+
+        telemetry.observe_prefill_progress(
+            73,
+            processed_tokens=59_104,
+            total_tokens=59_104,
+        )
+        # The cap is lifecycle-based, not a permanent mutation of the budget:
+        # decode/subsequent non-prefill slices retain MLX-LM's 25-step batch.
+        assert sum(1 for _ in budget) == 25
 
 
 def test_force_cancel_all_without_a_generation_context_is_a_noop(tmp_path):

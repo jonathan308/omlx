@@ -970,6 +970,10 @@ class DistributedBatchedEngine(BatchedEngine):
             and existing.get("plan_hash") == self.deployment.plan_hash
             and isinstance(existing.get("epoch"), int)
             and not isinstance(existing.get("epoch"), bool)
+            # Only merge a marker written by this engine lifetime. A stale
+            # pre-restart `scope=all` file is a startup watermark, not pending
+            # work, and must never widen a new targeted disconnect.
+            and int(existing["epoch"]) == self._last_cancel_epoch
             and int(existing["epoch"]) > ack_epoch
         ):
             if existing.get("scope") == "all":

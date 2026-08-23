@@ -168,6 +168,7 @@ class RuntimeTelemetry:
         self._transport_to_request: dict[str, int] = {}
         self._request_to_transport: dict[int, str] = {}
         self._pending_transport_cancels: set[str] = set()
+        self._cancel_requested_requests: set[int] = set()
         self._pending_uid = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
@@ -367,6 +368,17 @@ class RuntimeTelemetry:
             sample.updated_at = now
             self._publish_locked(now, force=True)
 
+    def has_active_prefill(self) -> bool:
+        """Whether a request still has prompt chunks left on this rank."""
+
+        with self._lock:
+            return any(
+                sample.first_token_at is None
+                and sample.prefill_total_tokens > 0
+                and sample.prefill_processed_tokens < sample.prefill_total_tokens
+                for sample in self._requests.values()
+            )
+
     def observe_token(self, request_id: int) -> None:
         now = float(self._clock())
         with self._lock:
@@ -403,6 +415,7 @@ class RuntimeTelemetry:
                 transport_request_id = self._request_to_transport.get(request_id)
                 if transport_request_id in self._pending_transport_cancels:
                     self._pending_transport_cancels.discard(transport_request_id)
+                    self._cancel_requested_requests.add(request_id)
                     cancel_immediately = True
         if cancel_immediately:
             stop = getattr(context, "stop", None)
@@ -454,6 +467,7 @@ class RuntimeTelemetry:
                 request_id = self._uid_to_request.pop(uid, None)
                 if request_id is None:
                     continue
+                self._cancel_requested_requests.discard(request_id)
                 self._request_to_uid.pop(request_id, None)
                 queue = self._request_queues.get(request_id)
                 finished = self._finish_locked(
@@ -481,6 +495,32 @@ class RuntimeTelemetry:
         with self._lock:
             self._batch_generator = generator
 
+    def merge_requested_cancel_uids(self, uids: Any) -> list[Any]:
+        """Inject requested UIDs into MLX-LM's rank-zero cancellation vote.
+
+        This runs on the generation thread immediately before its existing
+        ``_share_object(uids_to_remove)`` broadcast.  It is therefore safe for
+        distributed collectives: rank zero remains the single producer and
+        every peer receives/removes the same list at the same batch boundary.
+        The heartbeat thread never calls ``BatchGenerator.remove`` directly.
+        """
+
+        try:
+            merged = list(uids)
+        except TypeError:
+            merged = []
+        with self._lock:
+            requested = [
+                self._request_to_uid[request_id]
+                for request_id in self._cancel_requested_requests
+                if request_id in self._request_to_uid
+                and request_id in self._requests
+            ]
+        for uid in requested:
+            if uid not in merged:
+                merged.append(uid)
+        return merged
+
     def force_cancel_all(self, *, reason: str = "coordinator cancel") -> int:
         """Request cancellation through MLX-LM's shared server-loop path.
 
@@ -494,6 +534,7 @@ class RuntimeTelemetry:
         """
 
         with self._lock:
+            self._cancel_requested_requests.update(self._requests)
             contexts = [
                 context
                 for request_id, context in self._request_contexts.items()
@@ -536,6 +577,8 @@ class RuntimeTelemetry:
             request_id = self._transport_to_request.get(normalized)
             context = self._request_contexts.get(request_id)
             active = request_id in self._requests if request_id is not None else False
+            if active and request_id is not None:
+                self._cancel_requested_requests.add(request_id)
         if not active or context is None:
             with self._lock:
                 if len(self._pending_transport_cancels) < _MAX_TARGETED_CANCEL_REQUESTS:
@@ -767,6 +810,7 @@ class RuntimeTelemetry:
         sample = self._requests.pop(request_id, None)
         if sample is None:
             return False
+        self._cancel_requested_requests.discard(request_id)
         if getattr(self._pending_uid, "request_id", None) == request_id:
             self._pending_uid.request_id = None
         uid = self._request_to_uid.pop(request_id, None)
@@ -1126,6 +1170,7 @@ def install_server_telemetry(
     original_batch_generator = mlx_server.BatchGenerator
     original_prompt_cache = mlx_server.LRUPromptCache
     original_generation_context = mlx_server.GenerationContext
+    original_time_budget = mlx_server.TimeBudget
     original_handle_completion = mlx_server.APIHandler.handle_completion
     cancellation_state = threading.local()
     marker_path = getattr(marker, "path", None)
@@ -1651,10 +1696,36 @@ def install_server_telemetry(
         def _should_stop(self, value: Any) -> None:
             self.__dict__["_omlx_local_should_stop"] = bool(value)
 
+    class PrefillCancellationTimeBudget(original_time_budget):
+        """Expose one synchronized cancel/admission boundary per prompt chunk.
+
+        MLX-LM's distributed TimeBudget normally batches 25 ``next()`` calls
+        before sharing ``uids_to_remove``.  With 2,048-token prompt chunks that
+        deferred a disconnect by 51,200 tokens.  Every rank observes the same
+        prompt lifecycle, so limiting only active-prefill slices to one step is
+        symmetric and lets the existing rank-zero cancellation vote run after
+        at most the in-progress chunk. Decode keeps the amortized 25-step slice.
+        """
+
+        def __next__(self) -> Any:
+            if (
+                telemetry.has_active_prefill()
+                and getattr(self, "_current_iterations", 0) >= 1
+            ):
+                raise StopIteration()
+            return super().__next__()
+
     class TelemetryResponseGenerator(original):
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
+            # MLX-LM calls this with the rank-zero-owned ``uids_to_remove``
+            # list once per batch-loop slice. Merge heartbeat/transport aborts
+            # here, on the generation thread, so cancellation cannot depend on
+            # cross-thread mutation of GenerationContext and cannot remove a
+            # UID on only one rank.
+            if int(getattr(self, "_rank", 0)) == 0 and isinstance(obj, list):
+                obj = telemetry.merge_requested_cancel_uids(obj)
             if control_plane is not None:
                 return control_plane.broadcast_object(obj)
 
@@ -1853,6 +1924,7 @@ def install_server_telemetry(
     mlx_server.ResponseGenerator = TelemetryResponseGenerator
     mlx_server.LRUPromptCache = TelemetryPromptCache
     mlx_server.GenerationContext = CoordinatedGenerationContext
+    mlx_server.TimeBudget = PrefillCancellationTimeBudget
     mlx_server.APIHandler.handle_completion = request_correlated_handle_completion
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
@@ -1879,6 +1951,7 @@ def install_server_telemetry(
         mlx_server.BatchGenerator = original_batch_generator
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
+        mlx_server.TimeBudget = original_time_budget
         mlx_server.APIHandler.handle_completion = original_handle_completion
         mlx_server.stream_generate = original_stream_generate
         snapshot_writer_closed = True
