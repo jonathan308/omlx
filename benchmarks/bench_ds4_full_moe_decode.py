@@ -95,6 +95,33 @@ def reference(
     scores,
     activation_limit,
 ):
+    activated = reference_pair(
+        x,
+        up_weight,
+        up_scales,
+        gate_weight,
+        gate_scales,
+        indices,
+        activation_limit,
+    )
+    return reference_down(
+        activated,
+        down_weight,
+        down_scales,
+        indices,
+        scores,
+    )
+
+
+def reference_pair(
+    x,
+    up_weight,
+    up_scales,
+    gate_weight,
+    gate_scales,
+    indices,
+    activation_limit,
+):
     expanded = mx.expand_dims(x, (-2, -3))
     kwargs = {
         "transpose": True,
@@ -121,7 +148,17 @@ def reference(
     )
     gate = mx.minimum(gate, activation_limit)
     up = mx.clip(up, -activation_limit, activation_limit)
-    activated = (gate * mx.sigmoid(gate)) * up
+    return (gate * mx.sigmoid(gate)) * up
+
+
+def reference_down(activated, down_weight, down_scales, indices, scores):
+    kwargs = {
+        "transpose": True,
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "sorted_indices": False,
+    }
     down = mx.gather_qmm(
         activated,
         down_weight,
@@ -220,6 +257,29 @@ def main() -> int:
     def candidate():
         return fast.deepseek_mxfp4_full_decode(*common, args.activation_limit)
 
+    def stock_pair():
+        return reference_pair(
+            x,
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            indices,
+            args.activation_limit,
+        )
+
+    activated_reference = stock_pair()
+    mx.eval(activated_reference)
+
+    def stock_down():
+        return reference_down(
+            activated_reference,
+            down_weight,
+            down_scales,
+            indices,
+            scores,
+        )
+
     for _ in range(args.warmup):
         mx.eval(stock())
         mx.synchronize()
@@ -234,7 +294,12 @@ def main() -> int:
     max_abs = float(mx.max(difference).item())
     nonzero = int(mx.sum(difference != 0).item())
 
-    timings = {"stock": [], "candidate": []}
+    timings = {
+        "stock": [],
+        "candidate": [],
+        "stock_pair": [],
+        "stock_down": [],
+    }
     for iteration in range(args.iterations):
         order = ("stock", "candidate") if iteration % 2 == 0 else (
             "candidate",
@@ -246,8 +311,16 @@ def main() -> int:
             mx.synchronize()
             timings[name].append((time.perf_counter_ns() - started) / 1e6)
 
+        for name, function in (("stock_pair", stock_pair), ("stock_down", stock_down)):
+            started = time.perf_counter_ns()
+            mx.eval(function())
+            mx.synchronize()
+            timings[name].append((time.perf_counter_ns() - started) / 1e6)
+
     stock_stats = summarize(timings["stock"])
     candidate_stats = summarize(timings["candidate"])
+    stock_pair_stats = summarize(timings["stock_pair"])
+    stock_down_stats = summarize(timings["stock_down"])
     speedup = stock_stats["median_ms"] / candidate_stats["median_ms"]
     passed = exact and speedup >= args.min_speedup
     print(
@@ -271,6 +344,8 @@ def main() -> int:
                     "nonzero": nonzero,
                 },
                 "stock": stock_stats,
+                "stock_pair": stock_pair_stats,
+                "stock_down": stock_down_stats,
                 "candidate": candidate_stats,
                 "speedup": speedup,
                 "min_speedup": args.min_speedup,
