@@ -34,6 +34,7 @@ from omlx.patches.deepseek_v4.verify_attention import (
     rowwise_gemm,
 )
 from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
+from omlx.patches.deepseek_v4.hierarchical_indexer import hierarchical_topk
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
@@ -2763,6 +2764,38 @@ class Indexer(nn.Module):
                     ):
                         _mask_ratio = int(pool_cache.ratio)
                         _mask_q_offset = int(query_offset)
+                    hierarchical_indices = hierarchical_topk(
+                        q,
+                        pooled,
+                        weights,
+                        pool_cache,
+                        query_offset=(
+                            int(query_offset)
+                            if isinstance(query_offset, int)
+                            else -1
+                        ),
+                        topk=self.index_topk,
+                        ratio=_mask_ratio,
+                        kernels=glm_fast,
+                    )
+                    if hierarchical_indices is not None:
+                        indices = (
+                            _gather_indexer_rows(
+                                hierarchical_indices, total_rows, row_group
+                            )
+                            if row_sharded
+                            else hierarchical_indices
+                        )
+                        return (
+                            _broadcast_indexer_indices(
+                                indices,
+                                shape=tuple(indices.shape),
+                                group=row_group,
+                                owner=decode_owner,
+                            )
+                            if owner_decode
+                            else indices
+                        )
                     # v25 from-scratch MMA score kernel: bit-exact and faster
                     # on the qualified M2/M3/M5 DS4F pairings, including the
                     # fused pooled-ratio mask (validated across aligned and

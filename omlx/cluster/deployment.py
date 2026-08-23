@@ -84,6 +84,12 @@ _RANK_ENV_DEFAULTS = (
     # Bit-exact DS4F ratio-4 MMA score path, physically qualified on M2 Ultra,
     # M3 Ultra, and M5 Max. Carry one rollback value to every TP rank.
     ("OMLX_DSV4F_MMA_SCORE", "1"),
+    # Certified low-rank screen + exact candidate rescore. Default-off until
+    # its full TP2 100K/250K rate and cache-lifecycle gates clear.
+    ("OMLX_DSV4_HIERARCHICAL_INDEXER", "0"),
+    ("OMLX_DSV4_HIERARCHICAL_MIN_POOL", "16000"),
+    ("OMLX_DSV4_HIERARCHICAL_REFRESH_POOL", "2048"),
+    ("OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION", "0.30"),
     # Weighted row shards require padding every rank to the largest shard for
     # all_gather. The first 3:5/30K live gate was slower, so retain the exact
     # implementation only as an operator A/B and ship equal row counts.

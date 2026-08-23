@@ -99,6 +99,10 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_INDEXER_ROW_TP",
         "OMLX_DSV4_NATIVE_INDEXER",
         "OMLX_DSV4F_MMA_SCORE",
+        "OMLX_DSV4_HIERARCHICAL_INDEXER",
+        "OMLX_DSV4_HIERARCHICAL_MIN_POOL",
+        "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL",
+        "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION",
         "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
         "OMLX_DSV4_ADAPTIVE_PREFILL",
         "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER",
@@ -141,6 +145,10 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
     assert "OMLX_DSV4_NATIVE_INDEXER=1" in envs
     assert "OMLX_DSV4F_MMA_SCORE=1" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_INDEXER=0" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_MIN_POOL=16000" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL=2048" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION=0.30" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
     assert "OMLX_DSV4_ADAPTIVE_PREFILL=1" in envs
     assert "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER=4096" in envs
