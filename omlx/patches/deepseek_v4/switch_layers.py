@@ -16,6 +16,9 @@ import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.deepseek_v4.decode_consistency import (
+    is_armed as is_dspark_verify_armed,
+)
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
@@ -63,6 +66,13 @@ _DEEPSEEK_MXFP4_TAIL8 = os.environ.get(
     "OMLX_DSV4_MOE_TAIL8", "0"
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_TAIL8_LOGGED = False
+# Exact M=1024 M5 Max rank-1 5/8 expert-blocked TensorOps path. The physical
+# layer gate cleared every BF16 boundary at 1.513x composed, but production
+# remains explicit opt-in until the full distributed cold-prefill A/B clears.
+_DEEPSEEK_MXFP4_NAX_BLOCKS = os.environ.get(
+    "OMLX_DSV4_NAX_MOE_BLOCKS", "0"
+).strip().lower() in ("1", "true", "on")
+_DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED = False
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -542,6 +552,76 @@ class SwitchGLU(nn.Module):
             )
         )
 
+    def _can_use_mxfp4_nax_blocks_prefill(
+        self,
+        request_shape,
+        indices,
+        scores,
+        x_sorted,
+        original_dtype,
+    ) -> bool:
+        """Preflight the exact DS4F M5 rank-1 5/8 BF16 contract."""
+
+        if (
+            not _DEEPSEEK_MXFP4_NAX_BLOCKS
+            or self.training
+            or is_dspark_verify_armed()
+            or not getattr(self, "_omlx_dsv4f_exact_config", False)
+            or getattr(self, "_omlx_dsv4f_moe_tp", None) != (2, 1, (3, 5))
+        ):
+            return False
+        if (
+            request_shape != (1, 1024, 4096)
+            or tuple(indices.shape) != (1, 1024, 6)
+            or indices.dtype != mx.uint32
+            or scores is None
+            or tuple(scores.shape) != tuple(indices.shape)
+            or scores.dtype != mx.float32
+            or tuple(x_sorted.shape) != (6144, 1, 4096)
+            or x_sorted.dtype != mx.bfloat16
+            or original_dtype != mx.bfloat16
+        ):
+            return False
+        activation_limit = getattr(self.activation, "limit", None)
+        if activation_limit != 10.0 or getattr(self.activation, "fp32", False):
+            return False
+
+        projections = (self.up_proj, self.gate_proj, self.down_proj)
+        if not all(
+            isinstance(projection, QuantizedSwitchLinear)
+            and projection.group_size == 32
+            and projection.bits == 4
+            and projection.mode == "mxfp4"
+            and projection.get("biases") is None
+            and "bias" not in projection
+            and projection["weight"].dtype == mx.uint32
+            and projection["scales"].dtype == mx.uint8
+            for projection in projections
+        ):
+            return False
+        up, gate, down = projections
+        if (
+            tuple(up["weight"].shape) != (256, 1280, 512)
+            or tuple(up["scales"].shape) != (256, 1280, 128)
+            or tuple(gate["weight"].shape) != tuple(up["weight"].shape)
+            or tuple(gate["scales"].shape) != tuple(up["scales"].shape)
+            or tuple(down["weight"].shape) != (256, 4096, 160)
+            or tuple(down["scales"].shape) != (256, 4096, 40)
+        ):
+            return False
+
+        try:
+            exact_device = mx.device_info().get("device_name") == "Apple M5 Max"
+        except Exception:
+            return False
+        return bool(
+            exact_device
+            and is_nax_available()
+            and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks_nax")
+            and glm_fast.ds4_projection_nax_kernels_built()
+            and glm_fast.ds4_projection_nax_device_available()
+        )
+
     def __call__(self, x, indices, scores=None) -> mx.array:
         if self._can_use_mxfp4_full_decode(x, indices, scores):
             global _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED
@@ -616,6 +696,21 @@ class SwitchGLU(nn.Module):
         if use_f16_moe:
             x = x.astype(mx.float16)
 
+        use_nax_blocks_prefill = self._can_use_mxfp4_nax_blocks_prefill(
+            request_shape,
+            indices,
+            scores,
+            x,
+            original_dtype,
+        )
+        nax_block_plan = None
+        if use_nax_blocks_prefill:
+            nax_block_plan = _build_mxfp4_blocks(
+                idx,
+                self.up_proj.num_experts,
+                _DEEPSEEK_MXFP4_LARGE_BLOCK_BM,
+            )
+
         use_pair_proj = (
             block_plan is not None
             and native_kinds is not None
@@ -645,7 +740,31 @@ class SwitchGLU(nn.Module):
             use_f16_moe,
             block_plan,
         )
-        if use_pair_proj:
+        if use_nax_blocks_prefill:
+            global _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED
+            if not _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED:
+                _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "DeepSeek V4 exact M5 NAX BM32 routed-MoE prefill active "
+                    "(rank=1, TP=3:5, M=1024; "
+                    "OMLX_DSV4_NAX_MOE_BLOCKS=0 disables)"
+                )
+            block_meta, block_count = nax_block_plan
+            x_up = glm_fast.deepseek_mxfp4_gather_qmm_blocks_nax(
+                x,
+                self.up_proj["weight"],
+                self.up_proj["scales"],
+                block_meta,
+                block_count,
+            )
+            x_gate = glm_fast.deepseek_mxfp4_gather_qmm_blocks_nax(
+                x,
+                self.gate_proj["weight"],
+                self.gate_proj["scales"],
+                block_meta,
+                block_count,
+            )
+        elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
             )
@@ -722,7 +841,16 @@ class SwitchGLU(nn.Module):
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
-        if use_tail8_prefill:
+        if use_nax_blocks_prefill:
+            x = self.activation(x_up, x_gate)
+            x = glm_fast.deepseek_mxfp4_gather_qmm_blocks_nax(
+                x,
+                self.down_proj["weight"],
+                self.down_proj["scales"],
+                block_meta,
+                block_count,
+            )
+        elif use_tail8_prefill:
             x = glm_fast.deepseek_mxfp4_gather_qmm_blocks_tail8(
                 x,
                 self.down_proj["weight"],

@@ -7,7 +7,8 @@ collective, or checkpoint representation.
 ## Decision
 
 The first BM32 NAX primitive passed every lossless boundary and the physical
-M5 performance gate:
+M5 performance gate. A production-facing seam is now available behind
+`OMLX_DSV4_NAX_MOE_BLOCKS=1`; the shipped and cluster-hostfile default is `0`.
 
 | Component | Stock M5 NAX | Expert-blocked NAX | Speedup |
 |---|---:|---:|---:|
@@ -16,9 +17,8 @@ M5 performance gate:
 | Down, fixed input | 4.452 ms | 3.135 ms | **1.420x** |
 | Composed routed projection | 13.490 ms | 8.916 ms | **1.513x** |
 
-The composed result clears the 1.45x isolated gate. The implementation remains
-prototype-only until a narrow runtime seam and full 3:5 TP cold-prefill A/B
-clear independently.
+The composed result clears the 1.45x isolated gate. The runtime seam remains
+opt-in until the full 3:5 TP cold-prefill A/B clears independently.
 
 ## Structural opportunity
 
@@ -109,17 +109,38 @@ physical profile is saved as
 
 ## Remaining gates and pitfalls
 
-1. Capture real per-layer router-count distributions. The kernel supports
-   zero, partial, full, and multiple BM32 blocks, but the performance result
-   used the balanced 24-route fixture.
-2. Add a default-off, exact-model/rank/shape runtime seam and rerun every
-   boundary inside a real layer.
-3. Run fixed-content and independent cold 14K TP prompts with O-A enabled;
+The seam fails closed before building the candidate block plan unless all of
+the following agree:
+
+- explicit flag `OMLX_DSV4_NAX_MOE_BLOCKS=1`;
+- the established exact DeepSeek-V4-Flash-0731 config fingerprint;
+- TP size 2, rank 1, routed-MoE weights `(3,5)`;
+- physical device name `Apple M5 Max` and NAX capability;
+- BF16 M=1024/top-6 input, FP32 scores, and the exact 5/8 MXFP4 weight shapes;
+- non-training and non-DSpark-verification state; and
+- native Python symbol, optional NAX metallib, and NAX device-artifact guards.
+
+After the complete preflight, the candidate alone constructs the existing
+BM32 plan. It dispatches separate BF16 up and gate projections, preserves the
+stock LimitedSwiGLU boundary, dispatches BF16 down, and rejoins the unchanged
+inverse-sort, score, shared-expert, and rank-order all-sum path. There is no
+catch-and-retry after candidate graph construction.
+
+Focused coverage exercises a fixed 6,144-route distribution containing an
+inactive expert plus experts with 1, 31, 32, and 33 rows. The actual production
+block builder produces no block, one partial block, one full block, and two
+blocks respectively, while all other experts carry realistic 24/25-row loads.
+The full-model gate should still record naturally occurring per-layer counts.
+
+Remaining work:
+
+1. Run fixed-content and independent cold 14K TP prompts with O-A enabled;
    require identical output hashes and at least +10% over the post-O-A control.
-4. Do not substitute the M3 FP16 tail kernel as the oracle. Stock M5 NAX uses
+2. Record naturally occurring router-count distributions during that gate.
+3. Do not substitute the M3 FP16 tail kernel as the oracle. Stock M5 NAX uses
    BF16 projection and activation boundaries and is not array-equal to that
    Steel path.
-5. Keep the M3 asymmetric tail candidate available once the faster M5 ceases
+4. Keep the M3 asymmetric tail candidate available once the faster M5 ceases
    to be the MoE straggler.
 
 An expert-subset/route-ownership layout, like ds4-metal's Mac TP path, is a

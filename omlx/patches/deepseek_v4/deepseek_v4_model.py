@@ -1819,6 +1819,14 @@ class DeepseekV4MoE(nn.Module):
             config.n_routed_experts,
             activation=LimitedSwiGLU(config.swiglu_limit),
         )
+        try:
+            self.switch_mlp._omlx_dsv4f_exact_config = _dsv4f_exact_config(
+                config, 4
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Future/partial configs fail closed before the tuned path can
+            # create a graph.
+            self.switch_mlp._omlx_dsv4f_exact_config = False
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -3670,4 +3678,9 @@ class Model(nn.Module):
                 "all-to-sharded",
                 group=group,
                 weights=moe_shard_weights,
+            )
+            layer.ffn.switch_mlp._omlx_dsv4f_moe_tp = (
+                int(N),
+                int(rank),
+                tuple(moe_shard_weights or ()),
             )

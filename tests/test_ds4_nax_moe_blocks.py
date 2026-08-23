@@ -61,7 +61,9 @@ def test_native_source_keeps_stock_nax_simd_geometry_and_bf16_boundary():
     assert "kMaxBlocks = 448" in cpp
     assert "x.dtype() != bfloat16" in cpp
     assert "ds4_prefill_moe_nax.metal" in cmake
-    assert SYMBOL not in switch
+    assert '"OMLX_DSV4_NAX_MOE_BLOCKS", "0"' in switch
+    assert "_can_use_mxfp4_nax_blocks_prefill" in switch
+    assert SYMBOL in switch
 
 
 def test_fast_registry_exposes_isolated_symbol():
