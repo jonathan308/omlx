@@ -1136,7 +1136,7 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     const int E = up_weight.shape(0);
     const int I = up_weight.shape(1);
     const int H = down_weight.shape(1);
-    if (K <= 0 || K % 512 != 0 || I <= 0 || I % 512 != 0 || H <= 0 ||
+    if (K <= 0 || K % 512 != 0 || I <= 0 || I % 256 != 0 || H <= 0 ||
         E <= 0 || indices.shape(-1) != topk ||
         indices.size() != int64_t(tokens) * topk || x.size() != int64_t(tokens) * K) {
       return true;
@@ -1218,7 +1218,7 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     compute_encoder.set_bytes(K, 11);
     compute_encoder.set_bytes(activation_limit_, 12);
     compute_encoder.dispatch_threadgroups(
-        MTL::Size((I + 3) / 4, routes, 1), MTL::Size(32, 1, 1));
+        MTL::Size((I + 1) / 2, routes, 1), MTL::Size(32, 1, 1));
 
     kname.clear();
     concatenate(
@@ -1238,7 +1238,7 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     compute_encoder.set_bytes(H, 8);
     compute_encoder.set_bytes(I, 9);
     compute_encoder.dispatch_threadgroups(
-        MTL::Size((H + 3) / 4, tokens, 1), MTL::Size(32, 1, 1));
+        MTL::Size((H + 1) / 2, tokens, 1), MTL::Size(32, 1, 1));
   }
 
   DEFINE_NAME(DeepseekMxfp4FullDecodePrimitive)

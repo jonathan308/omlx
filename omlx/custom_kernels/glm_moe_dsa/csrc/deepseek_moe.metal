@@ -1324,8 +1324,12 @@ template <typename T, int ROWS, int TOPK>
 
     if (expert < uint32_t(experts)) {
       for (int k = 0; k < K; k += k_step) {
-        const device T* x_ptr = activated + size_t(route) * K + k +
-            size_t(simd_lane) * values_per_lane;
+        const int lane_k = k + int(simd_lane) * values_per_lane;
+        if (lane_k >= K) {
+          continue;
+        }
+        const device T* x_ptr =
+            activated + size_t(route) * K + lane_k;
         load_vector<T, float, values_per_lane>(x_ptr, x_lane);
 
 #pragma unroll
@@ -1335,10 +1339,10 @@ template <typename T, int ROWS, int TOPK>
             continue;
           }
           const size_t matrix_row = size_t(expert) * N + output_row;
-          const size_t value_offset = matrix_row * packed_per_row +
-              size_t(k) / 8 + size_t(simd_lane) * 2;
+          const size_t value_offset =
+              matrix_row * packed_per_row + size_t(lane_k) / 8;
           const size_t scale_offset = matrix_row * scales_per_row +
-              size_t(k) / group_size + size_t(simd_lane) / 2;
+              size_t(lane_k) / group_size;
           const float scale =
               dequantize_scale<float, group_size>(down_scales[scale_offset]);
           route_sum[row] += qdot<float, values_per_lane, bits>(
@@ -1382,12 +1386,12 @@ template <typename T, int ROWS, int TOPK>
       "deepseek_mxfp4_pair_swiglu_decode_" #type,                            \
       deepseek_mxfp4_pair_swiglu_decode,                                      \
       type,                                                                    \
-      4)                                                                       \
+      2)                                                                       \
   instantiate_kernel(                                                         \
       "deepseek_mxfp4_down_score_sum_decode_" #type,                         \
       deepseek_mxfp4_down_score_sum_decode,                                   \
       type,                                                                    \
-      4,                                                                       \
+      2,                                                                       \
       6)
 
 instantiate_deepseek_mxfp4_full_decode(float16_t);

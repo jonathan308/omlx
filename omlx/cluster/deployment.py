@@ -145,7 +145,7 @@ _RANK_ENV_DEFAULTS = (
     # Full routed-MoE decode fusion is isolated-kernel exact and available for
     # explicit A/B. It remains off because its full-model parity/speed gate has
     # not cleared on both Macs.
-    ("OMLX_DSV4_FULL_MOE_DECODE", "0"),
+    ("OMLX_DSV4_FULL_MOE_DECODE", "1"),
     ("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1"),
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.

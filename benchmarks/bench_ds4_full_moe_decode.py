@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=20)
+    parser.add_argument("--rank", type=int, choices=(0, 1))
+    parser.add_argument("--shard-weights", default="3,5")
     parser.add_argument("--tokens", type=int, default=1, choices=range(1, 9))
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--warmup", type=int, default=6)
@@ -156,6 +158,30 @@ def main() -> int:
         down_scales,
         shard_names,
     ) = load_layer(args.model, args.layer)
+    shard_weights = tuple(int(item) for item in args.shard_weights.split(","))
+    if args.rank is not None:
+        if any(weight < 1 for weight in shard_weights):
+            raise ValueError("shard weights must be positive")
+        total = sum(shard_weights)
+        full_intermediate = int(up_weight.shape[1])
+        start = full_intermediate * sum(shard_weights[: args.rank]) // total
+        stop = full_intermediate * sum(shard_weights[: args.rank + 1]) // total
+        up_weight = mx.contiguous(up_weight[:, start:stop])
+        up_scales = mx.contiguous(up_scales[:, start:stop])
+        gate_weight = mx.contiguous(gate_weight[:, start:stop])
+        gate_scales = mx.contiguous(gate_scales[:, start:stop])
+        down_weight = mx.contiguous(down_weight[:, :, start // 8 : stop // 8])
+        down_scales = mx.contiguous(
+            down_scales[:, :, start // 32 : stop // 32]
+        )
+        mx.eval(
+            up_weight,
+            up_scales,
+            gate_weight,
+            gate_scales,
+            down_weight,
+            down_scales,
+        )
     input_dims = up_weight.shape[2] * 8
     dtype = getattr(mx, args.dtype)
     mx.random.seed(20260822)
@@ -229,6 +255,8 @@ def main() -> int:
             {
                 "model": str(args.model),
                 "layer": args.layer,
+                "rank": args.rank,
+                "shard_weights": shard_weights,
                 "shards": shard_names,
                 "tokens": args.tokens,
                 "dtype": args.dtype,

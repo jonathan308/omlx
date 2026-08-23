@@ -53,7 +53,7 @@ _NAX_STOCK_MIN_ROUTES = int(
 # Experimental full routed-MoE decode primitive.  Default OFF until its
 # whole-SwitchGLU A/B clears exact parity and end-to-end throughput gates.
 _DEEPSEEK_MXFP4_FULL_DECODE = os.environ.get(
-    "OMLX_DSV4_FULL_MOE_DECODE", "0"
+    "OMLX_DSV4_FULL_MOE_DECODE", "1"
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS = int(
     os.environ.get("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "1")
@@ -489,11 +489,21 @@ class SwitchGLU(nn.Module):
         down_weight = self.down_proj["weight"]
         intermediate = int(up_weight.shape[1])
         input_dims = int(x.shape[-1])
+        try:
+            device_name = str(mx.device_info().get("device_name") or "")
+        except Exception:
+            return False
+        qualified_shape = (
+            device_name == "Apple M3 Ultra" and intermediate in (768, 2048)
+        ) or (
+            device_name == "Apple M5 Max" and intermediate == 1280
+        )
         if (
-            input_dims <= 0
+            not qualified_shape
+            or input_dims <= 0
             or input_dims % 512
             or intermediate <= 0
-            or intermediate % 512
+            or intermediate % 256
             or tuple(gate_weight.shape) != tuple(up_weight.shape)
             or int(up_weight.shape[2]) * 8 != input_dims
             or int(down_weight.shape[0]) != int(up_weight.shape[0])

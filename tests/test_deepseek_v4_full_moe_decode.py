@@ -128,12 +128,25 @@ def test_deepseek_mxfp4_full_decode_is_bit_exact(
     assert mx.array_equal(candidate, reference).item()
 
 
+@pytest.mark.parametrize("hidden_dims", (768, 1280))
+def test_deepseek_mxfp4_full_decode_is_exact_on_asymmetric_tp_tails(hidden_dims):
+    mx = pytest.importorskip("mlx.core")
+    fast = _native_fast()
+    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=hidden_dims)
+
+    reference = _reference(args)
+    candidate = fast.deepseek_mxfp4_full_decode(*args, 10.0)
+    mx.eval(reference, candidate)
+
+    assert mx.array_equal(candidate, reference).item()
+
+
 def test_switchglu_full_decode_seam_is_opt_in_and_returns_reduced_rows(monkeypatch):
     mx = pytest.importorskip("mlx.core")
     fast = _native_fast()
     from omlx.patches.deepseek_v4 import switch_layers
 
-    args = _fixture(mx.bfloat16, 1, mx.uint32)
+    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=768)
     (
         x,
         up_weight,
@@ -146,7 +159,7 @@ def test_switchglu_full_decode_seam_is_opt_in_and_returns_reduced_rows(monkeypat
         scores,
     ) = args
 
-    switch = switch_layers.SwitchGLU(512, 512, 8)
+    switch = switch_layers.SwitchGLU(512, 768, 8)
     switch.eval()
     for projection, weight, scales in (
         (switch.up_proj, up_weight, up_scales),
@@ -183,6 +196,11 @@ def test_switchglu_full_decode_seam_is_opt_in_and_returns_reduced_rows(monkeypat
         return real_call(*call_args, **kwargs)
 
     monkeypatch.setattr(switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE", True)
+    monkeypatch.setattr(
+        switch_layers.mx,
+        "device_info",
+        lambda: {"device_name": "Apple M3 Ultra"},
+    )
     with patch.object(
         switch_layers.glm_fast,
         "deepseek_mxfp4_full_decode",
@@ -205,7 +223,7 @@ def test_switchglu_full_decode_default_remains_disabled(monkeypatch):
     assert not switch._can_use_mxfp4_full_decode(None, None, None)
 
 
-def test_switchglu_full_decode_rejects_unserved_asymmetric_tp_width(monkeypatch):
+def test_switchglu_full_decode_accepts_served_asymmetric_tp_width(monkeypatch):
     mx = pytest.importorskip("mlx.core")
     from omlx.patches.deepseek_v4 import switch_layers
 
@@ -232,6 +250,11 @@ def test_switchglu_full_decode_rejects_unserved_asymmetric_tp_width(monkeypatch)
     )()
     monkeypatch.setattr(switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE", True)
     monkeypatch.setattr(
-        switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 6
+        switch_layers.mx,
+        "device_info",
+        lambda: {"device_name": "Apple M3 Ultra"},
     )
-    assert not switch._can_use_mxfp4_full_decode(x, indices, scores)
+    monkeypatch.setattr(
+        switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 1
+    )
+    assert switch._can_use_mxfp4_full_decode(x, indices, scores)
