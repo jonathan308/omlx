@@ -458,6 +458,9 @@ _DEEPSEEK_V4_QKV_BUNDLE_DECODE = os.getenv(
     "OMLX_DSV4_QKV_BUNDLE_DECODE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = False
+_DEEPSEEK_V4_QKV_BUNDLE_ALL_SCHEDULES = os.getenv(
+    "OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 
 
 def _decode_qkv_projection_bundle(
@@ -484,6 +487,8 @@ def _decode_qkv_projection_bundle(
     if ratio not in (0, 4, 128):
         return None
     if ratio in (0, 128):
+        if not _DEEPSEEK_V4_QKV_BUNDLE_ALL_SCHEDULES:
+            return None
         try:
             if mx.device_info().get("device_name") != "Apple M5 Max":
                 return None

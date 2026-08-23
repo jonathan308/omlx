@@ -104,6 +104,9 @@ _RANK_ENV_DEFAULTS = (
     # Exact one-dispatch DS4 B1 ratio-4 Q/KV/compressor bundle. Physical TP2
     # gate: +9.6% short decode with unchanged 14K prefill and exact hashes.
     ("OMLX_DSV4_QKV_BUNDLE_DECODE", "1"),
+    # Ratio-0/128 siblings are exact and locally faster on M5, but did not
+    # improve whole-model TP2 decode after ratio-4 moved the critical path.
+    ("OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"),
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
