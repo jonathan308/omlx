@@ -664,6 +664,12 @@ def native_shard_is_layer_local(shard: Any) -> tuple[bool, str]:
     explicit adapter instead of being guessed at runtime.
     """
 
+    # Inspect the stable class function rather than a transient bound-method
+    # wrapper. After progressive sharding has evaluated dozens of large MLX
+    # module trees, Python 3.13 can fail source recovery for the bound object
+    # even though ``type(model).shard`` still points at the same auditable
+    # function. Auxiliary MTP stages repeat this proof after the backbone loop.
+    shard = getattr(shard, "__func__", shard)
     try:
         tree = ast.parse(textwrap.dedent(inspect.getsource(shard)))
     except (OSError, TypeError, IndentationError, SyntaxError):

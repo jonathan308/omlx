@@ -116,6 +116,8 @@ def test_planner_and_loader_apply_the_same_native_tensor_proof():
     from mlx_lm.models import iquestloopcoder, qwen3
 
     assert native_shard_is_layer_local(qwen3.Model.shard)[0] is True
+    bound_owner = type("BoundShardOwner", (), {"shard": qwen3.Model.shard})()
+    assert native_shard_is_layer_local(bound_owner.shard)[0] is True
     assert native_shard_is_layer_local(iquestloopcoder.Model.shard)[0] is False
     assert _supports_tensor_parallel({"model_type": "qwen3"}) is True
     assert _supports_tensor_parallel({"model_type": "iquestloopcoder"}) is False
