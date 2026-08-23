@@ -81,6 +81,9 @@ _RANK_ENV_DEFAULTS = (
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
     ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
     ("OMLX_DSV4_NATIVE_INDEXER", "1"),
+    # Bit-exact DS4F ratio-4 MMA score path, physically qualified on M2 Ultra,
+    # M3 Ultra, and M5 Max. Carry one rollback value to every TP rank.
+    ("OMLX_DSV4F_MMA_SCORE", "1"),
     # Weighted row shards require padding every rank to the largest shard for
     # all_gather. The first 3:5/30K live gate was slower, so retain the exact
     # implementation only as an operator A/B and ship equal row counts.

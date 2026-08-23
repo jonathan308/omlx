@@ -2630,6 +2630,38 @@ class TestDS4NAXIndexerScoreDispatch:
         bad.index_n_heads = 32
         assert not dm._dsv4f_nax_indexer_score_enabled(bad, 4)
 
+    @pytest.mark.parametrize(
+        "device_name", ("Apple M2 Ultra", "Apple M3 Ultra", "Apple M5 Max")
+    )
+    def test_lossless_mma_gate_accepts_qualified_apple_chips(
+        self, applied_patch, monkeypatch, device_name
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": device_name})
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_MMA_SCORE", True)
+
+        assert dm._dsv4f_mma_score_enabled(cfg, 4)
+        assert not dm._dsv4f_mma_score_enabled(cfg, 128)
+
+    def test_lossless_mma_gate_rejects_unknown_chip_and_config(
+        self, applied_patch, monkeypatch
+    ):
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cfg = self._exact_config(dm)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_MMA_SCORE", True)
+        monkeypatch.setattr(
+            dm.mx, "device_info", lambda: {"device_name": "Apple M6 Ultra"}
+        )
+        assert not dm._dsv4f_mma_score_enabled(cfg, 4)
+
+        monkeypatch.setattr(
+            dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"}
+        )
+        bad = SimpleNamespace(**vars(cfg))
+        bad.index_topk = 256
+        assert not dm._dsv4f_mma_score_enabled(bad, 4)
+
     @staticmethod
     def _run_projected_indexer(dm, monkeypatch, *, group=None):
         import mlx.core as mx

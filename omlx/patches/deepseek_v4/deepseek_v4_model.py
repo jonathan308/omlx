@@ -1493,10 +1493,13 @@ _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
 _DEEPSEEK_V4_INDEXER_SHAPE_WARNED = False
 _DEEPSEEK_V4_SPARSE_ATTN_SHAPE_WARNED = False
 _DEEPSEEK_V4_DSPARK_TOPK_SHAPE_WARNED = False
-_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
-    "OMLX_DSV4F_M2_MMA_SCORE", "1"
+# The original v25 gate was qualified on M2 Ultra first.  Keep its environment
+# name as a compatibility alias, while the preferred name reflects the now
+# qualified M2 Ultra / M3 Ultra / M5 Max family.
+_DEEPSEEK_V4_MMA_SCORE = os.getenv(
+    "OMLX_DSV4F_MMA_SCORE", os.getenv("OMLX_DSV4F_M2_MMA_SCORE", "1")
 ).strip().lower() in ("1", "true", "on", "yes")
-_DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+_DEEPSEEK_V4_MMA_SCORE_LOGGED = False
 _DEEPSEEK_V4_NAX_INDEXER_SCORE = os.getenv(
     # Experimental/default-off: the first M5 strict gate retained exact top-k
     # membership but found a one-BF16-ULP score drift in 1/8,208 outputs. Keep
@@ -1730,32 +1733,47 @@ def _dsv4f_exact_config(config, compress_ratio: int) -> bool:
     )
 
 
-def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
-    """True only for the exact DeepSeek-V4-Flash / Apple M2 Ultra pairing.
+def _dsv4f_mma_exact_pairing(config, compress_ratio: int) -> bool:
+    """True only for a benchmark-qualified DS4-Flash / Apple GPU pairing.
 
-    The v25 MMA indexer score kernel is benchmark-proven (and bit-exact
-    validated) on precisely this checkpoint/hardware combination; every
-    other pairing keeps the Steel kernel.
+    The v25 MMA indexer score kernel is benchmark-proven and bit-exact on M2
+    Ultra, M3 Ultra, and M5 Max for this precise checkpoint fingerprint.
+    Unknown Apple generations and every other model keep the Steel kernel.
     """
     try:
-        if mx.device_info().get("device_name") != "Apple M2 Ultra":
+        if mx.device_info().get("device_name") not in {
+            "Apple M2 Ultra",
+            "Apple M3 Ultra",
+            "Apple M5 Max",
+        }:
             return False
     except Exception:
         return False
     return _dsv4f_exact_config(config, compress_ratio)
 
 
-def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
-    """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
+def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
+    """Compatibility alias for callers written before M3/M5 qualification."""
+    return _dsv4f_mma_exact_pairing(config, compress_ratio)
 
-    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
-    and an extension build exposing the symbol. The kernel serves bf16 /
+
+def _dsv4f_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Gate for the exact v25 from-scratch MMA score kernel.
+
+    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_MMA_SCORE=0, with
+    OMLX_DSV4F_M2_MMA_SCORE retained as an alias), and an extension build
+    exposing the symbol. The kernel serves bf16 /
     H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
     the fingerprint and this call site; N >= 64 is re-checked per call.
     """
-    if not _DEEPSEEK_V4_M2_MMA_SCORE:
+    if not _DEEPSEEK_V4_MMA_SCORE:
         return False
-    return _dsv4f_m2_exact_pairing(config, compress_ratio)
+    return _dsv4f_mma_exact_pairing(config, compress_ratio)
+
+
+def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Compatibility alias for the original M2-named startup gate."""
+    return _dsv4f_mma_score_enabled(config, compress_ratio)
 
 
 def _dsv4f_nax_indexer_score_enabled(config, compress_ratio: int) -> bool:
@@ -2606,7 +2624,7 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
-        self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
+        self._m2_mma_score = _dsv4f_mma_score_enabled(
             config, compress_ratio
         )
         self._nax_indexer_score = _dsv4f_nax_indexer_score_enabled(
@@ -2745,11 +2763,11 @@ class Indexer(nn.Module):
                     ):
                         _mask_ratio = int(pool_cache.ratio)
                         _mask_q_offset = int(query_offset)
-                    # v25 from-scratch MMA score kernel: 1.37x over Steel
-                    # on the exact M2/DSV4F pairing, bit-exact incl. the
+                    # v25 from-scratch MMA score kernel: bit-exact and faster
+                    # on the qualified M2/M3/M5 DS4F pairings, including the
                     # fused pooled-ratio mask (validated across aligned and
                     # unaligned M/N and chunked-prefill offsets). Gated by
-                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
+                    # fingerprint + OMLX_DSV4F_MMA_SCORE + extension
                     # symbol; every other configuration keeps the Steel
                     # path below unchanged.
                     _use_mma = (
@@ -2790,13 +2808,13 @@ class Indexer(nn.Module):
                             "deepseek_v4: DS4F M5/NAX ratio-4 indexer score "
                             "kernel active (TensorOps 16x32 tile)"
                         )
-                    global _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED
-                    if _use_mma and not _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED:
-                        _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = True
+                    global _DEEPSEEK_V4_MMA_SCORE_LOGGED
+                    if _use_mma and not _DEEPSEEK_V4_MMA_SCORE_LOGGED:
+                        _DEEPSEEK_V4_MMA_SCORE_LOGGED = True
                         logging.getLogger(__name__).info(
-                            "deepseek_v4: DSV4F/M2 v25 MMA indexer score "
+                            "deepseek_v4: DSV4F v25 MMA indexer score "
                             "kernel active (zero-per-head-barrier, "
-                            "1.37x over Steel)"
+                            "lossless qualified Apple GPU path)"
                         )
                     if _use_mma:
                         scores4 = glm_fast.dsa_indexer_scores_mma(

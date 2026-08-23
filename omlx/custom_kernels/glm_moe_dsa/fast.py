@@ -189,7 +189,7 @@ def dsa_indexer_scores_mma(
     *,
     stream=None,
 ) -> mx.array:
-    """v25 M2 from-scratch MMA indexer scores (~1.37x over the Steel kernel).
+    """v25 from-scratch MMA indexer scores (qualified on M2/M3/M5).
 
     Serves ONLY bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal;
     the extension raises on anything else — callers gate and fall back to
