@@ -99,6 +99,14 @@ async def test_private_rank_zero_client_has_finite_inactivity_timeouts():
         await client.aclose()
 
 
+def test_nonstream_rank_zero_json_has_no_false_long_prefill_deadline():
+    timeout = DistributedBatchedEngine._nonstream_timeout()
+    assert timeout.connect == 10.0
+    assert timeout.read is None
+    assert timeout.write == 30.0
+    assert timeout.pool == 10.0
+
+
 @pytest.mark.asyncio
 async def test_request_read_timeout_defaults_from_env_var(monkeypatch):
     monkeypatch.setenv("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "600")

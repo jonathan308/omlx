@@ -274,6 +274,20 @@ class DistributedBatchedEngine(BatchedEngine):
             ),
         )
 
+    @staticmethod
+    def _nonstream_timeout() -> httpx.Timeout:
+        """No read deadline for rank-zero responses that cannot keep alive.
+
+        MLX-LM emits keepalive frames for SSE streams, so the client's normal
+        read timeout remains a useful inactivity watchdog there. Its JSON
+        endpoints emit no bytes until prefill and generation both finish;
+        applying the same 300-second inactivity rule aborts healthy 200K+
+        prompts. JACCL's progress guard, the worker heartbeat, launcher
+        supervision, and public-request cancellation remain the stall guards.
+        """
+
+        return httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+
     @property
     def model_type(self) -> str | None:
         return self._model_type
@@ -963,12 +977,18 @@ class DistributedBatchedEngine(BatchedEngine):
         request_id = await self._enter_request()
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/chat/completions", json=payload)
+            response = await client.post(
+                "/v1/chat/completions",
+                json=payload,
+                timeout=self._nonstream_timeout(),
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/chat/completions", json=retry_payload
+                        "/v1/chat/completions",
+                        json=retry_payload,
+                        timeout=self._nonstream_timeout(),
                     )
                     if response.status_code < 400:
                         break
@@ -1313,12 +1333,18 @@ class DistributedBatchedEngine(BatchedEngine):
         request_id = await self._enter_request()
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/completions", json=payload)
+            response = await client.post(
+                "/v1/completions",
+                json=payload,
+                timeout=self._nonstream_timeout(),
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/completions", json=retry_payload
+                        "/v1/completions",
+                        json=retry_payload,
+                        timeout=self._nonstream_timeout(),
                     )
                     if response.status_code < 400:
                         break
