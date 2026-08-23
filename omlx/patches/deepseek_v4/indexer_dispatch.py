@@ -3,7 +3,18 @@
 
 from __future__ import annotations
 
+import os
+
 _NATIVE_INDEXER_DISABLED = False
+
+
+def _operator_disabled() -> bool:
+    return os.environ.get("OMLX_DSV4_NATIVE_INDEXER", "1").strip().lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 def disable_native_indexer() -> None:
@@ -14,12 +25,12 @@ def disable_native_indexer() -> None:
 
 def native_indexer_disabled() -> bool:
     """Return whether a runtime kernel failure disabled the native path."""
-    return _NATIVE_INDEXER_DISABLED
+    return _NATIVE_INDEXER_DISABLED or _operator_disabled()
 
 
 def native_indexer_available() -> bool:
     """Return whether both native indexer kernels are usable in this process."""
-    if _NATIVE_INDEXER_DISABLED:
+    if _NATIVE_INDEXER_DISABLED or _operator_disabled():
         return False
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast

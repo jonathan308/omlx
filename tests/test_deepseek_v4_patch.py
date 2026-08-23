@@ -89,6 +89,21 @@ class TestCacheInjection:
         assert cache.offset == 0
 
 
+def test_b1_cache_offset_uses_host_scalar_without_sync(applied_patch):
+    import mlx.core as mx
+
+    dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+    cache = SimpleNamespace(offset=mx.array([15360]), _offset=15360)
+
+    old = dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = True
+    assert dsv4._b1_cache_offset(cache, 1) == 15360
+    assert dsv4._b1_cache_offset(cache, 2) is cache.offset
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = False
+    assert dsv4._b1_cache_offset(cache, 1) is cache.offset
+    dsv4._DEEPSEEK_V4_B1_SCALAR_OFFSET = old
+
+
 class TestUtilsPatch:
     """mlx_lm.utils.load_model + _load_safetensors + SAFETENSORS_DTYPE_FALLBACKS."""
 

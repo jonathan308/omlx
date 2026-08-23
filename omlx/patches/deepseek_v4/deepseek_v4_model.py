@@ -48,6 +48,9 @@ from .mla import MultiLinear
 from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
+_DEEPSEEK_V4_B1_SCALAR_OFFSET = os.getenv(
+    "OMLX_DSV4_B1_SCALAR_OFFSET", "1"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
 # Fused sparse decode attention (decode_fast.sparse_attn_decode) replaces the
 # composed rowwise-GEMM + logsumexp glue of _dspark_sparse_exact_attention
@@ -3140,6 +3143,24 @@ def _batch_indexer_rows(
     return results
 
 
+def _b1_cache_offset(cache: Any, batch_size: int) -> Any:
+    """Use BatchRotatingKVCache's host absolute offset for a B=1 request.
+
+    The public ``offset`` is an MLX vector because batched rows may differ.
+    Its private ``_offset`` is the same absolute position as a Python integer
+    while B=1, which lets the exact DS4 WSDPA/native-mask routes dispatch
+    without a device synchronization. Multi-row batches retain the vector.
+    """
+
+    if cache is None:
+        return 0
+    if _DEEPSEEK_V4_B1_SCALAR_OFFSET and batch_size == 1:
+        host_offset = getattr(cache, "_offset", None)
+        if isinstance(host_offset, int) and not isinstance(host_offset, bool):
+            return host_offset
+    return cache.offset
+
+
 class LocalAttention(nn.Module):
     """DeepSeek V4 attention with no KV compression."""
 
@@ -3196,7 +3217,7 @@ class LocalAttention(nn.Module):
         _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        offset = _b1_cache_offset(cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         projection_bank = _decode_qkv_projection_bundle(self, x)
@@ -3316,7 +3337,7 @@ class CompressedAttention(nn.Module):
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         projection_bank = _decode_qkv_projection_bundle(self, x)
@@ -3518,7 +3539,7 @@ class SparseCompressedAttention(nn.Module):
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         projection_bank = _decode_qkv_projection_bundle(self, x)

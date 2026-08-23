@@ -57,3 +57,11 @@ def test_runtime_failure_disables_native_state(monkeypatch):
     indexer_dispatch.disable_native_indexer()
     assert indexer_dispatch.native_indexer_disabled()
     assert not indexer_dispatch.native_indexer_available()
+
+
+def test_operator_can_disable_native_indexer_without_runtime_failure(monkeypatch):
+    monkeypatch.setenv("OMLX_DSV4_NATIVE_INDEXER", "0")
+    monkeypatch.setattr(indexer_dispatch, "_NATIVE_INDEXER_DISABLED", False)
+
+    assert indexer_dispatch.native_indexer_disabled()
+    assert not indexer_dispatch.native_indexer_available()

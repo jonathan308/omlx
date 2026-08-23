@@ -80,6 +80,7 @@ _RANK_ENV_DEFAULTS = (
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
     ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
+    ("OMLX_DSV4_NATIVE_INDEXER", "1"),
     # Weighted row shards require padding every rank to the largest shard for
     # all_gather. The first 3:5/30K live gate was slower, so retain the exact
     # implementation only as an operator A/B and ship equal row counts.
@@ -125,6 +126,9 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_WSDPA", "1"),
     ("OMLX_DSV4_WSDPA_TP", "1"),
     ("OMLX_DSV4_WSDPA_TOPK", "1"),
+    # BatchRotatingKVCache's B=1 host offset unlocks the exact scalar WSDPA
+    # ABI. Matched 30K gate: +52.0%, identical completion hash.
+    ("OMLX_DSV4_B1_SCALAR_OFFSET", "1"),
     # Decode has one sparse-indexer row, so row TP cannot divide it. The
     # measured fastest rank computes the exact top-k once and broadcasts only
     # 512 int32 indices; ``off`` restores replicated indexer work.
