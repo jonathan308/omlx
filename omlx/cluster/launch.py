@@ -3228,9 +3228,26 @@ class DistributedJobSupervisor:
         if process is not None:
             process_group = process.pid
             deadline = time.monotonic() + self.stop_timeout
+            group_signal_denied = False
             if _process_group_alive(process_group):
-                with suppress(ProcessLookupError):
+                try:
                     os.killpg(process_group, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as exc:
+                    # The launcher may already be reaped while macOS has
+                    # recycled its PGID for a foreign process. Never signal a
+                    # group we cannot prove we own. We can still complete a
+                    # safe teardown after waitpid confirms our launcher exited
+                    # and the deployment-marker sweep proves no rank survived.
+                    group_signal_denied = True
+                    logger.warning(
+                        "Could not signal former distributed process group %d "
+                        "(%s); verifying launcher exit and sweeping rank "
+                        "markers instead",
+                        process_group,
+                        exc,
+                    )
             if process.poll() is None:
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(
@@ -3242,32 +3259,55 @@ class DistributedJobSupervisor:
             # that rank orphaned (PPID 1) and its unified-memory allocation
             # resident. Stop is complete only when the entire launch process
             # group has disappeared.
-            remaining = max(0.0, deadline - time.monotonic())
-            group_gone = _wait_for_process_group_exit(process_group, remaining)
-            for attempt in (1, 2):
-                if group_gone:
-                    break
-                logger.error(
-                    "Distributed process group %d survived SIGKILL "
-                    "(attempt %d/2); %s",
-                    process_group,
-                    attempt,
-                    "retrying" if attempt == 1 else "sweeping rank markers",
-                )
-                with suppress(ProcessLookupError):
-                    os.killpg(process_group, signal.SIGKILL)
-                group_gone = _wait_for_process_group_exit(process_group, 2.0)
+            if group_signal_denied:
+                group_gone = process.poll() is not None
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                group_gone = _wait_for_process_group_exit(process_group, remaining)
+                for attempt in (1, 2):
+                    if group_gone:
+                        break
+                    logger.error(
+                        "Distributed process group %d survived SIGKILL "
+                        "(attempt %d/2); %s",
+                        process_group,
+                        attempt,
+                        "retrying" if attempt == 1 else "sweeping rank markers",
+                    )
+                    try:
+                        os.killpg(process_group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError as exc:
+                        logger.warning(
+                            "Could not SIGKILL distributed process group %d: %s",
+                            process_group,
+                            exc,
+                        )
+                        break
+                    group_gone = _wait_for_process_group_exit(process_group, 2.0)
 
             # A rank that escaped the group (reparented before the kill)
             # survives a verified group exit; sweep it by its marker pid.
-            leftovers = self._sweep_rank_leftovers(process_group=process_group)
-            if not group_gone and not _process_group_alive(process_group):
+            leftovers = self._sweep_rank_leftovers(
+                process_group=None if group_signal_denied else process_group
+            )
+            if (
+                not group_signal_denied
+                and not group_gone
+                and not _process_group_alive(process_group)
+            ):
                 group_gone = True
             if not group_gone or leftovers:
                 problems = []
                 if not group_gone:
                     problems.append(
-                        f"process group {process_group} survived SIGKILL twice"
+                        (
+                            f"launcher {process.pid} did not exit after process-group "
+                            "permission denial"
+                        )
+                        if group_signal_denied
+                        else f"process group {process_group} survived SIGKILL twice"
                     )
                 problems.extend(leftovers)
                 detail = "; ".join(problems)
