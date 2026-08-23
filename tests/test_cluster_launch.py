@@ -406,6 +406,44 @@ def test_supervisor_stop_reaps_group_when_launcher_already_exited(monkeypatch):
     assert supervisor.process is None
 
 
+def test_supervisor_stop_handles_reused_group_permission_error(monkeypatch):
+    class Launcher:
+        pid = 43212
+        stdout = None
+        stderr = None
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        stop_timeout=0.1,
+    )
+    supervisor.process = Launcher()
+    swept = []
+    monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        launch.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(
+            PermissionError("Operation not permitted")
+        ),
+    )
+    monkeypatch.setattr(
+        launch.DistributedJobSupervisor,
+        "_sweep_rank_leftovers",
+        lambda self, **kwargs: swept.append(kwargs) or [],
+    )
+
+    supervisor.stop()
+
+    assert swept == [{"process_group": None}]
+    assert supervisor.process is None
+    assert supervisor.status().phase == "stopped"
+
+
 def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
     calls = []
     versions = _local_runtime_versions()
