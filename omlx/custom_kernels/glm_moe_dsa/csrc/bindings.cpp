@@ -63,7 +63,8 @@ NB_MODULE(_ext, m) {
       "weights"_a,
       "mask_ratio"_a = 0,
       "mask_q_offset"_a = 0,
-      "stream"_a = nb::none());
+      "stream"_a = nb::none(),
+      "use_wm4_wn1"_a = false);
   m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,

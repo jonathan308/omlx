@@ -49,7 +49,10 @@ mx::array dsa_indexer_scores_mma(
     const mx::array& weights,
     int mask_ratio = 0,
     int mask_q_offset = 0,
-    mx::StreamOrDevice s = {});
+    mx::StreamOrDevice s = {},
+    // Default-off physical A/B candidate for the exact DS4 D=128 prefill
+    // domain. The production WM2xWN2 route remains the default.
+    bool use_wm4_wn1 = false);
 
 mx::array dsa_topk_indices(
     const mx::array& scores,

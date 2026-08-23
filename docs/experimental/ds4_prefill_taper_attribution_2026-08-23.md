@@ -52,6 +52,31 @@ sheet, or a certified screen whose total full-pool work is demonstrably below
 the saved exact scan. Projection/MoE work remains the parallel campaign for
 raising the context-independent floor.
 
+## Exact M3 MMA partition follow-up
+
+A bounded follow-up kept the production MMA kernel's 64x64 output tile,
+128-thread group, 16KB resident K panel, MMA reduction order, and learned-head
+reduction order, but repartitioned its four simdgroups from WM2xWN2 to WM4xWN1.
+That halves device Q-fragment loads in exchange for rereading B fragments from
+threadgroup memory. Complete BF16 score sheets and deterministic top-512
+indices were bit-identical to both WM2xWN2 and Steel, including unaligned
+boundary tiles.
+
+On the M3 Ultra (`applegpu_g15d`), a 15-repetition interleaved physical gate
+measured positive medians at every taper context:
+
+| context | WM2 score | WM4 score | score gain | WM2 21-layer graph | WM4 21-layer graph | graph gain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 30K | 4.874 ms | 4.699 ms | 1.0373x | 87.350 ms | 86.506 ms | 1.0098x |
+| 100K | 12.949 ms | 12.863 ms | 1.0067x | 267.321 ms | 262.302 ms | 1.0191x |
+| 250K | 31.368 ms | 30.967 ms | 1.0130x | 653.971 ms | 643.753 ms | 1.0159x |
+
+The identical raw candidate was also gated on M5 Max (`applegpu_g17s`) and
+rejected: its 21-layer ratios were 0.9930x / 0.9921x / 0.9924x. Dispatch is
+therefore fail-closed on the exact architecture string: only
+`applegpu_g15d` requests WM4xWN1; M5 and every unknown architecture retain the
+qualified WM2xWN2 path in both Python and the native primitive.
+
 ## Reproduce
 
 The profiler now chooses the same qualified MMA-vs-Steel route as serving,
@@ -67,6 +92,18 @@ attribute measured live rates directly:
   --observed-tps 870,784,619 \
   --score-kernel auto \
   --output /tmp/ds4-indexer-taper.json
+```
+
+Re-run the WM partition gate on an idle qualified M3 Ultra with:
+
+```bash
+/Users/jonathanspangler/omlx-v2-build/bin/python \
+  benchmarks/bench_ds4_mma_indexer_partition.py \
+  --query-tokens 512 \
+  --logical-chunk-tokens 1024 \
+  --pooled-tokens 7500,25000,62500 \
+  --layers 21 --warmup 4 --repeats 15 \
+  --output /tmp/ds4-wm4-gate.json
 ```
 
 For a single-node 1,024-token chunk, use `--query-tokens 1024` with the same

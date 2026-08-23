@@ -98,6 +98,34 @@ def _probe_mma_score(ext) -> bool:
 _EXT_MMA_SCORE = _probe_mma_score(_ext)
 
 
+def _probe_mma_wm4(ext) -> bool:
+    """True iff the extension exposes the default-off WM4xWN1 A/B route."""
+    fn = getattr(ext, "dsa_indexer_scores_mma", None)
+    doc = getattr(fn, "__doc__", None) or ""
+    return "use_wm4_wn1" in doc
+
+
+_EXT_MMA_WM4 = _probe_mma_wm4(_ext)
+
+
+def dsa_indexer_mma_wm4_wn1_eligible(
+    device_info: dict[str, Any] | None = None,
+) -> bool:
+    """Use WM4xWN1 only on its physically qualified M3 Ultra GPU.
+
+    The architecture gate is intentionally stricter than the marketing device
+    name. Raw A/B on ``applegpu_g17s`` (M5 Max) was exact but slower, so every
+    non-``applegpu_g15d`` device remains on the production WM2xWN2 partition.
+    """
+    if not _EXT_MMA_WM4:
+        return False
+    try:
+        info = mx.device_info() if device_info is None else device_info
+    except Exception:
+        return False
+    return info.get("architecture") == "applegpu_g15d"
+
+
 def _probe_nax_score(ext) -> bool:
     """True iff the extension exposes the optional DS4 NAX score ABI."""
     if ext is None:
@@ -188,6 +216,7 @@ def dsa_indexer_scores_mma(
     mask_q_offset: int = 0,
     *,
     stream=None,
+    use_wm4_wn1: bool = False,
 ) -> mx.array:
     """v25 from-scratch MMA indexer scores (qualified on M2/M3/M5).
 
@@ -203,13 +232,25 @@ def dsa_indexer_scores_mma(
             "dsa_indexer_scores_mma requires a local extension build that "
             "exposes the v25 MMA score kernel"
         )
+    kwargs = dict(
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
+    if use_wm4_wn1:
+        if not _EXT_MMA_WM4:
+            raise RuntimeError(
+                "the built extension does not expose the WM4xWN1 MMA A/B route"
+            )
+        # Mirror the native primitive's fail-closed architecture check so old
+        # or unknown Apple GPUs never even request the candidate pipeline.
+        if dsa_indexer_mma_wm4_wn1_eligible():
+            kwargs["use_wm4_wn1"] = True
     return _ext.dsa_indexer_scores_mma(
         queries,
         keys,
         weights,
-        mask_ratio=mask_ratio,
-        mask_q_offset=mask_q_offset,
-        **_native_stream_kwargs(stream),
+        **kwargs,
     )
 
 

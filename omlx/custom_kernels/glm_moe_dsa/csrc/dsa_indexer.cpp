@@ -369,10 +369,15 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
   static constexpr int kThreads = 128; // WM=2, WN=2
   static constexpr int kSwizzleLog = 2;
 
-  MMADSAIndexerScoresPrimitive(Stream stream, int mask_ratio, int mask_q_offset)
+  MMADSAIndexerScoresPrimitive(
+      Stream stream,
+      int mask_ratio,
+      int mask_q_offset,
+      bool use_wm4_wn1)
       : Primitive(stream),
         mask_ratio_(mask_ratio),
-        mask_q_offset_(mask_q_offset) {}
+        mask_q_offset_(mask_q_offset),
+        use_wm4_wn1_(use_wm4_wn1) {}
 
   static bool unsupported(
       const array& q,
@@ -430,6 +435,11 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const int M = q.shape(2);
     const int N = k.shape(2);
     const int D = q.shape(3);
+    // Physical qualification is deliberately exact: WM4xWN1 wins on the
+    // M3 Ultra's g15d GPU but regresses on the M5 Max's g17s GPU.  A caller
+    // hint can therefore never move an unknown/non-g15d device off WM2xWN2.
+    const bool wm4_wn1_active = use_wm4_wn1_ &&
+        d.get_architecture() == "applegpu_g15d";
 
     int tile_bm = kBM;
     int tile_threads = kThreads;
@@ -439,7 +449,10 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     const char* boundary_name = D == 48
         ? "mma_dsa_indexer_score_bfloat16_d48_boundary"
         : "mma_dsa_indexer_score_bfloat16_boundary";
-    if (D == 128 && M <= 16) {
+    if (wm4_wn1_active && D == 128 && M >= kBM) {
+      interior_name = "mma_dsa_indexer_score_bfloat16_wm4_interior";
+      boundary_name = "mma_dsa_indexer_score_bfloat16_wm4_boundary";
+    } else if (D == 128 && M <= 16) {
       tile_bm = 16;
       tile_threads = 64;
       interior_name = "mma_dsa_indexer_score_bfloat16_bm16_interior";
@@ -469,7 +482,13 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
     MTL::Size group_dims = MTL::Size(tile_threads, 1, 1);
     MTL::Size grid_dims = MTL::Size(tg_x, tg_y, B);
 
-    auto lib = d.get_library("omlx_glm_mma_dsa_v25", []() {
+    // Give the candidate a fresh runtime-library identity.  The production
+    // v25 library name intentionally remains unchanged so a candidate build
+    // cannot perturb its compiler or OS shader-cache entry during A/B.
+    const char* library_name = wm4_wn1_active
+        ? "omlx_glm_mma_dsa_wm4_v1"
+        : "omlx_glm_mma_dsa_v25";
+    auto lib = d.get_library(library_name, []() {
       return std::string(kMMADSAScoreKernelSource);
     });
     auto& compute_encoder = metal::get_command_encoder(s);
@@ -498,15 +517,17 @@ class MMADSAIndexerScoresPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const MMADSAIndexerScoresPrimitive&>(other);
     return mask_ratio_ == rhs.mask_ratio_ &&
-        mask_q_offset_ == rhs.mask_q_offset_;
+        mask_q_offset_ == rhs.mask_q_offset_ &&
+        use_wm4_wn1_ == rhs.use_wm4_wn1_;
   }
   auto state() const {
-    return std::make_tuple(mask_ratio_, mask_q_offset_);
+    return std::make_tuple(mask_ratio_, mask_q_offset_, use_wm4_wn1_);
   }
 
  private:
   int mask_ratio_;
   int mask_q_offset_;
+  bool use_wm4_wn1_;
 };
 
 class DSATopKIndicesPrimitive : public Primitive {
@@ -1005,7 +1026,8 @@ array dsa_indexer_scores_mma(
     const array& weights,
     int mask_ratio,
     int mask_q_offset,
-    StreamOrDevice s) {
+    StreamOrDevice s,
+    bool use_wm4_wn1) {
   if (queries.ndim() != 4 || keys.ndim() != 4 || weights.ndim() != 3) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.dsa_indexer_scores_mma] expected q/k rank 4 "
@@ -1053,7 +1075,7 @@ array dsa_indexer_scores_mma(
       std::move(out_shape),
       bfloat16,
       std::make_shared<MMADSAIndexerScoresPrimitive>(
-          stream, mask_ratio, mask_q_offset),
+          stream, mask_ratio, mask_q_offset, use_wm4_wn1),
       std::move(inputs));
 }
 
