@@ -617,6 +617,7 @@
                                     @click="setPlanStrategy(option.key)"
                                     :disabled="option.disabled"
                                     :title="option.disabledReason"
+                                    :data-selected="planStrategy === option.key ? 'true' : 'false'"
                                     class="px-2.5 py-1 text-[10px] font-semibold transition-colors inline-flex items-center gap-1.5"
                                     :class="[
                                         planStrategy === option.key
@@ -638,6 +639,61 @@
                          x-show="selectedStrategyOption().disabledReason"
                          x-text="selectedStrategyOption().disabledReason"></div>
                 </div>
+
+                <!-- Serving limits are a profile, not three unrelated knobs:
+                     the server can safely lower all three together when a
+                     rank has less headroom. Compatible overlapping requests
+                     are continuously batched automatically. -->
+                <div class="mt-4" data-cluster-v2-serving-profile>
+                    <div class="flex items-center justify-between gap-3 mb-2">
+                        <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Serving profile</div>
+                        <span class="text-[10px] text-neutral-400">Auto-tuned down if memory requires it</span>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <template x-for="option in executionProfileOptions()" :key="option.key">
+                            <button type="button"
+                                    @click="setExecutionProfile(option.key)"
+                                    :disabled="planLoading"
+                                    :data-selected="executionProfile === option.key ? 'true' : 'false'"
+                                    :data-cluster-v2-serving-profile-option="option.key"
+                                    class="rounded-xl border px-3 py-2 text-left transition-colors disabled:opacity-40"
+                                    :class="executionProfile === option.key
+                                        ? 'bg-neutral-900 border-neutral-900 text-white'
+                                        : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50'">
+                                <span class="block text-xs font-semibold" x-text="option.label"></span>
+                                <span class="block text-[10px] mt-0.5 opacity-80" x-text="option.limits"></span>
+                                <span class="block text-[9px] mt-1 opacity-60" x-text="option.detail"></span>
+                            </button>
+                        </template>
+                    </div>
+                    <p class="text-[10px] text-neutral-500 mt-1.5">
+                        There is no separate batching switch: these are admission limits, and compatible requests that overlap are coalesced continuously up to the batch target.
+                    </p>
+                </div>
+
+                <!-- The rank-local memory prompt cache is always on. Durable
+                     SSD snapshots are opt-in because the first request writes
+                     one shard-local snapshot per rank at each boundary. -->
+                <label class="mt-4 flex items-start justify-between gap-4 rounded-xl border border-neutral-200 px-3 py-2.5"
+                       data-cluster-v2-prompt-cache-ssd>
+                    <span class="min-w-0">
+                        <span class="block text-xs font-semibold text-neutral-900">Persistent prompt reuse</span>
+                        <span class="block text-[10px] text-neutral-500 mt-0.5">
+                            Save aligned prompt snapshots on each Mac so prefixes survive restarts. Writes run in the background; memory reuse stays on either way, and snapshots above the safe 512 MiB pending limit are skipped.
+                        </span>
+                    </span>
+                    <span class="inline-flex items-center gap-2 flex-shrink-0 pt-0.5">
+                        <span class="text-[10px] font-semibold text-neutral-500"
+                              x-text="promptCacheSsd ? 'On' : 'Off'"></span>
+                        <input type="checkbox"
+                               x-model="promptCacheSsd"
+                               @change="runPlan()"
+                               :disabled="planLoading"
+                               class="h-4 w-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 disabled:opacity-40"
+                               aria-label="Persist distributed prompt snapshots to SSD"
+                               data-cluster-v2-prompt-cache-ssd-toggle>
+                    </span>
+                </label>
 
                 <!-- Per-node roles: how much of each Mac the cluster may take.
                      Default is unchanged (this Mac = Workstation, peers =
@@ -713,14 +769,9 @@
                             <div class="h-12 flex overflow-hidden rounded-xl border border-neutral-200 bg-neutral-100"
                                  data-cluster-v2-split-bar-tensor>
                                 <template x-for="(assignment, index) in planAssignments()" :key="assignment.rank">
-                                    <div class="h-full flex items-center justify-center px-2 border-r border-white last:border-r-0 transition-[width] duration-700 ease-out"
-                                         :class="[
-                                             'bg-neutral-900 text-white',
-                                             'bg-neutral-600 text-white',
-                                             'bg-neutral-400 text-white',
-                                             'bg-neutral-300 text-neutral-700',
-                                             'bg-neutral-200 text-neutral-700',
-                                         ][index % 5]"
+                                    <div class="cluster-v2-tensor-segment h-full flex items-center justify-center px-2 border-r border-white last:border-r-0 transition-[width] duration-700 ease-out"
+                                         :class="'cluster-v2-tensor-segment--' + (index % 5)"
+                                         :data-tensor-tone="index % 5"
                                          :style="'width: ' + (100 / Math.max(planAssignments().length, 1)) + '%'"
                                          :title="planNodeName(assignment) + ' · ' + tensorShareLabel()">
                                         <span class="text-[10px] sm:text-xs font-semibold truncate"
@@ -826,6 +877,9 @@
                             x-text="configuredDeployment() ? displayModelName(configuredDeployment()) : ''"></h4>
                         <p class="text-xs text-neutral-500 mt-1"
                            x-text="deploymentStatus().detail"></p>
+                        <p class="text-[10px] text-neutral-400 mt-1"
+                           x-text="deploymentCacheLabel()"
+                           data-cluster-v2-active-cache-mode></p>
                     </div>
                     <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border self-start"
                           :class="deploymentStatus().tone"
@@ -835,6 +889,148 @@
                               :class="{ 'animate-pulse': deploymentStatus().pulse }"></span>
                         <span x-text="deploymentStatus().label"></span>
                     </span>
+                </div>
+
+                <!-- Resolved worker limits and capability, not profile
+                     guesses. Runtime can reduce the requested profile for
+                     headroom or decline cache merging for an incompatible
+                     model, and both outcomes are explicit here. -->
+                <div class="mt-4 rounded-xl border border-neutral-200 overflow-hidden"
+                     x-show="deploymentRuntimeState() === 'ready'"
+                     data-cluster-v2-serving-status>
+                    <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Batching &amp; concurrency</div>
+                            <div class="text-[10px] text-neutral-400 mt-0.5">Resolved worker limits · changes require a signed re-plan</div>
+                        </div>
+                        <span class="text-[10px] font-semibold text-neutral-500"
+                              x-text="deploymentExecutionProfileLabel() + ' profile'"></span>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-neutral-100">
+                        <div class="px-4 py-3" data-cluster-v2-batching-state>
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="text-[9px] uppercase tracking-wider text-neutral-400">Continuous batching</span>
+                                <span class="inline-flex rounded-full border px-2 py-0.5 text-[9px] font-semibold"
+                                      :class="deploymentBatchStatus().tone"
+                                      x-text="deploymentBatchStatus().label"></span>
+                            </div>
+                            <div class="text-[10px] text-neutral-500 mt-1"
+                                 x-text="deploymentBatchStatus().detail"></div>
+                        </div>
+                        <div class="px-4 py-3" data-cluster-v2-decode-concurrency>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-400">Decode concurrency</div>
+                            <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
+                                 x-text="deploymentExecution()?.decode_concurrency ?? '—'"></div>
+                            <div class="text-[10px] text-neutral-500">maximum in-flight decode requests</div>
+                        </div>
+                        <div class="px-4 py-3" data-cluster-v2-prompt-concurrency>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-400">Prompt concurrency</div>
+                            <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
+                                 x-text="deploymentExecution()?.prompt_concurrency ?? '—'"></div>
+                            <div class="text-[10px] text-neutral-500"
+                                 x-text="'maximum prefills · batch target ' + (deploymentBatchStatus().target || '—')"></div>
+                        </div>
+                    </div>
+                    <div class="px-4 py-2 border-t border-neutral-100 text-[10px] text-neutral-400"
+                         x-show="deploymentExecution()?.tuning_reason"
+                         x-text="deploymentExecution()?.tuning_reason"></div>
+                    <div class="px-4 py-3 border-t border-neutral-100"
+                         data-cluster-v2-serving-replan>
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                            <div>
+                                <div class="text-[10px] font-semibold text-neutral-700">Change serving profile</div>
+                                <div class="text-[9px] text-neutral-400 mt-0.5">Select to preview a signed plan. Applying waits for request quiescence, reloads the ranks, and runs readiness again.</div>
+                            </div>
+                            <div class="inline-flex rounded-lg border border-neutral-200 overflow-hidden self-start sm:self-auto">
+                                <template x-for="option in executionProfileOptions()" :key="'active-' + option.key">
+                                    <button type="button"
+                                            @click="previewExecutionProfile(option.key)"
+                                            :disabled="executionReplanBusy || deploymentExecution()?.profile === option.key"
+                                            :data-selected="executionReplan?.profile === option.key ? 'true' : 'false'"
+                                            :data-cluster-v2-active-profile="option.key"
+                                            class="px-2.5 py-1 text-[10px] font-semibold transition-colors border-l first:border-l-0 border-neutral-200 disabled:opacity-40"
+                                            :class="executionReplan?.profile === option.key
+                                                ? 'bg-neutral-900 text-white'
+                                                : 'text-neutral-600 hover:bg-neutral-50'"
+                                            x-text="option.label"></button>
+                                </template>
+                            </div>
+                        </div>
+                        <div x-show="executionReplan" x-cloak
+                             class="mt-2 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2"
+                             data-cluster-v2-serving-replan-confirm>
+                            <div class="text-[10px] text-amber-800">
+                                <span class="font-semibold" x-text="executionReplan ? executionReplan.profile.charAt(0).toUpperCase() + executionReplan.profile.slice(1) : ''"></span>
+                                <span> is previewed and signed. The current cluster remains live until you apply it.</span>
+                            </div>
+                            <div class="flex items-center gap-2 flex-shrink-0">
+                                <button type="button" @click="executionReplan = null"
+                                        :disabled="executionReplanBusy"
+                                        class="px-2.5 py-1 text-[10px] font-semibold text-neutral-600 border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-40">Cancel</button>
+                                <button type="button" @click="applyExecutionProfileReplan()"
+                                        :disabled="executionReplanBusy"
+                                        class="px-2.5 py-1 text-[10px] font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-40"
+                                        data-cluster-v2-serving-replan-apply>
+                                    <span x-text="executionReplanBusy ? 'Applying…' : 'Apply signed re-plan'"></span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- One row per request. Rank zero publishes these snapshots
+                     independently; using last_request here used to collapse a
+                     concurrent batch to whichever request updated last. -->
+                <div class="mt-4 rounded-xl border border-neutral-200 overflow-hidden"
+                     x-show="deploymentRuntimeState() === 'ready'"
+                     data-cluster-v2-request-speeds>
+                    <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
+                        <div>
+                            <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Request speeds</div>
+                            <div class="text-[10px] text-neutral-400 mt-0.5">Independent end-to-end rates from the coordinator</div>
+                        </div>
+                        <span class="text-[10px] font-semibold text-neutral-500"
+                              x-text="deploymentRequestCountLabel()"></span>
+                    </div>
+                    <template x-if="!deploymentRequestMetrics().length">
+                        <div class="px-4 py-3 text-xs text-neutral-400">
+                            No request measured yet. Prefill and decode rates appear here when inference starts.
+                        </div>
+                    </template>
+                    <div class="divide-y divide-neutral-100"
+                         x-show="deploymentRequestMetrics().length">
+                        <template x-for="(request, index) in deploymentRequestMetrics()"
+                                  :key="'request-speed-' + (request.request_id ?? index)">
+                            <div class="grid grid-cols-1 sm:grid-cols-[minmax(8rem,1fr)_minmax(7rem,0.8fr)_minmax(7rem,0.8fr)] gap-3 px-4 py-3 bg-white"
+                                 data-cluster-v2-request-speed-row>
+                                <div class="min-w-0">
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs font-semibold text-neutral-900"
+                                              x-text="request.request_id == null ? (request._history ? 'Last request' : 'Current request') : 'Request #' + request.request_id"></span>
+                                        <span class="inline-flex px-2 py-0.5 rounded-full border text-[9px] font-semibold"
+                                              :class="requestPhaseTone(request)"
+                                              x-text="requestPhaseLabel(request)"></span>
+                                    </div>
+                                    <div class="text-[10px] text-neutral-400 mt-1"
+                                         x-text="requestPromptDetail(request)"></div>
+                                </div>
+                                <div data-cluster-v2-request-prefill-rate>
+                                    <div class="text-[9px] uppercase tracking-wider text-blue-700">Prefill</div>
+                                    <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
+                                         x-text="requestPrefillRate(request)"></div>
+                                    <div class="text-[10px] text-neutral-400 mt-0.5"
+                                         x-text="request.prefill_progress?.active ? 'live average' : 'prompt average'"></div>
+                                </div>
+                                <div data-cluster-v2-request-decode-rate>
+                                    <div class="text-[9px] uppercase tracking-wider text-green-700">Decode</div>
+                                    <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
+                                         x-text="requestDecodeRate(request)"></div>
+                                    <div class="text-[10px] text-neutral-400 mt-0.5"
+                                         x-text="requestDecodeDetail(request)"></div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
                 </div>
 
                 <!-- Device list + health -->

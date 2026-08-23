@@ -304,6 +304,69 @@ def test_live_prefill_separates_recent_chunk_rate_from_sustained_average():
     assert progress["eta"] == 20.0
 
 
+def test_concurrent_requests_keep_separate_live_prefill_and_decode_rates():
+    """A newer request must not overwrite another request's live rate."""
+
+    clock = _Clock()
+    telemetry = RuntimeTelemetry(_Marker(), clock=clock, publish_interval=0)
+
+    prefill_id = telemetry.begin_request()
+    telemetry.observe_context(prefill_id, prompt_tokens=100, cached_tokens=0)
+    telemetry.mark_pending_uid(prefill_id)
+    telemetry.bind_pending_uid((71,))
+
+    clock.value = 1.0
+    decode_id = telemetry.begin_request()
+    telemetry.observe_context(decode_id, prompt_tokens=20, cached_tokens=0)
+    clock.value = 2.0
+    telemetry.observe_token(decode_id)
+    clock.value = 3.0
+    telemetry.observe_token(decode_id)
+    clock.value = 4.0
+    telemetry.observe_prefill_progress(
+        71,
+        processed_tokens=40,
+        total_tokens=100,
+    )
+
+    snapshot = telemetry.snapshot()
+    requests = snapshot["active_request_metrics"]
+
+    assert snapshot["active_requests"] == 2
+    assert snapshot["active_request_metrics_truncated"] == 0
+    assert [request["request_id"] for request in requests] == [
+        prefill_id,
+        decode_id,
+    ]
+    assert requests[0]["prefill_progress"]["active"] is True
+    assert requests[0]["prefill_tps"] == 10.0
+    assert requests[0]["decode_tps"] == 0.0
+    assert requests[1]["prefill_progress"]["active"] is False
+    assert requests[1]["prefill_tps"] == 20.0
+    assert requests[1]["decode_tps"] == 0.5
+
+    telemetry.finish_request(decode_id)
+    snapshot = telemetry.snapshot()
+    assert [
+        request["request_id"] for request in snapshot["active_request_metrics"]
+    ] == [prefill_id]
+
+
+def test_active_request_detail_is_bounded_without_losing_total_count():
+    telemetry = RuntimeTelemetry(_Marker(), clock=_Clock(), publish_interval=0)
+
+    for _ in range(66):
+        telemetry.begin_request()
+
+    snapshot = telemetry.snapshot()
+
+    assert snapshot["active_requests"] == 66
+    assert len(snapshot["active_request_metrics"]) == 64
+    assert snapshot["active_request_metrics_truncated"] == 2
+    assert snapshot["active_request_metrics"][0]["request_id"] == 1
+    assert snapshot["active_request_metrics"][-1]["request_id"] == 64
+
+
 def test_queue_observer_preserves_mlx_lm_queue_contract():
     marker = _Marker()
     telemetry = RuntimeTelemetry(marker, publish_interval=0)
@@ -384,6 +447,7 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
         publish_interval=0,
         execution=execution_profile("balanced"),
         assignment=assignment,
+        prompt_cache_ssd_enabled=True,
     )
     clock.value = 1.0
     telemetry.observe_batch_step(
@@ -396,6 +460,11 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
         remaining_tokens=25,
         entries=3,
         nbytes=4096,
+        memory_entries=2,
+        memory_bytes=1024,
+        ssd_entries=1,
+        ssd_bytes=3072,
+        hit_tier="ssd",
     )
 
     snapshot = telemetry.snapshot()
@@ -406,6 +475,17 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
     assert snapshot["cache"]["affinity"] == "deployment"
     assert snapshot["cache"]["hit_rate"] == 1.0
     assert snapshot["cache"]["tokens_reused"] == 75
+    assert snapshot["cache"]["ssd_enabled"] is True
+    assert snapshot["cache"]["memory"] == {
+        "entries": 2,
+        "bytes": 1024,
+        "hits": 0,
+    }
+    assert snapshot["cache"]["ssd"] == {
+        "entries": 1,
+        "bytes": 3072,
+        "hits": 1,
+    }
     assert snapshot["stage"]["predicted_stage_seconds"] == 0.21
     assert snapshot["stage"]["observed_step_seconds"] == 0.25
 

@@ -4793,16 +4793,40 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
     cache = metrics.get("cache") if isinstance(metrics, dict) else None
     if not isinstance(cache, dict):
         return None
+    memory = cache.get("memory")
+    if not isinstance(memory, dict):
+        memory = {}
+    ssd = cache.get("ssd")
+    if not isinstance(ssd, dict):
+        ssd = {}
+    total_entries = int(cache.get("entries", 0) or 0)
+    total_bytes = int(cache.get("bytes", 0) or 0)
+    has_tier_split = bool(memory or ssd or "ssd_enabled" in cache)
     return {
         "rank_prompt_cache": {
-            "entries": int(cache.get("entries", 0) or 0),
-            "bytes": int(cache.get("bytes", 0) or 0),
+            "entries": total_entries,
+            "bytes": total_bytes,
             "lookups": int(cache.get("lookups", 0) or 0),
             "hits": int(cache.get("hits", 0) or 0),
             "misses": int(cache.get("misses", 0) or 0),
             "hit_rate": float(cache.get("hit_rate", 0.0) or 0.0),
             "tokens_reused": int(cache.get("tokens_reused", 0) or 0),
             "affinity": str(cache.get("affinity", "none")),
+            "ssd_enabled": bool(cache.get("ssd_enabled", False)),
+            "memory_entries": int(
+                (memory.get("entries", 0) or 0) if has_tier_split else total_entries
+            ),
+            "memory_bytes": int(
+                (memory.get("bytes", 0) or 0) if has_tier_split else total_bytes
+            ),
+            "memory_hits": int(
+                (memory.get("hits", 0) or 0)
+                if has_tier_split
+                else int(cache.get("hits", 0) or 0)
+            ),
+            "ssd_entries": int(ssd.get("entries", 0) or 0),
+            "ssd_bytes": int(ssd.get("bytes", 0) or 0),
+            "ssd_hits": int(ssd.get("hits", 0) or 0),
         },
     }
 

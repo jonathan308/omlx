@@ -156,6 +156,7 @@ def test_partial_measurements_fall_back_to_original_memory_objective():
 
 def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     settings = execution_profile("throughput")
+    assert settings.prompt_cache_ssd is False
     assignments = [
         SimpleNamespace(headroom_bytes=3 * 1024**3),
         SimpleNamespace(headroom_bytes=20 * 1024**3),

@@ -492,6 +492,13 @@ def test_runtime_cache_distributed_row_uses_rank_prompt_cache(tmp_path):
         "hit_rate": 0.75,
         "tokens_reused": 300,
         "affinity": "deployment",
+        "ssd_enabled": False,
+        "memory_entries": 2,
+        "memory_bytes": 4096,
+        "memory_hits": 3,
+        "ssd_entries": 0,
+        "ssd_bytes": 0,
+        "ssd_hits": 0,
     }
     # Rank prompt-cache/snapshot stats are NOT the tiered hot/SSD cache and
     # must not leak into its columns or aggregates.
@@ -503,6 +510,36 @@ def test_runtime_cache_distributed_row_uses_rank_prompt_cache(tmp_path):
     assert payload["hot_cache_entries"] == 0
     assert payload["total_num_files"] == 0
     assert payload["total_size_bytes"] == 0
+
+
+def test_runtime_cache_distributed_row_exposes_the_real_tier_split(tmp_path):
+    metrics = _metrics_payload()["metrics"]
+    metrics["cache"].update(
+        {
+            "ssd_enabled": True,
+            "memory": {"entries": 2, "bytes": 4096, "hits": 1},
+            "ssd": {"entries": 7, "bytes": 65536, "hits": 2},
+            "entries": 9,
+            "bytes": 69632,
+        }
+    )
+    live = {
+        "metrics": metrics,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "age_seconds": 0.3,
+        "stale": False,
+    }
+
+    payload = _build_runtime_cache(_CachePool(live), tmp_path)
+
+    rank_cache = payload["models"][0]["rank_prompt_cache"]
+    assert rank_cache["ssd_enabled"] is True
+    assert rank_cache["memory_entries"] == 2
+    assert rank_cache["memory_bytes"] == 4096
+    assert rank_cache["memory_hits"] == 1
+    assert rank_cache["ssd_entries"] == 7
+    assert rank_cache["ssd_bytes"] == 65536
+    assert rank_cache["ssd_hits"] == 2
 
 
 def test_runtime_cache_distributed_stale_marker_contributes_no_row(tmp_path):
@@ -533,6 +570,10 @@ def test_status_template_renders_cluster_badge_and_rank_cache_row():
     assert "m.cluster.live && m.cluster.live.stale" in status
     assert "m.cache_tier === 'rank-prompt-snapshot'" in status
     assert "m.rank_prompt_cache" in status
+    assert "m.rank_prompt_cache?.ssd_enabled" in status
+    assert "m.rank_prompt_cache?.memory_entries" in status
+    assert "m.rank_prompt_cache?.ssd_entries" in status
+    assert "m.rank_prompt_cache?.ssd_hits" in status
     for key in (
         "cluster.badge.label",
         "cluster.badge.tensor",
@@ -540,5 +581,9 @@ def test_status_template_renders_cluster_badge_and_rank_cache_row():
         "cluster.badge.stale",
         "cluster.badge.rank_cache",
         "cluster.badge.rank_cache_entries",
+        "cluster.badge.rank_cache_memory",
+        "cluster.badge.rank_cache_ssd",
+        "cluster.badge.rank_cache_ssd_off",
+        "cluster.badge.rank_cache_hits",
     ):
         assert en.get(key), f"en.json missing {key}"

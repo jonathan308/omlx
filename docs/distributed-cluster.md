@@ -212,6 +212,20 @@ persistent rank set, allowing each rank's local cache to be reused.
 Multi-connection tuning applies only to the TCP Ring backend. JACCL owns its
 Thunderbolt RDMA connection strategy and never receives Ring-only flags.
 
+Every distributed rank has a bounded in-memory MLX-LM prompt cache. The
+cluster planner's **Persistent prompt reuse** option adds a second,
+rank-local SSD snapshot tier: each rank saves its own layer state at aligned
+prefill boundaries, and a later request restores a boundary only when every
+rank reports the matching snapshot. Snapshot directories are scoped by
+deployment, signed plan, and rank, so a changed layer or tensor split cannot
+restore incompatible state. Writes run in a bounded FIFO behind prefill; they
+never block on a saturated queue, and only committed files participate in
+cross-rank restore votes. Detached pending state is capped at two writes and
+512 MiB per rank, so larger long-context snapshots are safely skipped rather
+than risking an OOM. Leaving it off does not disable the in-memory prompt
+cache. The active-cluster card and runtime-cache row report which mode is
+actually running.
+
 **Experimental token-only output** is opt-in. For a model whose pipeline
 forward path matches the pinned, validated contract, oMLX removes the final
 hidden-state all-gather, samples on rank zero, and all-sums only the selected

@@ -21,6 +21,7 @@ _BACKENDS = {"ring", "jaccl", "jaccl-ring"}
 _REQUEST_STATES = {"running", "completed", "failed", "cancelled"}
 _MAX_COUNTER = 2**63 - 1
 _RUNTIME_STALE_AFTER_SECONDS = 45.0
+_MAX_ACTIVE_REQUEST_METRICS = 64
 
 
 def _process_is_live(pid: int) -> bool:
@@ -182,6 +183,81 @@ def _validated_assignments(
     return sorted(assignments, key=lambda item: item["rank"])
 
 
+def _validated_request_metrics(
+    current: Any,
+    *,
+    label: str,
+    require_request_id: bool,
+) -> dict[str, Any]:
+    if not isinstance(current, dict) or current.get("status") not in _REQUEST_STATES:
+        raise ValueError(f"{label} metrics are invalid")
+    request = {"status": current["status"]}
+    request_id = current.get("request_id")
+    if require_request_id or request_id is not None:
+        request["request_id"] = _nonnegative_int(
+            request_id,
+            f"{label} request_id",
+        )
+    for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
+        request[key] = _nonnegative_int(current.get(key), f"{label} {key}")
+    if request["cached_tokens"] > request["prompt_tokens"]:
+        raise ValueError("runtime cached token count exceeds prompt tokens")
+    for key in (
+        "elapsed_seconds",
+        "prefill_tps",
+        "decode_tps",
+        "end_to_end_tps",
+    ):
+        request[key] = _nonnegative_float(current.get(key), f"{label} {key}")
+    request["ttft_seconds"] = _nonnegative_float(
+        current.get("ttft_seconds"),
+        f"{label} ttft_seconds",
+        optional=True,
+    )
+    progress = current.get("prefill_progress")
+    if progress is not None:
+        if not isinstance(progress, dict):
+            raise ValueError("runtime prefill progress is invalid")
+        active = progress.get("active")
+        if not isinstance(active, bool):
+            raise ValueError("runtime prefill progress active flag is invalid")
+        validated_progress = {
+            "active": active,
+            "processed": _nonnegative_int(
+                progress.get("processed"),
+                f"{label} prefill processed",
+            ),
+            "total": _nonnegative_int(
+                progress.get("total"),
+                f"{label} prefill total",
+            ),
+            "speed": _nonnegative_float(
+                progress.get("speed"),
+                f"{label} prefill speed",
+            ),
+            # Added after the first live cluster release. Old rank markers only
+            # have ``speed`` (the latest chunk), so retain compatibility while
+            # giving new dashboards a stable end-to-end running average.
+            "average_speed": _nonnegative_float(
+                progress.get("average_speed", progress.get("speed")),
+                f"{label} prefill average speed",
+            ),
+            "eta": _nonnegative_float(
+                progress.get("eta"),
+                f"{label} prefill eta",
+                optional=True,
+            ),
+            "elapsed": _nonnegative_float(
+                progress.get("elapsed"),
+                f"{label} prefill elapsed",
+            ),
+        }
+        if validated_progress["processed"] > validated_progress["total"]:
+            raise ValueError("runtime prefill progress exceeds its total")
+        request["prefill_progress"] = validated_progress
+    return request
+
+
 def _validated_metrics(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("scope") != "end_to_end_pipeline":
         raise ValueError("runtime metrics have an invalid scope")
@@ -209,6 +285,35 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         value.get("aggregate_wall_tps", 0.0),
         "metrics aggregate_wall_tps",
     )
+
+    active_details = value.get("active_request_metrics")
+    if active_details is not None:
+        if (
+            not isinstance(active_details, list)
+            or len(active_details) > _MAX_ACTIVE_REQUEST_METRICS
+        ):
+            raise ValueError("runtime active-request metrics are invalid")
+        requests = [
+            _validated_request_metrics(
+                item,
+                label="active-request metrics",
+                require_request_id=True,
+            )
+            for item in active_details
+        ]
+        if any(item["status"] != "running" for item in requests):
+            raise ValueError("runtime active-request metric is not running")
+        request_ids = [item["request_id"] for item in requests]
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("runtime active-request IDs are not unique")
+        truncated = _nonnegative_int(
+            value.get("active_request_metrics_truncated", 0),
+            "metrics active_request_metrics_truncated",
+        )
+        if len(requests) + truncated != result["active_requests"]:
+            raise ValueError("runtime active-request metric count is inconsistent")
+        result["active_request_metrics"] = requests
+        result["active_request_metrics_truncated"] = truncated
 
     cache = value.get("cache")
     if cache is not None:
@@ -243,6 +348,39 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         if hit_rate is None or hit_rate > 1:
             raise ValueError("runtime cache hit rate is out of range")
         validated_cache["hit_rate"] = hit_rate
+
+        tier_keys = ("ssd_enabled", "memory", "ssd")
+        if any(key in cache for key in tier_keys):
+            if not all(key in cache for key in tier_keys):
+                raise ValueError("runtime cache tier metrics are incomplete")
+            ssd_enabled = cache["ssd_enabled"]
+            if not isinstance(ssd_enabled, bool):
+                raise ValueError("runtime cache SSD enabled flag is invalid")
+            validated_cache["ssd_enabled"] = ssd_enabled
+            for tier in ("memory", "ssd"):
+                raw_tier = cache[tier]
+                if not isinstance(raw_tier, dict):
+                    raise ValueError(f"runtime cache {tier} tier is invalid")
+                validated_cache[tier] = {
+                    key: _nonnegative_int(
+                        raw_tier.get(key),
+                        f"cache metrics {tier} {key}",
+                    )
+                    for key in ("entries", "bytes", "hits")
+                }
+            memory_tier = validated_cache["memory"]
+            ssd_tier = validated_cache["ssd"]
+            if (
+                memory_tier["entries"] + ssd_tier["entries"]
+                != validated_cache["entries"]
+                or memory_tier["bytes"] + ssd_tier["bytes"]
+                != validated_cache["bytes"]
+                or memory_tier["hits"] + ssd_tier["hits"]
+                != validated_cache["hits"]
+            ):
+                raise ValueError("runtime cache tier totals are inconsistent")
+            if not ssd_enabled and any(ssd_tier.values()):
+                raise ValueError("runtime cache SSD tier is populated while disabled")
         result["cache"] = validated_cache
 
     pipeline = value.get("pipeline")
@@ -380,67 +518,11 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
     if current is None:
         result["last_request"] = None
         return result
-    if not isinstance(current, dict) or current.get("status") not in _REQUEST_STATES:
-        raise ValueError("runtime last-request metrics are invalid")
-    request = {"status": current["status"]}
-    for key in ("prompt_tokens", "cached_tokens", "completion_tokens"):
-        request[key] = _nonnegative_int(current.get(key), f"metrics {key}")
-    if request["cached_tokens"] > request["prompt_tokens"]:
-        raise ValueError("runtime cached token count exceeds prompt tokens")
-    for key in (
-        "elapsed_seconds",
-        "prefill_tps",
-        "decode_tps",
-        "end_to_end_tps",
-    ):
-        request[key] = _nonnegative_float(current.get(key), f"metrics {key}")
-    request["ttft_seconds"] = _nonnegative_float(
-        current.get("ttft_seconds"),
-        "metrics ttft_seconds",
-        optional=True,
+    result["last_request"] = _validated_request_metrics(
+        current,
+        label="last-request metrics",
+        require_request_id=False,
     )
-    progress = current.get("prefill_progress")
-    if progress is not None:
-        if not isinstance(progress, dict):
-            raise ValueError("runtime prefill progress is invalid")
-        active = progress.get("active")
-        if not isinstance(active, bool):
-            raise ValueError("runtime prefill progress active flag is invalid")
-        validated_progress = {
-            "active": active,
-            "processed": _nonnegative_int(
-                progress.get("processed"),
-                "metrics prefill processed",
-            ),
-            "total": _nonnegative_int(
-                progress.get("total"),
-                "metrics prefill total",
-            ),
-            "speed": _nonnegative_float(
-                progress.get("speed"),
-                "metrics prefill speed",
-            ),
-            # Added after the first live cluster release. Old rank markers only
-            # have ``speed`` (the latest chunk), so retain compatibility while
-            # giving new dashboards a stable end-to-end running average.
-            "average_speed": _nonnegative_float(
-                progress.get("average_speed", progress.get("speed")),
-                "metrics prefill average speed",
-            ),
-            "eta": _nonnegative_float(
-                progress.get("eta"),
-                "metrics prefill eta",
-                optional=True,
-            ),
-            "elapsed": _nonnegative_float(
-                progress.get("elapsed"),
-                "metrics prefill elapsed",
-            ),
-        }
-        if validated_progress["processed"] > validated_progress["total"]:
-            raise ValueError("runtime prefill progress exceeds its total")
-        request["prefill_progress"] = validated_progress
-    result["last_request"] = request
     return result
 
 

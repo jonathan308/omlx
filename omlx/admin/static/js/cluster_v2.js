@@ -36,6 +36,7 @@
 //     GET    /admin/api/cluster/deployments     — active deployments
 //     POST   /admin/api/cluster/deployments     — activate an approved plan
 //     DELETE /admin/api/cluster/deployments/{id}— deactivate
+//     POST   /admin/api/cluster/replan           — signed preview/apply reload
 //
 // State machine (wizardState()): empty → discovering → device_card → pairing →
 // checks → plan → active, with error as an overlay state (banner + toasts,
@@ -66,6 +67,7 @@ function clusterV2Wizard() {
         nodeRoles: '/admin/api/cluster/node-roles',
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
+        replan: '/admin/api/cluster/replan',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
     };
@@ -222,6 +224,16 @@ function clusterV2Wizard() {
         // The server resolves its TP degree, host order and backend together;
         // the client never reconstructs those decisions after preview.
         planStrategy: 'auto',
+        // Scheduler limits are selected as one of the server-owned execution
+        // profiles. The worker may safely reduce these values for available
+        // headroom, and the active view always renders those resolved values.
+        // Continuous batching itself is automatic for batchable models; this
+        // profile controls its target width and prompt/decode admission limits.
+        executionProfile: 'balanced',
+        // The volatile rank-local prompt LRU is always enabled. Persistent
+        // SSD boundary snapshots are explicit because their bounded detached
+        // payloads consume memory and disk even though writes run in back.
+        promptCacheSsd: false,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
         // recommendation badge to the fast-transport heuristic.
@@ -255,6 +267,8 @@ function clusterV2Wizard() {
         stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
+        executionReplan: null,
+        executionReplanBusy: false,
 
         // ---- feedback ----------------------------------------------------------
         toasts: [],
@@ -502,6 +516,205 @@ function clusterV2Wizard() {
             return jobs.filter((job) => job?.deployment_id === id);
         },
 
+        deploymentRuntimeJob(deployment = this.configuredDeployment()) {
+            const jobs = this.deploymentRuntimeJobs(deployment);
+            return (
+                jobs.find(
+                    (job) => Number(job.rank) === 0 && job.live === true,
+                ) ||
+                jobs.find((job) => job.live === true) ||
+                jobs.find((job) => Number(job.rank) === 0) ||
+                jobs[0] ||
+                null
+            );
+        },
+
+        deploymentMetricsJob(deployment = this.configuredDeployment()) {
+            const jobs = this.deploymentRuntimeJobs(deployment).filter(
+                (job) => job?.metrics && typeof job.metrics === 'object',
+            );
+            return (
+                jobs.find(
+                    (job) => Number(job.rank) === 0 && job.live === true,
+                ) ||
+                jobs.find((job) => job.live === true) ||
+                jobs.find((job) => Number(job.rank) === 0) ||
+                jobs[0] ||
+                null
+            );
+        },
+
+        deploymentExecution(deployment = this.configuredDeployment()) {
+            const job =
+                this.deploymentMetricsJob(deployment) ||
+                this.deploymentRuntimeJob(deployment);
+            const metricsExecution = job?.metrics?.execution;
+            if (metricsExecution && typeof metricsExecution === 'object') {
+                return metricsExecution;
+            }
+            if (job?.execution && typeof job.execution === 'object') {
+                return job.execution;
+            }
+            const configured = deployment?.execution;
+            return configured && typeof configured === 'object'
+                ? configured
+                : null;
+        },
+
+        deploymentExecutionProfileLabel(
+            deployment = this.configuredDeployment(),
+        ) {
+            const profile = String(
+                this.deploymentExecution(deployment)?.profile || 'balanced',
+            );
+            return profile.charAt(0).toUpperCase() + profile.slice(1);
+        },
+
+        deploymentBatchStatus(deployment = this.configuredDeployment()) {
+            const job = this.deploymentRuntimeJob(deployment);
+            const metrics = job?.metrics || {};
+            const pipeline = metrics.pipeline || {};
+            const execution = this.deploymentExecution(deployment) || {};
+            const capability = job?.optimizations?.coalesced_batching;
+            const target = Math.max(
+                1,
+                Number(
+                    pipeline.microbatch_target ||
+                        execution.pipeline_microbatch_size ||
+                        1,
+                ),
+            );
+            const lastSize = Math.max(
+                0,
+                Number(pipeline.last_batch?.coalesced_batch_size || 0),
+            );
+            if (capability?.active === false) {
+                return {
+                    label: 'Unavailable',
+                    detail:
+                        capability.reason ||
+                        'This model cannot merge its request caches.',
+                    tone: 'bg-amber-50 border-amber-200 text-amber-700',
+                    target,
+                };
+            }
+            if (target <= 1 || capability?.enabled === false) {
+                return {
+                    label: 'Sequential',
+                    detail: 'The resolved batch target is one request.',
+                    tone: 'bg-neutral-50 border-neutral-200 text-neutral-600',
+                    target,
+                };
+            }
+            if (lastSize > 1) {
+                return {
+                    label: `Batched ${lastSize}`,
+                    detail: `Last scheduler step coalesced ${lastSize} of ${target} possible requests.`,
+                    tone: 'bg-green-50 border-green-200 text-green-700',
+                    target,
+                };
+            }
+            return {
+                label: 'Automatic',
+                detail: `Enabled for overlapping compatible requests, up to ${target} per scheduler step.`,
+                tone: 'bg-green-50 border-green-200 text-green-700',
+                target,
+            };
+        },
+
+        deploymentRequestMetrics(deployment = this.configuredDeployment()) {
+            const metrics = this.deploymentMetricsJob(deployment)?.metrics;
+            if (!metrics) return [];
+            const active = Array.isArray(metrics.active_request_metrics)
+                ? metrics.active_request_metrics.filter(
+                    (request) => request && request.status === 'running',
+                )
+                : [];
+            if (active.length) {
+                return active.map((request) => ({ ...request, _history: false }));
+            }
+            const last = metrics.last_request;
+            if (!last || typeof last !== 'object') return [];
+            return [{
+                ...last,
+                // Old rank markers expose only last_request.  While one is
+                // active it is still live; otherwise keep the completed row
+                // visible so a fast request is not missed between 1 Hz polls.
+                _history: Number(metrics.active_requests || 0) === 0,
+            }];
+        },
+
+        deploymentRequestCountLabel(deployment = this.configuredDeployment()) {
+            const metrics = this.deploymentMetricsJob(deployment)?.metrics;
+            const active = Math.max(0, Number(metrics?.active_requests || 0));
+            const hidden = Math.max(
+                0,
+                Number(metrics?.active_request_metrics_truncated || 0),
+            );
+            if (active > 0) {
+                return `${active} active${hidden ? ` · ${hidden} not shown` : ''}`;
+            }
+            return metrics?.last_request ? 'Last completed request' : 'Waiting';
+        },
+
+        requestPhaseLabel(request) {
+            if (request?._history) {
+                return request?.status === 'failed' ? 'Failed' : 'Complete';
+            }
+            if (request?.prefill_progress?.active) return 'Prefill';
+            if (Number(request?.completion_tokens || 0) > 0) return 'Decode';
+            return 'Queued';
+        },
+
+        requestPhaseTone(request) {
+            const phase = this.requestPhaseLabel(request);
+            if (phase === 'Prefill') return 'bg-blue-50 border-blue-200 text-blue-700';
+            if (phase === 'Decode') return 'bg-green-50 border-green-200 text-green-700';
+            if (phase === 'Failed') return 'bg-red-50 border-red-200 text-red-700';
+            return 'bg-neutral-50 border-neutral-200 text-neutral-600';
+        },
+
+        formatRequestRate(rate) {
+            const value = Number(rate);
+            if (!Number.isFinite(value) || value <= 0) return '—';
+            return `${value.toFixed(value >= 100 ? 0 : 1)} tok/s`;
+        },
+
+        requestPrefillRate(request) {
+            const progress = request?.prefill_progress;
+            const rate = progress?.active
+                ? Number(progress.average_speed || request?.prefill_tps || 0)
+                : Number(request?.prefill_tps || 0);
+            return this.formatRequestRate(rate);
+        },
+
+        requestDecodeRate(request) {
+            const tokens = Math.max(0, Number(request?.completion_tokens || 0));
+            if (!request?._history && tokens === 1) return 'Measuring…';
+            return this.formatRequestRate(request?.decode_tps);
+        },
+
+        requestPromptDetail(request) {
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            const progress = request?.prefill_progress;
+            if (progress?.active) {
+                const processed = Math.max(0, Number(progress.processed || 0));
+                const total = Math.max(0, Number(progress.total || 0));
+                return `${processed.toLocaleString()} / ${total.toLocaleString()} new`;
+            }
+            const uncached = Math.max(0, prompt - cached);
+            return `${uncached.toLocaleString()} new${cached ? ` · ${cached.toLocaleString()} cached` : ''}`;
+        },
+
+        requestDecodeDetail(request) {
+            const tokens = Math.max(0, Number(request?.completion_tokens || 0));
+            return `${tokens.toLocaleString()} generated`;
+        },
+
         deploymentRuntimeLauncher(deployment = this.configuredDeployment()) {
             const id = deployment?.deployment_id;
             const launchers = this.runtimePayload?.launchers;
@@ -651,6 +864,16 @@ function clusterV2Wizard() {
                 tone: 'bg-amber-50 border-amber-200 text-amber-700',
                 pulse: false,
             };
+        },
+
+        deploymentCacheLabel(deployment = this.configuredDeployment()) {
+            const enabled = Boolean(
+                deployment?.execution?.prompt_cache_ssd ??
+                    deployment?.prompt_cache_ssd,
+            );
+            return enabled
+                ? 'Prompt reuse · memory + persistent SSD snapshots'
+                : 'Prompt reuse · memory only (SSD snapshots off)';
         },
 
         // =====================================================================
@@ -1629,6 +1852,48 @@ function clusterV2Wizard() {
         // =====================================================================
         // Execution strategy — auto / tensor / pipeline, server-recommended
         // =====================================================================
+        executionProfileOptions() {
+            return [
+                {
+                    key: 'interactive',
+                    label: 'Interactive',
+                    limits: '4 decode · 2 prompt · batch 2',
+                    detail: 'Lower queueing and memory use',
+                },
+                {
+                    key: 'balanced',
+                    label: 'Balanced',
+                    limits: '8 decode · 4 prompt · batch 4',
+                    detail: 'Default mix of latency and throughput',
+                },
+                {
+                    key: 'throughput',
+                    label: 'Throughput',
+                    limits: '16 decode · 8 prompt · batch 8',
+                    detail: 'Wider automatic batches when requests overlap',
+                },
+            ];
+        },
+
+        setExecutionProfile(key) {
+            if (
+                this.planLoading ||
+                !this.executionProfileOptions().some(
+                    (option) => option.key === key,
+                ) ||
+                this.executionProfile === key
+            ) {
+                return;
+            }
+            this.executionProfile = key;
+            // Catalogue recommendations also use the workload profile, so do
+            // not retain a recommendation computed for the old limits.
+            this.catalogueModels = null;
+            this.catalogueFailed = false;
+            if (this.modelOptions.length) this.loadCatalogue();
+            if (this.selectedModelPath) this.runPlan();
+        },
+
         catalogueEntryForModel() {
             if (!Array.isArray(this.catalogueModels)) return null;
             const model = this.selectedModel();
@@ -1767,7 +2032,7 @@ function clusterV2Wizard() {
                     body: JSON.stringify({
                         nodes: this.planNodes(),
                         models: candidates,
-                        execution_profile: 'balanced',
+                        execution_profile: this.executionProfile,
                     }),
                 });
                 this.catalogueModels = payload?.models || [];
@@ -1853,7 +2118,8 @@ function clusterV2Wizard() {
                     model_path: this.selectedModelPath,
                     nodes,
                     hosts: this.deploymentHosts(),
-                    execution_profile: 'balanced',
+                    execution_profile: this.executionProfile,
+                    prompt_cache_ssd: this.promptCacheSsd,
                     prefer: 'speed',
                     strategy: this.planStrategy,
                     detect_transports: true,
@@ -2262,6 +2528,102 @@ function clusterV2Wizard() {
             } finally {
                 this.stopStagingPoll();
                 this.activateBusy = false;
+            }
+        },
+
+        executionReplanBody(profile) {
+            const deployment = this.configuredDeployment();
+            const execution = this.deploymentExecution(deployment) || {};
+            if (!deployment?.deployment_id) return null;
+            const body = {
+                deployment_id: deployment.deployment_id,
+                execution_profile: profile,
+                auto_tune: execution.auto_tune !== false,
+                sampling_rank_only: execution.sampling_rank_only !== false,
+                async_overlap: execution.async_overlap !== false,
+                cache_affinity: execution.cache_affinity !== false,
+                prompt_cache_ssd: execution.prompt_cache_ssd === true,
+                target_context_tokens:
+                    Number(deployment.target_context_tokens) || 8192,
+            };
+            if (Number(execution.max_kv_size) > 0) {
+                body.max_kv_size = Number(execution.max_kv_size);
+            }
+            if (Number(execution.ring_connections_per_ip) > 0) {
+                body.ring_connections_per_ip = Number(
+                    execution.ring_connections_per_ip,
+                );
+            }
+            if (typeof deployment.mtp_enabled === 'boolean') {
+                body.mtp_enabled = deployment.mtp_enabled;
+            }
+            if (Number(deployment.mtp_num_draft_tokens) > 0) {
+                body.mtp_num_draft_tokens = Number(
+                    deployment.mtp_num_draft_tokens,
+                );
+            }
+            return body;
+        },
+
+        async previewExecutionProfile(profile) {
+            const current = this.deploymentExecution()?.profile || 'balanced';
+            if (profile === current) {
+                this.executionReplan = null;
+                return;
+            }
+            const body = this.executionReplanBody(profile);
+            if (!body || this.executionReplanBusy) return;
+            this.executionReplanBusy = true;
+            try {
+                const preview = await this.apiFetch(CLUSTER_V2_API.replan, {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                });
+                const signature = preview?.plan?.placement_signature;
+                if (typeof signature !== 'string' || signature.length < 16) {
+                    throw new Error('The re-plan preview was not signed.');
+                }
+                this.executionReplan = { profile, body, preview };
+            } catch (error) {
+                this.executionReplan = null;
+                this.notify(
+                    'error',
+                    error?.message || 'Could not preview the serving profile.',
+                );
+            } finally {
+                this.executionReplanBusy = false;
+            }
+        },
+
+        async applyExecutionProfileReplan() {
+            const pending = this.executionReplan;
+            const signature = pending?.preview?.plan?.placement_signature;
+            if (!pending || !signature || this.executionReplanBusy) return;
+            this.executionReplanBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.replan, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        ...pending.body,
+                        approved_placement: signature,
+                    }),
+                });
+                this.executionProfile = pending.profile;
+                this.executionReplan = null;
+                this.notify(
+                    'success',
+                    'Serving profile applied and distributed readiness re-checked.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message ||
+                        'Could not apply the signed serving-profile re-plan.',
+                );
+            } finally {
+                this.executionReplanBusy = false;
             }
         },
 

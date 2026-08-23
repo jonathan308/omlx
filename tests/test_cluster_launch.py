@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -117,6 +118,7 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
         cwd=Path("/opt/omlx"),
         control_host="10.0.0.1",
         control_port=32140,
+        launcher_lease=(tmp_path / "coordinator.lease").resolve(),
     )
 
     assert argv[0] == "/opt/omlx/bin/python"
@@ -127,6 +129,9 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv[argv.index("--control-host") + 1] == "10.0.0.1"
     assert argv[argv.index("--control-port") + 1] == "32140"
     assert argv[argv.index("--control-token") + 1] == deployment.plan_hash
+    assert argv[argv.index("--launcher-lease") + 1] == str(
+        (tmp_path / "coordinator.lease").resolve()
+    )
     assert argv[argv.index("--plan-hash") + 1] == deployment.plan_hash
     assert argv[argv.index("--connections-per-ip") + 1] == "2"
     assert argv[argv.index("--execution-profile") + 1] == "balanced"
@@ -277,6 +282,72 @@ def test_supervisor_preserves_structured_peer_loss_reason():
     assert supervisor.status().failure_reason == reason
     assert reason in supervisor._exit_detail(1)
     assert "generic launcher noise" not in supervisor._exit_detail(1)
+
+
+def test_supervisor_refreshes_rank_zero_lifetime_lease(tmp_path):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+        launcher_lease_interval=0.01,
+    )
+    path = supervisor._prepare_launcher_lease()
+    first = json.loads(path.read_text(encoding="utf-8"))
+    supervisor.process = _fake_launcher(pid=54321)
+
+    supervisor._start_launcher_lease_heartbeat()
+    deadline = launch.time.monotonic() + 1.0
+    while launch.time.monotonic() < deadline:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if current["launcher_pid"] == 54321 and (
+            current["updated_at"] > first["updated_at"]
+        ):
+            break
+        launch.time.sleep(0.01)
+    else:
+        pytest.fail("launcher lease heartbeat did not refresh")
+
+    supervisor._stop_launcher_lease_heartbeat(remove=False)
+
+    assert current["deployment_id"] == "cluster-test"
+    assert current["plan_hash"] == "c" * 64
+    assert current["coordinator_pid"] == launch.os.getpid()
+    assert path.exists()
+    supervisor._stop_launcher_lease_heartbeat(remove=True)
+    assert not path.exists()
+
+
+def test_stale_supervisor_lease_kills_rank_with_live_launcher_parent(tmp_path):
+    """A dead public server cannot leave an adopted mlx.launch tree loaded."""
+
+    from omlx.cluster.inference_worker import _watch_launcher_parent
+
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    lease = supervisor._prepare_launcher_lease()
+    stale = launch.time.time() - 120.0
+    launch.os.utime(lease, (stale, stale))
+    exits = []
+    marker = SimpleNamespace(update=lambda _phase, **_extra: None)
+
+    _watch_launcher_parent(
+        94666,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=30.0,
+        # The orphaned launcher is still alive and remains the rank's parent.
+        # Only the coordinator lease can distinguish this from a live server.
+        get_parent_pid=lambda: 94666,
+        wait=lambda _seconds: None,
+        exit_process=exits.append,
+        emit_event=lambda _event: None,
+        release_memory=lambda _reason: None,
+    )
+
+    assert exits == [1]
 
 
 def test_supervisor_prefers_rank_marker_over_mlx_cleanup_traceback(monkeypatch):
@@ -1778,10 +1849,14 @@ def _parsed_plan(deployment: ClusterDeployment, tmp_path):
 def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
     from omlx.cluster.inference_worker import _prompt_cache_ssd_dir
 
-    deployment = _deployment()
+    baseline = _deployment()
+    deployment = replace(
+        baseline,
+        execution=replace(baseline.execution, prompt_cache_ssd=True),
+    )
     args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
 
-    # On by default: the flag rides the one argv every host runs.
+    # When explicitly enabled, the flag rides the one argv every host runs.
     assert "--prompt-cache-ssd" in _worker_argv(deployment, tmp_path)
     assert args.prompt_cache_ssd is True
 

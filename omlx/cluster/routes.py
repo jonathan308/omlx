@@ -449,8 +449,8 @@ class ClusterPlanRequest(BaseModel):
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     # Process-lifetime prefix snapshots are a reuse optimization, not a cold
-    # prefill requirement. None/False keeps synchronous SSD writes off the
-    # launch path; True is an explicit cluster contract.
+    # prefill requirement. None/False keeps the bounded SSD write-behind tier
+    # out of the launch contract; True enables it explicitly on every rank.
     prompt_cache_ssd: bool | None = None
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
@@ -766,7 +766,7 @@ def _placement_signature(plan: dict[str, Any]) -> str:
                 "mtp_num_draft_tokens": mtp_num_draft_tokens,
             }
     # False is the latency-safe default and intentionally shares the legacy
-    # signature. Enabling synchronous distributed SSD snapshots is a material
+    # signature. Enabling distributed SSD snapshot write-behind is a material
     # launch-mode change and must be explicitly approved.
     if bool(plan.get("prompt_cache_ssd", False)):
         if isinstance(rows, dict):
@@ -1014,6 +1014,11 @@ class ClusterAutoconfigureRequest(BaseModel):
     sampling_rank_only: bool = True
     async_overlap: bool = True
     cache_affinity: bool = True
+    # Distributed workers always retain their bounded in-memory prompt LRU.
+    # Durable boundary snapshots add bounded detached state and SSD traffic,
+    # so one-click setup keeps them opt-in and carries the choice through the
+    # signed plan instead of silently changing memory/disk use at activation.
+    prompt_cache_ssd: bool = False
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
@@ -1231,6 +1236,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         layer_count=request.layer_count,
         nodes=request.nodes,
         execution_profile=request.execution_profile,
+        prompt_cache_ssd=request.prompt_cache_ssd,
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
@@ -1626,7 +1632,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     staging = await asyncio.to_thread(_staging_for, request, choice)
     staging_ready = staging is None or bool(staging.get("ready"))
 
-    plan_payload = _plan_with_signature(choice.plan.to_dict())
+    plan_contract = choice.plan.to_dict()
+    # False deliberately retains the legacy placement signature. True is a
+    # material launch-mode choice because every rank creates a persistent,
+    # plan-scoped SSD snapshot store and must therefore be explicitly signed.
+    if request.prompt_cache_ssd:
+        plan_contract["prompt_cache_ssd"] = True
+    plan_payload = _plan_with_signature(plan_contract)
     preflight_summary = describe_preflight(issues)
     if fabric_blocker:
         preflight_summary = f"Cluster link is not ready: {fabric_blocker}"
@@ -1675,6 +1687,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "sampling_rank_only": request.sampling_rank_only,
             "async_overlap": request.async_overlap,
             "cache_affinity": request.cache_affinity,
+            "prompt_cache_ssd": request.prompt_cache_ssd,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
             "ring_connections_per_ip": (
@@ -3717,7 +3730,7 @@ async def _activate_and_report(
         )
         # Every persisted deployment field that reaches a worker is part of
         # runtime identity.  Comparing only plan/MTP let execution toggles
-        # (notably synchronous SSD snapshots) reuse an engine launched with a
+        # (notably SSD snapshot write-behind) reuse an engine launched with a
         # different contract.
         already_loaded = loaded_deployment == deployment
         if not already_loaded:

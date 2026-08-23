@@ -230,11 +230,40 @@ def test_autoconfigure_returns_an_activatable_proposal():
     assert activation["sampling_rank_only"] is True
     assert activation["async_overlap"] is False
     assert activation["cache_affinity"] is False
+    assert activation["prompt_cache_ssd"] is False
+    assert "prompt_cache_ssd" not in body["plan"]
     assert activation["max_kv_size"] == 4096
     assert activation["target_context_tokens"] == 4096
     assert body["plan"]["cluster"]["target_context_tokens"] == 4096
     assert activation["ring_connections_per_ip"] == (
         7 if activation["backend"] == "ring" else None
+    )
+
+
+def test_autoconfigure_signs_and_activates_explicit_ssd_prompt_snapshots():
+    """One-click used to ignore this field, leaving every rank memory-only."""
+
+    from fastapi.testclient import TestClient
+
+    baseline = _autoconfigure_payload()
+    enabled = baseline | {"prompt_cache_ssd": True}
+    with TestClient(_app()) as client:
+        cold = client.post("/admin/api/cluster/autoconfigure", json=baseline)
+        durable = client.post("/admin/api/cluster/autoconfigure", json=enabled)
+
+    assert cold.status_code == 200, cold.text
+    assert durable.status_code == 200, durable.text
+    cold_body = cold.json()
+    durable_body = durable.json()
+    assert cold_body["activation"]["prompt_cache_ssd"] is False
+    assert "prompt_cache_ssd" not in cold_body["plan"]
+    assert durable_body["activation"]["prompt_cache_ssd"] is True
+    assert durable_body["plan"]["prompt_cache_ssd"] is True
+    assert durable_body["activation"]["approved_placement"] == (
+        durable_body["plan"]["placement_signature"]
+    )
+    assert durable_body["plan"]["placement_signature"] != (
+        cold_body["plan"]["placement_signature"]
     )
 
 

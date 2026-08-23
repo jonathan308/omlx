@@ -1427,7 +1427,14 @@ async def _release_after_stream(
         async for chunk in generator:
             yield chunk
     finally:
-        await lease.release()
+        try:
+            # StreamingResponse closes this outer iterator on disconnect.
+            # Await the nested body close before releasing the pool lease so
+            # its engine request (and, for clusters, private rank-zero HTTP
+            # response) cannot outlive the lease that was protecting it.
+            await _aclose_async_iterator(generator)
+        finally:
+            await lease.release()
 
 
 async def get_engine_for_model(
@@ -2318,6 +2325,23 @@ async def _safe_anext(ait):
         return await ait.__anext__()
     except StopAsyncIteration:
         return _KEEPALIVE_SENTINEL
+
+
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Deterministically unwind a nested async stream, when it supports it.
+
+    ``async for`` does not await ``aclose()`` on the iterator when the *outer*
+    async generator is closed at one of its own yield points. The runtime may
+    eventually finalize that iterator, but a client disconnect must release an
+    inference request now: local engines abort their scheduler request in that
+    close path and the distributed engine closes its private rank-zero HTTP
+    response there. The compatibility check keeps this safe for custom async
+    iterators used by integrations and tests.
+    """
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
 
 
 async def _with_sse_keepalive(
@@ -4572,23 +4596,24 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    engine_stream = engine.stream_generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        stop=request.stop,
+        seed=request.seed,
+        **gen_kwargs,
+    )
     try:
-        async for output in engine.stream_generate(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            xtc_probability=xtc_probability,
-            xtc_threshold=xtc_threshold,
-            stop=request.stop,
-            seed=request.seed,
-            **gen_kwargs,
-        ):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -4620,6 +4645,8 @@ async def stream_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Record metrics
     if last_output and last_output.finished:
@@ -4842,8 +4869,9 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -4897,6 +4925,8 @@ async def stream_chat_completion(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
@@ -5306,8 +5336,9 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -5384,6 +5415,8 @@ async def stream_anthropic_messages(
         yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
@@ -6836,8 +6869,9 @@ async def stream_responses_api(
         else:
             stream_content = False
 
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine_stream:
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -6886,6 +6920,8 @@ async def stream_responses_api(
             },
         )
         return
+    finally:
+        await _aclose_async_iterator(engine_stream)
 
     # Flush remaining content from parsers
     if stream_content:

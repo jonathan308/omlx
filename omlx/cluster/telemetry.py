@@ -33,6 +33,12 @@ _MAX_SHARED_REQUEST_BYTES = 256 * 1024 * 1024
 _SHARED_OBJECT_MAGIC = 0x4F4D4C58  # ASCII "OMLX"
 _SHARED_OBJECT_HEADER_BYTES = 64
 
+# Runtime markers are capped at 64 KiB.  A normal deployment admits eight
+# concurrent requests, but keep enough bounded detail for deliberately wider
+# serving configurations without letting telemetry grow with an unbounded
+# queue.  ``active_requests`` remains the authoritative total when truncated.
+_MAX_ACTIVE_REQUEST_METRICS = 64
+
 # How often a rank refreshes its marker with nothing to report.
 #
 # Every other publish is request-driven, so an idle deployment's marker simply
@@ -117,6 +123,7 @@ class RuntimeTelemetry:
         cancel_deployment_id: str = "",
         cancel_plan_hash: str = "",
         cancel_epoch_floor: int = 0,
+        prompt_cache_ssd_enabled: bool = False,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -162,6 +169,13 @@ class RuntimeTelemetry:
         self._cache_tokens_reused = 0
         self._cache_entries = 0
         self._cache_bytes = 0
+        self._cache_memory_entries = 0
+        self._cache_memory_bytes = 0
+        self._cache_memory_hits = 0
+        self._cache_ssd_entries = 0
+        self._cache_ssd_bytes = 0
+        self._cache_ssd_hits = 0
+        self._cache_ssd_enabled = bool(prompt_cache_ssd_enabled)
         # Rank-side force-cancel surface. The coordinator drops a cancel file
         # next to the runtime markers; the heartbeat picks it up and removes
         # every active uid through BatchGenerator.remove — MLX-LM's own
@@ -585,6 +599,11 @@ class RuntimeTelemetry:
         remaining_tokens: int,
         entries: int,
         nbytes: int,
+        memory_entries: int | None = None,
+        memory_bytes: int | None = None,
+        ssd_entries: int | None = None,
+        ssd_bytes: int | None = None,
+        hit_tier: str | None = None,
     ) -> None:
         now = float(self._clock())
         prompt = max(0, int(prompt_tokens))
@@ -595,15 +614,53 @@ class RuntimeTelemetry:
             if reused > 0:
                 self._cache_hits += 1
                 self._cache_tokens_reused += reused
+                if hit_tier == "ssd":
+                    self._cache_ssd_hits += 1
+                else:
+                    # The optional argument preserves the old in-memory-only
+                    # caller contract while making durable restores explicit.
+                    self._cache_memory_hits += 1
             self._cache_entries = max(0, int(entries))
             self._cache_bytes = max(0, int(nbytes))
+            if memory_entries is None and ssd_entries is None:
+                # Backward-compatible callers report the volatile tier only.
+                memory_entries = entries
+                memory_bytes = nbytes
+            if memory_entries is not None:
+                self._cache_memory_entries = max(0, int(memory_entries))
+            if memory_bytes is not None:
+                self._cache_memory_bytes = max(0, int(memory_bytes))
+            if ssd_entries is not None:
+                self._cache_ssd_entries = max(0, int(ssd_entries))
+            if ssd_bytes is not None:
+                self._cache_ssd_bytes = max(0, int(ssd_bytes))
             self._publish_locked(now, force=False)
 
-    def observe_cache_state(self, *, entries: int, nbytes: int) -> None:
+    def observe_cache_state(
+        self,
+        *,
+        entries: int,
+        nbytes: int,
+        memory_entries: int | None = None,
+        memory_bytes: int | None = None,
+        ssd_entries: int | None = None,
+        ssd_bytes: int | None = None,
+    ) -> None:
         now = float(self._clock())
         with self._lock:
             self._cache_entries = max(0, int(entries))
             self._cache_bytes = max(0, int(nbytes))
+            if memory_entries is None and ssd_entries is None:
+                memory_entries = entries
+                memory_bytes = nbytes
+            if memory_entries is not None:
+                self._cache_memory_entries = max(0, int(memory_entries))
+            if memory_bytes is not None:
+                self._cache_memory_bytes = max(0, int(memory_bytes))
+            if ssd_entries is not None:
+                self._cache_ssd_entries = max(0, int(ssd_entries))
+            if ssd_bytes is not None:
+                self._cache_ssd_bytes = max(0, int(ssd_bytes))
             self._publish_locked(now, force=False)
 
     def _finish_locked(
@@ -714,6 +771,7 @@ class RuntimeTelemetry:
         )
         end_to_end_tps = sample.completion_tokens / elapsed if elapsed > 0 else 0.0
         return {
+            "request_id": sample.request_id,
             "status": status,
             "prompt_tokens": sample.prompt_tokens,
             "cached_tokens": sample.cached_tokens,
@@ -735,9 +793,13 @@ class RuntimeTelemetry:
         }
 
     def _snapshot_locked(self, now: float) -> dict[str, Any]:
+        active_samples = sorted(
+            self._requests.values(),
+            key=lambda item: item.request_id,
+        )
         active_sample = (
-            max(self._requests.values(), key=lambda item: item.updated_at)
-            if self._requests
+            max(active_samples, key=lambda item: item.updated_at)
+            if active_samples
             else None
         )
         current = (
@@ -746,13 +808,13 @@ class RuntimeTelemetry:
             else self._last_completed
         )
         active_completion_tokens = sum(
-            sample.completion_tokens for sample in self._requests.values()
+            sample.completion_tokens for sample in active_samples
         )
         uptime = max(0.0, now - self._started_at)
         total_generated = self._completion_tokens_total + active_completion_tokens
         active_decode_seconds = sum(
             now - sample.first_token_at
-            for sample in self._requests.values()
+            for sample in active_samples
             if sample.first_token_at is not None
         )
         decode_seconds = self._decode_seconds_total + active_decode_seconds
@@ -774,6 +836,18 @@ class RuntimeTelemetry:
             "prompt_tokens_total": self._prompt_tokens_total,
             "completion_tokens_total": self._completion_tokens_total,
             "cached_tokens_total": self._cached_tokens_total,
+            # ``last_request`` is retained for older dashboards.  New clients
+            # use this stable request-id ordered collection so concurrent
+            # prompt/decode rates never overwrite one another before the API
+            # boundary.
+            "active_request_metrics": [
+                self._sample_snapshot(sample, now=now, status="running")
+                for sample in active_samples[:_MAX_ACTIVE_REQUEST_METRICS]
+            ],
+            "active_request_metrics_truncated": max(
+                0,
+                len(active_samples) - _MAX_ACTIVE_REQUEST_METRICS,
+            ),
             "aggregate_decode_tps": (
                 total_generated / decode_seconds if decode_seconds > 0 else 0.0
             ),
@@ -793,6 +867,17 @@ class RuntimeTelemetry:
                 "tokens_reused": self._cache_tokens_reused,
                 "entries": self._cache_entries,
                 "bytes": self._cache_bytes,
+                "ssd_enabled": self._cache_ssd_enabled,
+                "memory": {
+                    "entries": self._cache_memory_entries,
+                    "bytes": self._cache_memory_bytes,
+                    "hits": self._cache_memory_hits,
+                },
+                "ssd": {
+                    "entries": self._cache_ssd_entries,
+                    "bytes": self._cache_ssd_bytes,
+                    "hits": self._cache_ssd_hits,
+                },
             },
             "pipeline": {
                 "batch_steps": self._batch_steps,
@@ -910,6 +995,7 @@ def install_server_telemetry(
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
     ssd_cache_persistent: bool = False,
+    ssd_write_behind: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
 ) -> Iterator[RuntimeTelemetry]:
@@ -964,6 +1050,7 @@ def install_server_telemetry(
         cancel_deployment_id=marker_deployment_id,
         cancel_plan_hash=marker_plan_hash,
         cancel_epoch_floor=worker_cancel_epoch_floor,
+        prompt_cache_ssd_enabled=bool(ssd_cache_dir),
     )
 
     snapshot_ctx = threading.local()
@@ -981,6 +1068,7 @@ def install_server_telemetry(
             step=snapshot_step,
             max_entries=ssd_max_entries,
             persistent=ssd_cache_persistent,
+            write_behind=ssd_write_behind,
         )
     try:
         group = mx.distributed.init()
@@ -1307,18 +1395,30 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
-        def _omlx_cache_inventory(self) -> tuple[int, int]:
-            """Combined volatile LRU and durable rank-local snapshot tiers."""
+        def _omlx_cache_inventory(
+            self,
+        ) -> tuple[int, int, int, int, int, int]:
+            """Combined totals plus observable memory and SSD tier splits."""
 
+            memory_entries = len(self)
+            memory_bytes = self.nbytes
             disk_entries = len(ssd_store) if ssd_store is not None else 0
             disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
-            return len(self) + disk_entries, self.nbytes + disk_bytes
+            return (
+                memory_entries + disk_entries,
+                memory_bytes + disk_bytes,
+                memory_entries,
+                memory_bytes,
+                disk_entries,
+                disk_bytes,
+            )
 
         def _fetch_observed(self, model: Any, tokens: list[int]) -> Any:
             return super().fetch_nearest_cache(model, tokens)
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
+            hit_tier = "memory" if cache is not None else None
             if cache is not None and not rest and tokens:
                 # MLX-LM's exact-hit branch returns an empty rest, unlike its
                 # shorter/longer branches which cap the prefix at len - 1. The
@@ -1337,6 +1437,7 @@ def install_server_telemetry(
                     rest = list(tokens[-1:])
                 else:
                     cache, rest = None, list(tokens)
+                    hit_tier = None
             # Record the full prompt so the boundary-snapshot callback can key
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
@@ -1352,8 +1453,18 @@ def install_server_telemetry(
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
+                        hit_tier = "ssd"
             cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
-            entries, nbytes = self._omlx_cache_inventory()
+            if cache is None:
+                hit_tier = None
+            (
+                entries,
+                nbytes,
+                memory_entries,
+                memory_bytes,
+                ssd_entries,
+                ssd_bytes,
+            ) = self._omlx_cache_inventory()
             # Observe the final agreed tier. Recording the volatile lookup
             # before SSD restore made a real durable hit appear as a miss on
             # the cluster dashboard even while per-request cached_tokens was
@@ -1363,6 +1474,11 @@ def install_server_telemetry(
                 remaining_tokens=len(rest),
                 entries=entries,
                 nbytes=nbytes,
+                memory_entries=memory_entries,
+                memory_bytes=memory_bytes,
+                ssd_entries=ssd_entries,
+                ssd_bytes=ssd_bytes,
+                hit_tier=hit_tier,
             )
             return cache, rest
 
@@ -1391,8 +1507,22 @@ def install_server_telemetry(
 
         def insert_cache(self, *args: Any, **kwargs: Any) -> Any:
             result = super().insert_cache(*args, **kwargs)
-            entries, nbytes = self._omlx_cache_inventory()
-            telemetry.observe_cache_state(entries=entries, nbytes=nbytes)
+            (
+                entries,
+                nbytes,
+                memory_entries,
+                memory_bytes,
+                ssd_entries,
+                ssd_bytes,
+            ) = self._omlx_cache_inventory()
+            telemetry.observe_cache_state(
+                entries=entries,
+                nbytes=nbytes,
+                memory_entries=memory_entries,
+                memory_bytes=memory_bytes,
+                ssd_entries=ssd_entries,
+                ssd_bytes=ssd_bytes,
+            )
             return result
 
     class CoordinatedGenerationContext(original_generation_context):
@@ -1593,6 +1723,17 @@ def install_server_telemetry(
     mlx_server.GenerationContext = CoordinatedGenerationContext
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
+        # A persistent manifest can already contain useful snapshots before
+        # the first lookup. Publish that inventory as soon as serving begins
+        # so "enabled but idle" is distinguishable from "not wired".
+        telemetry.observe_cache_state(
+            entries=len(ssd_store),
+            nbytes=ssd_store.nbytes,
+            memory_entries=0,
+            memory_bytes=0,
+            ssd_entries=len(ssd_store),
+            ssd_bytes=ssd_store.nbytes,
+        )
     # Started here rather than by the caller: this block is exactly the span
     # during which a rank is alive and expected to look alive, and a heartbeat
     # a caller can forget to start is a heartbeat that will be forgotten.
@@ -1606,7 +1747,19 @@ def install_server_telemetry(
         mlx_server.LRUPromptCache = original_prompt_cache
         mlx_server.GenerationContext = original_generation_context
         mlx_server.stream_generate = original_stream_generate
-        if ssd_store is not None and not ssd_cache_persistent:
+        snapshot_writer_closed = True
+        if ssd_store is not None:
+            snapshot_writer_closed = ssd_store.close(timeout=10.0)
+            if not snapshot_writer_closed:
+                logger.warning(
+                    "Prompt snapshot writer did not drain within 10 seconds; "
+                    "leaving its directory intact for failure-safe teardown"
+                )
+        if (
+            ssd_store is not None
+            and snapshot_writer_closed
+            and not ssd_cache_persistent
+        ):
             # Legacy process-lifetime mode: a hard crash skips this and the
             # next nonpersistent store reclaims the leftovers instead.
             shutil.rmtree(ssd_store.directory, ignore_errors=True)

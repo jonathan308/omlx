@@ -319,6 +319,7 @@ def _pid_alive(pid: int) -> bool:
 
 _LAUNCH_MANIFEST_PREFIX = "launch-"
 _LOOPBACK_SSH_TARGETS = {"127.0.0.1", "localhost", "::1"}
+_DEFAULT_LAUNCHER_LEASE_INTERVAL = 5.0
 
 
 def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
@@ -332,6 +333,55 @@ def _launcher_log_path(state_dir: str | Path, deployment_id: str) -> Path:
     """Private, durable output from every rank relayed by ``mlx.launch``."""
 
     return Path(state_dir).expanduser() / f"{deployment_id}-launcher.log"
+
+
+def _launcher_lease_path(state_dir: str | Path, deployment_id: str) -> Path:
+    """Process-lifetime lease watched by the local rank-zero worker.
+
+    The coordinator instance makes the path unique across server restarts. A
+    newly started server must not refresh an old launch's lease before the
+    orphan reaper has had a chance to identify it.
+    """
+
+    return (
+        Path(state_dir).expanduser().resolve()
+        / f"launch-{deployment_id}-{_COORDINATOR_INSTANCE_ID}.lease"
+    )
+
+
+def _write_launcher_lease(
+    path: Path,
+    deployment: ClusterDeployment,
+    *,
+    launcher_pid: int | None,
+) -> None:
+    """Atomically refresh the coordinator-owned rank lifetime lease."""
+
+    payload = {
+        "schema_version": 1,
+        "deployment_id": deployment.deployment_id,
+        "plan_hash": deployment.plan_hash,
+        "coordinator_pid": os.getpid(),
+        "coordinator_instance": _COORDINATOR_INSTANCE_ID,
+        "launcher_pid": launcher_pid,
+        "updated_at": time.time(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            temporary.unlink()
 
 
 def _serve_release_path(state_dir: str | Path, deployment_id: str) -> Path:
@@ -1192,6 +1242,7 @@ def build_mlx_launch_argv(
     state_dir: str = "~/.omlx/cluster/runtime",
     control_host: str | None = None,
     control_port: int | None = None,
+    launcher_lease: Path | None = None,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
 
@@ -1230,6 +1281,8 @@ def build_mlx_launch_argv(
             raise ValueError("rank-control port must be between 1 and 65535")
     if cwd is not None and not cwd.is_absolute():
         raise ValueError("distributed working directory must be absolute")
+    if launcher_lease is not None and not launcher_lease.is_absolute():
+        raise ValueError("launcher lease path must be absolute")
 
     launcher = (
         "from mlx._distributed_utils.launch import main; raise SystemExit(main() or 0)"
@@ -1300,6 +1353,8 @@ def build_mlx_launch_argv(
             deployment.execution.tuning_reason,
         ]
     )
+    if launcher_lease is not None:
+        argv.extend(["--launcher-lease", str(launcher_lease)])
     if control_host is not None and control_port is not None:
         argv.extend(
             [
@@ -2752,8 +2807,14 @@ class DistributedJobSupervisor:
         load_timeout: float = 1800.0,
         stop_timeout: float = 10.0,
         preflight: bool = True,
+        launcher_lease_interval: float = _DEFAULT_LAUNCHER_LEASE_INTERVAL,
     ) -> None:
-        if load_timeout <= 0 or stop_timeout <= 0:
+        if (
+            load_timeout <= 0
+            or stop_timeout <= 0
+            or not math.isfinite(launcher_lease_interval)
+            or launcher_lease_interval <= 0
+        ):
             raise ValueError("supervisor timeouts must be positive")
         self.deployment = deployment
         self.python_executable = _validate_python_executable(python_executable)
@@ -2762,6 +2823,7 @@ class DistributedJobSupervisor:
         self.load_timeout = load_timeout
         self.stop_timeout = stop_timeout
         self.preflight = preflight
+        self.launcher_lease_interval = float(launcher_lease_interval)
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
         self.collective_port: int | None = None
@@ -2777,10 +2839,81 @@ class DistributedJobSupervisor:
         self._readers: list[threading.Thread] = []
         self._launcher_log: Any | None = None
         self._launcher_log_bytes = 0
+        self._launcher_lease_path: Path | None = None
+        self._launcher_lease_stop = threading.Event()
+        self._launcher_lease_thread: threading.Thread | None = None
 
     @property
     def endpoint(self) -> str | None:
         return f"http://127.0.0.1:{self.port}" if self.port is not None else None
+
+    def _prepare_launcher_lease(self) -> Path:
+        """Publish the lease before spawning anything that may outlive us."""
+
+        path = _launcher_lease_path(
+            self.state_dir,
+            self.deployment.deployment_id,
+        )
+        _write_launcher_lease(path, self.deployment, launcher_pid=None)
+        self._launcher_lease_path = path
+        return path
+
+    def _start_launcher_lease_heartbeat(self) -> None:
+        """Keep rank zero tied to this coordinator, independent of PPID.
+
+        ``mlx.launch`` is deliberately started in a new session and can be
+        reparented to PID 1 if oMLX exits. Its ranks therefore cannot use their
+        immediate parent as proof that the public server still exists. This
+        daemon refreshes a local lease rank zero watches; after a coordinator
+        crash the daemon vanishes with it, rank zero self-terminates, and peer
+        liveness tears down the remote ranks.
+        """
+
+        path = self._launcher_lease_path
+        if path is None or self._launcher_lease_thread is not None:
+            return
+        self._launcher_lease_stop.clear()
+
+        def heartbeat() -> None:
+            while not self._launcher_lease_stop.wait(
+                self.launcher_lease_interval
+            ):
+                process = self.process
+                try:
+                    _write_launcher_lease(
+                        path,
+                        self.deployment,
+                        launcher_pid=(process.pid if process is not None else None),
+                    )
+                except OSError as exc:
+                    # Fail closed: if writes keep failing the old lease ages
+                    # out and the ranks release their memory. Continuing to
+                    # claim ownership without a renewable lease recreates the
+                    # orphan this mechanism exists to prevent.
+                    logger.warning("Could not refresh launcher lease: %s", exc)
+
+        self._launcher_lease_thread = threading.Thread(
+            target=heartbeat,
+            name="omlx-cluster-launcher-lease",
+            daemon=True,
+        )
+        self._launcher_lease_thread.start()
+
+    def _stop_launcher_lease_heartbeat(
+        self,
+        *,
+        remove: bool,
+        timeout: float = 2.0,
+    ) -> None:
+        self._launcher_lease_stop.set()
+        thread, self._launcher_lease_thread = self._launcher_lease_thread, None
+        if thread is not None:
+            thread.join(timeout=timeout)
+        path = self._launcher_lease_path
+        if remove and path is not None:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+            self._launcher_lease_path = None
 
     def _warm_selected_fabric(self) -> dict[str, Any] | None:
         """Create and retire one verified JACCL group before loading weights.
@@ -2869,6 +3002,12 @@ class DistributedJobSupervisor:
         self.port, self.collective_port = _available_launch_ports(self.deployment)
         control_host = self.deployment.hosts[0].ips[0]
         self.control_port = _available_control_port(control_host)
+        try:
+            launcher_lease = self._prepare_launcher_lease()
+        except OSError as exc:
+            raise DistributedLaunchError(
+                f"Could not create the cluster launcher lease: {exc}"
+            ) from exc
         argv = build_mlx_launch_argv(
             self.deployment,
             hostfile=hostfile,
@@ -2879,6 +3018,7 @@ class DistributedJobSupervisor:
             state_dir=self.state_dir,
             control_host=control_host,
             control_port=self.control_port,
+            launcher_lease=launcher_lease,
         )
         self._phase = "loading"
         try:
@@ -2898,6 +3038,12 @@ class DistributedJobSupervisor:
                 env=environment,
                 start_new_session=True,
             )
+            _write_launcher_lease(
+                launcher_lease,
+                self.deployment,
+                launcher_pid=self.process.pid,
+            )
+            self._start_launcher_lease_heartbeat()
             self._write_launch_manifest()
             self._open_launcher_log()
             self._start_readers()
@@ -3224,6 +3370,11 @@ class DistributedJobSupervisor:
         launches`` enough evidence to finish the job (G8).
         """
 
+        # Stop renewing before teardown begins. If ordinary signaling wedges,
+        # the lease becomes the independent backstop that makes rank zero
+        # release itself instead of remaining resident under an orphaned
+        # ``mlx.launch`` process.
+        self._stop_launcher_lease_heartbeat(remove=False)
         process = self.process
         if process is not None:
             process_group = process.pid
@@ -3342,6 +3493,7 @@ class DistributedJobSupervisor:
         self.failure_event = None
         self._phase = "stopped"
         self._remove_launch_manifest()
+        self._stop_launcher_lease_heartbeat(remove=True)
         with suppress(Exception):
             _set_serve_release(self.deployment, self.state_dir, None)
         if self._temporary is not None:

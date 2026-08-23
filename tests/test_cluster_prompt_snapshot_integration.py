@@ -238,6 +238,7 @@ def test_persistent_tier_survives_telemetry_teardown(tmp_path, monkeypatch):
         _Marker(),
         ssd_cache_dir=str(tmp_path),
         ssd_cache_persistent=True,
+        ssd_write_behind=True,
         prefill_step_size=STEP,
     ):
         tokens = list(range(8))

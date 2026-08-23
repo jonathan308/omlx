@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -661,6 +662,22 @@ def _configure_tensor_shard_weights(
 ) -> tuple[int, ...]:
     """Publish this rank's signed asymmetric TP partition to model adapters."""
 
+    component_overrides = (
+        "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
+        "OMLX_TP_MOE_SHARD_WEIGHTS",
+    )
+    configured_overrides = tuple(
+        name for name in component_overrides if os.environ.get(name, "").strip()
+    )
+    for name in component_overrides:
+        os.environ.pop(name, None)
+    if configured_overrides:
+        logger.warning(
+            "Ignoring unsigned tensor-component shard overrides (%s); "
+            "the signed worker plan controls rank ownership",
+            ", ".join(configured_overrides),
+        )
+
     if tensor_parallel_size < 2:
         os.environ.pop("OMLX_TP_SHARD_WEIGHTS", None)
         return (1,)
@@ -927,7 +944,10 @@ def _watch_launcher_parent(
     until the Mac is rebooted.
     """
 
-    watched = Path(watched_marker_path) if watched_marker_path else None
+    watched = (
+        Path(watched_marker_path).expanduser() if watched_marker_path else None
+    )
+    watched_once = False
     while True:
         wait(poll_interval)
         reason = None
@@ -940,6 +960,7 @@ def _watch_launcher_parent(
         elif watched is not None and marker_stale_after > 0:
             try:
                 age = time.time() - watched.stat().st_mtime
+                watched_once = True
             except OSError:
                 age = None
             # A lease that never appeared yet is not stale; the launcher may
@@ -949,19 +970,34 @@ def _watch_launcher_parent(
                     f"launcher lease {watched} is stale ({age:.1f}s > "
                     f"{marker_stale_after:.1f}s); the launcher is wedged"
                 )
+            elif age is None and watched_once:
+                reason = (
+                    f"launcher lease {watched} disappeared after activation; "
+                    "the coordinator no longer owns this rank"
+                )
         if reason is None:
             continue
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
         # failure to "heartbeat missing" with no explanation.
-        marker.update("launcher_lost", error=reason)
+        try:
+            marker.update("launcher_lost", error=reason)
+        except Exception:
+            # Diagnostics are secondary to releasing an orphaned rank. A
+            # read-only/full state directory must not disable the watchdog.
+            logger.warning("Launcher watchdog marker update failed", exc_info=True)
         if on_abort is not None:
             try:
                 on_abort(reason)
             except Exception:
                 logger.warning("Launcher watchdog abort stage failed", exc_info=True)
-        emit_event({"type": "launcher_lost", "reason": reason})
+        try:
+            emit_event({"type": "launcher_lost", "reason": reason})
+        except Exception:
+            # The coordinator's pipe is expected to be gone in the exact
+            # failure this watchdog handles; BrokenPipe must not prevent exit.
+            logger.warning("Launcher watchdog event emission failed", exc_info=True)
         try:
             release_memory(f"launcher watchdog exit: {reason}")
         except Exception:
@@ -1077,12 +1113,30 @@ def _start_launcher_watchdog(
     parent_pid: int,
     *,
     state_dir: str | None = None,
+    launcher_lease: str | None = None,
+    rank: int = 0,
 ) -> None:
-    # Optional coordinator/launcher lease file: when configured (and once
-    # it exists), the watchdog also fires if it goes stale — covering a
-    # launcher that is alive but wedged, which the parent-pid check alone
-    # cannot see. Off by default, preserving the original PPID-only watch.
-    lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
+    # Rank zero is local by deployment invariant, so it can watch the
+    # coordinator-owned lease without SSH traffic. Remote ranks follow rank
+    # zero through the peer watchdog. The environment fallback keeps manual
+    # worker launches compatible with the original opt-in surface.
+    automatic_lease = str(launcher_lease or "").strip()
+    manual_lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
+    lease = automatic_lease or manual_lease
+    if rank != 0 and automatic_lease:
+        # The automatic path lives on the coordinator Mac. A manual per-rank
+        # environment override remains supported for operators who mirror
+        # their own leases to every host.
+        lease = manual_lease
+    try:
+        lease_stale_after = float(
+            os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE_TIMEOUT", "30.0")
+            or "30.0"
+        )
+    except ValueError:
+        lease_stale_after = 30.0
+    if not math.isfinite(lease_stale_after) or lease_stale_after <= 0:
+        lease_stale_after = 30.0
     deployment_id = str(marker.payload.get("deployment_id") or "")
 
     def on_abort(reason: str) -> None:
@@ -1099,6 +1153,7 @@ def _start_launcher_watchdog(
         args=(parent_pid, marker),
         kwargs={
             "watched_marker_path": lease or None,
+            "marker_stale_after": lease_stale_after,
             "on_abort": on_abort,
         },
         name="omlx-cluster-launcher-watchdog",
@@ -1508,7 +1563,13 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     marker.start_heartbeat()
     _install_signal_handlers()
-    _start_launcher_watchdog(marker, launcher_parent_pid, state_dir=args.state_dir)
+    _start_launcher_watchdog(
+        marker,
+        launcher_parent_pid,
+        state_dir=args.state_dir,
+        launcher_lease=args.launcher_lease,
+        rank=rank,
+    )
     # Before the load, not after it. Loading a 300 GB model takes twenty
     # minutes, and a peer that goes away inside that window left every other
     # rank blocked in its first collective with nothing watching at all.
@@ -1790,6 +1851,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         assignment=assignment,
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
+                        ssd_write_behind=bool(args.prompt_cache_ssd),
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
@@ -1892,6 +1954,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-dir",
         default="~/.omlx/cluster/runtime",
         help="Local state directory shown by the oMLX GUI on each node",
+    )
+    parser.add_argument(
+        "--launcher-lease",
+        default="",
+        help=(
+            "Coordinator-owned lifetime lease. Rank zero exits if this stops "
+            "refreshing; remote ranks follow through peer liveness."
+        ),
     )
     parser.add_argument("--control-host", default="")
     parser.add_argument("--control-port", type=int, default=0)

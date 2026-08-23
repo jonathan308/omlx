@@ -75,6 +75,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/stage",
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
+    "/admin/api/cluster/replan",
 }
 
 
@@ -453,6 +454,277 @@ component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }}
     assert "runtime endpoint down" in result["detail"]
 
 
+def test_active_panel_preserves_per_request_prefill_and_decode_rates():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/m' }];
+component.runtimePayload = { jobs: [
+  // Rank zero is the coordinator and owns end-to-end request telemetry.
+  { deployment_id: 'pool-a', rank: 0, live: true, metrics: {
+    active_requests: 2,
+    active_request_metrics_truncated: 0,
+    active_request_metrics: [
+      {
+        request_id: 41, status: 'running', prompt_tokens: 4000,
+        cached_tokens: 1000, completion_tokens: 0, prefill_tps: 812.4,
+        decode_tps: 0, prefill_progress: {
+          active: true, processed: 2000, total: 3000,
+          average_speed: 812.4,
+        },
+      },
+      {
+        request_id: 42, status: 'running', prompt_tokens: 512,
+        cached_tokens: 0, completion_tokens: 11, prefill_tps: 905.2,
+        decode_tps: 44.25, prefill_progress: {
+          active: false, processed: 512, total: 512,
+          average_speed: 905.2,
+        },
+      },
+    ],
+    last_request: { request_id: 42, status: 'running' },
+  } },
+  // A peer marker may carry the same requests, but must not duplicate rows.
+  { deployment_id: 'pool-a', rank: 1, live: true, metrics: {
+    active_requests: 1,
+    active_request_metrics: [{ request_id: 999, status: 'running' }],
+  } },
+] };
+const rows = component.deploymentRequestMetrics();
+const active = {
+  ids: rows.map((row) => row.request_id),
+  phases: rows.map((row) => component.requestPhaseLabel(row)),
+  prefill: rows.map((row) => component.requestPrefillRate(row)),
+  decode: rows.map((row) => component.requestDecodeRate(row)),
+  count: component.deploymentRequestCountLabel(),
+};
+const metrics = component.runtimePayload.jobs[0].metrics;
+metrics.active_requests = 0;
+metrics.active_request_metrics = [];
+metrics.last_request = {
+  request_id: 42, status: 'completed', prompt_tokens: 512,
+  cached_tokens: 0, completion_tokens: 64, prefill_tps: 905.2,
+  decode_tps: 44.25,
+};
+const completed = component.deploymentRequestMetrics()[0];
+process.stdout.write(JSON.stringify({
+  active,
+  completed: {
+    id: completed.request_id,
+    history: completed._history,
+    phase: component.requestPhaseLabel(completed),
+    count: component.deploymentRequestCountLabel(),
+  },
+}));
+"""
+    )
+
+    assert result["active"] == {
+        "ids": [41, 42],
+        "phases": ["Prefill", "Decode"],
+        "prefill": ["812 tok/s", "905 tok/s"],
+        "decode": ["—", "44.3 tok/s"],
+        "count": "2 active",
+    }
+    assert result["completed"] == {
+        "id": 42,
+        "history": True,
+        "phase": "Complete",
+        "count": "Last completed request",
+    }
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-request-speeds" in template
+    assert "data-cluster-v2-request-speed-row" in template
+    assert "data-cluster-v2-request-prefill-rate" in template
+    assert "data-cluster-v2-request-decode-rate" in template
+
+
+def test_serving_profile_drives_the_server_owned_signed_plan():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+component.setExecutionProfile('throughput');
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+let posted = null;
+component.apiFetch = async (url, options) => {
+  if (url.endsWith('/autoconfigure')) {
+    posted = JSON.parse(options.body);
+    return {
+      plan: { assignments: [], placement_signature: 'a'.repeat(16) },
+      activation: {
+        execution_profile: posted.execution_profile,
+        approved_placement: 'a'.repeat(16),
+      },
+    };
+  }
+  return {};
+};
+(async () => {
+  await component.runPlan();
+  process.stdout.write(JSON.stringify({
+    selected: component.executionProfile,
+    posted: posted.execution_profile,
+    activation: component.activationRequestBody().execution_profile,
+    presets: component.executionProfileOptions().map((option) => ({
+      key: option.key,
+      limits: option.limits,
+    })),
+  }));
+})();
+"""
+    )
+
+    assert result["selected"] == "throughput"
+    assert result["posted"] == "throughput"
+    assert result["activation"] == "throughput"
+    assert result["presets"] == [
+        {"key": "interactive", "limits": "4 decode · 2 prompt · batch 2"},
+        {"key": "balanced", "limits": "8 decode · 4 prompt · batch 4"},
+        {"key": "throughput", "limits": "16 decode · 8 prompt · batch 8"},
+    ]
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-serving-profile" in template
+    assert "data-cluster-v2-serving-profile-option" in template
+    assert "There is no separate batching switch" in template
+
+
+def test_active_serving_status_uses_resolved_runtime_limits_and_batch_evidence():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{
+  deployment_id: 'pool-a', model: '/models/m',
+  execution: {
+    profile: 'balanced', decode_concurrency: 8, prompt_concurrency: 4,
+    pipeline_microbatch_size: 4, tuning_reason: 'configured fallback',
+  },
+}];
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, live: true,
+  optimizations: { coalesced_batching: {
+    enabled: true, active: true, reason: 'model cache is mergeable',
+  } },
+  metrics: {
+    execution: {
+      profile: 'throughput', decode_concurrency: 12,
+      prompt_concurrency: 6, pipeline_microbatch_size: 8,
+      tuning_reason: 'throughput profile auto-tuned for headroom',
+    },
+    pipeline: {
+      microbatch_target: 8,
+      last_batch: { coalesced_batch_size: 5 },
+    },
+  },
+}] };
+const execution = component.deploymentExecution();
+const batch = component.deploymentBatchStatus();
+process.stdout.write(JSON.stringify({
+  profile: component.deploymentExecutionProfileLabel(),
+  decode: execution.decode_concurrency,
+  prompt: execution.prompt_concurrency,
+  batch,
+}));
+"""
+    )
+
+    assert result["profile"] == "Throughput"
+    assert result["decode"] == 12
+    assert result["prompt"] == 6
+    assert result["batch"]["label"] == "Batched 5"
+    assert result["batch"]["target"] == 8
+    assert "5 of 8" in result["batch"]["detail"]
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-serving-status" in template
+    assert "data-cluster-v2-batching-state" in template
+    assert "data-cluster-v2-decode-concurrency" in template
+    assert "data-cluster-v2-prompt-concurrency" in template
+
+
+def test_active_profile_change_uses_preview_signature_for_replan_apply():
+    result = _run_wizard(
+        """
+global.setTimeout = () => 0;
+component.deploymentsPayload = [{
+  deployment_id: 'pool-a', model: '/models/m', target_context_tokens: 131072,
+  mtp_enabled: false,
+  execution: {
+    profile: 'balanced', auto_tune: true, sampling_rank_only: true,
+    async_overlap: true, cache_affinity: true, prompt_cache_ssd: true,
+    max_kv_size: 131072, ring_connections_per_ip: 4,
+    decode_concurrency: 8, prompt_concurrency: 4,
+    pipeline_microbatch_size: 4,
+  },
+}];
+const replanBodies = [];
+component.apiFetch = async (url, options) => {
+  const body = options && options.body ? JSON.parse(options.body) : null;
+  if (url.endsWith('/replan')) {
+    replanBodies.push(body);
+    if (!body.approved_placement) {
+      return { mode: 'preview', plan: { placement_signature: 'f'.repeat(16) } };
+    }
+    return { mode: 'applied', ok: true };
+  }
+  if (url.endsWith('/deployments')) return { deployments: component.deploymentsPayload };
+  if (url.endsWith('/runtime')) return { jobs: [], launchers: [] };
+  return {};
+};
+(async () => {
+  await component.previewExecutionProfile('throughput');
+  const pending = component.executionReplan && component.executionReplan.profile;
+  await component.applyExecutionProfileReplan();
+  process.stdout.write(JSON.stringify({
+    pending,
+    bodies: replanBodies,
+    selected: component.executionProfile,
+    cleared: component.executionReplan,
+  }));
+})();
+"""
+    )
+
+    assert result["pending"] == "throughput"
+    assert len(result["bodies"]) == 2
+    preview, apply = result["bodies"]
+    assert preview["deployment_id"] == "pool-a"
+    assert preview["execution_profile"] == "throughput"
+    assert preview["max_kv_size"] == 131072
+    assert preview["prompt_cache_ssd"] is True
+    assert "approved_placement" not in preview
+    assert apply == preview | {"approved_placement": "f" * 16}
+    assert "nodes" not in apply and "hosts" not in apply
+    assert result["selected"] == "throughput"
+    assert result["cleared"] is None
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-serving-replan" in template
+    assert "data-cluster-v2-serving-replan-confirm" in template
+    assert "data-cluster-v2-serving-replan-apply" in template
+
+
+def test_dark_tensor_controls_use_explicit_high_contrast_palette():
+    template = _read(TEMPLATE)
+    stylesheet = _read("omlx/admin/static/css/dashboard.css")
+
+    assert (
+        ":data-selected=\"planStrategy === option.key ? 'true' : 'false'\"" in template
+    )
+    assert "cluster-v2-tensor-segment" in template
+    assert ':data-tensor-tone="index % 5"' in template
+    assert "[data-cluster-v2-strategy-picker]" in stylesheet
+    assert 'button[data-selected="true"]' in stylesheet
+    assert "[data-cluster-v2-strategy-recommended]" in stylesheet
+    assert "color: #f8fafc !important" in stylesheet
+    assert ".cluster-v2-tensor-segment--2 { background: #52525b; }" in stylesheet
+
+    tensor_bar = template.split("data-cluster-v2-split-bar-tensor", 1)[1].split(
+        "</template>", 1
+    )[0]
+    assert "bg-neutral-400 text-white" not in tensor_bar
+
+
 def test_one_hertz_tick_polls_runtime_ownership_and_not_just_deployments():
     javascript = _read(JAVASCRIPT)
     tick = javascript.split("async tick() {", 1)[1].split("},", 1)[0]
@@ -796,6 +1068,64 @@ def test_strategy_picker_renders_between_models_and_roles():
     # Disabled options explain themselves.
     assert ":disabled=\"option.disabled\"" in picker
     assert ":title=\"option.disabledReason\"" in picker
+
+
+def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "data-cluster-v2-prompt-cache-ssd" in template
+    assert "data-cluster-v2-prompt-cache-ssd-toggle" in template
+    assert "data-cluster-v2-active-cache-mode" in template
+    assert 'x-model="promptCacheSsd"' in template
+    assert '@change="runPlan()"' in template
+    assert "promptCacheSsd: false" in javascript
+    assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
+    assert "Writes run in the background" in template
+    assert "512 MiB pending limit" in template
+
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+const posted = [];
+component.apiFetch = async (url, options) => {
+  const body = options && options.body ? JSON.parse(options.body) : null;
+  if (url.endsWith('/autoconfigure')) {
+    posted.push(body.prompt_cache_ssd);
+    const signature = body.prompt_cache_ssd ? 'd'.repeat(16) : 'c'.repeat(16);
+    return {
+      plan: { assignments: [], placement_signature: signature },
+      activation: { approved_placement: signature },
+    };
+  }
+  return {};
+};
+component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
+component.selectedModelPath = '/models/m';
+
+(async () => {
+  const defaultValue = component.promptCacheSsd;
+  await component.runPlan();
+  component.promptCacheSsd = true;
+  await component.runPlan();
+  process.stdout.write(JSON.stringify({
+    defaultValue,
+    posted,
+    enabledLabel: component.deploymentCacheLabel({
+      execution: { prompt_cache_ssd: true },
+    }),
+    disabledLabel: component.deploymentCacheLabel({
+      execution: { prompt_cache_ssd: false },
+    }),
+  }));
+})();
+""",
+    )
+
+    assert result["defaultValue"] is False
+    assert result["posted"] == [False, True]
+    assert "persistent SSD snapshots" in result["enabledLabel"]
+    assert "SSD snapshots off" in result["disabledLabel"]
 
 
 def test_every_strategy_uses_server_autoconfigure_and_its_tp_choice():

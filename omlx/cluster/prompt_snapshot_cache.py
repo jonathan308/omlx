@@ -44,9 +44,11 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import struct
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
@@ -59,6 +61,17 @@ logger = logging.getLogger(__name__)
 # recurrent states), so the count bound mainly limits how many distinct
 # reusable boundaries exist across all prompts; the byte bound is the backstop.
 _MAX_ENTRIES_DEFAULT = 512
+_MAX_PENDING_WRITES_DEFAULT = 2
+_PENDING_MAX_BYTES_DEFAULT = 512 * 1024 * 1024
+
+
+@dataclass
+class _FrozenPromptSnapshot:
+    """Detached, fully evaluated payload safe to hand to the writer thread."""
+
+    tensors: dict[str, Any]
+    metadata: dict[str, str]
+    nbytes: int
 
 
 class PoolingCacheSnapshot:
@@ -313,6 +326,67 @@ def _wrap_for_save(
     return [wrap(entry) for entry in cache]
 
 
+def _prepare_snapshot_payload(
+    cache: list[Any], *, boundary: int, segment_start: int
+) -> tuple[dict[str, Any], dict[str, str], int]:
+    """Flatten one boundary while its live cache still names that boundary.
+
+    This deliberately does not copy the arrays yet.  The caller first uses the
+    returned byte count to reserve bounded write-behind capacity, then copies
+    and evaluates every leaf before returning control to generation.  Metadata
+    is also sampled here: rotating offsets and recurrent layouts are just as
+    boundary-sensitive as the tensor bytes.
+    """
+
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    wrapped = _wrap_for_save(
+        cache,
+        boundary=boundary,
+        segment_start=segment_start,
+    )
+    tensors = dict(tree_flatten([entry.state for entry in wrapped]))
+    if not tensors or any(not isinstance(value, mx.array) for value in tensors.values()):
+        raise TypeError("prompt snapshot state must contain only MLX arrays")
+    metadata = dict(
+        tree_flatten(
+            [
+                [entry.meta_state for entry in wrapped],
+                {},
+                [type(entry).__name__ for entry in wrapped],
+            ]
+        )
+    )
+    if any(not isinstance(value, str) for value in metadata.values()):
+        raise TypeError("prompt snapshot metadata must contain only strings")
+    nbytes = sum(int(value.nbytes) for value in tensors.values())
+    return tensors, metadata, nbytes
+
+
+def _freeze_snapshot_payload(
+    tensors: dict[str, Any], metadata: dict[str, str], nbytes: int
+) -> _FrozenPromptSnapshot:
+    """Copy and fully materialize a payload on its owning inference thread.
+
+    ``KVCache`` and ``RotatingKVCache`` use slice assignment, so merely keeping
+    another Python reference would let later prefill/decode overwrite the
+    alleged boundary before the writer reaches it.  ``mx.array`` creates a
+    detached buffer and the blocking eval is load-bearing: lazy arrays created
+    on a thread-local generation stream cannot safely be evaluated by the
+    background writer.
+    """
+
+    import mlx.core as mx
+
+    from omlx.utils.metal_sync import _mx_buffer_access_lock
+
+    with _mx_buffer_access_lock:
+        frozen = {name: mx.array(value) for name, value in tensors.items()}
+        mx.eval(*frozen.values())
+    return _FrozenPromptSnapshot(frozen, dict(metadata), nbytes)
+
+
 @dataclass
 class _Entry:
     tokens: tuple[int, ...]
@@ -382,12 +456,18 @@ class SSDPromptSnapshotStore:
         max_entries: int = _MAX_ENTRIES_DEFAULT,
         max_bytes: int | None = None,
         persistent: bool = False,
+        write_behind: bool = False,
+        max_pending_writes: int = _MAX_PENDING_WRITES_DEFAULT,
+        pending_max_bytes: int = _PENDING_MAX_BYTES_DEFAULT,
     ) -> None:
         self.directory = Path(directory)
         self.step = max(1, int(step))
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max_bytes
         self.persistent = bool(persistent)
+        self.write_behind = bool(write_behind)
+        self.max_pending_writes = max(1, int(max_pending_writes))
+        self.pending_max_bytes = max(1, int(pending_max_bytes))
         self._lock = threading.RLock()
         # Access-ordered: most-recently-used at the end. The order is advanced
         # only by put/load, both driven by the identical request stream every
@@ -400,12 +480,33 @@ class SSDPromptSnapshotStore:
         # get a wire stand-in instead (see ``_wrap_for_save``); this flag is
         # the backstop for a type nobody has taught the store about yet.
         self._serialisable = True
+        self._closed = False
+        # Write-behind owns detached, fully evaluated payloads only.  Entries
+        # remain pending until their atomic rename and manifest update finish;
+        # present_boundaries/load intentionally expose committed files only.
+        self._pending: dict[str, int] = {}
+        self._capturing: set[str] = set()
+        self._pending_cond = threading.Condition(self._lock)
+        self._pending_bytes = 0
+        self._pending_peak_bytes = 0
+        self._write_failures = 0
+        self._write_queue: queue.Queue[Any] | None = None
+        self._writer_thread: threading.Thread | None = None
+        self._stop_enqueued = False
         _register_snapshot_classes()
         self.directory.mkdir(parents=True, exist_ok=True)
         if self.persistent:
             self._load_manifest_or_reset()
         else:
             self._clear_directory()
+        if self.write_behind:
+            self._write_queue = queue.Queue(maxsize=self.max_pending_writes)
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name="cluster-prompt-snapshot-writer",
+                daemon=True,
+            )
+            self._writer_thread.start()
 
     def __len__(self) -> int:
         with self._lock:
@@ -415,6 +516,26 @@ class SSDPromptSnapshotStore:
     def nbytes(self) -> int:
         with self._lock:
             return self._nbytes
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._lock:
+            return self._pending_bytes
+
+    @property
+    def pending_peak_bytes(self) -> int:
+        with self._lock:
+            return self._pending_peak_bytes
+
+    @property
+    def write_failures(self) -> int:
+        with self._lock:
+            return self._write_failures
 
     def _path(self, key: str) -> Path:
         return self.directory / f"{key}.safetensors"
@@ -541,27 +662,46 @@ class SSDPromptSnapshotStore:
         as their newest slab, everything else as full state. A file that
         already exists is this boundary written by an earlier request sharing
         the prefix; it is kept and touched rather than rewritten, which is
-        what lets branching prompts share their common chain.
+        what lets branching prompts share their common chain.  By default the
+        write is synchronous.  With ``write_behind=True`` a detached boundary
+        payload is queued and True means accepted, not yet durable; reads and
+        rank votes continue to expose committed files only.
         """
 
-        from mlx_lm.models.cache import save_prompt_cache
-
-        if not self._serialisable:
-            return False
         token_tuple = tuple(int(t) for t in tokens)
         boundary = len(token_tuple)
         if boundary == 0 or boundary % self.step != 0:
             return False
         key = self._chain_keys(model, token_tuple)[-1]
         with self._lock:
+            if self._closed or not self._serialisable:
+                return False
             entry = self._index.get(key)
             if entry is not None and (
                 entry.tokens == token_tuple
                 or (not entry.tokens and entry.boundary == boundary)
             ):
-                self._index.move_to_end(key)
-                self._persist_index_locked()
+                # In write-behind mode a peer rank may still have this key
+                # pending.  Treating an already-committed duplicate as an LRU
+                # touch on only the faster rank would make count eviction
+                # depend on SSD timing.  Loads remain rank-agreed touches.
+                if not self.write_behind:
+                    self._index.move_to_end(key)
+                    self._persist_index_locked()
                 return True
+            if self.write_behind and key in self._pending:
+                return True
+
+        if self.write_behind:
+            return self._put_write_behind(
+                key=key,
+                token_tuple=token_tuple,
+                boundary=boundary,
+                cache=cache,
+            )
+
+        from mlx_lm.models.cache import save_prompt_cache
+
         wrapped = _wrap_for_save(
             cache, boundary=boundary, segment_start=boundary - self.step
         )
@@ -606,6 +746,239 @@ class SSDPromptSnapshotStore:
             self._evict_locked()
             self._persist_index_locked()
         return True
+
+    def _put_write_behind(
+        self,
+        *,
+        key: str,
+        token_tuple: tuple[int, ...],
+        boundary: int,
+        cache: list[Any],
+    ) -> bool:
+        """Freeze one exact boundary and enqueue it without SSD backpressure.
+
+        Capacity is reserved before copying.  If the detached payload would
+        exceed either the byte or count budget, this checkpoint is dropped.
+        In particular, a single oversized long-context snapshot never gets a
+        special exemption: duplicating multi-gigabyte state on a constrained
+        rank would defeat the memory safety the bound exists to provide.
+        """
+
+        try:
+            tensors, metadata, nbytes = _prepare_snapshot_payload(
+                cache,
+                boundary=boundary,
+                segment_start=boundary - self.step,
+            )
+        except Exception as error:
+            with self._lock:
+                self._serialisable = False
+            logger.warning(
+                "prompt snapshot store disabled: %s: %s",
+                type(error).__name__,
+                error,
+            )
+            return False
+
+        with self._lock:
+            if self._closed or not self._serialisable:
+                return False
+            if key in self._pending:
+                return True
+            entry = self._index.get(key)
+            if entry is not None and (
+                entry.tokens == token_tuple
+                or (not entry.tokens and entry.boundary == boundary)
+            ):
+                return True
+            if (
+                nbytes > self.pending_max_bytes
+                or len(self._pending) >= self.max_pending_writes
+                or self._pending_bytes + nbytes > self.pending_max_bytes
+            ):
+                return False
+            self._pending[key] = nbytes
+            self._pending_bytes += nbytes
+            self._pending_peak_bytes = max(
+                self._pending_peak_bytes,
+                self._pending_bytes,
+            )
+            self._capturing.add(key)
+
+        try:
+            frozen = _freeze_snapshot_payload(tensors, metadata, nbytes)
+        except Exception as error:
+            self._release_pending(key, failed=True)
+            with self._lock:
+                self._serialisable = False
+            logger.warning(
+                "prompt snapshot store disabled: %s: %s",
+                type(error).__name__,
+                error,
+            )
+            return False
+
+        item = (key, token_tuple, boundary, frozen)
+        write_queue = self._write_queue
+        if write_queue is None:
+            self._release_pending(key, failed=True)
+            return False
+        try:
+            write_queue.put_nowait(item)
+        except queue.Full:
+            # Reservation count and queue capacity normally make this
+            # unreachable.  Fail closed instead of falling back to a blocking
+            # inline SSD write on the latency-sensitive prefill path.
+            self._release_pending(key, failed=True)
+            return False
+        with self._pending_cond:
+            self._capturing.discard(key)
+            self._pending_cond.notify_all()
+        return True
+
+    def _release_pending(self, key: str, *, failed: bool = False) -> None:
+        with self._pending_cond:
+            nbytes = self._pending.pop(key, None)
+            self._capturing.discard(key)
+            if nbytes is not None:
+                self._pending_bytes = max(0, self._pending_bytes - nbytes)
+            if failed:
+                self._write_failures += 1
+            self._pending_cond.notify_all()
+
+    def _write_frozen_snapshot(
+        self,
+        key: str,
+        token_tuple: tuple[int, ...],
+        boundary: int,
+        frozen: _FrozenPromptSnapshot,
+    ) -> None:
+        """Atomically write and index one already detached payload."""
+
+        import mlx.core as mx
+
+        from omlx.utils.metal_sync import _mx_buffer_access_lock
+
+        target = self._path(key)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{key}.", suffix=".safetensors", dir=self.directory
+        )
+        os.close(descriptor)
+        try:
+            # save_safetensors reads MLX buffers through the Python buffer
+            # protocol.  Serialize it against process-wide clear_cache calls,
+            # just like the scheduler's asynchronous tiered-cache writer.
+            with _mx_buffer_access_lock:
+                mx.save_safetensors(
+                    temporary,
+                    frozen.tensors,
+                    frozen.metadata,
+                )
+            size = os.path.getsize(temporary)
+            os.replace(temporary, target)
+        except Exception:
+            with suppress(OSError):
+                os.unlink(temporary)
+            raise
+
+        with self._lock:
+            previous = self._index.pop(key, None)
+            if previous is not None:
+                self._nbytes -= previous.nbytes
+            self._index[key] = _Entry(
+                token_tuple,
+                target.name,
+                size,
+                boundary,
+            )
+            self._nbytes += size
+            self._index.move_to_end(key)
+            self._evict_locked()
+            self._persist_index_locked()
+
+    def _writer_loop(self) -> None:
+        write_queue = self._write_queue
+        if write_queue is None:
+            return
+        while True:
+            item = write_queue.get()
+            if item is None:
+                write_queue.task_done()
+                return
+            key, token_tuple, boundary, frozen = item
+            failed = False
+            try:
+                with self._lock:
+                    serialisable = self._serialisable
+                if not serialisable:
+                    failed = True
+                    continue
+                self._write_frozen_snapshot(
+                    key,
+                    token_tuple,
+                    boundary,
+                    frozen,
+                )
+            except OSError:
+                # Transient disk failures omit only this rank's boundary.  The
+                # unanimous restore vote prevents peers from using theirs.
+                failed = True
+            except Exception as error:
+                failed = True
+                with self._lock:
+                    self._serialisable = False
+                logger.warning(
+                    "prompt snapshot store disabled: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+            finally:
+                self._release_pending(key, failed=failed)
+                write_queue.task_done()
+
+    def flush(self, timeout: float = 30.0) -> bool:
+        """Boundedly wait until every accepted write has committed or failed.
+
+        A False result means the daemon writer may still own a detached payload;
+        callers must not remove its directory.  It can be retried after the
+        filesystem recovers, and process exit remains the final fallback for a
+        permanently wedged filesystem.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._pending_cond:
+            while self._pending or self._capturing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pending_cond.wait(timeout=remaining)
+        return True
+
+    def close(self, timeout: float = 30.0) -> bool:
+        """Stop submissions and boundedly drain/join the daemon writer.
+
+        Returns False rather than hanging teardown when storage is wedged.  On
+        False the snapshot directory must be left intact because the writer may
+        still complete its atomic rename there.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._pending_cond:
+            self._closed = True
+        write_queue = self._write_queue
+        writer = self._writer_thread
+        if write_queue is None or writer is None:
+            return True
+        if not self.flush(timeout=max(0.0, deadline - time.monotonic())):
+            return False
+        with self._lock:
+            if not self._stop_enqueued:
+                # No pending item remains, so the bounded queue has room and
+                # the sentinel cannot overtake a still-capturing submission.
+                write_queue.put_nowait(None)
+                self._stop_enqueued = True
+        writer.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not writer.is_alive()
 
     def present_boundaries(self, model: Any, tokens: list[int]) -> tuple[int, ...]:
         """Boundaries whose whole chain is on disk, longest first.

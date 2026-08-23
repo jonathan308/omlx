@@ -247,7 +247,7 @@ def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):
         )
 
 
-def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch):
+def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch, caplog):
     assignments = tuple(
         PipelineAssignment(
             node_id=f"node-{rank}",
@@ -265,6 +265,8 @@ def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch):
         for rank in range(2)
     )
     monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "1,1")
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
 
     assert _configure_tensor_shard_weights(
         assignments,
@@ -272,6 +274,26 @@ def test_signed_tensor_shard_weights_replace_a_stale_environment(monkeypatch):
         tensor_parallel_size=2,
     ) == (5, 3)
     assert os.environ["OMLX_TP_SHARD_WEIGHTS"] == "5,3"
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "unsigned tensor-component shard overrides" in caplog.text
+    assert "3,5" not in caplog.text
+    assert "4,4" not in caplog.text
+
+
+def test_non_tp_worker_clears_unsigned_component_shard_overrides(monkeypatch):
+    monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
+
+    assert _configure_tensor_shard_weights(
+        (),
+        rank=0,
+        tensor_parallel_size=1,
+    ) == (1,)
+    assert "OMLX_TP_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS" not in os.environ
+    assert "OMLX_TP_MOE_SHARD_WEIGHTS" not in os.environ
 
 
 def test_decode_indexer_owner_uses_the_fastest_measured_tp_rank(monkeypatch):
@@ -1593,6 +1615,65 @@ def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
         )
 
     assert exit_codes == []
+
+
+def test_launcher_watchdog_fires_if_a_seen_lease_disappears(tmp_path):
+    exit_codes: list[int] = []
+    updates: list[tuple[str, dict]] = []
+    marker = SimpleNamespace(
+        update=lambda phase, **extra: updates.append((phase, extra))
+    )
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    polls = 0
+
+    def wait(_seconds):
+        nonlocal polls
+        polls += 1
+        if polls == 2:
+            lease.unlink()
+
+    _watch_launcher_parent(
+        42,
+        marker,
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=wait,
+        exit_process=exit_codes.append,
+        emit_event=lambda _event: None,
+        release_memory=lambda _reason: None,
+    )
+
+    assert exit_codes == [1]
+    assert "disappeared" in updates[0][1]["error"]
+
+
+def test_launcher_watchdog_exits_when_dead_server_breaks_diagnostics(tmp_path):
+    lease = tmp_path / "launcher-lease.json"
+    lease.write_text("{}", encoding="utf-8")
+    stale = time.time() - 120.0
+    os.utime(lease, (stale, stale))
+    exit_codes: list[int] = []
+    releases: list[str] = []
+
+    def broken(*_args, **_kwargs):
+        raise BrokenPipeError("coordinator pipe is gone")
+
+    _watch_launcher_parent(
+        42,
+        SimpleNamespace(update=broken),
+        watched_marker_path=lease,
+        marker_stale_after=45.0,
+        get_parent_pid=lambda: 42,
+        wait=lambda _seconds: None,
+        exit_process=exit_codes.append,
+        emit_event=broken,
+        release_memory=releases.append,
+    )
+
+    assert len(releases) == 1
+    assert exit_codes == [1]
 
 
 def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):

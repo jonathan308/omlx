@@ -253,6 +253,127 @@ def test_runtime_markers_reject_nonfinite_rates(tmp_path):
     assert "out of range" in result["warnings"][0]
 
 
+def _tiered_cache_metrics():
+    return {
+        "affinity": "deployment",
+        "lookups": 5,
+        "hits": 3,
+        "misses": 2,
+        "hit_rate": 0.6,
+        "tokens_reused": 6_144,
+        "entries": 9,
+        "bytes": 69_632,
+        "ssd_enabled": True,
+        "memory": {"entries": 2, "bytes": 4_096, "hits": 1},
+        "ssd": {"entries": 7, "bytes": 65_536, "hits": 2},
+    }
+
+
+def test_runtime_markers_preserve_validated_cache_tier_metrics(tmp_path):
+    metrics = _metrics() | {"cache": _tiered_cache_metrics()}
+    payload = _marker(assignments=_assignments(), metrics=metrics)
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["metrics"]["cache"] == metrics["cache"]
+
+
+def test_runtime_markers_reject_inconsistent_cache_tier_totals(tmp_path):
+    cache = _tiered_cache_metrics()
+    cache["ssd"]["bytes"] += 1
+    metrics = _metrics() | {"cache": cache}
+    (tmp_path / "job.json").write_text(
+        json.dumps(_marker(assignments=_assignments(), metrics=metrics))
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "cache tier totals are inconsistent" in result["warnings"][0]
+
+
+def test_runtime_markers_reject_partial_or_disabled_ssd_tier_metrics(tmp_path):
+    partial = _tiered_cache_metrics()
+    partial.pop("memory")
+    (tmp_path / "partial.json").write_text(
+        json.dumps(
+            _marker(assignments=_assignments(), metrics=_metrics() | {"cache": partial})
+        )
+    )
+    disabled = _tiered_cache_metrics()
+    disabled["ssd_enabled"] = False
+    (tmp_path / "disabled.json").write_text(
+        json.dumps(
+            _marker(assignments=_assignments(), metrics=_metrics() | {"cache": disabled})
+        )
+    )
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert any("cache tier metrics are incomplete" in item for item in result["warnings"])
+    assert any(
+        "SSD tier is populated while disabled" in item for item in result["warnings"]
+    )
+
+
+def test_runtime_markers_preserve_distinct_active_request_rates(tmp_path):
+    metrics = _metrics()
+    first = metrics["last_request"] | {
+        "request_id": 7,
+        "status": "running",
+        "prefill_tps": 410.0,
+        "decode_tps": 0.0,
+    }
+    second = metrics["last_request"] | {
+        "request_id": 8,
+        "status": "running",
+        "prefill_tps": 205.0,
+        "decode_tps": 37.5,
+    }
+    metrics |= {
+        "active_requests": 2,
+        "active_request_metrics": [first, second],
+        "active_request_metrics_truncated": 0,
+        "last_request": second,
+    }
+    payload = _marker(assignments=_assignments(), metrics=metrics)
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    requests = result["jobs"][0]["metrics"]["active_request_metrics"]
+    assert [
+        (item["request_id"], item["prefill_tps"], item["decode_tps"])
+        for item in requests
+    ] == [
+        (7, 410.0, 0.0),
+        (8, 205.0, 37.5),
+    ]
+
+
+def test_runtime_markers_reject_duplicate_active_request_ids(tmp_path):
+    metrics = _metrics()
+    request = metrics["last_request"] | {
+        "request_id": 7,
+        "status": "running",
+    }
+    metrics |= {
+        "active_requests": 2,
+        "active_request_metrics": [request, dict(request)],
+        "active_request_metrics_truncated": 0,
+    }
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["jobs"] == []
+    assert "IDs are not unique" in result["warnings"][0]
+
+
 def test_runtime_markers_reject_impossible_prefill_progress(tmp_path):
     metrics = _metrics()
     metrics["last_request"]["prefill_progress"]["processed"] = 385

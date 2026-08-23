@@ -3,6 +3,9 @@
 one linear chain of slabs, and stay consistent across ranks that see the same
 requests."""
 
+import threading
+import time
+
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
@@ -493,3 +496,145 @@ def test_a_failed_write_leaves_the_index_unchanged(tmp_path, monkeypatch):
     assert store.present_boundaries(MODEL, list(range(STEP))) == ()
     # No half-written temp file is left behind.
     assert list(tmp_path.glob("*")) == []
+
+
+def test_write_behind_freezes_mutable_rotating_state_at_the_boundary(
+    tmp_path, monkeypatch
+):
+    """The worker must never observe a live cache after decode overwrites it."""
+
+    started = threading.Event()
+    release = threading.Event()
+    original_save = mx.save_safetensors
+
+    def _blocked_save(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "save_safetensors", _blocked_save)
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=4,
+        persistent=True,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    cache = RotatingKVCache(max_size=4)
+    _advance([cache], 4)
+    expected_state = [value.tolist() for value in cache.state]
+    expected_meta = cache.meta_state
+
+    assert store.put(MODEL, [0, 1, 2, 3], [cache])
+    assert started.wait(timeout=5)
+    _advance([cache], 1)  # overwrites the live full rotating buffer in place
+    assert cache.meta_state != expected_meta
+    release.set()
+    assert store.flush(timeout=5)
+
+    restored = store.load(MODEL, [0, 1, 2, 3], 4)
+    assert restored is not None
+    assert restored[0].meta_state == expected_meta
+    assert [value.tolist() for value in restored[0].state] == expected_state
+    assert store.close(timeout=5)
+
+
+def test_write_behind_strictly_rejects_one_oversized_payload(tmp_path):
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=2,
+        write_behind=True,
+        pending_max_bytes=1,
+    )
+
+    assert store.put(MODEL, [0, 1], _kv()) is False
+    assert store.pending_count == 0
+    assert store.pending_bytes == 0
+    assert store.pending_peak_bytes == 0
+    assert store.close(timeout=5)
+
+
+def test_write_behind_count_saturation_drops_instead_of_blocking_prefill(
+    tmp_path, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+    original_save = mx.save_safetensors
+
+    def _blocked_save(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "save_safetensors", _blocked_save)
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=2,
+        write_behind=True,
+        max_pending_writes=1,
+        pending_max_bytes=1024 * 1024,
+    )
+    assert store.put(MODEL, [0, 1], _kv())
+    assert started.wait(timeout=5)
+
+    before = time.monotonic()
+    assert store.put(MODEL, [2, 3], _kv()) is False
+    assert time.monotonic() - before < 0.5
+    assert store.pending_count == 1
+
+    release.set()
+    assert store.close(timeout=5)
+
+
+def test_write_behind_close_is_bounded_when_the_writer_stalls(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    original_save = mx.save_safetensors
+
+    def _blocked_save(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "save_safetensors", _blocked_save)
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=2,
+        persistent=True,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    assert store.put(MODEL, [0, 1], _kv())
+    assert started.wait(timeout=5)
+
+    before = time.monotonic()
+    assert store.close(timeout=0.02) is False
+    assert time.monotonic() - before < 0.5
+    # A timed-out close leaves the directory alone while the daemon writer may
+    # still own its atomic staging file.  A later retry finishes cleanly.
+    assert tmp_path.is_dir()
+    release.set()
+    assert store.close(timeout=5)
+
+
+def test_write_behind_fifo_keeps_successful_rank_key_order_symmetric(tmp_path):
+    rank0 = SSDPromptSnapshotStore(
+        tmp_path / "r0",
+        step=2,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    rank1 = SSDPromptSnapshotStore(
+        tmp_path / "r1",
+        step=2,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    for tokens in ([0, 1], [2, 3]):
+        assert rank0.put(MODEL, tokens, _kv(layers=1))
+        assert rank1.put(MODEL, tokens, _kv(layers=2))
+    assert rank0.flush(timeout=5)
+    assert rank1.flush(timeout=5)
+    assert list(rank0._index) == list(rank1._index)
+    assert rank0.close(timeout=5)
+    assert rank1.close(timeout=5)
