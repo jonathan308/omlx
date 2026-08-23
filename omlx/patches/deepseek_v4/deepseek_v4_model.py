@@ -169,7 +169,11 @@ def _owned_projection_bank(
         packed = mx.concatenate(values, axis=-1)
     else:
         shape = (*x.shape[:-1], total)
-        packed = mx.zeros(shape, dtype=x.dtype)
+        # A free constant has no edge to this layer, so MLX may enqueue later
+        # placeholder reductions ahead of the owner's real projection graphs.
+        # Tie the placeholder to the replicated layer input to preserve the
+        # same per-layer collective order without adding arithmetic.
+        packed = mx.depends(mx.zeros(shape, dtype=x.dtype), x)
     packed = mx.distributed.all_sum(packed, group=group)
     boundaries = []
     cursor = 0
