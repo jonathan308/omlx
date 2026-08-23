@@ -104,6 +104,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE",
         "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP",
         "OMLX_DSV4_PREFILL_YIELD",
+        "OMLX_DSV4_PREFILL_STEP_TRACE",
         "OMLX_DSV4_PREFILL_ASYNC_DEPTH",
         "OMLX_DSV4_WSDPA",
         "OMLX_DSV4_WSDPA_TP",
@@ -142,6 +143,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE=2048" in envs
     assert "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP=1" in envs
     assert "OMLX_DSV4_PREFILL_YIELD=1" in envs
+    assert "OMLX_DSV4_PREFILL_STEP_TRACE=0" in envs
     assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=0" in envs
     assert "OMLX_DSV4_WSDPA=1" in envs
     assert "OMLX_DSV4_WSDPA_TP=1" in envs
@@ -168,6 +170,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
     monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "0")
     monkeypatch.setenv("OMLX_DSV4_PREFILL_YIELD", "0")
+    monkeypatch.setenv("OMLX_DSV4_PREFILL_STEP_TRACE", "1")
     monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
     monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
@@ -193,6 +196,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" not in envs
     assert "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP=0" in envs
     assert "OMLX_DSV4_PREFILL_YIELD=0" in envs
+    assert "OMLX_DSV4_PREFILL_STEP_TRACE=1" in envs
     assert "OMLX_DSV4_PREFILL_YIELD=1" not in envs
     assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=2" in envs
     assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=0" not in envs

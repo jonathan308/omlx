@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ _DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
 _DSV4_PREFILL_YIELD_ENV = "OMLX_DSV4_PREFILL_YIELD"
 _DSV4_PREFILL_ASYNC_DEPTH_ENV = "OMLX_DSV4_PREFILL_ASYNC_DEPTH"
 _CLUSTER_PREFILL_SHAPE_WARMUP_ENV = "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP"
+_DSV4_PREFILL_STEP_TRACE_ENV = "OMLX_DSV4_PREFILL_STEP_TRACE"
 
 
 def _capability(
@@ -1424,12 +1426,25 @@ def install_runtime_optimizations(
                     if previous_cache_arrays:
                         mx.eval(*previous_cache_arrays)
                 else:
+                    step_started = time.perf_counter()
                     instance.model(
                         tokens_array[:, :width],
                         cache=instance.prompt_cache,
                         skip_lm_head=True,
                     )
                     mx.eval([cache.state for cache in instance.prompt_cache])
+                    if os.environ.get(
+                        _DSV4_PREFILL_STEP_TRACE_ENV, "0"
+                    ).strip().lower() in {"1", "true", "on", "yes"}:
+                        print(
+                            "DSV4_PREFILL_STEP_TRACE "
+                            f"rank={os.getenv('MLX_RANK', '?')} "
+                            f"start={processed_tokens} width={width} "
+                            f"wall={time.perf_counter() - step_started:.6f} "
+                            f"active_gib={mx.get_active_memory() / 1024**3:.3f} "
+                            f"cache_gib={mx.get_cache_memory() / 1024**3:.3f}",
+                            flush=True,
+                        )
 
                 tokens_array = tokens_array[:, width:]
                 processed_tokens += width

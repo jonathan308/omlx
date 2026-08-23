@@ -113,6 +113,7 @@ _RANK_ENV_DEFAULTS = (
     # Yield long prompt work back to live decode after one 1K DS4 kernel call.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
+    ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
     # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off
     # until a live lossless A/B clears the promotion gate; carrying the value
     # in the hostfile guarantees that both ranks make the same queue decision.
