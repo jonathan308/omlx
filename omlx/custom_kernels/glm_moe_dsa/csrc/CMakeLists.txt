@@ -129,6 +129,34 @@ if(MLX_BUILD_METAL AND NOT OMLX_SKIP_METALLIB_BUILD)
 
   add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_metallib)
 
+  # Decode-only experiments live in a separate library so adding/removing a
+  # B1 kernel cannot perturb the qualified classic prefill metallib's binary or
+  # pipeline-cache behavior.
+  set(OMLX_GLM_DECODE_AIR
+      ${CMAKE_CURRENT_BINARY_DIR}/ds4_qkv_bundle_decode.air)
+  add_custom_command(
+    OUTPUT ${OMLX_GLM_DECODE_AIR}
+    COMMAND
+      xcrun -sdk macosx metal ${OMLX_GLM_METAL_FLAGS} -c
+      ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle_decode.metal
+      ${OMLX_GLM_METAL_INCLUDE_ARGS} -o ${OMLX_GLM_DECODE_AIR}
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/ds4_qkv_bundle_decode.metal
+            ${OMLX_GLM_METAL_HEADERS}
+    COMMENT "Building ds4_qkv_bundle_decode.air"
+    VERBATIM)
+  set(OMLX_GLM_DECODE_METALLIB
+      ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/omlx_glm_kernels_decode.metallib)
+  add_custom_command(
+    OUTPUT ${OMLX_GLM_DECODE_METALLIB}
+    COMMAND xcrun -sdk macosx metal ${OMLX_GLM_DECODE_AIR} -o
+            ${OMLX_GLM_DECODE_METALLIB}
+    DEPENDS ${OMLX_GLM_DECODE_AIR}
+    COMMENT "Building omlx_glm_kernels_decode.metallib"
+    VERBATIM)
+  add_custom_target(omlx_glm_kernels_decode_metallib
+                    DEPENDS ${OMLX_GLM_DECODE_METALLIB})
+  add_dependencies(omlx_glm_kernel_ops omlx_glm_kernels_decode_metallib)
+
   # M5/NAX indexer scores and the isolated DS4 projection tile sweep use the
   # MetalPerformancePrimitives tensor API and therefore live in an optional
   # macOS-26.2 metallib. Keeping this separate preserves the classic Steel

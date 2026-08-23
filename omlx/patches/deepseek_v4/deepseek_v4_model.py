@@ -455,7 +455,7 @@ _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
     "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_QKV_BUNDLE_DECODE = os.getenv(
-    "OMLX_DSV4_QKV_BUNDLE_DECODE", "0"
+    "OMLX_DSV4_QKV_BUNDLE_DECODE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = False
 

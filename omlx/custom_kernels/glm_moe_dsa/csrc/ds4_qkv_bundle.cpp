@@ -95,7 +95,8 @@ class DS4QKVCompressorBundleB1Primitive : public Primitive {
     auto& out = outputs[0];
     out.set_data(allocator::malloc(out.nbytes()));
 
-    auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
+    auto lib = d.get_library(
+        "omlx_glm_kernels_decode", current_binary_dir());
     auto& encoder = metal::get_command_encoder(s);
 
     auto kernel = d.get_kernel("ds4_qkv_bundle_all_b1", lib);

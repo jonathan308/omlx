@@ -24,11 +24,16 @@ def test_native_source_reports_one_heterogeneous_dispatch_and_fixed_slices():
         Path(__file__).parents[1]
         / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_qkv_bundle.metal"
     ).read_text()
+    decode_metal = (
+        Path(__file__).parents[1]
+        / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_qkv_bundle_decode.metal"
+    ).read_text()
     assert "kDispatches = 1" in source
     assert "kPackedRows = 4096" in source
     assert source.count("dispatch_threadgroups") == 1
-    assert "ds4_qkv_bundle_all_b1" in metal
-    assert "virtual_group = group_id * 2 + cohort" in metal
+    assert "ds4_qkv_bundle_all_b1" not in metal
+    assert "ds4_qkv_bundle_all_b1" in decode_metal
+    assert "virtual_group = group_id * 2 + cohort" in decode_metal
     assert "packed_dense_offset = 1536" in metal
     assert "group_row < 1024" in metal
     assert "group_row < 2048" in metal

@@ -57,7 +57,7 @@ def test_first_native_abi_stops_before_ape_and_cache_mutation():
     assert contract["parity"]["decode_positions"] == [0, 1, 2, 3]
 
 
-def test_symbol_has_only_a_default_off_exact_production_seam():
+def test_symbol_has_only_the_exact_promoted_production_seam():
     root = Path(__file__).parents[1]
     model = root / "omlx/patches/deepseek_v4/deepseek_v4_model.py"
     allowed = {
@@ -70,7 +70,7 @@ def test_symbol_has_only_a_default_off_exact_production_seam():
             hits.append(path)
     assert hits == []
     source = model.read_text()
-    assert '"OMLX_DSV4_QKV_BUNDLE_DECODE", "0"' in source
+    assert '"OMLX_DSV4_QKV_BUNDLE_DECODE", "1"' in source
     assert "_decode_qkv_projection_bundle(self, x)" in source
 
 
