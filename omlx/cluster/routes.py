@@ -448,6 +448,10 @@ class ClusterPlanRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    # Process-lifetime prefix snapshots are a reuse optimization, not a cold
+    # prefill requirement. None/False keeps synchronous SSD writes off the
+    # launch path; True is an explicit cluster contract.
+    prompt_cache_ssd: bool | None = None
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
@@ -502,6 +506,7 @@ class ClusterDeploymentRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    prompt_cache_ssd: bool | None = None
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -760,6 +765,14 @@ def _placement_signature(plan: dict[str, Any]) -> str:
                 "mtp_enabled": mtp_enabled,
                 "mtp_num_draft_tokens": mtp_num_draft_tokens,
             }
+    # False is the latency-safe default and intentionally shares the legacy
+    # signature. Enabling synchronous distributed SSD snapshots is a material
+    # launch-mode change and must be explicitly approved.
+    if bool(plan.get("prompt_cache_ssd", False)):
+        if isinstance(rows, dict):
+            rows = rows | {"prompt_cache_ssd": True}
+        else:
+            rows = {"rows": rows, "prompt_cache_ssd": True}
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -829,6 +842,7 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
         ("path_map", {}),
         ("mtp_enabled", False),
         ("mtp_num_draft_tokens", None),
+        ("prompt_cache_ssd", False),
     ):
         before = approved.get(field, default)
         after = launched.get(field, default)
@@ -2828,6 +2842,8 @@ async def cluster_plan(request: ClusterPlanRequest):
             mtp_enabled=request.mtp_enabled,
             mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         )
+    if request.prompt_cache_ssd is not None:
+        payload["prompt_cache_ssd"] = request.prompt_cache_ssd
     return _plan_with_signature(payload)
 
 
@@ -2896,6 +2912,7 @@ def _execution_for_request(
         requested,
         async_overlap=request.async_overlap,
         cache_affinity=request.cache_affinity,
+        prompt_cache_ssd=bool(getattr(request, "prompt_cache_ssd", False)),
         # The context chosen beside the model is both a reservation and a
         # runtime ceiling. Without this fallback the planner could reserve
         # 256k while the server used an unrelated advanced default (or no
@@ -2961,6 +2978,7 @@ def _create_deployment(
         target_context_tokens=request.target_context_tokens,
         mtp_enabled=request.mtp_enabled,
         mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        prompt_cache_ssd=request.prompt_cache_ssd,
         path_map=request.path_map,
     )
     plan = _create_cluster_plan(plan_request)
@@ -3031,6 +3049,8 @@ def _create_deployment(
             mtp_enabled=request.mtp_enabled,
             mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         )
+    if request.prompt_cache_ssd is not None:
+        plan_payload["prompt_cache_ssd"] = request.prompt_cache_ssd
     return deployment, plan_payload
 
 
@@ -3695,28 +3715,18 @@ async def _activate_and_report(
             "deployment",
             None,
         )
-        already_loaded = bool(
-            loaded_deployment is not None
-            and loaded_deployment.deployment_id == deployment.deployment_id
-            and loaded_deployment.plan_hash == deployment.plan_hash
-            and loaded_deployment.mtp_enabled == deployment.mtp_enabled
-            and loaded_deployment.mtp_num_draft_tokens
-            == deployment.mtp_num_draft_tokens
-        )
+        # Every persisted deployment field that reaches a worker is part of
+        # runtime identity.  Comparing only plan/MTP let execution toggles
+        # (notably synchronous SSD snapshots) reuse an engine launched with a
+        # different contract.
+        already_loaded = loaded_deployment == deployment
         if not already_loaded:
             await pool.prepare_cluster_reload(model_id)
         await asyncio.to_thread(registry.upsert, deployment)
         try:
             engine = await pool.get_engine(model_id)
             active_deployment = getattr(engine, "deployment", None)
-            if (
-                active_deployment is None
-                or active_deployment.deployment_id != deployment.deployment_id
-                or active_deployment.plan_hash != deployment.plan_hash
-                or active_deployment.mtp_enabled != deployment.mtp_enabled
-                or active_deployment.mtp_num_draft_tokens
-                != deployment.mtp_num_draft_tokens
-            ):
+            if active_deployment != deployment:
                 raise DistributedLaunchError(
                     "engine pool did not activate the approved distributed plan"
                 )
@@ -3890,6 +3900,7 @@ class ClusterReplanRequest(BaseModel):
     )
     mtp_enabled: bool | None = None
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    prompt_cache_ssd: bool | None = None
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
@@ -4042,6 +4053,13 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
                 else current.mtp_num_draft_tokens
                 if current is not None
                 else None
+            ),
+            prompt_cache_ssd=(
+                request.prompt_cache_ssd
+                if "prompt_cache_ssd" in request.model_fields_set
+                else current.execution.prompt_cache_ssd
+                if current is not None
+                else False
             ),
             path_map=path_map,
             # Not consulted by planning; activation re-checks the real one

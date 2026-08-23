@@ -83,6 +83,7 @@ def _approval_for(payload):
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            prompt_cache_ssd=payload.get("prompt_cache_ssd"),
         )
     )
     return routes._placement_signature(plan.to_dict())
@@ -292,6 +293,35 @@ def test_replan_inherits_tensor_parallelism_and_context(tmp_path, monkeypatch):
     assert preview.status_code == 200, preview.json()
     assert preview.json()["plan"]["tensor_parallel_size"] == 2
     assert preview.json()["plan"]["cluster"]["target_context_tokens"] == 32768
+
+
+def test_replan_snapshot_toggle_is_signed_and_forces_reload(active_deployment):
+    deployment_id = active_deployment.deployment["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "prompt_cache_ssd": True},
+    )
+
+    assert preview.status_code == 200, preview.json()
+    payload = preview.json()
+    assert payload["plan"]["prompt_cache_ssd"] is True
+    assert payload["changes"]["settings"]["prompt_cache_ssd"] == {
+        "before": False,
+        "after": True,
+    }
+
+    applied = _client().post(
+        "/admin/api/cluster/replan",
+        json={
+            "deployment_id": deployment_id,
+            "prompt_cache_ssd": True,
+            "approved_placement": payload["plan"]["placement_signature"],
+        },
+    )
+
+    assert applied.status_code == 200, applied.json()
+    assert active_deployment.pool.reloads == 2
+    assert active_deployment.pool.entry.engine.deployment.execution.prompt_cache_ssd
 
 
 def test_replan_carries_path_map_forward(tmp_path, monkeypatch):

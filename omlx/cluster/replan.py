@@ -98,6 +98,7 @@ def summarize_deployment(deployment: ClusterDeployment) -> dict[str, Any]:
         "target_context_tokens": deployment.target_context_tokens,
         "mtp_enabled": deployment.mtp_enabled,
         "mtp_num_draft_tokens": deployment.mtp_num_draft_tokens,
+        "prompt_cache_ssd": deployment.execution.prompt_cache_ssd,
         "path_map": dict(deployment.path_map),
         "assignments": [
             {
@@ -127,6 +128,7 @@ def placement_view(deployment: ClusterDeployment) -> dict[str, Any]:
         "path_map": dict(deployment.path_map),
         "mtp_enabled": deployment.mtp_enabled,
         "mtp_num_draft_tokens": deployment.mtp_num_draft_tokens,
+        "prompt_cache_ssd": deployment.execution.prompt_cache_ssd,
         "assignments": [
             assignment.to_dict() for assignment in deployment.assignments
         ]

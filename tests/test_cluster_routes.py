@@ -109,6 +109,7 @@ def _approval_for(payload: dict) -> str:
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            prompt_cache_ssd=payload.get("prompt_cache_ssd"),
         )
     )
     return routes._placement_signature(plan.to_dict())
@@ -2700,6 +2701,7 @@ def test_activation_persists_mtp_launch_contract(monkeypatch):
     assert deployment.mtp_num_draft_tokens == 3
     assert plan["mtp_enabled"] is True
     assert plan["mtp_num_draft_tokens"] == 3
+    assert deployment.execution.prompt_cache_ssd is False
 
 
 def test_mtp_launch_contract_changes_placement_signature():
@@ -2716,4 +2718,24 @@ def test_mtp_launch_contract_changes_placement_signature():
         plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 2}
     ) != routes._placement_signature(
         plan | {"mtp_enabled": True, "mtp_num_draft_tokens": 3}
+    )
+
+
+def test_distributed_ssd_snapshots_are_explicit_and_signed(monkeypatch):
+    monkeypatch.setattr(
+        routes, "_create_cluster_plan", lambda req: _fake_plan(["studio", "m5"])
+    )
+    baseline, baseline_plan = routes._create_deployment(_activation_request("ring"))
+    snapshots, snapshot_plan = routes._create_deployment(
+        _activation_request("ring").model_copy(
+            update={"prompt_cache_ssd": True}
+        )
+    )
+
+    assert baseline.execution.prompt_cache_ssd is False
+    assert "prompt_cache_ssd" not in baseline_plan
+    assert snapshots.execution.prompt_cache_ssd is True
+    assert snapshot_plan["prompt_cache_ssd"] is True
+    assert routes._placement_signature(snapshot_plan) != (
+        routes._placement_signature(baseline_plan)
     )
