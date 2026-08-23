@@ -258,6 +258,42 @@ def test_replan_preview_derives_current_cluster(active_deployment):
     assert active_deployment.pool.reloads == 1  # only the initial activation
 
 
+def test_replan_inherits_tensor_parallelism_and_context(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "nemotron"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: replace(
+            _layout(path),
+            tensor_parallel_heads=2,
+            tensor_parallel_kv_heads=2,
+            tensor_parallel_divisors=(2,),
+            supports_tensor_parallel=True,
+        ),
+    )
+    pool = _RecordingPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+
+    body = _deployment_payload(model_path)
+    body.update(tensor_parallel_size=2, target_context_tokens=32768)
+    body["approved_placement"] = _approval_for(body)
+    activation = _client().post("/admin/api/cluster/deployments", json=body)
+    assert activation.status_code == 200, activation.json()
+
+    deployment_id = activation.json()["deployment"]["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "mtp_enabled": True},
+    )
+
+    assert preview.status_code == 200, preview.json()
+    assert preview.json()["plan"]["tensor_parallel_size"] == 2
+    assert preview.json()["plan"]["cluster"]["target_context_tokens"] == 32768
+
+
 def test_replan_carries_path_map_forward(tmp_path, monkeypatch):
     """A replan of a per-node-path deployment must not revert to same-path."""
 

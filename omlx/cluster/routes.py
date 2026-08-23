@@ -3884,8 +3884,10 @@ class ClusterReplanRequest(BaseModel):
     cache_affinity: bool = True
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
-    tensor_parallel_size: int = Field(default=1, ge=1, le=64)
-    target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    tensor_parallel_size: int | None = Field(default=None, ge=1, le=64)
+    target_context_tokens: int | None = Field(
+        default=None, ge=1, le=1_048_576
+    )
     mtp_enabled: bool | None = None
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
@@ -4013,8 +4015,20 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
             cache_affinity=request.cache_affinity,
             max_kv_size=request.max_kv_size,
             ring_connections_per_ip=request.ring_connections_per_ip,
-            tensor_parallel_size=request.tensor_parallel_size,
-            target_context_tokens=request.target_context_tokens,
+            tensor_parallel_size=(
+                request.tensor_parallel_size
+                if request.tensor_parallel_size is not None
+                else current.tensor_parallel_size
+                if current is not None
+                else 1
+            ),
+            target_context_tokens=(
+                request.target_context_tokens
+                if request.target_context_tokens is not None
+                else current.target_context_tokens
+                if current is not None
+                else 8192
+            ),
             mtp_enabled=(
                 request.mtp_enabled
                 if request.mtp_enabled is not None
