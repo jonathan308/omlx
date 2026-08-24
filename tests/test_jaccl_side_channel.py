@@ -25,6 +25,7 @@ def test_socket_side_channel_orders_ranks_and_reuses_connections(monkeypatch):
     port = _free_loopback_port()
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
     monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "direct")
     results: dict[str, bytes] = {}
     errors: list[BaseException] = []
     server_ready = threading.Event()
@@ -57,6 +58,35 @@ def test_socket_side_channel_orders_ranks_and_reuses_connections(monkeypatch):
     }
 
 
+def test_sidecar_orders_ranks_without_using_parent_network(monkeypatch):
+    port = _free_loopback_port()
+    monkeypatch.setenv("MLX_JACCL_COORDINATOR", f"127.0.0.1:{port}")
+    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("OMLX_JACCL_SIDE_CHANNEL_TRANSPORT", "sidecar")
+    results: dict[str, bytes] = {}
+    errors: list[BaseException] = []
+
+    first = jaccl_all_gather_factory(0, 2)
+    second = jaccl_all_gather_factory(1, 2)
+
+    def rank_zero() -> None:
+        try:
+            results["server"] = first(b"aa", 2)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=rank_zero)
+    thread.start()
+    results["client"] = second(b"bb", 2)
+    thread.join(3)
+    getattr(first, "close")()
+    getattr(second, "close")()
+
+    assert not thread.is_alive()
+    assert not errors
+    assert results == {"server": b"aabb", "client": b"aabb"}
+
+
 @pytest.mark.parametrize("value", ["", "host", "127.0.0.1:0", "[::1]:8000"])
 def test_side_channel_requires_a_valid_ipv4_coordinator(monkeypatch, value):
     monkeypatch.setenv("MLX_JACCL_COORDINATOR", value)
@@ -71,6 +101,8 @@ def test_init_cluster_group_only_injects_factory_for_enabled_jaccl(monkeypatch):
         def init(self, **kwargs):
             calls.append(kwargs)
             return "group"
+
+    Distributed.init.__doc__ = "init(..., *, all_gather_factory: Callable = None)"
 
     class MX:
         distributed = Distributed()
@@ -87,3 +119,18 @@ def test_init_cluster_group_only_injects_factory_for_enabled_jaccl(monkeypatch):
 
     assert init_cluster_group(MX(), backend="ring", strict=False) == "group"
     assert calls[-1] == {"backend": "ring", "strict": False}
+
+
+def test_init_cluster_group_does_not_trust_a_newer_stub_than_native():
+    calls: list[dict[str, object]] = []
+
+    class Distributed:
+        def init(self, **kwargs):
+            calls.append(kwargs)
+            return "group"
+
+    class MX:
+        distributed = Distributed()
+
+    assert init_cluster_group(MX(), backend="jaccl", strict=True) == "group"
+    assert calls == [{"backend": "jaccl", "strict": True}]
