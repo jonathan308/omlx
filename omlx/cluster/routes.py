@@ -923,6 +923,9 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 _QUALIFIED_TP_SHARD_WEIGHTS_ENV = "OMLX_TP_QUALIFIED_SHARD_WEIGHTS"
 _QUALIFIED_TP_MODEL_IDENTITY_ENV = "OMLX_TP_QUALIFIED_MODEL_IDENTITY"
+_EXPERIMENTAL_DISTRIBUTED_DSV4_ANE_ENV = (
+    "OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL"
+)
 
 
 class _UnpromotablePerformanceCalibration(ValueError):
@@ -3321,6 +3324,24 @@ def _execution_for_request(
         if deepseek_ane_request is not None
         else None
     )
+    distributed = len(assignments) > 1
+    experimental_distributed_ane = os.environ.get(
+        _EXPERIMENTAL_DISTRIBUTED_DSV4_ANE_ENV,
+        "0",
+    ).strip().lower() in {"1", "true", "on", "yes"}
+    distributed_ane_rejected = bool(
+        deepseek_ane.enabled
+        and distributed
+        and not experimental_distributed_ane
+    )
+    if distributed_ane_rejected:
+        # PR #3059 is physically qualified only on a single M3 Ultra. TP2
+        # uses a lockstep 1024-token DS4 kernel for long prompts; a 4096-tile
+        # provider never dispatches and adds fallback overhead, while a 1024
+        # provider made the heterogeneous ranks miss a collective deadline.
+        # Keep the normal cluster path exact and fast until a model/runtime/
+        # topology qualification proves one fixed shape on every rank.
+        deepseek_ane = DeepseekAnePrefillSettings()
     requested = replace(
         requested,
         async_overlap=request.async_overlap,
@@ -3353,6 +3374,14 @@ def _execution_for_request(
         assignments,
         backend=backend,
     )
+    if distributed_ane_rejected:
+        tuned = replace(
+            tuned,
+            tuning_reason=(
+                f"{tuned.tuning_reason}; DeepSeek ANE disabled because "
+                "distributed fixed-shape offload is not lockstep-qualified"
+            ),
+        )
     if (
         tuned.deepseek_ane_prefill.enabled
         and tuned.prefill_step_size != tuned.deepseek_ane_prefill.sequence_length

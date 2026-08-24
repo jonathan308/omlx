@@ -1041,6 +1041,42 @@ def test_deepseek_ane_disables_when_memory_tuner_reduces_tile():
     assert "reduced the prefill step" in execution.tuning_reason
 
 
+def test_deepseek_ane_defaults_off_for_distributed_deployment(monkeypatch):
+    monkeypatch.delenv("OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL", raising=False)
+    request = _deepseek_ane_execution_request(auto_tune=False)
+    request.tensor_parallel_size = 2
+
+    execution = routes._execution_for_request(
+        request,
+        [
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+        ],
+        backend="jaccl",
+    )
+
+    assert execution.deepseek_ane_prefill.enabled is False
+    assert "not lockstep-qualified" in execution.tuning_reason
+
+
+def test_deepseek_ane_distributed_experiment_requires_operator_opt_in(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_DSV4_ANE_EXPERIMENTAL", "1")
+    request = _deepseek_ane_execution_request(auto_tune=False)
+    request.tensor_parallel_size = 2
+
+    execution = routes._execution_for_request(
+        request,
+        [
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+            SimpleNamespace(headroom_bytes=32 * 1024**3),
+        ],
+        backend="jaccl",
+    )
+
+    assert execution.deepseek_ane_prefill.enabled is True
+    assert execution.prefill_step_size == 4096
+
+
 def test_low_power_synthetic_profile_cannot_shape_node_budget():
     node = routes.ClusterPlanNodeRequest(
         node_id="m5-max",
