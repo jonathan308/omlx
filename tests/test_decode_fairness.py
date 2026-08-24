@@ -7,6 +7,7 @@ prefill is force-chunked, chunks are capped, and each chunk accrues a
 decode time debt that must be repaid before the next chunk runs.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,6 +155,30 @@ class TestContendedChunkCap:
         s = _make_scheduler()
         get_decode_activity().publish("other-engine", 1)
         assert s._contended_prefill_cap() == _CONTENDED_PREFILL_CHUNK
+
+    @pytest.mark.parametrize(
+        ("decode_rows", "expected_quantum"),
+        ((1, 512), (2, 256), (4, 128)),
+    )
+    def test_b1_b2_b4_decode_rows_scale_prompt_quantum(
+        self, decode_rows, expected_quantum
+    ):
+        s = _make_scheduler()
+        s.running = {f"r{row}": MagicMock() for row in range(decode_rows)}
+
+        budget = s._mixed_batch_budget()
+
+        assert budget.active_decode_rows == decode_rows
+        assert budget.decode_row_budget == s.config.completion_batch_size
+        assert budget.prompt_row_budget == 1
+        assert budget.prompt_token_budget == expected_quantum
+        assert s._contended_prefill_cap() == expected_quantum
+
+    def test_other_engine_row_count_scales_quantum(self):
+        s = _make_scheduler()
+        get_decode_activity().publish("other-engine", 4)
+        assert s._active_decode_rows() == 4
+        assert s._contended_prefill_cap() == 128
 
     def test_no_cap_when_fairness_disabled(self):
         s = _make_scheduler(decode_fairness=False)
@@ -321,11 +346,11 @@ class TestAdaptiveChunkCap:
         s._prefill_tps_best = 100.0
         assert s._contended_prefill_cap() == 256
 
-    def test_cap_ceils_at_step_size_for_fast_prefill(self):
+    def test_cap_never_returns_to_full_chunk_for_fast_prefill(self):
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
         s._prefill_tps_best = 100000.0
-        assert s._contended_prefill_cap() == 2048
+        assert s._contended_prefill_cap() == _CONTENDED_PREFILL_CHUNK
 
     def test_decode_rate_sampling_solo_vs_contended(self):
         from omlx.prefill_progress import get_prefill_tracker
@@ -433,6 +458,95 @@ class TestStepGating:
         with patch.object(s, "_schedule_waiting", return_value=([], [])):
             s.step()
         assert get_decode_activity().others_decoding("someone-else")
+
+
+class TestMixedPrefillBudgets:
+    @staticmethod
+    def _request(request_id):
+        return SimpleNamespace(request_id=request_id)
+
+    @pytest.mark.parametrize(
+        ("decode_rows", "quantum"),
+        ((1, 512), (2, 256), (4, 128)),
+    )
+    def test_b1_b2_b4_runs_one_prompt_row_then_round_robins(
+        self, decode_rows, quantum
+    ):
+        s = _make_scheduler()
+        s.running = {f"d{row}": MagicMock() for row in range(decode_rows)}
+        requests = [self._request(f"p{row}") for row in range(4)]
+        states = {
+            request.request_id: SimpleNamespace(
+                request_id=request.request_id,
+                tokens_processed=0,
+            )
+            for request in requests
+        }
+        s.prefilling.extend(requests)
+        s._prefill_states.update(states)
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += quantum
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["p0"]
+        assert [request.request_id for request in s.prefilling] == [
+            "p1",
+            "p2",
+            "p3",
+            "p0",
+        ]
+
+    @pytest.mark.parametrize("decode_rows", (1, 2, 4))
+    def test_cancelled_prefill_row_does_not_consume_mixed_budget(
+        self, decode_rows
+    ):
+        s = _make_scheduler()
+        s.running = {f"d{row}": MagicMock() for row in range(decode_rows)}
+        cancelled = self._request("cancelled")
+        live = self._request("live")
+        live_state = SimpleNamespace(request_id="live", tokens_processed=0)
+        s.prefilling.extend((cancelled, live))
+        s._prefill_states["live"] = live_state
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += 128
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["live"]
+        assert [request.request_id for request in s.prefilling] == ["live"]
+
+    def test_idle_turn_keeps_all_prompt_rows_and_wide_quantum(self):
+        s = _make_scheduler()
+        requests = [self._request(f"p{row}") for row in range(4)]
+        for request in requests:
+            s._prefill_states[request.request_id] = SimpleNamespace(
+                request_id=request.request_id,
+                tokens_processed=0,
+            )
+        s.prefilling.extend(requests)
+        calls = []
+
+        def step(state):
+            calls.append(state.request_id)
+            state.tokens_processed += s.config.prefill_step_size
+            return False
+
+        with patch.object(s, "_step_prefill_chunk", side_effect=step):
+            s._advance_chunked_prefills([], [])
+
+        assert calls == ["p0", "p1", "p2", "p3"]
+        assert s._mixed_batch_budget().prompt_row_budget == 0
 
 
 class TestAdmissionDeferral:

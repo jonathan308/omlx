@@ -131,9 +131,14 @@ _RANK_ENV_DEFAULTS = (
     # Exact 256-way B1 router top-6. Default-off until the full TP2 rate/hash
     # gate confirms the isolated 2.6% selection win scales across 40 layers.
     ("OMLX_DSV4_ROUTER_TOPK_DECODE", "1"),
-    # Yield long prompt work back to live decode after one 1K DS4 kernel call.
+    # Yield long prompt work back to live decode after one bounded DS4 slice.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
+    # Shared continuous-batching policy. Mirrored B1/B2/B4 decode rows turn
+    # this base into 512/256/128 prompt quanta; exporting both values keeps
+    # tensor ranks in lockstep when an operator overrides either knob.
+    ("OMLX_CONTENDED_PREFILL_CHUNK", "512"),
+    ("OMLX_MIXED_PREFILL_MIN_QUANTUM", "128"),
     ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
     # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off
     # until a live lossless A/B clears the promotion gate; carrying the value

@@ -1235,6 +1235,43 @@ def _outer_prefill_batch(
     )
 
 
+class _PromptRows:
+    def __init__(self, uids, totals):
+        self.uids = list(uids)
+        self.tokens = [[] for _ in self.uids]
+        self._omlx_total_prompt_lengths = dict(totals)
+        self.prompted = None
+
+    def __len__(self):
+        return len(self.uids)
+
+    def _filter(self, indices):
+        self.uids = [self.uids[index] for index in indices]
+        self.tokens = [self.tokens[index] for index in indices]
+
+    def split(self, indices):
+        selected = sorted(indices)
+        left = [
+            index for index in range(len(self.uids)) if index not in selected
+        ]
+        selected_batch = _PromptRows(
+            [self.uids[index] for index in selected],
+            self._omlx_total_prompt_lengths,
+        )
+        self._filter(left)
+        return selected_batch
+
+    def extend(self, other):
+        self.uids.extend(other.uids)
+        self.tokens.extend(other.tokens)
+
+    def generate(self, _last_inputs):
+        return SimpleNamespace(uids=list(self.uids))
+
+    def prompt(self, prompts):
+        self.prompted = [list(prompt) for prompt in prompts]
+
+
 def test_ds4_outer_prefill_yield_is_decode_and_request_aware():
     long_pending = ((7, [[0] * 6000], 6000),)
     short_pending = ((8, [[0] * 4096], 4096),)
@@ -1249,7 +1286,7 @@ def test_ds4_outer_prefill_yield_is_decode_and_request_aware():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 512
     )
 
     # Idle long requests retain the wider outer slice (and its lower scheduler
@@ -1311,8 +1348,88 @@ def test_ds4_outer_prefill_yields_when_decode_promotes_this_turn():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 512
     )
+
+
+def test_ds4_outer_prefill_matches_admission_before_boundary_promotion():
+    batch = _outer_prefill_batch(
+        generation_uids=tuple(range(7)),
+        current=((10, [[1]], 1),),
+        pending=((11, [[0] * 6000], 6000),),
+        completion_limit=8,
+    )
+
+    # Pinned MLX-LM admits the pending long row while generation is B7, then
+    # promotes the resident boundary row to B8. The long prompt still executes
+    # in that turn, so its outer slice must be bounded at B8 pressure.
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            batch,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 128
+    )
+
+
+def test_ds4_outer_prefill_scans_every_stock_admissible_pending_row():
+    short = (8, [[0] * 1000], 1000)
+    long = (9, [[0] * 6000], 6000)
+    batch = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=(short, long),
+    )
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            batch,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 512
+    )
+
+    boundary_then_long = _outer_prefill_batch(
+        generation_uids=(99,),
+        pending=((8, [[1]], 1), long),
+    )
+    assert (
+        _deepseek_v4_outer_prefill_step(
+            boundary_then_long,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        == 256
+    )
+
+
+@pytest.mark.parametrize(
+    ("decode_rows", "expected_quantum"),
+    ((1, 512), (2, 256), (4, 128)),
+)
+def test_ds4_outer_prefill_uses_rank_deterministic_b1_b2_b4_budget(
+    decode_rows,
+    expected_quantum,
+):
+    left = _outer_prefill_batch(
+        generation_uids=tuple(range(decode_rows)),
+        pending=((7, [[0] * 6000], 6000),),
+    )
+    right = _outer_prefill_batch(
+        generation_uids=tuple(range(decode_rows)),
+        pending=((7, [[0] * 6000], 6000),),
+    )
+
+    decisions = [
+        _deepseek_v4_outer_prefill_step(
+            batch,
+            long_after=4096,
+            kernel_step=1024,
+        )
+        for batch in (left, right)
+    ]
+
+    assert decisions == [expected_quantum, expected_quantum]
 
 
 def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
@@ -1335,7 +1452,9 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
     )
     batch._stream = mx.default_stream(mx.default_device())
     observed = []
-    batch._next = lambda: observed.append(batch.prefill_step_size) or ([], [])
+    batch._next = lambda: observed.append(
+        (batch.prefill_step_size, batch.prefill_batch_size)
+    ) or ([], [])
     original_next = mlx_generate.BatchGenerator.next
 
     with install_runtime_optimizations(
@@ -1349,17 +1468,20 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
         assert mlx_generate.BatchGenerator.next is not original_next
         mlx_generate.BatchGenerator.next(batch)
         assert batch.prefill_step_size == 2048
+        assert batch.prefill_batch_size == 4
 
         def fail_turn():
-            assert batch.prefill_step_size == 1024
+            assert batch.prefill_step_size == 512
+            assert batch.prefill_batch_size == 1
             raise RuntimeError("synthetic scheduler failure")
 
         batch._next = fail_turn
         with pytest.raises(RuntimeError, match="synthetic scheduler failure"):
             mlx_generate.BatchGenerator.next(batch)
         assert batch.prefill_step_size == 2048
+        assert batch.prefill_batch_size == 4
 
-    assert observed == [1024]
+    assert observed == [(512, 1)]
     assert mlx_generate.BatchGenerator.next is original_next
 
     monkeypatch.setenv("OMLX_DSV4_PREFILL_YIELD", "0")
@@ -1375,6 +1497,360 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
         assert item["active"] is False
         assert "disabled by the operator" in item["reason"]
         assert mlx_generate.BatchGenerator.next is original_next
+
+
+def test_ds4_runtime_processes_one_existing_prompt_row_and_rotates(monkeypatch):
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    model = DS4Model()
+    batch = _outer_prefill_batch(
+        generation_uids=(99,),
+        current=(
+            (1, [[0] * 6000], 6000),
+            (2, [[0] * 6000], 6000),
+        ),
+    )
+    batch._prompt_batch = _PromptRows((1, 2), {1: 6000, 2: 6000})
+    batch._stream = mx.default_stream(mx.default_device())
+    observed = []
+
+    def turn():
+        observed.append(
+            (
+                list(batch._prompt_batch.uids),
+                len(batch._currently_processing),
+                batch.prefill_step_size,
+                batch.prefill_batch_size,
+            )
+        )
+        return ([], [])
+
+    batch._next = turn
+
+    with install_runtime_optimizations(
+        model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        mlx_generate.BatchGenerator.next(batch)
+        assert batch._prompt_batch.uids == [2, 1]
+        mlx_generate.BatchGenerator.next(batch)
+
+        def fail_turn():
+            assert batch._prompt_batch.uids == [1]
+            assert batch.prefill_step_size == 512
+            assert batch.prefill_batch_size == 1
+            raise RuntimeError("synthetic resident-row failure")
+
+        batch._next = fail_turn
+        with pytest.raises(RuntimeError, match="synthetic resident-row failure"):
+            mlx_generate.BatchGenerator.next(batch)
+        assert batch.prefill_step_size == 2048
+        assert batch.prefill_batch_size == 4
+
+    assert observed == [
+        ([1], 1, 512, 1),
+        ([2], 1, 512, 1),
+    ]
+    assert batch._prompt_batch.uids == [2, 1]
+    assert len(batch._currently_processing) == 2
+    assert batch._prompt_batch._omlx_total_prompt_lengths == {
+        1: 6000,
+        2: 6000,
+    }
+
+
+def test_ds4_runtime_promotes_ready_rows_before_bounded_prompt():
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    batch = _outer_prefill_batch(
+        current=(
+            (1, [[0] * 6000], 6000),
+            (2, [[7]], 1),
+            (3, [[0] * 6000], 6000),
+        ),
+    )
+    batch._prompt_batch = _PromptRows(
+        (1, 2, 3),
+        {1: 6000, 2: 1, 3: 6000},
+    )
+    batch._stream = mx.default_stream(mx.default_device())
+    observed = []
+
+    def turn():
+        observed.append(
+            (
+                list(batch._prompt_batch.uids),
+                batch.prefill_step_size,
+                batch.prefill_batch_size,
+            )
+        )
+        # Mirror MLX-LM's boundary split: UID 2 enters generation before UID 1
+        # performs the prompt call.
+        batch._prompt_batch._filter([0])
+        batch._currently_processing = [batch._currently_processing[0]]
+        return ([], [SimpleNamespace(uid=2)])
+
+    batch._next = turn
+
+    with install_runtime_optimizations(
+        DS4Model(),
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        mlx_generate.BatchGenerator.next(batch)
+
+    assert observed == [([1, 2], 512, 2)]
+    assert batch._prompt_batch.uids == [3, 1]
+    assert len(batch._currently_processing) == 2
+
+
+def test_ds4_pinned_next_admits_no_extra_prompt_behind_ready_rows():
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    class GenerationRows:
+        def __init__(self):
+            self.uids = []
+
+        def __len__(self):
+            return len(self.uids)
+
+        def next(self):
+            return []
+
+        def extend(self, rows):
+            self.uids.extend(rows.uids)
+
+    batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch.model = DS4Model()
+    batch.prefill_step_size = 2048
+    batch.prefill_batch_size = 4
+    batch.completion_batch_size = 8
+    batch._generation_batch = GenerationRows()
+    batch._prompt_batch = _PromptRows(
+        (1, 2, 3),
+        {1: 1, 2: 1, 3: 6000},
+    )
+    batch._currently_processing = [
+        [[[11]], 0, 1],
+        [[[22]], 0, 1],
+        [[list(range(6000))], 0, 6000],
+    ]
+    batch._unprocessed_sequences = [object(), object()]
+    batch._gen_tokens_counter = 0
+    batch._steps_counter = 0
+    batch._prompt_tokens_counter = 0
+    batch._prompt_time_counter = 0.0
+    batch._stream = mx.default_stream(mx.default_device())
+    batch._old_wired_limit = None
+
+    def reject_extra_admission(_count):
+        raise AssertionError("ready rows must not admit extra prompt rows")
+
+    batch._make_batch = reject_extra_admission
+
+    with install_runtime_optimizations(
+        batch.model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        prompt_responses, _generation_responses = batch.next()
+
+    assert batch._generation_batch.uids == [1, 2]
+    assert batch._prompt_batch.uids == [3]
+    assert len(batch._currently_processing) == 1
+    assert len(prompt_responses) == 3
+    assert len(batch._prompt_batch.prompted) == 1
+    assert len(batch._prompt_batch.prompted[0]) == 256
+
+
+@pytest.mark.parametrize(
+    ("queued_total", "expected_width"),
+    ((6000, 512), (1000, 1000)),
+)
+def test_ds4_pinned_next_limits_pending_rows_during_decode(
+    queued_total,
+    expected_width,
+):
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    class GenerationRows:
+        def __init__(self):
+            self.uids = [99]
+
+        def __len__(self):
+            return len(self.uids)
+
+        def next(self):
+            return [SimpleNamespace(uid=99)]
+
+        def extend(self, rows):
+            self.uids.extend(rows.uids)
+
+    short = (1, [list(range(1000))], 1, None, [], None, None, None)
+    queued = (
+        2,
+        [list(range(queued_total))],
+        1,
+        None,
+        [],
+        None,
+        None,
+        None,
+    )
+    batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch.model = DS4Model()
+    batch.prefill_step_size = 2048
+    batch.prefill_batch_size = 4
+    batch.completion_batch_size = 8
+    batch._generation_batch = GenerationRows()
+    batch._prompt_batch = _PromptRows((), {})
+    batch._currently_processing = []
+    batch._unprocessed_sequences = [short, queued]
+    batch._gen_tokens_counter = 0
+    batch._steps_counter = 0
+    batch._prompt_tokens_counter = 0
+    batch._prompt_time_counter = 0.0
+    batch._stream = mx.default_stream(mx.default_device())
+    batch._old_wired_limit = None
+
+    def make_batch(count):
+        assert count == 1
+        uid, segments, _maximum, _cache, tokens, *_rest = (
+            batch._unprocessed_sequences.pop(0)
+        )
+        total = len(tokens) + sum(len(segment) for segment in segments)
+        batch._currently_processing.append([segments, 0, total])
+        return _PromptRows((uid,), {uid: total})
+
+    batch._make_batch = make_batch
+
+    with install_runtime_optimizations(
+        batch.model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        prompt_responses, generation_responses = batch.next()
+
+    assert len(generation_responses) == 1
+    assert len(prompt_responses) == 1
+    assert batch._prompt_batch.uids == [1]
+    assert len(batch._prompt_batch.prompted) == 1
+    assert len(batch._prompt_batch.prompted[0]) == expected_width
+    assert [item[0] for item in batch._unprocessed_sequences] == [2]
+
+
+def test_ds4_pinned_next_withholds_prompt_when_boundaries_fill_decode_budget():
+    class Attention:
+        dspark = True
+
+    class DS4Model:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                layers=[SimpleNamespace(attn=Attention())]
+            )
+
+        def __call__(self, value, cache=None, skip_lm_head=False):
+            return None
+
+    class GenerationRows:
+        def __init__(self):
+            self.uids = list(range(7))
+
+        def __len__(self):
+            return len(self.uids)
+
+        def next(self):
+            return [SimpleNamespace(uid=uid) for uid in self.uids]
+
+        def extend(self, rows):
+            self.uids.extend(rows.uids)
+
+    long = (11, [list(range(6000))], 1, None, [], None, None, None)
+    batch = mlx_generate.BatchGenerator.__new__(mlx_generate.BatchGenerator)
+    batch.model = DS4Model()
+    batch.prefill_step_size = 2048
+    batch.prefill_batch_size = 4
+    batch.completion_batch_size = 8
+    batch._generation_batch = GenerationRows()
+    batch._prompt_batch = _PromptRows((10,), {10: 1})
+    batch._currently_processing = [[[[10]], 0, 1]]
+    batch._unprocessed_sequences = [long]
+    batch._gen_tokens_counter = 0
+    batch._steps_counter = 0
+    batch._prompt_tokens_counter = 0
+    batch._prompt_time_counter = 0.0
+    batch._stream = mx.default_stream(mx.default_device())
+    batch._old_wired_limit = None
+
+    def reject_prompt_admission(_count):
+        raise AssertionError("a full projected decode batch must not admit prompt work")
+
+    batch._make_batch = reject_prompt_admission
+
+    with install_runtime_optimizations(
+        batch.model,
+        _Group(),
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=False,
+    ):
+        prompt_responses, generation_responses = batch.next()
+
+    assert len(generation_responses) == 7
+    assert len(prompt_responses) == 1
+    assert batch._generation_batch.uids == [*range(7), 10]
+    assert batch._prompt_batch.uids == []
+    assert batch._currently_processing == []
+    assert [item[0] for item in batch._unprocessed_sequences] == [11]
 
 
 def test_non_ds4_runtime_does_not_patch_outer_scheduler():

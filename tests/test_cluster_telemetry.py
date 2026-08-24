@@ -5,6 +5,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
@@ -162,8 +164,8 @@ def test_telemetry_publishes_structured_mtp_economics(monkeypatch):
     assert snapshot["mtp"] == expected
 
 
-def test_aggregate_decode_tps_uses_decode_time_not_uptime():
-    """Idle uptime must not dilute the aggregate decode rate.
+def test_average_request_decode_tps_uses_decode_time_not_uptime():
+    """Idle uptime must not dilute the average per-request decode rate.
 
     The old divisor (process uptime) reported ~2 tok/s on a deployment whose
     requests decoded at ~23 tok/s, because a serving rank is mostly idle
@@ -186,7 +188,8 @@ def test_aggregate_decode_tps_uses_decode_time_not_uptime():
     clock.value = 102.0
     snapshot = telemetry.snapshot()
     # 2 tokens over the 2 s decode window (first token -> finish).
-    assert snapshot["aggregate_decode_tps"] == 1.0
+    assert snapshot["average_request_decode_tps"] == 1.0
+    assert snapshot["aggregate_decode_tps"] == 0.0
     # The old semantic survives under an honest name.
     assert snapshot["aggregate_wall_tps"] == 2 / 102.0
 
@@ -199,7 +202,56 @@ def test_aggregate_decode_tps_uses_decode_time_not_uptime():
     telemetry.observe_token(request_id)
     snapshot = telemetry.snapshot()
     # (2 finished tokens + 2 active) / (2 s finished + 2 s active).
-    assert snapshot["aggregate_decode_tps"] == 1.0
+    assert snapshot["average_request_decode_tps"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("generation_rows", "elapsed", "expected"),
+    ((1, 0.05, 20.0), (2, 0.05, 40.0), (4, 0.05, 80.0)),
+)
+def test_aggregate_decode_tps_counts_overlapping_b1_b2_b4_steps(
+    generation_rows, elapsed, expected
+):
+    telemetry = RuntimeTelemetry(_Marker(), clock=_Clock(), publish_interval=0)
+
+    telemetry.observe_batch_step(
+        prompt_responses=3,
+        generation_responses=generation_rows,
+        elapsed_seconds=elapsed,
+    )
+
+    snapshot = telemetry.snapshot()
+    assert snapshot["aggregate_decode_tps"] == pytest.approx(expected)
+    assert snapshot["average_request_decode_tps"] == 0.0
+
+
+def test_aggregate_decode_tps_ignores_prompt_only_step_time():
+    telemetry = RuntimeTelemetry(_Marker(), clock=_Clock(), publish_interval=0)
+    telemetry.observe_batch_step(
+        prompt_responses=4,
+        generation_responses=0,
+        elapsed_seconds=1.0,
+    )
+    telemetry.observe_batch_step(
+        prompt_responses=0,
+        generation_responses=4,
+        elapsed_seconds=0.1,
+    )
+
+    assert telemetry.snapshot()["aggregate_decode_tps"] == pytest.approx(40.0)
+
+
+def test_aggregate_decode_tps_accumulates_b1_b2_b4_step_math():
+    telemetry = RuntimeTelemetry(_Marker(), clock=_Clock(), publish_interval=0)
+    for rows, elapsed in ((1, 0.02), (2, 0.04), (4, 0.08)):
+        telemetry.observe_batch_step(
+            prompt_responses=0,
+            generation_responses=rows,
+            elapsed_seconds=elapsed,
+        )
+
+    # Seven generated row-tokens over 140 ms of actual generation-step wall.
+    assert telemetry.snapshot()["aggregate_decode_tps"] == pytest.approx(50.0)
 
 
 def test_telemetry_publishes_live_mlx_lm_prefill_progress():
@@ -520,6 +572,7 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
     assert snapshot["pipeline"]["last_batch"]["coalesced_batch_size"] == 4
     assert snapshot["pipeline"]["microbatch_target"] == 4
     assert snapshot["pipeline"]["utilization"] == 0.25
+    assert snapshot["aggregate_decode_tps"] == 16.0
     assert snapshot["cache"]["affinity"] == "deployment"
     assert snapshot["cache"]["hit_rate"] == 1.0
     assert snapshot["cache"]["tokens_reused"] == 75

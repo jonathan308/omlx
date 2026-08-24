@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any
 
+from ..continuous_batching import (
+    DEFAULT_MIXED_PREFILL_QUANTUM,
+    continuous_batch_budget,
+)
 from .performance import ExecutionSettings
 
 _PREFILL_CLEAR_CACHE_EVERY_ENV = "OMLX_CLUSTER_PREFILL_CLEAR_CACHE_EVERY"
@@ -234,11 +238,12 @@ def _deepseek_v4_outer_prefill_step(
     4096) tokens, however, so the adaptive prompt loop executes two (or four)
     expensive 1024-token calls before returning control to an active decode.
 
-    Cap only that *outer* slice to one kernel call when this turn contains both
-    a decode and long-prompt prefill work.  Idle long prompts retain the wider
-    outer slice and allocator reuse.  The decision uses only mirrored batch
-    structure and full request lengths -- never local clocks -- so TP ranks
-    stay in collective lockstep.
+    Cap only that *outer* slice when this turn contains both decode and
+    long-prompt work. The shared continuous-batching policy selects 512/256/128
+    prompt tokens for B1/B2/B4 decode pressure. Idle long prompts retain the
+    wider outer slice and allocator reuse. The decision uses only mirrored
+    batch structure and full request lengths -- never local clocks -- so TP
+    ranks stay in collective lockstep.
     """
 
     try:
@@ -247,9 +252,6 @@ def _deepseek_v4_outer_prefill_step(
         long_after = max(0, int(long_after))
     except (AttributeError, TypeError, ValueError):
         return 1
-    if configured <= kernel_step:
-        return configured
-
     generation_batch = getattr(instance, "_generation_batch", None)
     generation_rows = _safe_batch_len(generation_batch)
     try:
@@ -265,7 +267,7 @@ def _deepseek_v4_outer_prefill_step(
     prompt_batch = getattr(instance, "_prompt_batch", None)
     prompt_uids = list(getattr(prompt_batch, "uids", ()) or ())
     current = list(getattr(instance, "_currently_processing", ()) or ())
-    will_decode = generation_rows > 0
+    decode_rows = generation_rows
     has_long_prefill = False
 
     for index, uid in enumerate(prompt_uids):
@@ -282,7 +284,7 @@ def _deepseek_v4_outer_prefill_step(
             # BatchGenerator promotes this row before processing prompt rows,
             # so another long row in the same turn already contends with a
             # latency-sensitive decode even if generation_batch is empty now.
-            will_decode = True
+            decode_rows += 1
             continue
         total = _current_prompt_total(instance, uid, index, staged)
         has_long_prefill |= total is not None and total > long_after
@@ -295,6 +297,10 @@ def _deepseek_v4_outer_prefill_step(
     pending_slots = max(0, prefill_limit - len(prompt_uids))
     pending_slots = min(
         pending_slots,
+        # Match pinned MLX-LM exactly: new rows are admitted before resident
+        # one-token boundaries move into generation. Scan every row stock
+        # ``_next`` could therefore admit, even though the bounded wrapper will
+        # later reduce real prompt admission to one row.
         max(0, completion_limit - generation_rows),
     )
     for staged in islice(iter(pending), pending_slots):
@@ -303,14 +309,80 @@ def _deepseek_v4_outer_prefill_step(
         except (IndexError, TypeError):
             segments = ()
         if _at_generation_boundary(segments):
-            will_decode = True
+            decode_rows += 1
             continue
         total = _pending_prompt_total(instance, staged)
         has_long_prefill |= total is not None and total > long_after
 
-    if will_decode and has_long_prefill:
-        return min(configured, kernel_step)
+    if decode_rows > 0 and has_long_prefill:
+        budget = continuous_batch_budget(
+            configured_prefill_tokens=configured,
+            active_decode_rows=decode_rows,
+            decode_row_budget=completion_limit,
+            max_prompt_tokens=configured,
+            mixed_prefill_quantum=min(
+                kernel_step,
+                DEFAULT_MIXED_PREFILL_QUANTUM,
+            ),
+        )
+        return budget.prefill_quantum
     return configured
+
+
+def _deepseek_v4_mixed_prompt_rows(instance: Any) -> bool:
+    """Whether pinned MLX-LM can run prompt work beside decode this turn.
+
+    Row gating is deliberately independent of the long-context token cap:
+    short prompts retain their configured width, but only one non-boundary row
+    may enter a mixed turn and projected-full decode batches admit none.
+    """
+
+    generation_rows = _safe_batch_len(
+        getattr(instance, "_generation_batch", None)
+    )
+    try:
+        completion_limit = max(1, int(instance.completion_batch_size))
+    except (AttributeError, TypeError, ValueError):
+        completion_limit = generation_rows + 1
+    if generation_rows >= completion_limit:
+        return False
+
+    prompt_batch = getattr(instance, "_prompt_batch", None)
+    prompt_uids = list(getattr(prompt_batch, "uids", ()) or ())
+    current = list(getattr(instance, "_currently_processing", ()) or ())
+    decode_rows = generation_rows
+    has_prompt_work = len(prompt_uids) > len(current)
+    for staged in current:
+        try:
+            segments = staged[0]
+        except (IndexError, TypeError):
+            has_prompt_work = True
+            continue
+        if _at_generation_boundary(segments):
+            decode_rows += 1
+        else:
+            has_prompt_work = True
+
+    pending = getattr(instance, "_unprocessed_sequences", ()) or ()
+    try:
+        prefill_limit = max(0, int(instance.prefill_batch_size))
+    except (AttributeError, TypeError, ValueError):
+        prefill_limit = len(prompt_uids)
+    pending_slots = min(
+        max(0, prefill_limit - len(prompt_uids)),
+        max(0, completion_limit - generation_rows),
+    )
+    for staged in islice(iter(pending), pending_slots):
+        try:
+            segments = staged[1]
+        except (IndexError, TypeError):
+            has_prompt_work = True
+            continue
+        if _at_generation_boundary(segments):
+            decode_rows += 1
+        else:
+            has_prompt_work = True
+    return decode_rows > 0 and has_prompt_work
 
 
 def _supports_coordinator_sampling(
@@ -1084,8 +1156,8 @@ def install_runtime_optimizations(
             enabled=outer_prefill_yield_enabled,
             active=outer_prefill_yield_active,
             reason=(
-                f"long DS4 outer slices yield after one "
-                f"{adaptive_prefill_step}-token model call while decode is live"
+                "mixed DS4 turns process one prompt row; long rows use shared "
+                "512/256/128-token budgets at B1/B2/B4"
                 if outer_prefill_yield_active
                 else (
                     "DS4 contended-prefill yielding is disabled by the operator"
@@ -1469,22 +1541,150 @@ def install_runtime_optimizations(
         """Run one MLX-LM turn with a contention-only DS4 outer slice cap."""
 
         previous_step = instance.prefill_step_size
+        previous_prefill_rows = instance.prefill_batch_size
+        mixed_prompt_rows = _deepseek_v4_mixed_prompt_rows(instance)
         effective_step = _deepseek_v4_outer_prefill_step(
             instance,
             long_after=adaptive_prefill_after,
             kernel_step=adaptive_prefill_step,
         )
-        if effective_step >= int(previous_step):
+        if effective_step >= int(previous_step) and not mixed_prompt_rows:
             return original_batch_next(instance, *args, **kwargs)
-        # Only the outer extraction width changes. PromptProcessingBatch keeps
-        # its configured width, and the adaptive DS4 loop still owns the exact
-        # 1024-token model-call schedule. The generation thread is the sole
-        # owner of this BatchGenerator, so the temporary value cannot race.
-        instance.prefill_step_size = effective_step
-        try:
-            return original_batch_next(instance, *args, **kwargs)
-        finally:
-            instance.prefill_step_size = previous_step
+
+        # Separate prompt-token and prompt-row budgets: process one prompt row
+        # before returning to the live decode batch. ``prefill_batch_size``
+        # limits only *new* admission in MLX-LM; rows already resident in
+        # ``_prompt_batch`` would otherwise all consume ``effective_step``.
+        # Temporarily split one resident row, then merge it behind the withheld
+        # rows so long prompts rotate fairly. The generation thread is the sole
+        # owner of this BatchGenerator, and both TP ranks observe the same UID
+        # order, so the mutation is race-free and collective-identical.
+        def run_bounded_turn() -> Any:
+            prompt_batch = getattr(instance, "_prompt_batch", None)
+            current = list(getattr(instance, "_currently_processing", ()) or ())
+            withheld_batch = None
+            withheld_current: list[Any] = []
+            total_lengths: dict[Any, Any] = {}
+            boundary_indices = [
+                index
+                for index, row in enumerate(current)
+                if row and _at_generation_boundary(row[0])
+            ]
+            generation_rows = _safe_batch_len(
+                getattr(instance, "_generation_batch", None)
+            )
+            try:
+                completion_limit = max(1, int(instance.completion_batch_size))
+            except (AttributeError, TypeError, ValueError):
+                completion_limit = generation_rows + len(boundary_indices) + 1
+            decode_full_after_boundaries = (
+                generation_rows + len(boundary_indices) >= completion_limit
+            )
+            # Boundary rows leave the prompt batch before model prefill. Add
+            # one real prompt slot only if their promotion leaves decode
+            # capacity; otherwise mirror MLX-LM's full-batch early return and
+            # preserve the independent decode-row budget.
+            active_row_limit = len(boundary_indices) + (
+                0 if decode_full_after_boundaries else 1
+            )
+
+            if len(current) > 1:
+                prompt_uids = list(getattr(prompt_batch, "uids", ()) or ())
+                if len(prompt_uids) != len(current):
+                    raise RuntimeError(
+                        "MLX-LM prompt batch and processing rows are not aligned"
+                    )
+                split = getattr(prompt_batch, "split", None)
+                if not callable(split):
+                    raise RuntimeError(
+                        "MLX-LM prompt batch cannot enforce the mixed row budget"
+                    )
+                total_lengths = dict(
+                    getattr(prompt_batch, "_omlx_total_prompt_lengths", {}) or {}
+                )
+                prompt_index = (
+                    None
+                    if decode_full_after_boundaries
+                    else next(
+                        (
+                            index
+                            for index in range(len(current))
+                            if index not in boundary_indices
+                        ),
+                        None,
+                    )
+                )
+                active_indices = sorted(
+                    boundary_indices
+                    + ([prompt_index] if prompt_index is not None else [])
+                )
+                withheld_indices = [
+                    index
+                    for index in range(len(current))
+                    if index not in active_indices
+                ]
+                if withheld_indices:
+                    # Every row already at its one-token boundary must be
+                    # promoted before the bounded prompt call; otherwise a
+                    # later ready row can wait behind N long 512-token quanta.
+                    # Add at most one real prompt row. ``split`` leaves all
+                    # withheld rows in the original batch and returns the
+                    # active subset.
+                    active_batch = split(active_indices)
+                    withheld_batch = prompt_batch
+                    withheld_current = [
+                        current[index] for index in withheld_indices
+                    ]
+                    instance._prompt_batch = active_batch
+                    instance._currently_processing = [
+                        current[index] for index in active_indices
+                    ]
+                    if total_lengths:
+                        active_batch._omlx_total_prompt_lengths = {
+                            uid: total_lengths[uid]
+                            for uid in getattr(active_batch, "uids", ())
+                            if uid in total_lengths
+                        }
+                        withheld_batch._omlx_total_prompt_lengths = {
+                            uid: total_lengths[uid]
+                            for uid in getattr(withheld_batch, "uids", ())
+                            if uid in total_lengths
+                        }
+
+            instance.prefill_step_size = effective_step
+            instance.prefill_batch_size = active_row_limit
+            try:
+                return original_batch_next(instance, *args, **kwargs)
+            finally:
+                instance.prefill_step_size = previous_step
+                instance.prefill_batch_size = previous_prefill_rows
+                if withheld_batch is not None:
+                    active_batch = instance._prompt_batch
+                    active_current = list(
+                        getattr(instance, "_currently_processing", ()) or ()
+                    )
+                    withheld_batch.extend(active_batch)
+                    instance._prompt_batch = withheld_batch
+                    instance._currently_processing = withheld_current + active_current
+                    merged_totals = dict(total_lengths)
+                    merged_totals.update(
+                        getattr(active_batch, "_omlx_total_prompt_lengths", {}) or {}
+                    )
+                    if merged_totals:
+                        withheld_batch._omlx_total_prompt_lengths = {
+                            uid: merged_totals[uid]
+                            for uid in getattr(withheld_batch, "uids", ())
+                            if uid in merged_totals
+                        }
+
+        stream = getattr(instance, "_stream", None)
+        if stream is None:
+            return run_bounded_turn()
+        # Cache filters and reassembly must be enqueued on the same stream as
+        # the prompt model call. ``BatchGenerator.next`` nests this stream
+        # context harmlessly.
+        with mx.stream(stream):
+            return run_bounded_turn()
 
     def coordinator_generation_step(instance: Any) -> Any:
         """Pinned GenerationBatch._step with one token collective per batch."""

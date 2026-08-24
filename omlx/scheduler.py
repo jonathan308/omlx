@@ -51,13 +51,20 @@ from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .continuous_batching import (
+    DEFAULT_MIXED_PREFILL_QUANTUM,
+    MIN_MIXED_PREFILL_QUANTUM,
+    MIXED_PREFILL_GRID,
+    ContinuousBatchBudget,
+    continuous_batch_budget,
+)
+from .decode_activity import get_decode_activity
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
 )
 from .patches.sdpa256_attention import set_unfused_headroom_provider
-from .decode_activity import get_decode_activity
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
@@ -1646,15 +1653,14 @@ _DECODE_FAIR_SHARE = float(os.environ.get("OMLX_DECODE_FAIR_SHARE", "0.5"))
 _DECODE_STALL_TARGET_MS = float(
     os.environ.get("OMLX_DECODE_STALL_TARGET_MS", "500")
 )
-_CONTENDED_PREFILL_CHUNK = int(
-    os.environ.get("OMLX_CONTENDED_PREFILL_CHUNK", "512")
-)
+_CONTENDED_PREFILL_CHUNK = DEFAULT_MIXED_PREFILL_QUANTUM
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
 # L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
 # route every contended chunk onto the ~4x-slower MLX fallback.
-_CONTENDED_CHUNK_GRID = 64
+_CONTENDED_CHUNK_GRID = MIXED_PREFILL_GRID
+_MIXED_PREFILL_MIN_QUANTUM = MIN_MIXED_PREFILL_QUANTUM
 _DECODE_ACTIVITY_TTL_S = 2.5
 
 
@@ -4945,32 +4951,72 @@ class Scheduler:
             logger.debug("decode-activity check failed: %s", exc)
             return False
 
+    def _active_decode_rows(self) -> int:
+        """Return local plus process-peer decode rows for budget pressure."""
+
+        rows = len(self.running)
+        try:
+            registry = get_decode_activity()
+            counter = getattr(registry, "other_decode_rows", None)
+            if callable(counter):
+                rows += max(
+                    0,
+                    int(counter(self._decode_activity_key, _DECODE_ACTIVITY_TTL_S)),
+                )
+            elif registry.others_decoding(
+                self._decode_activity_key, _DECODE_ACTIVITY_TTL_S
+            ):
+                rows += 1
+        except Exception as exc:
+            logger.debug("decode-row activity check failed: %s", exc)
+        return rows
+
     def _decode_contention(self) -> bool:
         """Any decode (own engine or another engine) this prefill contends
         with."""
         return bool(self.running) or self._others_decoding()
 
-    def _contended_prefill_cap(self) -> int:
-        """Chunk cap while decodes contend with this prefill (0 = no cap).
+    def _base_contended_prefill_quantum(self) -> int:
+        """B1 stall-time quantum before decode-row pressure scaling."""
 
-        Derived from the stall-time target and this engine's measured
-        prefill throughput, so the victim's stall stays ~constant in wall
-        time across machines and model sizes. Falls back to a fixed token
-        count until the first chunk has been timed.
-        """
-        if not self._decode_fairness:
-            return 0
-        if not self._decode_contention():
-            return 0
         tps = self._prefill_tps_best
+        ceiling = max(
+            1,
+            min(
+                self.config.prefill_step_size,
+                self.config.max_num_batched_tokens,
+                _CONTENDED_PREFILL_CHUNK,
+            ),
+        )
+        floor = min(_CONTENDED_CHUNK_FLOOR, ceiling)
         if tps and tps > 0.0:
             cap = int(_DECODE_STALL_TARGET_MS / 1000.0 * tps)
             cap = (cap // _CONTENDED_CHUNK_GRID) * _CONTENDED_CHUNK_GRID
             return max(
-                _CONTENDED_CHUNK_FLOOR,
-                min(cap, self.config.prefill_step_size),
+                floor,
+                min(cap, ceiling),
             )
-        return _CONTENDED_PREFILL_CHUNK
+        return ceiling
+
+    def _mixed_batch_budget(self) -> ContinuousBatchBudget:
+        """Deterministic prompt/decode budgets for the next scheduler turn."""
+
+        decode_rows = self._active_decode_rows() if self._decode_fairness else 0
+        return continuous_batch_budget(
+            configured_prefill_tokens=self.config.prefill_step_size,
+            active_decode_rows=decode_rows,
+            decode_row_budget=self.config.completion_batch_size,
+            max_prompt_tokens=self.config.max_num_batched_tokens,
+            mixed_prefill_quantum=self._base_contended_prefill_quantum(),
+            min_mixed_quantum=_MIXED_PREFILL_MIN_QUANTUM,
+            grid=_CONTENDED_CHUNK_GRID,
+        )
+
+    def _contended_prefill_cap(self) -> int:
+        """Prompt-token quantum while decodes run (0 means idle/unbounded)."""
+
+        budget = self._mixed_batch_budget()
+        return budget.prefill_quantum if budget.mixed else 0
 
     def _prefill_hold_deadline(self) -> float:
         """Effective hold deadline: own deadline or the shared one.
@@ -5575,12 +5621,14 @@ class Scheduler:
         scheduled: "list[Request]",
         rejected: "list[RequestOutput]",
     ) -> None:
-        """Process one prefill chunk per in-flight chunked-prefill request.
+        """Advance chunked prefills within this turn's prompt budgets.
 
         Called at the start of each step() before _schedule_waiting(). Each
-        call advances every request in self.prefilling by one prefill_step_size
-        chunk. When a request's prefill completes it is inserted into
-        BatchGenerator and moved to self.running.
+        Idle calls retain the existing all-row behavior. Mixed decode/prompt
+        calls consume one dynamically-sized prompt row and rotate it behind
+        untouched rows before returning to generation. When a request's
+        prefill completes it is inserted into BatchGenerator and moved to
+        self.running.
 
         Args:
             scheduled: The step's running list of newly-scheduled requests;
@@ -5594,6 +5642,10 @@ class Scheduler:
 
         pending_prefills = list(self.prefilling)
         still_prefilling: deque[Request] = deque()
+        cycled_prefills: deque[Request] = deque()
+        budget = self._mixed_batch_budget()
+        prompt_rows = 0
+        prompt_tokens = 0
 
         for index, request in enumerate(pending_prefills):
             rid = request.request_id
@@ -5603,6 +5655,22 @@ class Scheduler:
             # _do_abort_request() between steps — just skip it.
             if state is None:
                 continue
+
+            # Mixed turns reserve decode rows independently and allow only the
+            # planned prompt rows/tokens before returning to generation. Idle
+            # turns have zero (unbounded) budgets and retain today's loop.
+            if (
+                budget.prompt_row_budget > 0
+                and prompt_rows >= budget.prompt_row_budget
+            ) or (
+                budget.prompt_token_budget > 0
+                and prompt_tokens >= budget.prompt_token_budget
+            ):
+                still_prefilling.extend(pending_prefills[index:])
+                break
+
+            processed_before = int(getattr(state, "tokens_processed", 0) or 0)
+            prompt_rows += 1
 
             try:
                 done = self._step_prefill_chunk(state)
@@ -5661,8 +5729,19 @@ class Scheduler:
                 )
                 continue
 
+            prompt_tokens += max(
+                0,
+                int(getattr(state, "tokens_processed", processed_before) or 0)
+                - processed_before,
+            )
+
             if not done:
-                still_prefilling.append(request)
+                if budget.mixed:
+                    # Round-robin in-flight prompts so B2/B4 admission cannot
+                    # pin every mixed quantum to the oldest long request.
+                    cycled_prefills.append(request)
+                else:
+                    still_prefilling.append(request)
                 continue
 
             # Prefill complete — emit final boundary snapshot and insert.
@@ -5689,6 +5768,7 @@ class Scheduler:
 
             self._insert_prefilled_request(request, state, scheduled)
 
+        still_prefilling.extend(cycled_prefills)
         self.prefilling = still_prefilling
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:

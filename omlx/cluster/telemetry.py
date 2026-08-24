@@ -228,10 +228,12 @@ class RuntimeTelemetry:
         self._completion_tokens_total = 0
         self._cached_tokens_total = 0
         # Sum of per-request decode windows (first-token -> finish) for
-        # finished requests. aggregate_decode_tps divides generated tokens by
-        # this decode time, not by process uptime: uptime is mostly idle, so
-        # the old divisor reported ~2 tok/s while requests decoded at ~23.
+        # finished requests. This produces the average per-request rate. True
+        # aggregate throughput uses generation rows / batch-step wall time;
+        # summing overlapping request windows would divide concurrency away.
         self._decode_seconds_total = 0.0
+        self._decode_step_tokens_total = 0
+        self._decode_step_seconds_total = 0.0
         self._batch_steps = 0
         self._busy_seconds = 0.0
         self._idle_seconds = 0.0
@@ -858,11 +860,15 @@ class RuntimeTelemetry:
             self._busy_seconds += elapsed
             self._last_step_finished_at = now
             self._batch_steps += 1
+            generation_rows = max(0, int(generation_responses))
+            if generation_rows > 0 and elapsed > 0.0:
+                self._decode_step_tokens_total += generation_rows
+                self._decode_step_seconds_total += elapsed
             coalesced = max(prompt_responses, generation_responses)
             self._last_batch = {
                 "step_seconds": elapsed,
                 "prompt_responses": max(0, int(prompt_responses)),
-                "generation_responses": max(0, int(generation_responses)),
+                "generation_responses": generation_rows,
                 "coalesced_batch_size": max(0, int(coalesced)),
             }
             self._publish_locked(now, force=False)
@@ -1185,6 +1191,11 @@ class RuntimeTelemetry:
                 len(active_samples) - _MAX_ACTIVE_REQUEST_METRICS,
             ),
             "aggregate_decode_tps": (
+                self._decode_step_tokens_total / self._decode_step_seconds_total
+                if self._decode_step_seconds_total > 0
+                else 0.0
+            ),
+            "average_request_decode_tps": (
                 total_generated / decode_seconds if decode_seconds > 0 else 0.0
             ),
             # The pre-fix semantic (tokens / process uptime, idle included),

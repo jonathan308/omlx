@@ -462,6 +462,7 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
 ):
     metrics = _metrics() | {
         "aggregate_decode_tps": 31.5,
+        "average_request_decode_tps": 9.25,
         "cache": {
             "affinity": "deployment",
             "lookups": 4,
@@ -544,6 +545,7 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
     assert result["warnings"] == []
     job = result["jobs"][0]
     assert job["metrics"]["aggregate_decode_tps"] == 31.5
+    assert job["metrics"]["average_request_decode_tps"] == 9.25
     assert job["metrics"]["cache"]["hit_rate"] == 0.75
     assert job["metrics"]["pipeline"]["utilization"] == 0.8
     assert job["performance_profiles"][1]["node_id"] == "mobile"
