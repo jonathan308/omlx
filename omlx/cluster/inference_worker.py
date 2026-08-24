@@ -1510,7 +1510,9 @@ def run_worker(args: argparse.Namespace) -> int:
     mtp_enabled, mtp_num_draft_tokens = decode_worker_speculation(args.plan)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
-    group = mx.distributed.init(backend=init_backend, strict=True)
+    from .jaccl_side_channel import init_cluster_group
+
+    group = init_cluster_group(mx, backend=init_backend, strict=True)
     rank = group.rank()
     world_size = group.size()
     if world_size != len(assignments):
