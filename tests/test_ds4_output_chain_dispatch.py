@@ -41,6 +41,11 @@ def _eligible(monkeypatch, **overrides):
     monkeypatch.setattr(
         dm, "_DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL", overrides.pop("enabled", True)
     )
+    monkeypatch.setattr(
+        dm,
+        "_DEEPSEEK_V4_OUTPUT_CHAIN_EQUAL_TP",
+        overrides.pop("equal_enabled", True),
+    )
     verify = overrides.pop("verify", False)
     monkeypatch.setattr(
         dm,
@@ -94,6 +99,12 @@ def test_equal_k2048_chain_is_m3_only(monkeypatch):
     assert _eligible(monkeypatch, k=2048) is None
     monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"})
     assert _eligible(monkeypatch, k=2048) is not None
+
+
+def test_equal_k2048_has_independent_default_gate(monkeypatch):
+    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"})
+    assert _eligible(monkeypatch, k=2048, enabled=False) is not None
+    assert _eligible(monkeypatch, k=2048, equal_enabled=False) is None
 
 
 @pytest.mark.parametrize(

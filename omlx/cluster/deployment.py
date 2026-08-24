@@ -209,6 +209,9 @@ _RANK_ENV_DEFAULTS = (
     # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
     # Both ranks receive one value; exact shape/config guards decide locally.
     ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),
+    # Exact equal-TP2 M3 O-A->BF16->O-B chain. M5 retains NAX stock and every
+    # unequal/single topology retains its separately default-off legacy gate.
+    ("OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP", "1"),
     # Exact DSpark verify graph simplification: prepare all M O-A rows as one
     # grouped view instead of materializing M one-row slices + concatenate.
     # Default-off until the physical equal-TP2 decode gate clears.

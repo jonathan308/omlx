@@ -450,6 +450,9 @@ _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = False
 _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
     "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_OUTPUT_CHAIN_EQUAL_TP = os.getenv(
+    "OMLX_DSV4_OUTPUT_CHAIN_EQUAL_TP", "1"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
 _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE = os.getenv(
     "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"
@@ -750,20 +753,22 @@ def _attention_output_chain_native_inputs(
 ) -> Optional[Tuple[mx.array, mx.array, mx.array, mx.array]]:
     """Preflight the exact DS4 3:5 M=1024 O-A→BF16→O-B chain."""
 
+    prepared_shape = tuple(prepared.shape)
+    legacy_shapes = {
+        (1, 8, 1024, 1536),
+        (1, 8, 1024, 2560),
+        (1, 8, 1024, 4096),
+        (1, 8, 2048, 4096),
+    }
+    equal_shapes = {
+        (1, 8, 1024, 2048),
+        (1, 8, 2048, 2048),
+    }
     if (
-        not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL
-        or getattr(attn, "training", False)
+        getattr(attn, "training", False)
         or is_dspark_verify_armed()
         or prepared.dtype != mx.bfloat16
-        or tuple(prepared.shape)
-        not in (
-            (1, 8, 1024, 1536),
-            (1, 8, 1024, 2048),
-            (1, 8, 1024, 2560),
-            (1, 8, 1024, 4096),
-            (1, 8, 2048, 2048),
-            (1, 8, 2048, 4096),
-        )
+        or prepared_shape not in legacy_shapes | equal_shapes
     ):
         return None
     config = getattr(attn, "config", None)
@@ -792,6 +797,8 @@ def _attention_output_chain_native_inputs(
     o_b_scales = o_b.get("scales")
     k = int(prepared.shape[-1])
     if k == 2048:
+        if not _DEEPSEEK_V4_OUTPUT_CHAIN_EQUAL_TP:
+            return None
         try:
             # Equal TP2's K2048 classic chain is bit-exact and faster on M3
             # Ultra. M5 stock dispatches O-A/O-B through NAX TensorOps; the
@@ -801,6 +808,8 @@ def _attention_output_chain_native_inputs(
                 return None
         except Exception:
             return None
+    elif not _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL:
+        return None
     if (
         o_a_weight is None
         or o_a_scales is None
