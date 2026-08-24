@@ -1990,6 +1990,46 @@ def _indexer_head_reduce(scores, weights, scale):
     return (mx.maximum(scores, 0) * scale * weights).sum(axis=1)
 
 
+def _foldable_pool_mask_ratio(
+    pool_cache: Any,
+    pmask: Optional[mx.array],
+    *,
+    batch_size: int,
+    pooled_tokens: int,
+    query_offset: Any,
+) -> int:
+    """Return an exact uniform pooled-mask ratio, or zero for mx.where.
+
+    A singleton ``BatchPoolingCache`` has the same causal mask as
+    ``PoolingCache`` only when its one logical pool length fills the physical
+    view. Multi-row batches and restored/trimmed physical tails retain their
+    explicit 3-D validity mask.
+    """
+
+    if pmask is None or not isinstance(query_offset, int):
+        return 0
+    name = type(pool_cache).__name__
+    if name == "PoolingCache":
+        if pmask.ndim != 2:
+            return 0
+    elif name == "BatchPoolingCache":
+        lengths = getattr(pool_cache, "_pool_lengths", None)
+        if (
+            batch_size != 1
+            or pmask.ndim != 3
+            or not isinstance(lengths, list)
+            or lengths != [pooled_tokens]
+        ):
+            return 0
+    else:
+        return 0
+    try:
+        ratio = int(pool_cache.ratio)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return ratio if ratio > 0 else 0
+
+
 @partial(mx.compile, shapeless=True)
 def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     if sinks is not None:
@@ -2936,19 +2976,20 @@ class Indexer(nn.Module):
                     ).astype(q.dtype) * ((self.n_heads**-0.5) * self.scale)
                     # Fused pooled-ratio causal mask (lossless): the kernel
                     # epilogue writes the finfo(bf16).min sentinel itself
-                    # when the mask is the plain 2-D PoolingCache ratio mask,
-                    # bit-identical to the mx.where pass it replaces.
-                    # Batched 3-D masks keep the where pass; pmask is None
-                    # stays unmasked as before.
-                    _mask_ratio = 0
+                    # for a uniform PoolingCache ratio mask, bit-identical to
+                    # the mx.where pass it replaces. Singleton
+                    # BatchPoolingCache is also uniform when its logical pool
+                    # fills the physical view; true multi-row/tailed batches
+                    # keep the explicit 3-D mask.
+                    _mask_ratio = _foldable_pool_mask_ratio(
+                        pool_cache,
+                        pmask,
+                        batch_size=B,
+                        pooled_tokens=int(pooled.shape[1]),
+                        query_offset=query_offset,
+                    )
                     _mask_q_offset = 0
-                    if (
-                        pmask is not None
-                        and pmask.ndim == 2
-                        and isinstance(query_offset, int)
-                        and type(pool_cache).__name__ == "PoolingCache"
-                    ):
-                        _mask_ratio = int(pool_cache.ratio)
+                    if _mask_ratio:
                         _mask_q_offset = int(query_offset)
                     hierarchical_indices = hierarchical_topk(
                         q,

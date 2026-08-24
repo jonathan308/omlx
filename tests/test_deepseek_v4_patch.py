@@ -2980,6 +2980,98 @@ class TestDS4NAXIndexerScoreDispatch:
         assert out.shape == (B, L, 512)
         assert seen == [expected]
 
+    @pytest.mark.parametrize("physical_tail,expected_ratio", ((False, 4), (True, 0)))
+    def test_singleton_batch_mask_reaches_hierarchy_only_when_uniform(
+        self, applied_patch, monkeypatch, physical_tail, expected_ratio
+    ):
+        import mlx.core as mx
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        B, L, H, D, N, offset = 1, 64, 64, 128, 577, 2304
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = BatchPoolingCache(4, [0])
+        cache._pool_buf = pooled
+        cache._pool_extent = N
+        cache._pool_lengths = [N - 1 if physical_tail else N]
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=True,
+            _nax_indexer_score=False,
+            row_sharding_group=None,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_MMA_SCORE", True)
+        seen = {"hierarchy": [], "score": []}
+
+        def hierarchy(*args, **kwargs):
+            seen["hierarchy"].append((kwargs["ratio"], kwargs["query_offset"]))
+            return None
+
+        def scores(q, k, weights, **kwargs):
+            seen["score"].append(
+                (kwargs["mask_ratio"], kwargs["mask_q_offset"])
+            )
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(dm, "hierarchical_topk", hierarchy)
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda score_sheet, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, score_sheet.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=offset,
+            projected_q=q,
+            projected_weights=weights,
+        )
+
+        assert out.shape == (B, L, 512)
+        assert seen["hierarchy"] == [(expected_ratio, offset)]
+        assert seen["score"] == [
+            (expected_ratio, offset if expected_ratio else 0)
+        ]
+
+    def test_foldable_batch_mask_rejects_true_batches(self, applied_patch):
+        import mlx.core as mx
+        from mlx_lm.models.cache import BatchPoolingCache
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        cache = BatchPoolingCache(4, [0, 0])
+        cache._pool_lengths = [8, 8]
+        pmask = mx.ones((2, 16, 8), dtype=mx.bool_)
+
+        assert (
+            dm._foldable_pool_mask_ratio(
+                cache,
+                pmask,
+                batch_size=2,
+                pooled_tokens=8,
+                query_offset=32,
+            )
+            == 0
+        )
+
     @staticmethod
     def _run_projected_indexer(dm, monkeypatch, *, group=None):
         import mlx.core as mx
