@@ -1708,7 +1708,12 @@ class DiscoveryService:
             due = [
                 (ip, port)
                 for (ip, port), candidate in self._candidates.items()
-                if now - candidate["last_probe"] >= self.config.probe_interval
+                if now - candidate["last_probe"]
+                >= (
+                    self.config.heartbeat_interval
+                    if candidate.get("verified")
+                    else self.config.probe_interval
+                )
             ]
             due.sort(
                 key=lambda key: (
@@ -1830,9 +1835,13 @@ class DiscoveryService:
     def _maintenance_loop(self) -> None:
         last_probe = 0.0
         last_tailscale = 0.0
+        sweep_interval = min(
+            self.config.probe_interval,
+            self.config.heartbeat_interval,
+        )
         while not self._stop.is_set():
             now = self._clock()
-            if now - last_probe >= self.config.probe_interval:
+            if now - last_probe >= sweep_interval:
                 self._probe_sweep()
                 last_probe = now
             self._liveness_sweep()

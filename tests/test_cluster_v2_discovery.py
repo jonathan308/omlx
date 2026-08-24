@@ -511,6 +511,27 @@ def test_probe_sweep_respects_interval():
     assert calls == [("10.0.0.5", 8000)] * 2
 
 
+def test_verified_candidate_uses_heartbeat_cadence():
+    calls: list[tuple[str, int]] = []
+    clock = FakeClock()
+    service, _ = _service(
+        clock=clock,
+        prober=lambda ip, port, timeout: calls.append((ip, port))
+        or {
+            "node_id": "peer-node",
+            "version": "0.6.4.dev1",
+            "cluster_name": "omlx",
+        },
+    )
+    service.add_manual("10.0.0.5", 8000)
+    service.probe_now()
+    clock.advance(service.config.heartbeat_interval)
+    service.probe_now()
+
+    assert calls == [("10.0.0.5", 8000)] * 2
+    assert service.peers()[0].state == "discovered"
+
+
 def test_explicit_candidate_probe_bypasses_periodic_dedupe():
     calls: list[tuple[str, int]] = []
     service, _ = _service(
