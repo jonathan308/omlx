@@ -1510,6 +1510,22 @@ def install_server_telemetry(
                     positions.append(offset)
         return tuple(positions)
 
+    def prompt_cache_position_trace(cache: Any) -> tuple[dict[str, Any], ...]:
+        """Describe cached offsets for an operator-only DS4 reuse diagnosis."""
+
+        rows: list[dict[str, Any]] = []
+        for item in cache or ():
+            nested = getattr(item, "caches", None)
+            entries = nested if isinstance(nested, (list, tuple)) else (item,)
+            for entry in entries:
+                row: dict[str, Any] = {"type": type(entry).__name__}
+                for name in ("ratio", "remainder", "_pool_len", "offset", "max_size"):
+                    value = getattr(entry, name, None)
+                    if isinstance(value, int):
+                        row[name] = value
+                rows.append(row)
+        return tuple(rows)
+
     def agree_prompt_cache_plan(
         cache: Any,
         tokens: list[int],
@@ -1538,6 +1554,17 @@ def install_server_telemetry(
         suffix = len(rest) if cache is not None else len(tokens)
         positions = prompt_cache_positions(cache)
         incoherent = int(any(position != reused for position in positions))
+        if (
+            incoherent
+            and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1"
+        ):
+            logger.warning(
+                "Prompt-cache position diagnostic rank=%s reused=%s positions=%s details=%s",
+                rank,
+                reused,
+                positions,
+                prompt_cache_position_trace(cache),
+            )
         local = (reused, suffix, incoherent)
         plans: list[tuple[int, int, int]] = []
         if control_plane is not None:
