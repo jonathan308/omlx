@@ -61,6 +61,8 @@ def _eligible(monkeypatch, **overrides):
         "has_symbol",
         lambda name: name != missing_symbol,
     )
+    device = overrides.pop("device", "Apple M3 Ultra")
+    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": device})
     k = overrides.pop("k", 1536)
     o_a = _Projection(
         overrides.pop("o_a_weight", (8, 1024, k // 4)),
@@ -95,14 +97,11 @@ def test_single_m3_m2048_shape_is_eligible(monkeypatch):
 
 
 def test_equal_k2048_chain_is_m3_only(monkeypatch):
-    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M5 Max"})
-    assert _eligible(monkeypatch, k=2048) is None
-    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"})
+    assert _eligible(monkeypatch, k=2048, device="Apple M5 Max") is None
     assert _eligible(monkeypatch, k=2048) is not None
 
 
 def test_equal_k2048_has_independent_default_gate(monkeypatch):
-    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"})
     assert _eligible(monkeypatch, k=2048, enabled=False) is not None
     assert _eligible(monkeypatch, k=2048, equal_enabled=False) is None
 

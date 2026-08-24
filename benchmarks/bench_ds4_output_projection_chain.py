@@ -330,24 +330,29 @@ def main() -> int:
     # The imported loader and shape function intentionally share the source
     # module globals. Override their benchmark-only partition before loading;
     # no production model class or environment variable is touched.
-    rank_shape.__globals__["SHARD_WEIGHTS"] = shard_weights
-
-    if not fast.has_symbol("ds4_output_projection_chain") or not fast.has_symbol(
-        "ds4_output_oa_interleaved"
-    ):
-        raise RuntimeError("rebuilt DS4 output-chain native symbols are required")
-    reports = [
-        run_rank(
-            args.model.expanduser(),
-            layer,
-            rank,
-            warmup=args.warmup,
-            cycles=args.cycles,
-            parity_seeds=args.parity_seeds,
-        )
-        for layer in args.layers
-        for rank in args.ranks
-    ]
+    previous_shard_weights = rank_shape.__globals__["SHARD_WEIGHTS"]
+    try:
+        rank_shape.__globals__["SHARD_WEIGHTS"] = shard_weights
+        if not fast.has_symbol(
+            "ds4_output_projection_chain"
+        ) or not fast.has_symbol("ds4_output_oa_interleaved"):
+            raise RuntimeError(
+                "rebuilt DS4 output-chain native symbols are required"
+            )
+        reports = [
+            run_rank(
+                args.model.expanduser(),
+                layer,
+                rank,
+                warmup=args.warmup,
+                cycles=args.cycles,
+                parity_seeds=args.parity_seeds,
+            )
+            for layer in args.layers
+            for rank in args.ranks
+        ]
+    finally:
+        rank_shape.__globals__["SHARD_WEIGHTS"] = previous_shard_weights
     payload = {
         "scope": "isolated_real_weight_ds4_m1024_output_projection_chain",
         "production_dispatch": False,

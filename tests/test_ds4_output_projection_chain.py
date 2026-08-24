@@ -98,5 +98,5 @@ def test_campaign_cli_accepts_canonical_equal_tp2(monkeypatch, capsys):
         ],
     )
     assert campaign.main() == 0
-    assert campaign.rank_shape.__globals__["SHARD_WEIGHTS"] == (4, 4)
+    assert campaign.rank_shape.__globals__["SHARD_WEIGHTS"] == (3, 5)
     assert '"both_ranks_benefit": true' in capsys.readouterr().out
