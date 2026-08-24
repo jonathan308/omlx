@@ -11,6 +11,28 @@ from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
 _CANONICAL_WIDE_PREFILL = os.getenv(
     "OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_COMPILED_HC_DECODE_PRODUCER = os.getenv(
+    "OMLX_DSV4_COMPILED_HC_DECODE_PRODUCER", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+
+
+@mx.compile
+def _compiled_hc_decode_mixes(x: mx.array, weight: mx.array) -> mx.array:
+    y = x.astype(mx.float32)
+    z = mx.fast.rms_norm(y.flatten(-2), None, 1e-6)
+    return z @ weight.T
+
+
+def _can_use_compiled_hc_decode_producer(module, x: mx.array) -> bool:
+    return bool(
+        _COMPILED_HC_DECODE_PRODUCER
+        and not module.training
+        and tuple(x.shape) == (1, 1, 4, 4096)
+        and x.dtype == mx.bfloat16
+        and tuple(module.fn.shape) == (24, 16384)
+        and module.fn.dtype == mx.float32
+        and float(module.norm_eps) == 1e-6
+    )
 
 
 def _make_hc_sinkhorn_collapse_kernel():
@@ -239,8 +261,11 @@ class HyperConnection(nn.Module):
     def _call_one(self, x: mx.array):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
-        z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = decode_matmul(z, self.fn.T)
+        if _can_use_compiled_hc_decode_producer(self, x):
+            mixes = _compiled_hc_decode_mixes(x, self.fn)
+        else:
+            z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+            mixes = decode_matmul(z, self.fn.T)
 
         use_ops = (
             self.training

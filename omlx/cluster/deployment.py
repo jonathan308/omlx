@@ -125,6 +125,9 @@ _RANK_ENV_DEFAULTS = (
     # Experimental 2K outer tile with canonical 1K FP32 HC and compressed-
     # attention/cache boundaries. Both ranks must enter the same split graph.
     ("OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"),
+    # Exact FP32 decode HC producer compile. Shape/config gates retain the
+    # ordinary path for training, prefill and non-DS4 checkpoints.
+    ("OMLX_DSV4_COMPILED_HC_DECODE_PRODUCER", "0"),
     # Shape warmup enters the full distributed graph, so every rank must make
     # the same decision.  Coordinator-only overrides would cross collectives.
     ("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"),

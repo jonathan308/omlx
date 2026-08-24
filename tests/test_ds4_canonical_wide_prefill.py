@@ -92,3 +92,22 @@ def test_canonical_hyperconnection_preserves_two_1k_calls(monkeypatch):
         (1, 2048, 4),
         (1, 2048, 4, 4),
     ]
+
+
+def test_compiled_hc_decode_producer_is_exact_shape_only(monkeypatch):
+    monkeypatch.setattr(hc, "_COMPILED_HC_DECODE_PRODUCER", True)
+    module = SimpleNamespace(
+        training=False,
+        fn=mx.zeros((24, 16384), dtype=mx.float32),
+        norm_eps=1e-6,
+    )
+    decode = mx.zeros((1, 1, 4, 4096), dtype=mx.bfloat16)
+
+    assert hc._can_use_compiled_hc_decode_producer(module, decode)
+    module.training = True
+    assert not hc._can_use_compiled_hc_decode_producer(module, decode)
+    module.training = False
+    assert not hc._can_use_compiled_hc_decode_producer(
+        module,
+        mx.zeros((1, 2, 4, 4096), dtype=mx.bfloat16),
+    )
