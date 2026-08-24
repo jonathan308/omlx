@@ -544,6 +544,7 @@ _HELLO_STRUCT = struct.Struct(">4sQQ")  # magic, nonce, cluster_hash
 _MAX_DATAGRAM = 2048
 _RECENT_NONCES = 64
 _MAX_CANDIDATES = 256
+_MACOS_TAILSCALE_CLI = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 # Multicast-join failures we tolerate per-interface (macOS gotcha #3: skip
 # interfaces that do not support multicast instead of dying).
@@ -1031,6 +1032,22 @@ def _load_zeroconf() -> Any | None:
     except ImportError:
         return None
     return zeroconf
+
+
+def _tailscale_executable() -> str | None:
+    """Return the CLI from PATH or the normal signed macOS app bundle."""
+
+    discovered = shutil.which("tailscale")
+    if discovered:
+        return discovered
+    candidate = Path(
+        os.environ.get("OMLX_TAILSCALE_CLI", _MACOS_TAILSCALE_CLI)
+    ).expanduser()
+    if sys.platform == "darwin" and candidate.is_file() and os.access(
+        candidate, os.X_OK
+    ):
+        return str(candidate)
+    return None
 
 
 class DiscoveryService:
@@ -1831,11 +1848,12 @@ class DiscoveryService:
 
     @staticmethod
     def _read_tailscale_status() -> dict[str, Any] | None:
-        if shutil.which("tailscale") is None:
+        executable = _tailscale_executable()
+        if executable is None:
             return None
         try:
             result = subprocess.run(  # noqa: S603 - tailscale CLI lookup
-                ["tailscale", "status", "--json"],
+                [executable, "status", "--json"],
                 capture_output=True,
                 text=True,
                 timeout=5.0,

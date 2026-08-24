@@ -26,6 +26,7 @@ from omlx.cluster.discovery import (
     _classify_link,
     _http_probe_node_id,
     _system_proxy_probe_node_id,
+    _tailscale_executable,
     cluster_hash_u64,
     decode_hello,
     decode_wassup,
@@ -611,6 +612,19 @@ def test_tailscale_absent_is_a_noop():
     service, _ = _service(tailscale_status=lambda: None)
     service._tailscale_sweep()
     assert service._candidates == {}
+
+
+def test_macos_tailscale_app_binary_is_a_cli_fallback(
+    tmp_path, monkeypatch
+):
+    executable = tmp_path / "Tailscale"
+    executable.write_text("#!/bin/sh\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr("omlx.cluster.discovery.shutil.which", lambda _name: None)
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setenv("OMLX_TAILSCALE_CLI", str(executable))
+
+    assert _tailscale_executable() == str(executable)
 
 
 # -- link classification --------------------------------------------------------
