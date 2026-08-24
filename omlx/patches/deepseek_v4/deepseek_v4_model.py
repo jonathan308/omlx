@@ -3579,9 +3579,10 @@ def _canonical_wide_attention_prefill(
                 cache,
                 _standard_mask=True,
             )
-            # A true outer 1K step materializes its cache before the next model
-            # call. Preserve that dependency boundary inside the wide tile.
-            mx.eval(output, cache.state)
+            # A true outer 1K step queues its cache before the next model call.
+            # async_eval preserves that dependency/alias boundary without the
+            # host synchronization that erased the wider block's gain.
+            mx.async_eval(output, cache.state)
             outputs.append(output)
     finally:
         _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE.active = False
