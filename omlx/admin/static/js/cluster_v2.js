@@ -2067,14 +2067,31 @@ function clusterV2Wizard() {
             }
         },
 
-        // Tensor plans give every node ALL layers with a tensor_parallel_rank;
-        // the contiguous-range split bar would lie about them.
+        // Pure tensor plans give every node all layers. Hybrid plans give each
+        // TP group one contiguous stage, then split every layer in that stage.
         planIsTensor() {
             return (this.plan?.tensor_parallel_size || 1) > 1;
         },
 
+        planPipelineStages() {
+            return Math.max(1, Number(this.plan?.pipeline_stages || 1));
+        },
+
+        planIsHybrid() {
+            return this.planIsTensor() && this.planPipelineStages() > 1;
+        },
+
+        tensorGroupRows(assignment = null) {
+            if (!assignment) return this.planAssignments();
+            return this.planAssignments().filter(
+                (row) =>
+                    Number(row.start_layer) === Number(assignment.start_layer) &&
+                    Number(row.end_layer) === Number(assignment.end_layer),
+            );
+        },
+
         tensorShareLabel(assignment = null) {
-            const rows = this.planAssignments();
+            const rows = this.tensorGroupRows(assignment);
             const weights = rows.map((row) =>
                 Number(row.tensor_parallel_shard_weight || 1),
             );
@@ -2083,25 +2100,32 @@ function clusterV2Wizard() {
                 assignment?.tensor_parallel_shard_weight || 0,
             );
             if (assignment && total > 0 && new Set(weights).size > 1) {
-                return `${weight}/${total} tensor rows`;
+                return `${weight}/${total} tensor rows · layers [${assignment.start_layer}, ${assignment.end_layer})`;
             }
-            return t('cluster.v2.split.tensor_share').replace(
+            const share = t('cluster.v2.split.tensor_share').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),
             );
+            return this.planIsHybrid() && assignment
+                ? `${share} · layers [${assignment.start_layer}, ${assignment.end_layer})`
+                : share;
         },
 
         tensorSharePercent(assignment) {
-            const rows = this.planAssignments();
+            const rows = this.tensorGroupRows(assignment);
             const total = rows.reduce(
                 (sum, row) =>
                     sum + Number(row.tensor_parallel_shard_weight || 1),
                 0,
             );
-            return total > 0
-                ? (100 * Number(assignment?.tensor_parallel_shard_weight || 1)) /
-                      total
-                : 0;
+            if (total <= 0) return 0;
+            const tensorFraction =
+                Number(assignment?.tensor_parallel_shard_weight || 1) / total;
+            if (!this.planIsHybrid()) return 100 * tensorFraction;
+            const stageFraction =
+                Number(assignment?.layer_count || 0) /
+                Math.max(this.planTotalLayers(), 1);
+            return 100 * stageFraction * tensorFraction;
         },
 
         tensorQualification() {
@@ -2127,6 +2151,9 @@ function clusterV2Wizard() {
         },
 
         tensorQualificationLabel() {
+            if (this.planIsHybrid()) {
+                return `Hybrid TP×pipeline · equal safe tensor split in each of ${this.planPipelineStages()} stages`;
+            }
             const qualification = this.tensorQualification();
             const weights = this.planAssignments().map((assignment) =>
                 Number(assignment.tensor_parallel_shard_weight || 1),
@@ -2155,6 +2182,9 @@ function clusterV2Wizard() {
         },
 
         tensorCaptionLabel() {
+            if (this.planIsHybrid()) {
+                return `${this.plan?.tensor_parallel_size || 1}-way tensor × ${this.planPipelineStages()} pipeline stages`;
+            }
             return t('cluster.v2.split.tensor_caption').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),

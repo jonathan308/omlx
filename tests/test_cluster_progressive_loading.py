@@ -541,6 +541,102 @@ def test_progressive_pipeline_load_preserves_single_file_model_support(tmp_path)
     assert not (tmp_path / "model.safetensors.index.json").exists()
 
 
+def test_progressive_hybrid_load_shards_only_the_local_pipeline_stage(
+    tmp_path,
+    monkeypatch,
+):
+    """TP must see concrete stage layers, then restore global layer indices."""
+
+    seen = []
+    created = []
+
+    class Layer:
+        def __init__(self, index):
+            self.index = index
+
+        def parameters(self):
+            return [(f"weight-{self.index}", self)]
+
+    class Pipeline:
+        def __init__(self):
+            self.layers = [Layer(index) for index in range(4)]
+            self.start_idx = 0
+            self.end_idx = 4
+
+        def pipeline(self, _group):
+            self.start_idx = 2
+            self.end_idx = 4
+            self.layers[:2] = [None, None]
+
+    class Model:
+        model_type = "native_test"
+
+        def __init__(self):
+            self.model = Pipeline()
+            created.append(self)
+
+        def parameters(self):
+            values = [("embed.weight", "embed")]
+            values.extend(
+                (f"model.layers.{index}.weight", layer)
+                for index, layer in enumerate(self.model.layers)
+                if layer is not None
+            )
+            return values
+
+        def shard(self, _group):
+            return None
+
+    def fake_strategy(model, _group, *, mx_module, progress=None):
+        seen.append([layer.index for layer in model.model.layers])
+        assert all(layer is not None for layer in model.model.layers)
+        return "hybrid-test"
+
+    monkeypatch.setattr(
+        "omlx.cluster.progressive_loading.apply_tensor_strategy",
+        fake_strategy,
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "embed.weight": "model.safetensors",
+                    "model.layers.2.weight": "model.safetensors",
+                    "model.layers.3.weight": "model.safetensors",
+                }
+            }
+        )
+    )
+
+    class HybridMX(_FakeMX):
+        def set_cache_limit(self, _value):
+            return 1024
+
+    utils = SimpleNamespace(
+        _download=lambda _repo, allow_patterns=None: tmp_path,
+        load_config=lambda _path: {"model_type": "native_test"},
+        load_model=lambda *_args, **_kwargs: (Model(), {}),
+        load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
+        tree_flatten=lambda parameters: parameters,
+        open=open,
+        json=json,
+    )
+
+    loaded, tokenizer = progressive_sharded_load(
+        tmp_path,
+        pipeline_group=SimpleNamespace(),
+        tensor_group=SimpleNamespace(),
+        utils_module=utils,
+        mx_module=HybridMX(),
+    )
+
+    assert tokenizer == "tokenizer"
+    assert loaded is created[-1]
+    assert seen == [[2, 3]]
+    assert loaded.model.layers[:2] == [None, None]
+    assert [layer.index for layer in loaded.model.layers[2:]] == [2, 3]
+
+
 def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
     calls = []
 

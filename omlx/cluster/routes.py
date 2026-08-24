@@ -93,6 +93,7 @@ from .performance import (
     execution_profile,
     tune_execution_settings,
 )
+from .parallel_groups import hybrid_group_split_supported
 from .planner import (
     LOCAL_NODE,
     NodeBudget,
@@ -1240,17 +1241,18 @@ def _create_cluster_plan(
     qualified_tensor_shard_weights: tuple[tuple[int, ...], ...] | None = None,
     tensor_parallel_qualification: TPQualificationProvenance | None = None,
 ):
+    model, nodes = _model_and_nodes(request)
     if (
         request.tensor_parallel_size > 1
-        and request.tensor_parallel_size != len(request.nodes)
+        and request.tensor_parallel_size < len(nodes)
+        and len(nodes) % request.tensor_parallel_size == 0
+        and model.source != "synthetic"
+        and not model.supports_pipeline
     ):
         raise PlanningError(
-            "Tensor parallelism must use every detected node. Combining tensor "
-            "parallelism with multiple pipeline stages is not supported by the "
-            "pinned MLX model sharding path; choose 1 for pipeline-only or "
-            f"{len(request.nodes)} for one tensor-parallel stage."
+            "hybrid TP x pipeline requires a model architecture with a "
+            "validated pipeline forward path"
         )
-    model, nodes = _model_and_nodes(request)
     if (
         len(nodes) > 1
         and request.tensor_parallel_size == 1
@@ -1751,6 +1753,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
             qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+            hybrid_runtime_supported=hybrid_group_split_supported(
+                provisional_backend
+            ),
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1865,12 +1870,12 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             qualified_tensor_shard_weights=(
                 qualified_tensor_shard_weights
-                if choice.tensor_parallel_size > 1
+                if choice.tensor_parallel_size == len(ordered_budgets)
                 else None
             ),
             tensor_parallel_qualification=(
                 qualification_provenance
-                if choice.tensor_parallel_size > 1
+                if choice.tensor_parallel_size == len(ordered_budgets)
                 else None
             ),
         )
@@ -4403,6 +4408,20 @@ async def _activate_and_report(
     deployment = None
     try:
         deployment, plan = await asyncio.to_thread(_create_deployment, request)
+        if (
+            deployment.tensor_parallel_size > 1
+            and deployment.tensor_parallel_size < deployment.world_size
+            and not hybrid_group_split_supported(deployment.backend)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The loaded MLX {deployment.distributed_init_backend} backend "
+                    "does not implement Group.split, so this TP x pipeline "
+                    "placement cannot launch safely. Install the oMLX MLX/JACCL "
+                    "subgroup runtime on every rank or choose pure TP/pipeline."
+                ),
+            )
         # Before anything touches another Mac: is this the plan the user was
         # shown? Preview and activation posted different node objects for
         # months, and the second one dropped the split cap and the role, so the

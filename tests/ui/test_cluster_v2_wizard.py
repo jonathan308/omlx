@@ -309,6 +309,9 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     assert "Tailscale control" in javascript
     assert "Inference: JACCL over Thunderbolt RDMA" in javascript
     assert "device links below are control/discovery routes" in template
+    assert "planIsHybrid()" in javascript
+    assert "Hybrid TP×pipeline" in javascript
+    assert "pipeline stages" in javascript
     assert re.search(
         r"`/admin/api/cluster/deployments/\$\{encodeURIComponent\(id\)\}`",
         javascript,

@@ -42,6 +42,10 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
+from .parallel_groups import (
+    install_pipeline_group_routing,
+    split_parallel_groups,
+)
 from .performance import (
     DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
     DeepseekAnePrefillSettings,
@@ -97,8 +101,7 @@ def _trace_collectives(
 
     rank = int(group.rank())
     path = (
-        Path(state_dir).expanduser()
-        / f"{deployment_id}-collectives-rank-{rank}.jsonl"
+        Path(state_dir).expanduser() / f"{deployment_id}-collectives-rank-{rank}.jsonl"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     names = ("all_sum", "all_gather", "send", "recv_like")
@@ -172,10 +175,7 @@ def _wait_for_serve_release(
     faster rank aborting a healthy load at the old two-minute boundary.
     """
 
-    path = (
-        Path(state_dir).expanduser()
-        / f"{deployment_id}-serve.json"
-    )
+    path = Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
     deadline = float(clock()) + max(0.0, float(timeout))
     while True:
         try:
@@ -636,6 +636,7 @@ def _configure_distributed_mtp(
     enabled: bool,
     depth: int | None,
     tensor_parallel_size: int,
+    pipeline_stages: int = 1,
 ) -> int | None:
     """Validate and install the rank-identical speculative depth contract."""
 
@@ -643,6 +644,10 @@ def _configure_distributed_mtp(
         return None
     if tensor_parallel_size < 2:
         raise RuntimeError("distributed MTP currently requires pure tensor parallelism")
+    if pipeline_stages != 1:
+        raise RuntimeError(
+            "distributed MTP is not yet validated for hybrid TP x pipeline"
+        )
     model_type = _distributed_model_type(model_path)
     if not model_type.startswith("deepseek_v4"):
         raise RuntimeError(
@@ -715,9 +720,9 @@ def _configure_indexer_decode_owner(
 ) -> int | None:
     """Choose the fastest measured TP member for DS4 decode top-k work."""
 
-    requested = os.environ.get(
-        "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto"
-    ).strip().lower()
+    requested = (
+        os.environ.get("OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", "auto").strip().lower()
+    )
     if requested in {"false", "no", "off", "disabled"}:
         os.environ["OMLX_DSV4_INDEXER_DECODE_OWNER_RANK"] = "off"
         return None
@@ -841,9 +846,7 @@ def _enable_distributed_deepseek_ane_prefill(
                 down_fraction=settings.down_fraction,
                 wo_a_enabled=settings.wo_a_enabled,
                 wo_a_fraction=settings.wo_a_fraction,
-                cpu_fraction=(
-                    settings.cpu_fraction if settings.cpu_enabled else 0.0
-                ),
+                cpu_fraction=(settings.cpu_fraction if settings.cpu_enabled else 0.0),
                 cpu_threads=settings.cpu_threads,
                 cpu_shared_resource=settings.cpu_shared_resource,
             )
@@ -976,9 +979,7 @@ def _write_cancel_request(
         if plan_hash:
             payload["plan_hash"] = plan_hash
         temporary = path.with_name(path.name + ".tmp")
-        descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-        )
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, sort_keys=True)
         os.replace(temporary, path)
@@ -1019,9 +1020,7 @@ def _watch_launcher_parent(
     until the Mac is rebooted.
     """
 
-    watched = (
-        Path(watched_marker_path).expanduser() if watched_marker_path else None
-    )
+    watched = Path(watched_marker_path).expanduser() if watched_marker_path else None
     watched_once = False
     while True:
         wait(poll_interval)
@@ -1165,9 +1164,7 @@ def _start_peer_watchdog(
             plan_hash=marker.payload.get("plan_hash"),
         )
 
-    abort_grace = float(
-        os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0
-    )
+    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
@@ -1205,8 +1202,7 @@ def _start_launcher_watchdog(
         lease = manual_lease
     try:
         lease_stale_after = float(
-            os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE_TIMEOUT", "30.0")
-            or "30.0"
+            os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE_TIMEOUT", "30.0") or "30.0"
         )
     except ValueError:
         lease_stale_after = 30.0
@@ -1287,9 +1283,9 @@ def _validate_loaded_stage(
         and start in (None, 0)
         and end in (None, len(layers))
     )
-    if (
-        not expected_complete_tensor_stage
-        and (start, end) != (assignment.start_layer, assignment.end_layer)
+    if not expected_complete_tensor_stage and (start, end) != (
+        assignment.start_layer,
+        assignment.end_layer,
     ):
         raise RuntimeError(
             "loaded model pipeline range does not match the approved plan: "
@@ -1591,6 +1587,7 @@ def run_worker(args: argparse.Namespace) -> int:
             f"runtime world size {world_size} does not match plan size "
             f"{len(assignments)}"
         )
+    parallel_groups = split_parallel_groups(group, tensor_parallel_size)
     if args.plan_hash != plan_hash:
         raise RuntimeError("worker plan hash does not match launch contract")
     tensor_shard_weights = _configure_tensor_shard_weights(
@@ -1617,6 +1614,7 @@ def run_worker(args: argparse.Namespace) -> int:
         enabled=mtp_enabled,
         depth=mtp_num_draft_tokens,
         tensor_parallel_size=tensor_parallel_size,
+        pipeline_stages=parallel_groups.pipeline_stages,
     )
 
     marker = RuntimeMarker(
@@ -1761,6 +1759,12 @@ def run_worker(args: argparse.Namespace) -> int:
                     tensor_parallel_size=tensor_parallel_size,
                 )
             )
+            # MLX-LM understands separate pipeline/tensor groups, but its CLI
+            # exposes only one global either/or switch. The signed oMLX rank
+            # map is authoritative, so replace that provisional choice before
+            # the first weight is read.
+            provider.pipeline_group = parallel_groups.pipeline
+            provider.tensor_group = parallel_groups.tensor
             # Load synchronously on every rank so a "ready" event means the
             # complete distributed graph and weights are resident.
             #
@@ -1768,25 +1772,28 @@ def run_worker(args: argparse.Namespace) -> int:
             # it is checked again against what the rank actually holds, all the
             # way through the load. A rank that overruns dies here rather than
             # taking the Mac with it.
-            with watch_rank_load(
-                load_budget,
-                rank=rank,
-                node_id=getattr(assignment, "node_id", ""),
-                on_sample=lambda observed: marker.update(
-                    "loading",
-                    load_stage="loading_weights",
-                    load_memory_bytes=observed,
+            with (
+                watch_rank_load(
+                    load_budget,
+                    rank=rank,
+                    node_id=getattr(assignment, "node_id", ""),
+                    on_sample=lambda observed: marker.update(
+                        "loading",
+                        load_stage="loading_weights",
+                        load_memory_bytes=observed,
+                    ),
                 ),
-            ), install_progressive_loader(
-                mlx_server,
-                progress=lambda progress: marker.update(
-                    "loading",
-                    load_stage=progress.get("phase", "materializing_layers"),
-                    **{
-                        key: value
-                        for key, value in progress.items()
-                        if key != "phase"
-                    },
+                install_progressive_loader(
+                    mlx_server,
+                    progress=lambda progress: marker.update(
+                        "loading",
+                        load_stage=progress.get("phase", "materializing_layers"),
+                        **{
+                            key: value
+                            for key, value in progress.items()
+                            if key != "phase"
+                        },
+                    ),
                 ),
             ):
                 provider.load_default()
@@ -1812,13 +1819,21 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
-            with install_runtime_optimizations(
-                provider.model,
-                group,
-                execution,
-                batchable=provider.is_batchable,
-                pipeline_parallel=tensor_parallel_size == 1,
-            ) as optimizations:
+            model_group = parallel_groups.pipeline or parallel_groups.tensor or group
+            with (
+                install_pipeline_group_routing(
+                    provider.model,
+                    (parallel_groups.pipeline if parallel_groups.hybrid else None),
+                    mx_module=mx,
+                ),
+                install_runtime_optimizations(
+                    provider.model,
+                    model_group,
+                    execution,
+                    batchable=provider.is_batchable,
+                    pipeline_parallel=parallel_groups.pipeline_stages > 1,
+                ) as optimizations,
+            ):
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1838,6 +1853,9 @@ def run_worker(args: argparse.Namespace) -> int:
                     optimizations=optimizations,
                     mtp_enabled=mtp_enabled,
                     mtp_fixed_depth=mtp_fixed_depth,
+                    pipeline_stages=parallel_groups.pipeline_stages,
+                    pipeline_stage=parallel_groups.pipeline_stage,
+                    tensor_parallel_rank=parallel_groups.tensor_rank,
                     tensor_parallel_shard_weights=list(tensor_shard_weights),
                     indexer_decode_owner_rank=indexer_decode_owner,
                     output_protocol=protocol or None,
@@ -1940,9 +1958,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             rank=rank,
                             node_id=getattr(assignment, "node_id", ""),
                             start_layer=assignment.start_layer,
-                            layer_count=(
-                                assignment.end_layer - assignment.start_layer
-                            ),
+                            layer_count=(assignment.end_layer - assignment.start_layer),
                             tensor_parallel_size=assignment.tensor_parallel_size,
                             tensor_parallel_shard_weight=(
                                 tensor_shard_weights[assignment.tensor_parallel_rank]
@@ -2073,9 +2089,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--deepseek-ane-prefill", action="store_true")
     parser.add_argument("--deepseek-ane-sequence-length", type=int, default=4096)
-    parser.add_argument(
-        "--deepseek-ane-tail-padding-min-tokens", type=int, default=0
-    )
+    parser.add_argument("--deepseek-ane-tail-padding-min-tokens", type=int, default=0)
     parser.add_argument(
         "--deepseek-ane-down",
         action=argparse.BooleanOptionalAction,

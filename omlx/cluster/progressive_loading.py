@@ -194,10 +194,6 @@ def progressive_sharded_load(
         )
     if not has_pipeline and not has_tensor and tensor_group is None:
         raise ValueError("The model does not support any sharding")
-    if pipeline_group is not None and tensor_group is not None:
-        raise ValueError(
-            "progressive loading does not combine pipeline and tensor groups"
-        )
     if pipeline_group is tensor_group is None:
         group = mx_module.distributed.init()
         if has_tensor:
@@ -232,13 +228,7 @@ def progressive_sharded_load(
     )
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-        materialize_parameters_progressively(
-            model.parameters(),
-            mx_module=mx_module,
-            tree_flatten=utils_module.tree_flatten,
-            progress=progress,
-        )
-    elif tensor_group is not None:
+    if tensor_group is not None:
         # Tensor loading repeatedly materializes one full layer and replaces
         # it with a local shard. MLX's default free-buffer cache can retain the
         # discarded full-layer allocations: on a 128 GB rank we observed
@@ -289,12 +279,54 @@ def progressive_sharded_load(
         # rank killed at 163 GiB against an 84 GiB plan). Drop the snapshot
         # — and the pre-shard fixed list — before any sharding begins.
         del flat, fixed
-        strategy = apply_tensor_strategy(
-            model,
-            tensor_group,
-            mx_module=mx_module,
-            progress=progress,
+        # A pipeline model keeps global layer numbering by padding layers
+        # before this stage with None. Tensor strategies intentionally reject
+        # such a list because pure TP must never shard an incomplete model by
+        # accident. For an explicitly signed hybrid graph, temporarily expose
+        # only this stage's concrete layers, shard them inside its TP subgroup,
+        # then restore the global None-padded view for cache/range validation.
+        pipeline_owner = getattr(model, "model", None)
+        pipeline_layers = (
+            getattr(pipeline_owner, "layers", None)
+            if pipeline_group is not None
+            else None
         )
+        original_pipeline_layers = (
+            list(pipeline_layers) if isinstance(pipeline_layers, list) else None
+        )
+        active_positions = (
+            [
+                index
+                for index, layer in enumerate(original_pipeline_layers)
+                if layer is not None
+            ]
+            if original_pipeline_layers is not None
+            else []
+        )
+        if original_pipeline_layers is not None:
+            if not active_positions:
+                raise RuntimeError("hybrid pipeline stage contains no layers")
+            pipeline_owner.layers = [
+                original_pipeline_layers[index] for index in active_positions
+            ]
+        try:
+            strategy = apply_tensor_strategy(
+                model,
+                tensor_group,
+                mx_module=mx_module,
+                progress=progress,
+            )
+        finally:
+            if original_pipeline_layers is not None:
+                sharded_layers = list(pipeline_owner.layers)
+                if len(sharded_layers) != len(active_positions):
+                    raise RuntimeError(
+                        "tensor strategy changed the hybrid stage layer count"
+                    )
+                restored = list(original_pipeline_layers)
+                for index, layer in zip(active_positions, sharded_layers):
+                    restored[index] = layer
+                pipeline_owner.layers = restored
         # A native strategy may also replace a replicated embedding or output
         # head outside its layer loop. Re-flatten after sharding so those new
         # arrays, rather than stale pre-shard references, are materialized.
@@ -309,6 +341,13 @@ def progressive_sharded_load(
             set_cache_limit(previous_cache_limit)
         if progress is not None:
             progress({"phase": "tensor_ready", "strategy": strategy})
+    elif pipeline_group is not None:
+        materialize_parameters_progressively(
+            model.parameters(),
+            mx_module=mx_module,
+            tree_flatten=utils_module.tree_flatten,
+            progress=progress,
+        )
 
     # Do not add a final collective here. Every tensor above has already been
     # materialized locally, and the launcher withholds the endpoint until it

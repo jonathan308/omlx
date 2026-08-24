@@ -1162,7 +1162,7 @@ def test_low_power_synthetic_profile_cannot_shape_node_budget():
     assert routes._request_performance_profiles([node]) == ()
 
 
-def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch):
+def test_cluster_plan_route_signs_hybrid_tp_pipeline_placement(monkeypatch):
     gib = 1024**3
 
     from omlx.cluster.planner import ModelLayout
@@ -1175,6 +1175,8 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
             fixed_weight_bytes=1 * gib,
             layer_weight_bytes=(2 * gib,) * 80,
             tensor_parallel_heads=32,
+            supports_tensor_parallel=True,
+            supports_pipeline=True,
         ),
     )
 
@@ -1208,8 +1210,12 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
         },
     )
 
-    assert response.status_code == 400
-    assert "must use every detected node" in response.json()["detail"]
+    assert response.status_code == 200, response.text
+    plan = response.json()
+    assert plan["tensor_parallel_size"] == 2
+    assert plan["pipeline_stages"] == 2
+    assert len(plan["assignments"]) == 4
+    assert len({(row["start_layer"], row["end_layer"]) for row in plan["assignments"]}) == 2
 
 
 def test_cluster_plan_route_rejects_explicit_tp_for_unsupported_model(monkeypatch):

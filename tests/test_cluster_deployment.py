@@ -390,6 +390,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
     import base64
     import json
     import zlib
+
     compressed = base64.b64decode(encoded, altchars=b"-_")
     raw = zlib.decompress(compressed)
     payload = json.loads(raw)
@@ -417,6 +418,48 @@ def test_deployment_rejects_non_divisible_tensor_parallel_size():
             plan_hash="c" * 64,
             tensor_parallel_size=2,
         )
+
+
+def test_deployment_round_trip_preserves_hybrid_rank_map():
+    from omlx.cluster.planner import PipelineAssignment
+
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=f"node-{rank}",
+            rank=rank,
+            start_layer=20 if rank < 2 else 0,
+            end_layer=40 if rank < 2 else 20,
+            layer_weight_bytes=20 * GIB,
+            fixed_weight_bytes=GIB,
+            reserve_bytes=2 * GIB,
+            capacity_bytes=64 * GIB,
+            tensor_parallel_rank=rank % 2,
+            tensor_parallel_size=2,
+            sharded_weight_bytes=20 * GIB,
+        )
+        for rank in range(4)
+    )
+    deployment = ClusterDeployment(
+        deployment_id="hybrid-test",
+        model="mlx-community/test",
+        backend="ring",
+        hosts=tuple(
+            ClusterHost(
+                f"node-{rank}",
+                "127.0.0.1" if rank == 0 else f"node-{rank}.local",
+                (f"10.0.0.{rank + 1}",),
+            )
+            for rank in range(4)
+        ),
+        assignments=assignments,
+        plan_hash="d" * 64,
+        tensor_parallel_size=2,
+    )
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+    assert restored == deployment
+    assert restored.world_size == 4
+    assert restored.tensor_parallel_size == 2
 
 
 def test_deployment_round_trip_preserves_execution_and_performance_profiles():
@@ -594,9 +637,7 @@ def test_the_role_survives_the_worker_plan_and_the_registry_file():
     )
 
     # The registry writes and reloads this.
-    restored = ClusterDeployment.from_dict(
-        json.loads(json.dumps(deployment.to_dict()))
-    )
+    restored = ClusterDeployment.from_dict(json.loads(json.dumps(deployment.to_dict())))
     # The rank decodes this.
     _hash, decoded = decode_worker_plan(deployment.encode_worker_plan())
 

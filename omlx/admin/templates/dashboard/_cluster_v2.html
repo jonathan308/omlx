@@ -782,9 +782,10 @@
                             <span class="text-[10px] text-neutral-500"
                                   x-text="planIsTensor() ? backendLabel() : planTotalLayers() + ' layers total · ' + backendLabel()"></span>
                         </div>
-                        <!-- Tensor split: every Mac holds a slice of EVERY
-                             layer. Segment widths use the signed shard vector;
-                             equal fallback stays visually equal. -->
+                        <!-- Tensor/hybrid split. Pure TP assigns every Mac a
+                             slice of every layer. Hybrid assigns a contiguous
+                             layer stage to each TP group, then divides those
+                             layers by the signed tensor vector. -->
                         <template x-if="planIsTensor()">
                             <div class="h-12 flex overflow-hidden rounded-xl border border-neutral-200 bg-neutral-100"
                                  data-cluster-v2-split-bar-tensor>
@@ -795,7 +796,7 @@
                                          :style="'width: ' + tensorSharePercent(assignment) + '%'"
                                          :title="planNodeName(assignment) + ' · ' + tensorShareLabel(assignment)">
                                         <span class="text-[10px] sm:text-xs font-semibold truncate"
-                                              x-text="planNodeName(assignment) + ' · rank ' + (assignment.tensor_parallel_rank ?? index)"></span>
+                                              x-text="planNodeName(assignment) + (planIsHybrid() ? ' · S' + Math.floor(assignment.rank / Math.max(plan?.tensor_parallel_size || 1, 1)) + '/T' + (assignment.tensor_parallel_rank ?? 0) : ' · rank ' + (assignment.tensor_parallel_rank ?? index))"></span>
                                     </div>
                                 </template>
                             </div>

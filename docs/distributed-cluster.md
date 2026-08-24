@@ -75,6 +75,20 @@ KV cache stays on the rank that owns the corresponding layers. Centralizing KV
 on one Mac would add a network read/write to every layer and generated token,
 so it is not the default.
 
+Automatic topology selection considers every executable factorization of the
+selected Macs. With four compatible Macs, for example, it can choose pure TP4,
+hybrid TP2 × pipeline-2, or pipeline-4. In a hybrid plan each pipeline stage
+owns a dynamically balanced contiguous layer range, and every Mac inside that
+stage holds only its tensor shard of those layers. The signed plan and active
+dashboard show both coordinates; no rank loads a full checkpoint copy.
+
+Hybrid Beta currently requires one verified collective backend across the
+whole world. A future nested-fabric mode can use JACCL inside fast TP groups
+and a TCP pipeline edge between groups, but oMLX does not silently claim that
+mixed-backend topology today. Automatic hybrid selection also remains hidden
+unless the loaded MLX runtime explicitly reports backend subgroup support;
+stock Ring and stock JACCL builds do not implement `Group.split`.
+
 ## Requirements
 
 On every Mac:
