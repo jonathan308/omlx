@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -14,6 +15,17 @@ _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _LM_HEAD = re.compile(r"(?:^|\.)lm_head(?:\.|$)")
 _MTP = re.compile(r"(?:^|\.)mtp(?:\.|$)")
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _ds4_shard_native_enabled() -> bool:
+    """Explicit rollback gate; unknown values preserve the lazy loader."""
+
+    return os.environ.get("OMLX_DSV4_SHARD_NATIVE_LOAD", "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
 
 
 def _layer_index(path: str) -> int | None:
@@ -121,6 +133,37 @@ def progressive_sharded_load(
         tokenizer_config or {"trust_remote_code": trust_remote_code},
         eos_token_ids=metadata_config.get("eos_token_id", None),
     )
+
+    # DeepSeek-V4 has an explicit structure-first adapter for complete local
+    # checkpoints.  It builds/quantizes the empty module tree, applies the TP
+    # wrappers to those placeholders, then reads only this rank's exact
+    # safetensors ranges.  Try it before either call to ``load_model``: even a
+    # lazy full-checkpoint load constructs one graph for every full expert bank
+    # and defeats the purpose of shard-native loading.  Remote identifiers,
+    # partial checkpoints and unsupported tensor metadata return ``None``
+    # without changing the ordinary loader below.
+    if (
+        _ds4_shard_native_enabled()
+        and tensor_group is not None
+        and pipeline_group is None
+    ):
+        from .ds4_shard_native_adapter import try_deepseek_v4_rank_local_load
+
+        native = try_deepseek_v4_rank_local_load(
+            repo,
+            model_path,
+            metadata_config,
+            tensor_group,
+            utils_module=utils_module,
+            mx_module=mx_module,
+            progress=progress,
+        )
+        if native is not None:
+            model, config = native
+            if return_config:
+                return model, tokenizer, config
+            return model, tokenizer
+
     model, config = utils_module.load_model(
         model_path,
         lazy=True,

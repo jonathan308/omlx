@@ -181,6 +181,10 @@ _RANK_ENV_DEFAULTS = (
     # carried to both ranks, while the exact hardware/TP gate activates only
     # on the qualified M5 rank. Default-off until full cold-prefill A/B.
     ("OMLX_DSV4_NAX_MOE_BLOCKS", "0"),
+    # Structure-first local safetensors slicing. Default-off until a complete
+    # 60--100 GiB load clears strict sanitizer/parameter coverage, memory and
+    # first-token parity on every rank. Carry the rollback bit symmetrically.
+    ("OMLX_DSV4_SHARD_NATIVE_LOAD", "0"),
     # Optional routed-MoE-only TP split layered over a signed unequal outer
     # plan. Empty preserves the outer split. One hostfile value is exported to
     # every rank so a mixed plan cannot diverge locally.

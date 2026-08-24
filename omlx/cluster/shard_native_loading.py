@@ -156,6 +156,12 @@ class LocalSafetensors:
             raise ValueError(f"model path is not a directory: {self.root}")
         self.model_identity = model_identity_digest(self.root)
         self._headers: dict[str, dict[str, TensorDescriptor]] = {}
+        # One read-only byte mapping per shard avoids tens of thousands of
+        # open/mmap/close cycles on expert-heavy checkpoints (DS4 has 72,317
+        # indexed tensors).  Pages are still faulted only for the exact local
+        # ranges copied below; mapping a file does not make its full payload
+        # resident.
+        self._payloads: dict[str, np.memmap] = {}
         self._weight_map = self._read_weight_map()
 
     def _read_weight_map(self) -> dict[str, str]:
@@ -184,6 +190,51 @@ class LocalSafetensors:
                     raise ValueError(f"duplicate safetensors tensor {name!r}")
                 result[name] = path.name
         return result
+
+    @property
+    def tensor_names(self) -> tuple[str, ...]:
+        """Names in the checkpoint's signed index order.
+
+        The structure-first loader uses this without asking ``mx.load`` to
+        construct a lazy array for every full tensor first.
+        """
+
+        return tuple(self._weight_map)
+
+    def validate_complete(self) -> None:
+        """Prove the local checkpoint contains exactly its indexed tensors.
+
+        A Hugging Face identifier or a partially staged pipeline directory is
+        intentionally not eligible for range loading.  Production may only
+        select this path after every referenced shard and header has been
+        checked; the ordinary MLX-LM downloader remains the atomic fallback.
+        """
+
+        names_by_file: dict[str, set[str]] = {}
+        for name, filename in self._weight_map.items():
+            names_by_file.setdefault(filename, set()).add(name)
+        for filename, indexed in names_by_file.items():
+            header = self._header(filename)
+            actual = set(header)
+            if actual != indexed:
+                missing = sorted(indexed - actual)
+                extra = sorted(actual - indexed)
+                detail = []
+                if missing:
+                    detail.append(f"missing={missing[:3]!r}")
+                if extra:
+                    detail.append(f"extra={extra[:3]!r}")
+                raise ValueError(
+                    f"{filename}: safetensors index/header disagreement "
+                    + " ".join(detail)
+                )
+
+        indexed_files = set(names_by_file)
+        local_files = {path.name for path in self.root.glob("model*.safetensors")}
+        if local_files != indexed_files:
+            raise ValueError(
+                "local safetensors shard set does not exactly match the index"
+            )
 
     def _header(self, filename: str) -> dict[str, TensorDescriptor]:
         cached = self._headers.get(filename)
@@ -277,22 +328,24 @@ class LocalSafetensors:
             raise ValueError(f"index/header disagreement for tensor {name!r}")
         return descriptor
 
-    @staticmethod
     def _numpy_partition(
+        self,
         path: Path,
         descriptor: TensorDescriptor,
         partition: TensorPartition,
+        *,
+        use_mapping_cache: bool = False,
     ) -> np.ndarray:
         itemsize = _DTYPE_BYTES[descriptor.dtype]
         storage_dtype = np.dtype(f"<u{itemsize}")
-        source = np.memmap(
-            path,
-            dtype=storage_dtype,
-            mode="r",
-            offset=descriptor.payload_start + descriptor.data_start,
-            shape=descriptor.shape,
-            order="C",
-        )
+        mapped = self._payloads.get(descriptor.filename) if use_mapping_cache else None
+        if mapped is None:
+            mapped = np.memmap(path, dtype=np.uint8, mode="r")
+            if use_mapping_cache:
+                self._payloads[descriptor.filename] = mapped
+        start = descriptor.payload_start + descriptor.data_start
+        stop = descriptor.payload_start + descriptor.data_stop
+        source = mapped[start:stop].view(storage_dtype).reshape(descriptor.shape)
         normalized = partition.normalized(descriptor.shape)
         if normalized.axis is None:
             return np.array(source, copy=True, order="C")
@@ -317,12 +370,15 @@ class LocalSafetensors:
         self,
         name: str,
         partition: TensorPartition = _REPLICATED,
+        *,
+        use_mapping_cache: bool = False,
     ) -> tuple[TensorDescriptor, np.ndarray]:
         descriptor = self.descriptor(name)
         values = self._numpy_partition(
             self.root / descriptor.filename,
             descriptor,
             partition,
+            use_mapping_cache=use_mapping_cache,
         )
         if tuple(values.shape) != partition.local_shape(descriptor.shape):
             raise RuntimeError("rank-local safetensors slice has the wrong shape")
@@ -389,6 +445,45 @@ class LocalSafetensors:
         mx_module.eval(result)
         return result
 
+    def load_partition(
+        self,
+        name: str,
+        partition: TensorPartition = _REPLICATED,
+        *,
+        mx_module: Any,
+        expected_descriptor: TensorDescriptor | None = None,
+        evaluate: bool = False,
+    ) -> Any:
+        """Read one already-qualified local slice without a full-tensor graph.
+
+        ``expected_descriptor`` pins the read to the metadata inspected by the
+        adapter before it mutates a model structure.  Byte checksummed
+        :meth:`load_entry` remains available for persisted/cross-process
+        manifests; this one-shot loader instead validates the checkpoint file
+        snapshot before and after the complete load so it does not read every
+        60--100 GiB rank shard twice.
+        """
+
+        current = self.descriptor(name)
+        if expected_descriptor is not None and current != expected_descriptor:
+            raise ValueError("safetensors metadata changed after qualification")
+        descriptor, values = self.partition_bytes(
+            name,
+            partition,
+            use_mapping_cache=True,
+        )
+        storage = mx_module.array(values)
+        logical_dtype = getattr(mx_module, _MLX_DTYPE_NAMES[descriptor.dtype])
+        if descriptor.dtype == "BOOL":
+            result = storage.astype(logical_dtype)
+        elif storage.dtype == logical_dtype:
+            result = storage
+        else:
+            result = storage.view(logical_dtype)
+        if evaluate:
+            mx_module.eval(result)
+        return result
+
 
 def validate_quantized_partition(
     weight: TensorDescriptor,
@@ -437,6 +532,7 @@ def deepseek_v4_partition(
     shard_weights: tuple[int, ...],
     world_size: int,
     quant_boundary: int = 1,
+    o_groups: int = 8,
 ) -> TensorPartition:
     """Declare DS4's raw-checkpoint ownership without guessing other models.
 
@@ -447,13 +543,15 @@ def deepseek_v4_partition(
 
     if world_size != len(shard_weights) or not 0 <= rank < world_size:
         raise ValueError("DS4 shard vector does not match the TP group")
+    if o_groups < 1:
+        raise ValueError("DS4 output-group count must be positive")
     raw = name.removeprefix("model.")
     weighted = dict(rank=rank, weights=shard_weights)
     suffix = r"(?:weight|scales|biases|bias)"
     if re.fullmatch(
         rf"{_DS4_LAYER_OR_MTP}\.attn\.wq_b\.{suffix}", name
     ) or re.fullmatch(rf"{_DS4_LAYER_OR_MTP}\.attn\.attn_sink", name):
-        return TensorPartition(axis=0, segments=8, **weighted)
+        return TensorPartition(axis=0, segments=o_groups, **weighted)
     if re.fullmatch(
         rf"{_DS4_LAYER_OR_MTP}\.attn\.wo_a\.(?:weight|scales|biases)", name
     ):
