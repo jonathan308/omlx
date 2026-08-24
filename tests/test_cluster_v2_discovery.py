@@ -489,6 +489,22 @@ def test_probe_sweep_respects_interval():
     assert calls == [("10.0.0.5", 8000)] * 2
 
 
+def test_explicit_candidate_probe_bypasses_periodic_dedupe():
+    calls: list[tuple[str, int]] = []
+    service, _ = _service(
+        prober=lambda ip, port, timeout: calls.append((ip, port)) or None,
+    )
+    service.add_manual("10.0.0.5", 8000)
+
+    service.probe_candidate_now("10.0.0.5", 8000)
+    service.probe_candidate_now("10.0.0.5", 8000)
+
+    assert calls == [("10.0.0.5", 8000)] * 2
+    [state] = service.health()["candidate_states"]
+    assert state["last_transport"] == "custom"
+    assert state["last_error"] == "probe returned no identity"
+
+
 # -- liveness -------------------------------------------------------------------
 
 

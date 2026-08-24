@@ -533,6 +533,7 @@ from pathlib import Path  # noqa: E402
 from .._version import __version__ as _OMLX_VERSION  # noqa: E402
 
 logger = logging.getLogger(__name__)  # noqa: E402
+_probe_diagnostics = threading.local()
 
 MDNS_SERVICE_TYPE = "_omlx._tcp.local."
 MULTICAST_GROUP = "ff12::6f6d:6c78"
@@ -921,12 +922,17 @@ def _http_probe_node_id(
 
     host = f"[{ip}]" if ":" in ip else ip
     url = f"http://{host}:{port}/api/cluster/node_id"
+    _probe_diagnostics.value = {"transport": "direct", "error": ""}
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - cluster LAN probe of an announced address
             payload = json.loads(response.read(65536).decode("utf-8"))
-    except ValueError:
+    except ValueError as exc:
+        _probe_diagnostics.value = {
+            "transport": "direct",
+            "error": f"invalid response: {exc}",
+        }
         return None
-    except OSError:
+    except OSError as direct_exc:
         # Some macOS installations deny Homebrew Python outbound access to a
         # direct Thunderbolt subnet while Apple's system Python can reach the
         # same address. Rank control and JACCL bootstrap already use this
@@ -934,8 +940,19 @@ def _http_probe_node_id(
         # verified 10.0.0.x address does not require another manual seed.
         try:
             payload = _system_proxy_probe_node_id(ip, port, timeout)
-        except (OSError, RuntimeError, TimeoutError, ValueError):
+        except (OSError, RuntimeError, TimeoutError, ValueError) as proxy_exc:
+            _probe_diagnostics.value = {
+                "transport": "system-proxy",
+                "error": f"direct={direct_exc}; proxy={proxy_exc}",
+            }
             return None
+        if payload is None:
+            _probe_diagnostics.value = {
+                "transport": "system-proxy",
+                "error": f"direct={direct_exc}; proxy returned no identity",
+            }
+            return None
+        _probe_diagnostics.value = {"transport": "system-proxy", "error": ""}
     if not isinstance(payload, dict) or not isinstance(
         payload.get("node_id"), str
     ):
@@ -1132,6 +1149,18 @@ class DiscoveryService:
         with self._lock:
             threads = {t.name: t.is_alive() for t in self._threads}
             joined = sorted(self._joined)
+            candidate_states = [
+                {
+                    "ip": ip,
+                    "port": port,
+                    "node_id": value.get("node_id"),
+                    "if_type": value.get("if_type"),
+                    "verified": bool(value.get("verified", False)),
+                    "last_transport": value.get("last_transport"),
+                    "last_error": str(value.get("last_error") or "")[:1000],
+                }
+                for (ip, port), value in sorted(self._candidates.items())
+            ]
         return {
             "multicast_loop_alive": threads.get("omlx-discovery-mcast", False),
             "maintenance_loop_alive": threads.get(
@@ -1147,6 +1176,7 @@ class DiscoveryService:
                 self._local_network_blocked_suspected
             ),
             "candidates": len(self._candidates),
+            "candidate_states": candidate_states,
             "peers": len(self._peers),
         }
 
@@ -1256,6 +1286,11 @@ class DiscoveryService:
         """Run one probe sweep synchronously (maintenance loop does this)."""
 
         self._probe_sweep()
+
+    def probe_candidate_now(self, ip: str, port: int) -> None:
+        """Probe one explicit candidate now, bypassing periodic dedupe."""
+
+        self._probe_candidate(str(ip), int(port))
 
     def tick_liveness(self) -> None:
         """Evaluate suspect/dead transitions synchronously (loop does this)."""
@@ -1658,12 +1693,27 @@ class DiscoveryService:
             hint = candidate["node_id"]
             if_type = candidate["if_type"]
         started = self._clock()
+        _probe_diagnostics.value = None
         try:
             result = self._prober(ip, port, self.config.probe_timeout)
-        except Exception:
+        except Exception as exc:
             result = None
+            diagnostic = {
+                "transport": "custom",
+                "error": str(exc),
+            }
+        else:
+            diagnostic = getattr(_probe_diagnostics, "value", None) or {
+                "transport": "custom",
+                "error": "" if result is not None else "probe returned no identity",
+            }
         rtt = self._clock() - started
         if result is None:
+            with self._lock:
+                candidate = self._candidates.get((ip, port))
+                if candidate is not None:
+                    candidate["last_transport"] = diagnostic.get("transport")
+                    candidate["last_error"] = diagnostic.get("error")
             return
         node_id = result.get("node_id")
         if hint is not None and node_id != hint:
@@ -1682,6 +1732,8 @@ class DiscoveryService:
                 candidate["verified"] = True
                 candidate["rtt"] = rtt
                 candidate["node_id"] = node_id
+                candidate["last_transport"] = diagnostic.get("transport")
+                candidate["last_error"] = ""
             peer = self._peers.get(node_id)
             is_new = peer is None
             if peer is None:
