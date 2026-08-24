@@ -103,6 +103,42 @@ run_server() {
   exec "${venv_root}/bin/omlx" serve --host "${host}" --port "${port}"
 }
 
+unload_loaded_models() {
+  "${venv_root}/bin/python" - "${port}" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+port = sys.argv[1]
+base = f"http://127.0.0.1:{port}"
+try:
+    with urllib.request.urlopen(f"{base}/v1/models/status", timeout=5) as response:
+        models = json.load(response).get("models", [])
+except Exception:
+    raise SystemExit(0)
+
+for model in models:
+    if not model.get("loaded"):
+        continue
+    model_id = model.get("id")
+    if not isinstance(model_id, str) or not model_id:
+        continue
+    request = urllib.request.Request(
+        f"{base}/v1/models/{urllib.parse.quote(model_id, safe='')}/unload",
+        data=b"",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            response.read()
+        print(f"omlx-dev: unloaded {model_id}")
+    except Exception as exc:
+        print(f"omlx-dev: could not unload {model_id}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+
 start_server() {
   if pid=$(server_pid); then
     print -- "oMLX dev server already running (pid ${pid})"
@@ -135,6 +171,10 @@ stop_server() {
     print -- "oMLX dev server is not running"
     return 0
   fi
+  # Give EnginePool and the distributed supervisor their normal verified
+  # teardown path before launchd terminates the coordinator. This prevents a
+  # child launcher from being reparented and later marked launcher_lost.
+  unload_loaded_models
   launchctl bootout "${launch_target}"
   local attempts=0
   while kill -0 "${pid}" 2>/dev/null && (( attempts < 60 )); do
