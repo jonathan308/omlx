@@ -77,6 +77,9 @@ _RANK_ENV_DEFAULTS = (
     # changing JACCL execution. It is intentionally operator-only because one
     # line per tensor operation is too expensive for normal inference.
     ("OMLX_CLUSTER_TRACE_COLLECTIVES", "0"),
+    # Prompt-cache structure tracing is operator-only. It must reach every
+    # rank because cache reuse is a synchronized prefill decision.
+    ("OMLX_CLUSTER_CACHE_TRACE", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
