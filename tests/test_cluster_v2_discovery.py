@@ -6,6 +6,7 @@ the clock, interface listing, and tailscale status are all injected.
 """
 
 import errno
+import io
 import json
 import logging
 import socket
@@ -23,6 +24,8 @@ from omlx.cluster.discovery import (
     PeerCaps,
     PeerRecord,
     _classify_link,
+    _http_probe_node_id,
+    _system_proxy_probe_node_id,
     cluster_hash_u64,
     decode_hello,
     decode_wassup,
@@ -31,6 +34,27 @@ from omlx.cluster.discovery import (
 )
 from omlx.cluster.identity import NodeIdentity
 from omlx.cluster.registry import DeviceRegistry
+
+
+class FakeHTTPStream:
+    def __init__(self, response: bytes) -> None:
+        self.response = response
+        self.sent = b""
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent += payload
+
+    def makefile(self, *_args, **_kwargs):
+        return io.BytesIO(self.response)
+
+
+class FakeSystemProxy:
+    def __init__(self, response: bytes) -> None:
+        self.stream = FakeHTTPStream(response)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeClock:
@@ -327,6 +351,66 @@ def test_failed_probe_keeps_candidate_unverified_for_retry():
     assert service.peers() == []
     assert ("10.0.0.5", 8000) in service._candidates
     assert service._candidates[("10.0.0.5", 8000)]["verified"] is False
+
+
+def test_http_probe_falls_back_to_system_python_carrier(monkeypatch):
+    from omlx.cluster import discovery
+
+    monkeypatch.setattr(
+        discovery.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("macOS denied direct subnet")
+        ),
+    )
+    expected = {
+        "node_id": "peer-node",
+        "version": "0.6.4.dev1",
+        "cluster_name": "omlx",
+    }
+    calls = []
+    monkeypatch.setattr(
+        discovery,
+        "_system_proxy_probe_node_id",
+        lambda ip, port, timeout: calls.append((ip, port, timeout)) or expected,
+    )
+
+    assert _http_probe_node_id("10.0.0.1", 8000, 3.0) == expected
+    assert calls == [("10.0.0.1", 8000, 3.0)]
+
+
+def test_system_python_carrier_parses_bounded_node_probe(monkeypatch):
+    from omlx.cluster import system_socket_proxy
+
+    body = json.dumps(
+        {
+            "node_id": "peer-node",
+            "version": "0.6.4.dev1",
+            "cluster_name": "omlx",
+        }
+    ).encode()
+    response = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    proxy = FakeSystemProxy(response)
+    monkeypatch.setattr(
+        system_socket_proxy,
+        "should_proxy_control_socket",
+        lambda _host: True,
+    )
+    monkeypatch.setattr(
+        system_socket_proxy,
+        "open_system_tcp_proxy",
+        lambda host, port, *, timeout: proxy,
+    )
+
+    payload = _system_proxy_probe_node_id("10.0.0.1", 8000, 3.0)
+
+    assert payload is not None and payload["node_id"] == "peer-node"
+    assert proxy.stream.sent.startswith(b"GET /api/cluster/node_id HTTP/1.1\r\n")
+    assert proxy.closed is True
 
 
 def test_paired_manual_address_and_port_rehydrate_after_reboot(tmp_path):

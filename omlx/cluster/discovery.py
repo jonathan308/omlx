@@ -516,6 +516,7 @@ def _enrich_peer_transports(
 
 import errno  # noqa: E402
 import hashlib  # noqa: E402
+import http.client  # noqa: E402
 import ipaddress  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
@@ -923,13 +924,59 @@ def _http_probe_node_id(
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - cluster LAN probe of an announced address
             payload = json.loads(response.read(65536).decode("utf-8"))
-    except (OSError, ValueError):
+    except ValueError:
         return None
+    except OSError:
+        # Some macOS installations deny Homebrew Python outbound access to a
+        # direct Thunderbolt subnet while Apple's system Python can reach the
+        # same address. Rank control and JACCL bootstrap already use this
+        # bounded carrier. Reuse it for persisted-pair reboot recovery so a
+        # verified 10.0.0.x address does not require another manual seed.
+        try:
+            payload = _system_proxy_probe_node_id(ip, port, timeout)
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            return None
     if not isinstance(payload, dict) or not isinstance(
         payload.get("node_id"), str
     ):
         return None
     return payload
+
+
+def _system_proxy_probe_node_id(
+    ip: str,
+    port: int,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Probe one peer through the bounded macOS system-Python carrier."""
+
+    from .system_socket_proxy import (
+        open_system_tcp_proxy,
+        should_proxy_control_socket,
+    )
+
+    if not should_proxy_control_socket(ip):
+        return None
+    proxy = open_system_tcp_proxy(ip, port, timeout=timeout)
+    try:
+        host = f"[{ip}]" if ":" in ip else ip
+        request = (
+            "GET /api/cluster/node_id HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Accept: application/json\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        proxy.stream.sendall(request)
+        response = http.client.HTTPResponse(proxy.stream)
+        response.begin()
+        if response.status != 200:
+            return None
+        payload = json.loads(response.read(65536).decode("utf-8"))
+        if response.read(1):
+            return None
+        return payload if isinstance(payload, dict) else None
+    finally:
+        proxy.close()
 
 
 def _classify_link(ip: str, if_type: str, rtt: float | None) -> PeerLink:
