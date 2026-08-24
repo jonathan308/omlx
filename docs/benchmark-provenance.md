@@ -5,7 +5,33 @@ physical topology, workload, cache state, concurrency, and statistic. A bare
 tokens-per-second value is not reproducible and must not be presented as a
 general oMLX result.
 
-## DS4 optimization reference topology
+## Beta 1 qualification topology
+
+The Beta 1 qualification snapshot below was captured from clean source commit
+`6ebc22a822e3b50fe3c3d59acf1da62e8694f5dc`. It records accepted end-to-end
+observations; it is not a statistical claim beyond the identified runs.
+
+For this snapshot, **cold prefix** means `prefix-miss` on an already loaded
+deployment. It does not mean `cold-process`, does not include model-load time,
+and must not be relabeled that way in public comparisons.
+
+### Qwen text-model qualification
+
+| Component | Reference configuration |
+| --- | --- |
+| Rank 0 | Apple M3 Ultra, 256 GB unified memory |
+| Rank 1 | Apple M5 Max, 128 GB unified memory |
+| Interconnect | Direct Thunderbolt 5 link |
+| Collective backend | JACCL Thunderbolt RDMA |
+| Model | `mlx-community/Qwen3-30B-A3B-4bit` |
+| Tensor-parallel split | Equal `1:1` |
+| Speculative verification | Not qualified; no Qwen MTP claim for Beta 1 |
+
+Qwen3.8 models containing a vision tower are VLMs and are excluded from the
+distributed Beta 1 qualification. The Qwen result demonstrates a second
+text-only model family; it is not a universal-model compatibility claim.
+
+### DS4 optimization reference
 
 The current DeepSeek-V4-Flash optimization campaign uses this heterogeneous
 Apple Silicon setup:
@@ -25,6 +51,32 @@ count. Results from a single-rank microbenchmark, a modeled JACCL transfer, or
 only one of the two machines must say so; those results are not end-to-end
 two-host measurements. Record whether the direct TB5/JACCL path was physically
 active and measured rather than inferred from a bandwidth model.
+
+### Accepted Beta 1 measurements
+
+API and rank-marker rates are separate measurements. `Aggregate` always means
+the sum across the identified concurrent requests, never the rate of one
+request.
+
+| Model / topology | Scenario | Cache / load label | API tok/s | Rank-marker tok/s | Qualification detail |
+| --- | --- | --- | ---: | ---: | --- |
+| Qwen TP2 `1:1` | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 1,533.73 | 1,537.15 | Direct completion |
+| Qwen TP2 `1:1` | Decode | `prefix-miss`, single-stream, non-MTP | 56.83 | 56.46 | Same 30K request |
+| Qwen TP2 `1:1` | Exact-prompt repeat | `hot-prefix-hit`, fixed prompt | not applicable | not applicable | 30,004/30,005 tokens cached; TTFT 19.92 s -> 0.67 s |
+| Qwen TP2 `1:1` | Concurrent decode | `concurrent-4`, independent prompts, non-MTP | 216.3 aggregate | not recorded here | 4 x 512 output tokens; 2,048 tokens in 9.469 s |
+| Qwen TP2 `1:1` | In-flight cancellation | cold-prefix prefill | not applicable | not applicable | Both ranks stopped at 26,624 processed tokens and returned ready |
+| DS4 TP2 `3:5` | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 841.51 | 846.90 | Non-MTP prefill |
+| DS4 TP2 `3:5` | 100K prefill | cold-prefix (`prefix-miss`), single-stream | 771.77 | 773.86 | Non-MTP prefill |
+| DS4 TP2 `3:5` | 250K prefill | cold-prefix (`prefix-miss`), single-stream | 621.79 | 622.74 | Non-MTP prefill |
+| DS4 TP2 `3:5` | Decode | `prefix-miss`, single-stream, non-MTP | approximately 30-32 | not recorded here | B1 |
+| DS4 TP2 `3:5` | Decode | `prefix-miss`, single-stream, MTP depth 5 | 75.93 | not recorded here | B1 |
+| DS4 TP2 `3:5` | Concurrent decode | `concurrent-4`, non-MTP | 69.3 aggregate | not recorded here | B4 |
+| DS4 single M3 Ultra | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 481.02 | not applicable | Accepted single-node kernel stack; no distributed transport |
+
+The Qwen parity set used deterministic greedy requests with thinking disabled:
+four of six cases were token-exact, and two of six were semantically
+equivalent. This supports functional parity only. It is not evidence of
+bit-exact or universal token-exact distributed execution.
 
 ## Required run metadata
 
@@ -82,8 +134,11 @@ At minimum, a performance-bearing prerelease should link raw evidence for:
 4. warm-process, SSD-prefix-hit, single-stream;
 5. warm-process, prefix-miss, concurrent-N;
 6. warm-process, prefix-hit, concurrent-N;
-7. the same declared DS4/MTP depth-5 and 3:5 TP configuration used for the
-   headline comparison.
+7. the same declared DS4/MTP depth-5 and 3:5 TP configuration used for a DS4
+   headline comparison;
+8. the same declared Qwen non-MTP and 1:1 TP configuration used for a Qwen
+   headline comparison, with Qwen MTP marked `not qualified` until separately
+   measured.
 
 If a cell was not run, mark it `not measured`; do not silently substitute a
 projection, kernel-only measurement, or a different topology.
