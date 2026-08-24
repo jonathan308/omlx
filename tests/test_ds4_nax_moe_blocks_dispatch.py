@@ -128,6 +128,30 @@ def test_only_exact_enabled_m5_rank1_3x5_shape_is_eligible(monkeypatch):
     assert _eligible(monkeypatch)
 
 
+def test_exact_enabled_m5_rank1_equal_shape_is_eligible(monkeypatch):
+    assert _eligible(
+        monkeypatch,
+        tp=(2, 1, (4, 4)),
+        up_weight_shape=(256, 1024, 512),
+        up_scale_shape=(256, 1024, 128),
+        down_weight_shape=(256, 4096, 128),
+        down_scale_shape=(256, 4096, 32),
+    )
+
+
+def test_combined_flag_does_not_enable_equal_shape(monkeypatch):
+    assert not _eligible(
+        monkeypatch,
+        enabled=False,
+        combined=True,
+        tp=(2, 1, (4, 4)),
+        up_weight_shape=(256, 1024, 512),
+        up_scale_shape=(256, 1024, 128),
+        down_weight_shape=(256, 4096, 128),
+        down_scale_shape=(256, 4096, 32),
+    )
+
+
 def test_combined_switch_selects_the_same_exact_m5_rank1_contract(monkeypatch):
     assert _eligible(monkeypatch, enabled=False, combined=True)
     assert not _eligible(

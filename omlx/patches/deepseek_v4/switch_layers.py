@@ -618,14 +618,22 @@ class SwitchGLU(nn.Module):
         x_sorted,
         original_dtype,
     ) -> bool:
-        """Preflight the exact DS4F M5 rank-1 5/8 BF16 contract."""
+        """Preflight exact DS4F M5 rank-1 4/8 or 5/8 BF16 contracts."""
 
+        tp_contract = getattr(self, "_omlx_dsv4f_moe_tp", None)
+        nax_enabled = bool(
+            _DEEPSEEK_MXFP4_NAX_BLOCKS
+            or (
+                _DEEPSEEK_MXFP4_COMBINED
+                and tp_contract == (2, 1, (3, 5))
+            )
+        )
         if (
-            not (_DEEPSEEK_MXFP4_NAX_BLOCKS or _DEEPSEEK_MXFP4_COMBINED)
+            not nax_enabled
             or self.training
             or is_dspark_verify_armed()
             or not getattr(self, "_omlx_dsv4f_exact_config", False)
-            or getattr(self, "_omlx_dsv4f_moe_tp", None) != (2, 1, (3, 5))
+            or tp_contract not in {(2, 1, (3, 5)), (2, 1, (4, 4))}
         ):
             return False
         if (
@@ -658,13 +666,17 @@ class SwitchGLU(nn.Module):
         ):
             return False
         up, gate, down = projections
+        local_intermediate = 1280 if tp_contract == (2, 1, (3, 5)) else 1024
         if (
-            tuple(up["weight"].shape) != (256, 1280, 512)
-            or tuple(up["scales"].shape) != (256, 1280, 128)
+            tuple(up["weight"].shape) != (256, local_intermediate, 512)
+            or tuple(up["scales"].shape)
+            != (256, local_intermediate, 128)
             or tuple(gate["weight"].shape) != tuple(up["weight"].shape)
             or tuple(gate["scales"].shape) != tuple(up["scales"].shape)
-            or tuple(down["weight"].shape) != (256, 4096, 160)
-            or tuple(down["scales"].shape) != (256, 4096, 40)
+            or tuple(down["weight"].shape)
+            != (256, 4096, local_intermediate // 8)
+            or tuple(down["scales"].shape)
+            != (256, 4096, local_intermediate // 32)
         ):
             return False
 
@@ -804,9 +816,11 @@ class SwitchGLU(nn.Module):
                 _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED = True
                 logging.getLogger(__name__).info(
                     "DeepSeek V4 exact M5 NAX BM32 routed-MoE prefill active "
-                    "(rank=1, TP=3:5, M=1024; "
+                    "(rank=1, TP=%s, local_intermediate=%d, M=1024; "
                     "OMLX_DSV4_NAX_MOE_BLOCKS=0 and "
-                    "OMLX_DSV4_COMBINED_MOE_PREFILL=0 disable)"
+                    "OMLX_DSV4_COMBINED_MOE_PREFILL=0 disable)",
+                    ":".join(map(str, self._omlx_dsv4f_moe_tp[2])),
+                    int(self.up_proj["weight"].shape[1]),
                 )
             block_meta, block_count = nax_block_plan
             x_up = glm_fast.deepseek_mxfp4_gather_qmm_blocks_nax(
