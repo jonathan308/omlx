@@ -177,6 +177,7 @@ class DistributedBatchedEngine(BatchedEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        text_backbone_only: bool = False,
         python_executable: str | None = None,
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
@@ -235,6 +236,12 @@ class DistributedBatchedEngine(BatchedEngine):
             enable_thinking=enable_thinking,
             model_settings=model_settings,
         )
+        # Some unified VLM checkpoints (currently Qwen3.5/3.8) can be served
+        # losslessly by the distributed mlx-lm text backbone even though the
+        # coordinator catalogues the original checkpoint as multimodal.  Keep
+        # that limitation on the engine itself so every public API can reject
+        # unsupported media instead of silently dropping content parts.
+        self.text_backbone_only = bool(text_backbone_only)
         launch_kwargs: dict[str, Any] = {
             "cwd": cwd,
             "load_timeout": load_timeout,

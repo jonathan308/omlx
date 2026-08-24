@@ -196,6 +196,59 @@ from .exceptions import (
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .server_metrics import get_server_metrics, reset_server_metrics
 
+
+_MULTIMODAL_INPUT_TYPES = frozenset(
+    {
+        "image",
+        "image_url",
+        "input_image",
+        "video",
+        "video_url",
+        "input_video",
+        "audio",
+        "input_audio",
+    }
+)
+
+
+def _contains_multimodal_content(value: object) -> bool:
+    """Return whether an API content tree carries image/video/audio input."""
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        value = model_dump(exclude_none=True)
+
+    if isinstance(value, dict):
+        content_type = value.get("type")
+        if (
+            isinstance(content_type, str)
+            and content_type.lower() in _MULTIMODAL_INPUT_TYPES
+        ):
+            return True
+        return any(_contains_multimodal_content(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_multimodal_content(item) for item in value)
+    return False
+
+
+def _reject_cluster_text_backbone_multimodal(
+    engine: object,
+    content: object,
+) -> None:
+    """Fail closed when a distributed text-only wrapper receives media."""
+
+    if getattr(engine, "text_backbone_only", False) and _contains_multimodal_content(
+        content
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This clustered deployment serves only the model's text backbone; "
+                "image, video, and audio inputs are not supported. Use the model's "
+                "single-node VLM engine or send a text-only request."
+            ),
+        )
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -3812,6 +3865,7 @@ async def create_chat_completion(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -5848,6 +5902,7 @@ async def create_anthropic_message(
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.messages)
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -6353,6 +6408,7 @@ async def create_response(
         model_load_duration = time.perf_counter() - load_start
 
         resolved_model = _serving_model_id(lease, request.model)
+        _reject_cluster_text_backbone_multimodal(engine, request.input)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,

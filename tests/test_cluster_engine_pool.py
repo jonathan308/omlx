@@ -7,7 +7,11 @@ import pytest
 
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.planner import PipelineAssignment
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import (
+    EngineEntry,
+    EnginePool,
+    _entry_supports_cluster_text_backbone,
+)
 
 
 def _deployment(model_path: str) -> ClusterDeployment:
@@ -276,6 +280,7 @@ def test_remote_only_qwen35_registers_exact_text_backbone(tmp_path):
     assert entry.model_type == "llm"
     assert entry.engine_type == "batched"
     assert entry.config_model_type == "qwen3_5"
+    assert _entry_supports_cluster_text_backbone(entry) is True
 
 
 def test_cluster_only_pool_entry_is_removed_after_registry_deactivation(tmp_path):

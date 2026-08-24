@@ -88,8 +88,7 @@ def _config_supports_cluster_text_backbone(config: object) -> bool:
 
 def _entry_supports_cluster_text_backbone(entry: "EngineEntry") -> bool:
     if (
-        entry.engine_type != "vlm"
-        or entry.config_model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES
+        entry.config_model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES
     ):
         return False
     config_path = Path(entry.model_path).expanduser() / "config.json"
@@ -2797,6 +2796,7 @@ class EnginePool:
                             model_settings, "enable_thinking", None
                         ),
                         model_settings=model_settings,
+                        text_backbone_only=cluster_text_backbone,
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "

@@ -54,6 +54,16 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
     return engine
 
 
+def test_text_backbone_only_contract_is_explicit_and_default_off():
+    assert DistributedBatchedEngine(_deployment()).text_backbone_only is False
+    assert (
+        DistributedBatchedEngine(
+            _deployment(), text_backbone_only=True
+        ).text_backbone_only
+        is True
+    )
+
+
 def test_backend_chat_messages_serialize_native_tool_history_once():
     messages = [
         {
