@@ -12,9 +12,7 @@ import omlx.admin.routes as admin_routes
 
 def _pool(clear):
     core = SimpleNamespace(scheduler=None, clear_prompt_caches=clear)
-    entry = SimpleNamespace(
-        engine=SimpleNamespace(_engine=SimpleNamespace(engine=core))
-    )
+    entry = SimpleNamespace(engine=core)
     pool = SimpleNamespace()
     pool.get_status = MagicMock(return_value={
         "models": [{"id": "cluster-model", "loaded": True}]

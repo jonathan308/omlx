@@ -5486,8 +5486,17 @@ def _iter_loaded_engine_records():
         entry = engine_pool._entries.get(model_id)
         if entry is None or entry.engine is None:
             continue
-        async_core = getattr(entry.engine, "_engine", None)
-        core = getattr(async_core, "engine", None) if async_core is not None else None
+        # DistributedBatchedEngine is stored directly in the pool; local
+        # batched engines retain the historical async-wrapper chain.
+        direct = entry.engine
+        async_core = getattr(direct, "_engine", None)
+        core = (
+            direct
+            if callable(getattr(direct, "clear_prompt_caches", None))
+            else getattr(async_core, "engine", None)
+            if async_core is not None
+            else None
+        )
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if core is not None:
             yield model_id, scheduler, core
