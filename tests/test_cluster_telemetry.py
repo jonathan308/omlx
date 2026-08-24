@@ -122,7 +122,7 @@ def test_prompt_boundary_capture_uses_the_pre_decode_cache_key():
         prompt_cache,
         "model-key",
         BatchGenerator(),
-        response,
+        response.uid,
     ) == 3
     assert prompt_cache.insertions == [
         ("model-key", [1, 2, 3], ["prompt-cache"], "user")
@@ -134,7 +134,7 @@ def test_prompt_boundary_capture_ignores_non_boundary_responses():
         object(),
         "model-key",
         object(),
-        SimpleNamespace(uid=17, end_of_prompt=False),
+        None,
     ) == 0
 
 

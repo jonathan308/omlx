@@ -152,18 +152,15 @@ def _capture_prompt_boundary_cache(
     prompt_cache: Any,
     model_key: Any,
     batch_generator: Any,
-    response: Any,
+    uid: Any,
 ) -> int:
-    """Store an immutable prompt-side cache before assistant decode mutates it.
+    """Store an immutable prompt-side cache before its seed token is consumed.
 
     DS4 has sliding-window layers whose post-decode state cannot be trimmed
-    back through assistant tokens. Capturing at ``end_of_prompt`` is the one
-    point where MLX-LM exposes an exact prompt prefix on every rank.
+    backward. Capturing at the prompt-batch→generation boundary yields the
+    ``prompt[:-1]`` state MLX-LM needs for its next request.
     """
 
-    if not bool(getattr(response, "end_of_prompt", False)):
-        return 0
-    uid = getattr(response, "uid", None)
     if uid is None or prompt_cache is None or model_key is None:
         return 0
     try:
@@ -1719,6 +1716,21 @@ def install_server_telemetry(
                 if isinstance(item, (tuple, list)) and len(item) > 1
             )
 
+        def _generation_boundary_uids(self) -> tuple[Any, ...]:
+            """Prompt-batch UIDs whose final token moves to generation next."""
+
+            current = getattr(self, "_currently_processing", ())
+            prompt_batch = getattr(self, "_prompt_batch", None)
+            uids = tuple(getattr(prompt_batch, "uids", ()) or ())
+            return tuple(
+                uids[index]
+                for index, item in enumerate(current)
+                if index < len(uids)
+                and isinstance(item, (tuple, list))
+                and item
+                and self._at_generation_boundary(item[0])
+            )
+
         def _omlx_drain_cancel_boundary(self, epoch: int, uids: Any) -> None:
             """Finish all scheduled tensor work before a cancel rendezvous."""
 
@@ -1842,6 +1854,31 @@ def install_server_telemetry(
 
         def next(self) -> Any:
             at_boundary = self._about_to_enter_generation()
+            captured_boundaries: tuple[tuple[Any, int], ...] = ()
+            if at_boundary:
+                prompt_cache = getattr(snapshot_ctx, "prompt_cache", None)
+                model_key = getattr(snapshot_ctx, "model_key", None)
+                captured_boundaries = tuple(
+                    (uid, captured)
+                    for uid in self._generation_boundary_uids()
+                    if (
+                        captured := _capture_prompt_boundary_cache(
+                            prompt_cache,
+                            model_key,
+                            self,
+                            uid,
+                        )
+                    )
+                )
+                if (
+                    captured_boundaries
+                    and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1"
+                ):
+                    logger.warning(
+                        "Captured predecode prompt cache rank=%s boundaries=%s",
+                        rank,
+                        captured_boundaries,
+                    )
             if (
                 os.environ.get("OMLX_CLUSTER_TRACE_COLLECTIVES", "0")
                 .strip()
@@ -1907,18 +1944,6 @@ def install_server_telemetry(
                     processed_tokens=progress[0],
                     total_tokens=progress[1],
                 )
-                captured = _capture_prompt_boundary_cache(
-                    getattr(snapshot_ctx, "prompt_cache", None),
-                    getattr(snapshot_ctx, "model_key", None),
-                    self,
-                    response,
-                )
-                if captured and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1":
-                    logger.warning(
-                        "Captured prompt-boundary cache rank=%s tokens=%s",
-                        rank,
-                        captured,
-                    )
                 # This routine also retires the per-UID token bookkeeping at
                 # end_of_prompt; it is not only an SSD-cache operation.
                 self._omlx_snapshot_boundary(response)
