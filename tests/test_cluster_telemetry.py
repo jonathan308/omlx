@@ -1202,6 +1202,92 @@ def test_long_prefill_exposes_cancel_vote_within_one_chunk(tmp_path):
         assert sum(1 for _ in budget) == 25
 
 
+def test_distributed_cancel_epoch_drains_and_rendezvous_before_removal(
+    monkeypatch,
+):
+    """A cancel cannot filter rank-local caches before every peer is drained."""
+
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    events = []
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class ControlPlane:
+        def broadcast_object(self, obj):
+            events.append(("broadcast", obj))
+            return obj
+
+        def barrier(self):
+            events.append(("barrier", None))
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 0
+
+        def _share_object(self, _obj):
+            raise AssertionError("patched distributed sharing must own cancellation")
+
+    class FakeBatchGenerator:
+        def __init__(self):
+            self._prompt_batch = SimpleNamespace()
+
+        def remove(self, uids):
+            events.append(("remove", list(uids)))
+            return "removed"
+
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mx, "synchronize", lambda *args: events.append(("drain", None)))
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+    control = ControlPlane()
+
+    with install_server_telemetry(
+        _Marker(),
+        heartbeat_interval=0,
+        control_plane=control,
+    ):
+        import pytest
+
+        generator = mlx_server.ResponseGenerator()
+        batch = mlx_server.BatchGenerator()
+        with pytest.raises(RuntimeError, match="not armed"):
+            batch.remove([73])
+        assert events == []
+        assert generator._share_object([]) == []
+        assert events == [("broadcast", [])]
+        events.clear()
+        assert generator._share_object([73]) == [73]
+        assert batch.remove([73]) == "removed"
+
+    assert [event[0] for event in events] == [
+        "broadcast",
+        "drain",
+        "barrier",
+        "remove",
+    ]
+    envelope = events[0][1]
+    assert envelope["kind"] == "omlx.cancel_vote"
+    assert envelope["schema_version"] == 1
+    assert envelope["epoch"] > 0
+    assert envelope["uids"] == [73]
+
+
+def test_distributed_cancel_epoch_replay_is_rejected_before_removal(tmp_path):
+    telemetry = _cancel_telemetry(tmp_path)
+    vote = telemetry.make_cancel_vote([7])
+
+    assert telemetry.accept_cancel_vote(vote) == (vote["epoch"], [7])
+    import pytest
+
+    with pytest.raises(RuntimeError, match="did not advance"):
+        telemetry.accept_cancel_vote(vote)
+
+
 def test_force_cancel_all_without_a_generation_context_is_a_noop(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
 
