@@ -13,6 +13,12 @@ import zlib
 from contextlib import AbstractContextManager
 from typing import Any
 
+from .system_socket_proxy import (
+    SystemSocketProxy,
+    open_system_tcp_proxy,
+    should_proxy_control_socket,
+)
+
 _HANDSHAKE_MAGIC = b"OC2H"
 _MESSAGE_MAGIC = b"OC2M"
 _OWNED_BYTES_MAGIC = b"OC2B"
@@ -105,6 +111,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self._listener: socket.socket | None = None
         self._peers: dict[int, socket.socket] = {}
         self._stream: socket.socket | None = None
+        self._stream_proxy: SystemSocketProxy | None = None
         self._sequence = 0
         # Request/cancellation control and model-owned decisions normally run
         # on the same generation thread.  Serialize defensively so an
@@ -161,6 +168,29 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 raise
 
     def _connect_to_coordinator(self) -> None:
+        if should_proxy_control_socket(self.host):
+            proxy = open_system_tcp_proxy(
+                self.host,
+                self.port,
+                timeout=self._connect_timeout,
+            )
+            stream = proxy.stream
+            try:
+                self._configure(stream)
+                stream.sendall(
+                    _HANDSHAKE.pack(
+                        _HANDSHAKE_MAGIC,
+                        _VERSION,
+                        self.rank,
+                        self._token,
+                    )
+                )
+            except BaseException:
+                proxy.close()
+                raise
+            self._stream_proxy = proxy
+            self._stream = stream
+            return
         deadline = time.monotonic() + self._connect_timeout
         last_error: OSError | None = None
         while time.monotonic() < deadline:
@@ -447,6 +477,9 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
             except OSError:
                 pass
             self._stream = None
+        if self._stream_proxy is not None:
+            self._stream_proxy.close()
+            self._stream_proxy = None
         if self._listener is not None:
             try:
                 self._listener.close()
