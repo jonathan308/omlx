@@ -4781,6 +4781,11 @@ class BlockAwarePrefixCache(CacheManager):
                 # be dropped by the hash-lifecycle hooks (no block owns the
                 # hash) and the chain past this point is unverifiable.
                 break
+            # This helper owns the token-to-block association. Keep the block
+            # metadata complete even for direct callers (tests, restored
+            # indexes and future migration code) rather than relying on
+            # store_cache() to have populated it first.
+            block.token_count = len(block_tokens)
             block_hash = block.block_hash
             if block_hash is None:
                 block_hash = compute_block_hash(

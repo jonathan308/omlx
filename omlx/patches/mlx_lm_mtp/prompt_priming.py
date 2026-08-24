@@ -87,10 +87,10 @@ def prime_window() -> int:
 
     Escape hatch for the head-cache memory cost of priming (one
     full-attention layer of KV over the folded span). The cap is measured
-    against the span actually folded this request — with a warm prefix cache
-    that is only the boundary remainder, not the full prompt — so a
-    long-context request with a small remainder still primes. A remainder
-    larger than the window runs unprimed.
+    against the span actually folded this request. A restored warm prefix does
+    not currently restore the MTP head cache, so its boundary remainder stays
+    deliberately unprimed regardless of size; treating that suffix as a full
+    prompt history would make speculative rollback incorrect.
     """
     try:
         return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
