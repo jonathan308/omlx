@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gate the isolated M5 NAX expert-blocked DS4 routed-MoE projection.
 
-The real GPU path is fixed to the signed 3:5 rank-1 geometry: M=1024,
-top-k=6, 256 experts, hidden width 4096, and local intermediate width 1280.
+The promoted runtime remains fixed to signed 3:5 rank-1 geometry. This harness
+also accepts an explicit two-rank vector so equal-width candidates can be
+measured before changing that production gate. M=1024,
+top-k=6, 256 experts and hidden width 4096 remain fixed.
 It compares stock BF16 ``mx.gather_qmm`` with an expert-local BM32 NAX
 primitive at every projection/activation/restore boundary. No serving model
 imports or dispatches the candidate.
@@ -184,6 +186,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=20)
+    parser.add_argument("--rank", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--shard-weights",
+        default="3,5",
+        help="two comma-separated positive tensor shard weights",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--cycles", type=int, default=8)
     parser.add_argument("--min-speedup", type=float, default=MIN_COMPOSED_SPEEDUP)
@@ -196,8 +204,19 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _shard_weights(value: str) -> tuple[int, int]:
+    try:
+        parts = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise ValueError("--shard-weights must contain integers") from exc
+    if len(parts) != 2 or any(item <= 0 for item in parts):
+        raise ValueError("--shard-weights requires two positive integers")
+    return parts
+
+
 def main() -> None:
     args = _parse_args()
+    shard_weights = _shard_weights(args.shard_weights)
     if not fast.has_symbol(SYMBOL):
         raise RuntimeError(f"native symbol {SYMBOL} is unavailable")
     if not fast.has_symbol(PAIR_SYMBOL):
@@ -207,9 +226,13 @@ def main() -> None:
     if not fast.ds4_projection_nax_device_available():
         raise RuntimeError("physical device does not support the NAX primitive")
 
-    tensors = load_tp_layer(args.model, args.layer, rank=1)
-    if tensors["width"] != LOCAL_INTERMEDIATE:
-        raise RuntimeError("the first NAX gate requires the signed rank-1 5/8 slice")
+    tensors = load_tp_layer(
+        args.model,
+        args.layer,
+        rank=args.rank,
+        shard_weights=shard_weights,
+    )
+    local_intermediate = tensors["width"]
 
     mx.random.seed(20260822)
     hidden = mx.random.normal((1, TOKENS, HIDDEN)).astype(mx.bfloat16)
@@ -403,15 +426,15 @@ def main() -> None:
         "device": mx.device_info(),
         "model": str(args.model),
         "layer": args.layer,
-        "rank": 1,
+        "rank": args.rank,
         "route_pattern": args.route_pattern,
-        "shard_weights": [3, 5],
+        "shard_weights": list(shard_weights),
         "shape": {
             "tokens": TOKENS,
             "routes": ROUTES,
             "experts": EXPERTS,
             "hidden": HIDDEN,
-            "local_intermediate": LOCAL_INTERMEDIATE,
+            "local_intermediate": local_intermediate,
             "up_gate_weight": list(tensors["up_weight"].shape),
             "down_weight": list(tensors["down_weight"].shape),
             "block_meta": list(block_meta.shape),

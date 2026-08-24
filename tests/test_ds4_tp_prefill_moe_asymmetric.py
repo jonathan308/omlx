@@ -15,6 +15,11 @@ def test_exact_three_five_tp_slice_boundaries():
     assert ((2048 - 768) // 8, (2048 - 768) // 32) == (160, 40)
 
 
+def test_explicit_equal_tp_slice_boundaries_are_available_to_benchmarks():
+    assert shard_bounds(0, (4, 4)) == (0, 1024)
+    assert shard_bounds(1, (4, 4)) == (1024, 2048)
+
+
 def test_tail8_native_guards_accept_only_exact_ds4_tp_widths():
     source = (
         Path(__file__).parents[1]

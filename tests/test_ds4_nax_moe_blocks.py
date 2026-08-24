@@ -12,6 +12,7 @@ from benchmarks.bench_ds4_nax_moe_blocks import (
     MIN_COMPOSED_SPEEDUP,
     PAIR_SYMBOL,
     SYMBOL,
+    _shard_weights,
     route_fixture,
     structural_work_report,
 )
@@ -56,6 +57,13 @@ def test_boundary_and_skew_route_fixtures_stay_inside_fixed_block_abi(
 
 def test_gate_requires_lossless_1_45x_composed_speedup():
     assert MIN_COMPOSED_SPEEDUP == 1.45
+
+
+def test_benchmark_accepts_explicit_equal_or_asymmetric_tp_vectors():
+    assert _shard_weights("3,5") == (3, 5)
+    assert _shard_weights("4,4") == (4, 4)
+    with pytest.raises(ValueError, match="two positive"):
+        _shard_weights("8")
 
 
 def test_native_source_keeps_stock_nax_simd_geometry_and_bf16_boundary():

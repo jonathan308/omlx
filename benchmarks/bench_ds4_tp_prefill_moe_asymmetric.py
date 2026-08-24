@@ -45,16 +45,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def shard_bounds(rank: int) -> tuple[int, int]:
-    if rank not in (0, 1):
-        raise ValueError("3:5 TP has exactly two ranks")
-    unit = FULL_INTERMEDIATE // sum(SHARD_WEIGHTS)
-    start = unit * sum(SHARD_WEIGHTS[:rank])
-    stop = start + unit * SHARD_WEIGHTS[rank]
+def shard_bounds(
+    rank: int,
+    shard_weights: tuple[int, ...] = SHARD_WEIGHTS,
+) -> tuple[int, int]:
+    if not shard_weights or not 0 <= rank < len(shard_weights):
+        raise ValueError("rank is outside the explicit TP shard vector")
+    if any(value <= 0 for value in shard_weights):
+        raise ValueError("TP shard weights must be positive")
+    total = sum(shard_weights)
+    if FULL_INTERMEDIATE % total:
+        raise ValueError("TP shard weights do not divide the intermediate width")
+    unit = FULL_INTERMEDIATE // total
+    start = unit * sum(shard_weights[:rank])
+    stop = start + unit * shard_weights[rank]
     return start, stop
 
 
-def load_tp_layer(model_dir: Path, layer: int, rank: int):
+def load_tp_layer(
+    model_dir: Path,
+    layer: int,
+    rank: int,
+    shard_weights: tuple[int, ...] = SHARD_WEIGHTS,
+):
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())
     prefix = f"layers.{layer}.ffn.experts."
     shards = sorted(
@@ -68,7 +81,7 @@ def load_tp_layer(model_dir: Path, layer: int, rank: int):
     for shard in shards:
         tensors.update(mx.load(str(model_dir / shard)))
 
-    start, stop = shard_bounds(rank)
+    start, stop = shard_bounds(rank, shard_weights)
     width = stop - start
     packed_start, packed_stop = start // 8, stop // 8
     scale_start, scale_stop = start // 32, stop // 32
