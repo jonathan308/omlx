@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import shlex
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -395,6 +396,7 @@ class DistributedBatchedEngine(BatchedEngine):
                 ssh_target,
                 command,
                 timeout=45.0,
+                runner=subprocess.run,
             )
             if completed.returncode != 0:
                 detail = completed.stderr.strip() or completed.stdout.strip()

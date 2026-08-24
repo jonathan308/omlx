@@ -68,7 +68,7 @@ async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
 
     remote_calls = []
 
-    def remote(ssh_target, command, timeout):
+    def remote(ssh_target, command, timeout, runner):
         remote_calls.append((ssh_target, command, timeout))
         return SimpleNamespace(
             returncode=0,
