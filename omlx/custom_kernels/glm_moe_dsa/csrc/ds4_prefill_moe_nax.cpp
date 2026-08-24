@@ -41,7 +41,8 @@ bool row_contiguous(const array &value) {
 }
 
 bool supported_projection(int K, int N) {
-  return (K == 4096 && N == 1280) || (K == 1280 && N == 4096);
+  return (K == 4096 && (N == 1024 || N == 1280)) ||
+         ((K == 1024 || K == 1280) && N == 4096);
 }
 
 class DS4Mxfp4GatherQmmBlocksNaxPrimitive : public Primitive {
@@ -145,7 +146,7 @@ public:
         scales1.shape() != scales0.shape() || weight1.dtype() != uint32 ||
         scales1.dtype() != uint8 || !row_contiguous(weight1) ||
         !row_contiguous(scales1) || x.shape(2) != 4096 ||
-        weight0.shape(1) != 1280;
+        (weight0.shape(1) != 1024 && weight0.shape(1) != 1280);
   }
 
   void eval_cpu(const std::vector<array> & /* inputs */,
@@ -217,7 +218,8 @@ array deepseek_mxfp4_gather_qmm_blocks_nax(
     msg << "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_blocks_nax] "
            "isolated symbol requires BF16 x [6144,1,K], MXFP4 U32 weight "
            "[256,N,K/8], U8 scales [256,N,K/32], BM32 block_meta [448,3], "
-           "and either (K,N)=(4096,1280) or (1280,4096); got "
+           "and (K,N) in {(4096,1024),(1024,4096),(4096,1280),"
+           "(1280,4096)}; got "
         << x.shape() << ", " << weight.shape() << ", " << scales.shape()
         << ", " << block_meta.shape() << ", " << block_count.shape() << ".";
     throw std::invalid_argument(msg.str());
@@ -242,7 +244,7 @@ array deepseek_mxfp4_gather_qmm_pair_blocks_nax(
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.deepseek_mxfp4_gather_qmm_pair_blocks_nax] "
            "requires BF16 x [6144,1,4096], two MXFP4 U32 weights "
-           "[256,1280,512], two U8 scales [256,1280,128], and the BM32 "
+           "[256,N,512] with N in {1024,1280}, matching U8 scales, and the BM32 "
            "block plan; got "
         << x.shape() << ", " << weight0.shape() << ", " << scales0.shape()
         << ", " << weight1.shape() << ", " << scales1.shape() << ".";

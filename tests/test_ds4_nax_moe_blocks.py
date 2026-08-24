@@ -90,6 +90,7 @@ def test_native_source_keeps_stock_nax_simd_geometry_and_bf16_boundary():
     assert "kRoutes = 6144" in cpp
     assert "kExperts = 256" in cpp
     assert "kMaxBlocks = 448" in cpp
+    assert "N == 1024 || N == 1280" in cpp
     assert "x.dtype() != bfloat16" in cpp
     assert "ds4_prefill_moe_nax.metal" in cmake
     assert '"OMLX_DSV4_NAX_MOE_BLOCKS", "0"' in switch
