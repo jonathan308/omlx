@@ -18,6 +18,9 @@ _COMPILED_HC_DECODE_PRODUCER = os.getenv(
 _VERIFY_HC_PRENORM = os.getenv(
     "OMLX_DSV4_VERIFY_HC_PRENORM", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_PREFILL_HC_PRENORM = os.getenv(
+    "OMLX_DSV4_PREFILL_HC_PRENORM", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _VERIFY_HC_PRENORM_LOGGED = False
 
 
@@ -480,11 +483,19 @@ class HyperConnection(nn.Module):
 
         weight = getattr(norm, "weight", None)
         norm_eps = getattr(norm, "eps", None)
+        qualified_shape = tuple(x.shape) in (
+            (1, 6, 4, 4096),
+            (1, 1024, 4, 4096),
+        )
+        enabled_shape = bool(
+            (_VERIFY_HC_PRENORM and tuple(x.shape) == (1, 6, 4, 4096))
+            or (_PREFILL_HC_PRENORM and tuple(x.shape) == (1, 1024, 4, 4096))
+        )
         if not (
-            _VERIFY_HC_PRENORM
+            enabled_shape
             and _hc_sinkhorn_collapse_norm_kernel is not None
             and not self.training
-            and tuple(x.shape) == (1, 6, 4, 4096)
+            and qualified_shape
             and x.dtype == mx.bfloat16
             and self.hc_mult == 4
             and tuple(self.fn.shape) == (24, 16384)
@@ -500,9 +511,10 @@ class HyperConnection(nn.Module):
         if not _VERIFY_HC_PRENORM_LOGGED:
             _VERIFY_HC_PRENORM_LOGGED = True
             logging.getLogger(__name__).info(
-                "deepseek_v4: using exact M=6 FP32-HC sinkhorn/collapse -> "
+                "deepseek_v4: using exact M=%d FP32-HC sinkhorn/collapse -> "
                 "weighted RMSNorm continuation "
-                "(OMLX_DSV4_VERIFY_HC_PRENORM=0 disables)"
+                "(verify/prefill HC pre-norm gates disable)",
+                int(x.shape[1]),
             )
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)

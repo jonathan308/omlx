@@ -222,6 +222,9 @@ _RANK_ENV_DEFAULTS = (
     # Exact M=6 HC sinkhorn/collapse continuation into MLX's weighted
     # 4096-wide RMSNorm topology. Default-off pending physical TP2 decode.
     ("OMLX_DSV4_VERIFY_HC_PRENORM", "0"),
+    # Exact M=1024 HC sinkhorn/collapse continuation into the following
+    # weighted RMSNorm. Default-off pending physical cross-chip prefill A/B.
+    ("OMLX_DSV4_PREFILL_HC_PRENORM", "0"),
     # Split the exact FP32 HyperConnection residual branch so Metal can fill
     # communication bubbles without changing collective or arithmetic order.
     ("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"),
