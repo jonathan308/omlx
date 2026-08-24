@@ -1,11 +1,16 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+
+_CANONICAL_WIDE_PREFILL = os.getenv(
+    "OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 
 
 def _make_hc_sinkhorn_collapse_kernel():
@@ -231,7 +236,7 @@ class HyperConnection(nn.Module):
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array):
+    def _call_one(self, x: mx.array):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
@@ -254,6 +259,22 @@ class HyperConnection(nn.Module):
             self.sinkhorn_iters,
             self.hc_eps,
         )
+
+    def __call__(self, x: mx.array):
+        if (
+            _CANONICAL_WIDE_PREFILL
+            and not self.training
+            and x.ndim == 4
+            and tuple(x.shape[:2]) == (1, 2048)
+            and x.shape[2:] == (self.hc_mult, 4096)
+            and x.dtype == mx.bfloat16
+        ):
+            parts = (self._call_one(x[:, :1024]), self._call_one(x[:, 1024:]))
+            return tuple(
+                mx.concatenate([parts[0][index], parts[1][index]], axis=1)
+                for index in range(3)
+            )
+        return self._call_one(x)
 
 
 @mx.compile

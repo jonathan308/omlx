@@ -122,6 +122,9 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_ADAPTIVE_PREFILL_AFTER", "4096"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_STEP", "1024"),
     ("OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE", "2048"),
+    # Experimental 2K outer tile with canonical 1K FP32 HC and compressed-
+    # attention/cache boundaries. Both ranks must enter the same split graph.
+    ("OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"),
     # Shape warmup enters the full distributed graph, so every rank must make
     # the same decision.  Coordinator-only overrides would cross collectives.
     ("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "1"),
@@ -317,7 +320,9 @@ def validate_model_path_map(
         if not isinstance(node_id, str) or _NODE_ID.fullmatch(node_id) is None:
             raise ValueError(f"invalid path_map node ID: {node_id!r}")
         if known is not None and node_id not in known:
-            raise ValueError(f"path_map names a node outside the deployment: {node_id!r}")
+            raise ValueError(
+                f"path_map names a node outside the deployment: {node_id!r}"
+            )
         if not isinstance(raw_path, str):
             raise ValueError(f"path_map path for {node_id!r} must be a string")
         path = raw_path.strip()
@@ -531,17 +536,13 @@ class ClusterDeployment:
                 "tensor_parallel_size must be between 1 and the host count"
             )
         if len(self.hosts) % self.tensor_parallel_size != 0:
-            raise ValueError(
-                "host count must be divisible by tensor_parallel_size"
-            )
+            raise ValueError("host count must be divisible by tensor_parallel_size")
         if (
             not isinstance(self.target_context_tokens, int)
             or isinstance(self.target_context_tokens, bool)
             or not 1 <= self.target_context_tokens <= 1_048_576
         ):
-            raise ValueError(
-                "target_context_tokens must be between 1 and 1,048,576"
-            )
+            raise ValueError("target_context_tokens must be between 1 and 1,048,576")
         if not isinstance(self.mtp_enabled, bool):
             raise ValueError("mtp_enabled must be a boolean")
         if self.mtp_num_draft_tokens is not None and (
@@ -577,8 +578,7 @@ class ClusterDeployment:
                 raise ValueError("host order must match node IDs and pipeline ranks")
             if (
                 assignment.tensor_parallel_size != self.tensor_parallel_size
-                or assignment.tensor_parallel_rank
-                != rank % self.tensor_parallel_size
+                or assignment.tensor_parallel_rank != rank % self.tensor_parallel_size
             ):
                 raise ValueError(
                     "assignment tensor-parallel coordinates do not match deployment"
@@ -595,9 +595,7 @@ class ClusterDeployment:
                 raise ValueError(
                     "tensor layout qualification currently requires pure TP"
                 )
-            weights = tuple(
-                item.tensor_parallel_shard_weight for item in assignments
-            )
+            weights = tuple(item.tensor_parallel_shard_weight for item in assignments)
             if weights != qualification.shard_weights:
                 raise ValueError(
                     "deployment TP weights do not match qualification provenance"
@@ -763,9 +761,7 @@ class ClusterDeployment:
         worker_payload = {
             "schema_version": DEPLOYMENT_SCHEMA_VERSION,
             "plan_hash": self.plan_hash,
-            "assignments": [
-                assignment.to_dict() for assignment in self.assignments
-            ],
+            "assignments": [assignment.to_dict() for assignment in self.assignments],
             "performance_profiles": [
                 profile.to_dict() for profile in self.performance_profiles
             ],
@@ -832,9 +828,9 @@ def _decode_worker_payload(encoded: str) -> dict[str, Any]:
         raise ValueError("pipeline plan hash is invalid")
     qualification = payload.get("tensor_parallel_qualification")
     if qualification is not None:
-        payload["tensor_parallel_qualification"] = (
-            TPQualificationProvenance.from_dict(qualification).to_dict()
-        )
+        payload["tensor_parallel_qualification"] = TPQualificationProvenance.from_dict(
+            qualification
+        ).to_dict()
     return payload
 
 
@@ -866,17 +862,19 @@ def decode_worker_contract(
         raise ValueError("worker performance profiles do not match the shard plan")
     tensor_parallel_size = int(payload.get("tensor_parallel_size", 1))
     if not 1 <= tensor_parallel_size <= len(parsed):
-        raise ValueError("tensor_parallel_size must be between 1 and the assignment count")
+        raise ValueError(
+            "tensor_parallel_size must be between 1 and the assignment count"
+        )
     qualification_payload = payload.get("tensor_parallel_qualification")
     if qualification_payload is not None:
         qualification = TPQualificationProvenance.from_dict(qualification_payload)
         ordered = tuple(sorted(parsed, key=lambda item: item.rank))
-        if tensor_parallel_size != len(ordered) or tuple(
-            item.tensor_parallel_shard_weight for item in ordered
-        ) != qualification.shard_weights:
-            raise ValueError(
-                "worker TP weights do not match qualification provenance"
-            )
+        if (
+            tensor_parallel_size != len(ordered)
+            or tuple(item.tensor_parallel_shard_weight for item in ordered)
+            != qualification.shard_weights
+        ):
+            raise ValueError("worker TP weights do not match qualification provenance")
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
 
 

@@ -61,28 +61,25 @@ _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
 # with one Metal dispatch. The kernel is batch-row invariant by construction
 # (independent per-row reduction), preserving the DSpark decode==verify
 # contract. OMLX_DSV4_FUSED_SPARSE=0 forces the composed path.
-_DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED = (
-    os.environ.get("OMLX_DSV4_FUSED_SPARSE", "1").strip().lower()
-    in ("0", "false", "off")
-)
+_DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED = os.environ.get(
+    "OMLX_DSV4_FUSED_SPARSE", "1"
+).strip().lower() in ("0", "false", "off")
 _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = False
 # OMLX_DSV4_RING=0 disables the dspark_ring_gemm verify fast path, forcing
 # the per-row _sparse_pooled_attention route (fused or composed). Diagnostic
 # escape hatch for A/B benchmarking.
-_DEEPSEEK_V4_RING_VERIFY_DISABLED = (
-    os.environ.get("OMLX_DSV4_RING", "1").strip().lower()
-    in ("0", "false", "off")
-)
+_DEEPSEEK_V4_RING_VERIFY_DISABLED = os.environ.get(
+    "OMLX_DSV4_RING", "1"
+).strip().lower() in ("0", "false", "off")
 # The exact row-wise decode path exists to make one-token target decoding
 # bit-identical to DSpark's multi-row verification.  It is unnecessary when
 # speculative decoding is disabled and is materially slower on TP-local head
 # counts (24/32/40 on the supported 64-head checkpoint).  The MTP patch marks
 # attention modules that need the consistency contract at model construction;
 # this switch is a startup-time rollback to the legacy always-exact behavior.
-_DEEPSEEK_V4_EXACT_DECODE = (
-    os.environ.get("OMLX_DSV4_EXACT_DECODE", "0").strip().lower()
-    in ("1", "true", "on")
-)
+_DEEPSEEK_V4_EXACT_DECODE = os.environ.get(
+    "OMLX_DSV4_EXACT_DECODE", "0"
+).strip().lower() in ("1", "true", "on")
 
 # ``DeepseekV4Model.__call__`` normally materializes every cache update before
 # returning.  That barrier is the conservative default for decode and for all
@@ -118,7 +115,9 @@ def _tp_partition_weights(
         weights = tuple(int(item.strip()) for item in raw.split(","))
     except ValueError as exc:
         raise ValueError("OMLX_TP_SHARD_WEIGHTS must contain integers") from exc
-    if len(weights) != int(group.size()) or any(not 1 <= item <= 4096 for item in weights):
+    if len(weights) != int(group.size()) or any(
+        not 1 <= item <= 4096 for item in weights
+    ):
         raise ValueError(
             "OMLX_TP_SHARD_WEIGHTS must contain one positive weight per TP rank"
         )
@@ -228,15 +227,12 @@ def _validated_ds4_moe_tp_weights(
     try:
         weights = tuple(int(item.strip()) for item in raw.split(","))
     except ValueError as exc:
-        raise ValueError(
-            "OMLX_TP_MOE_SHARD_WEIGHTS must contain integers"
-        ) from exc
+        raise ValueError("OMLX_TP_MOE_SHARD_WEIGHTS must contain integers") from exc
     if len(weights) != int(group.size()) or any(
         not 1 <= item <= 4096 for item in weights
     ):
         raise ValueError(
-            "OMLX_TP_MOE_SHARD_WEIGHTS must contain one positive weight "
-            "per TP rank"
+            "OMLX_TP_MOE_SHARD_WEIGHTS must contain one positive weight per TP rank"
         )
     if outer_weights is None:
         # A conservative signed-equal plan may still qualify a mixed layout by
@@ -286,15 +282,12 @@ def _validated_ds4_non_moe_tp_weights(
     try:
         weights = tuple(int(item.strip()) for item in raw.split(","))
     except ValueError as exc:
-        raise ValueError(
-            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain integers"
-        ) from exc
+        raise ValueError("OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain integers") from exc
     if len(weights) != int(group.size()) or any(
         not 1 <= item <= 4096 for item in weights
     ):
         raise ValueError(
-            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain one positive weight "
-            "per TP rank"
+            "OMLX_TP_NON_MOE_SHARD_WEIGHTS must contain one positive weight per TP rank"
         )
     units = int(args.num_attention_heads) // int(args.o_groups)
     if sum(weights) != units:
@@ -310,14 +303,10 @@ def _validated_ds4_non_moe_tp_weights(
         )
     boundaries = [sum(weights[:rank]) for rank in range(1, len(weights))]
     if any(intermediate * boundary % units for boundary in boundaries):
-        raise ValueError(
-            "non-MoE override does not preserve shared-expert boundaries"
-        )
+        raise ValueError("non-MoE override does not preserve shared-expert boundaries")
     local_widths = [intermediate * weight // units for weight in weights]
     if any(width % 32 for width in local_widths):
-        raise ValueError(
-            "non-MoE override must preserve 32-value MXFP4 quant groups"
-        )
+        raise ValueError("non-MoE override must preserve 32-value MXFP4 quant groups")
     return None if len(set(weights)) == 1 else weights
 
 
@@ -433,6 +422,8 @@ def _shard_inplace_weighted(
             segments=segments,
         )
     )
+
+
 # Fused decode indexer (glm_moe_dsa.dsa_decode_scores, 64-head instantiation)
 # replaces the DSpark verify indexer score pipeline's fp32 cast of the pooled
 # context, the full-width rowwise GEMM, and the (rows, 64, P) fp32 score
@@ -441,10 +432,9 @@ def _shard_inplace_weighted(
 # the downstream dspark_fp32_topk_indices/_stable_topk_indices selection
 # semantics are unchanged. OMLX_DSV4_FUSED_DECODE_INDEXER=0 forces the fp32
 # reference path.
-_DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED = (
-    os.environ.get("OMLX_DSV4_FUSED_DECODE_INDEXER", "1").strip().lower()
-    in ("0", "false", "off")
-)
+_DEEPSEEK_V4_FUSED_DECODE_INDEXER_ENV_DISABLED = os.environ.get(
+    "OMLX_DSV4_FUSED_DECODE_INDEXER", "1"
+).strip().lower() in ("0", "false", "off")
 _DEEPSEEK_V4_FUSED_DECODE_INDEXER_FAILED = False
 _DEEPSEEK_V4_NAX_OA_PREFILL = os.getenv(
     "OMLX_DSV4_NAX_OA_PREFILL", "0"
@@ -464,6 +454,11 @@ _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
 _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
     "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL = os.getenv(
+    "OMLX_DSV4_CANONICAL_WIDE_PREFILL", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE = threading.local()
+_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED = False
 _DEEPSEEK_V4_QKV_BUNDLE_DECODE = os.getenv(
     "OMLX_DSV4_QKV_BUNDLE_DECODE", "1"
 ).strip().lower() in ("1", "true", "on", "yes")
@@ -559,9 +554,7 @@ def _decode_qkv_projection_bundle(
             packed = glm_fast.deepseek_v4_qkv_pair_b1(*args)
             boundaries = (1024,)
         elif ratio == 128:
-            if not glm_fast.has_symbol(
-                "deepseek_v4_qkv_compressor128_bundle_b1"
-            ):
+            if not glm_fast.has_symbol("deepseek_v4_qkv_compressor128_bundle_b1"):
                 return None
             compressor_kv, compressor_gate = compressor_pair
             packed = glm_fast.deepseek_v4_qkv_compressor128_bundle_b1(
@@ -758,7 +751,8 @@ def _attention_output_chain_native_inputs(
         or getattr(attn, "training", False)
         or is_dspark_verify_armed()
         or prepared.dtype != mx.bfloat16
-        or tuple(prepared.shape) not in (
+        or tuple(prepared.shape)
+        not in (
             (1, 8, 1024, 1536),
             (1, 8, 1024, 2560),
             (1, 8, 1024, 4096),
@@ -860,9 +854,7 @@ def _stock_attention_qkv_finalizer(
     q = mx.fast.rms_norm(q_raw, None, attn.config.rms_norm_eps)
     q = q.transpose(0, 2, 1, 3)
     q = attn.rope(q, offset)
-    kv = attn.kv_norm(kv_raw).reshape(
-        q_raw.shape[0], 1, q_raw.shape[1], attn.head_dim
-    )
+    kv = attn.kv_norm(kv_raw).reshape(q_raw.shape[0], 1, q_raw.shape[1], attn.head_dim)
     kv = attn.rope(kv, offset)
     return q, kv
 
@@ -878,9 +870,7 @@ def _attention_finalizer_native_inputs(
     verify_armed = is_dspark_verify_armed()
     tokens = int(q_raw.shape[1]) if q_raw.ndim == 4 else -1
     verify_route = bool(
-        _DEEPSEEK_V4_ATTN_FINALIZER_VERIFY
-        and verify_armed
-        and tokens == 6
+        _DEEPSEEK_V4_ATTN_FINALIZER_VERIFY and verify_armed and tokens == 6
     )
     prefill_route = bool(
         _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
@@ -920,11 +910,7 @@ def _attention_finalizer_native_inputs(
     ):
         return None
     weight = kv_norm.get("weight")
-    if (
-        weight is None
-        or weight.shape != (512,)
-        or weight.dtype != mx.bfloat16
-    ):
+    if weight is None or weight.shape != (512,) or weight.dtype != mx.bfloat16:
         return None
 
     try:
@@ -957,9 +943,7 @@ def _finalize_attention_qkv(
 ) -> Tuple[mx.array, mx.array]:
     """Select the exact native pair or the unchanged stock graph, once."""
 
-    native_inputs = _attention_finalizer_native_inputs(
-        attn, q_raw, kv_raw, offset
-    )
+    native_inputs = _attention_finalizer_native_inputs(attn, q_raw, kv_raw, offset)
     if native_inputs is None:
         return _stock_attention_qkv_finalizer(attn, q_raw, kv_raw, offset)
 
@@ -970,8 +954,7 @@ def _finalize_attention_qkv(
     if not _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED:
         _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL_LOGGED = True
         logging.getLogger(__name__).info(
-            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE "
-            "finalizers (M=%d, H=%d)",
+            "deepseek_v4: using exact BF16 Q/KV RMSNorm+RoPE finalizers (M=%d, H=%d)",
             q_raw.shape[1],
             q_raw.shape[2],
         )
@@ -1378,9 +1361,9 @@ def _native_router_select(
         if not glm_fast.has_symbol("ds4_router_topk_indices"):
             return None
         scores, biased = _router_native_pre(logits, bias)
-        indices = glm_fast.ds4_router_topk_indices(
-            biased.reshape(1, 256)
-        ).reshape(1, 1, 6)
+        indices = glm_fast.ds4_router_topk_indices(biased.reshape(1, 256)).reshape(
+            1, 1, 6
+        )
         weights = _router_native_post(
             scores,
             indices,
@@ -1616,9 +1599,7 @@ def _extend_mask(
             # prefix-contiguous, so trim only the physical tail.
             pool_mask = pool_mask[..., :pooled_width]
         elif mask_width < pooled_width:
-            raise ValueError(
-                "pooled attention validity mask is shorter than pooled KV"
-            )
+            raise ValueError("pooled attention validity mask is shorter than pooled KV")
 
     if pool_mask is None:
         pool_mask = mx.ones((B, H, L, pooled_width), dtype=mx.bool_)
@@ -1696,7 +1677,8 @@ _DEEPSEEK_V4_NAX_INDEXER_SCORE = os.getenv(
     # Experimental/default-off: the first M5 strict gate retained exact top-k
     # membership but found a one-BF16-ULP score drift in 1/8,208 outputs. Keep
     # Steel until the score sheet itself is bit-exact across the full matrix.
-    "OMLX_DSV4F_NAX_INDEXER_SCORE", "0"
+    "OMLX_DSV4F_NAX_INDEXER_SCORE",
+    "0",
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_NAX_INDEXER_SCORE_LOGGED = False
 _DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
@@ -1705,7 +1687,8 @@ _DEEPSEEK_V4_INDEXER_ROW_TP = os.getenv(
 _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS = os.getenv(
     # Default-off: the first live 3:5/30K gate lost 3.1% because padding the
     # all-gather to the larger 640-row shard outweighed the score imbalance.
-    "OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"
+    "OMLX_DSV4_WEIGHTED_INDEXER_ROWS",
+    "0",
 ).strip().lower() in ("1", "true", "on", "yes")
 try:
     _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS = tuple(
@@ -1732,11 +1715,12 @@ _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED = False
 _DEEPSEEK_V4_INDEXER_GATHER_P2P = os.getenv(
     # Default-off until a physical two-Mac lifetime gate proves that the
     # stricter ordering does not cost more than 2% at 100K-equivalent rows.
-    "OMLX_DSV4_INDEXER_GATHER_P2P", "0"
+    "OMLX_DSV4_INDEXER_GATHER_P2P",
+    "0",
 ).strip().lower() in ("1", "true", "on", "yes")
-_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = os.getenv(
-    "OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl"
-).strip().lower()
+_DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = (
+    os.getenv("OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl").strip().lower()
+)
 _DEEPSEEK_V4_INDEXER_CONTROL_LOGGED = False
 try:
     _DEEPSEEK_V4_INDEXER_ROW_TP_MIN_POOL = max(
@@ -1962,11 +1946,7 @@ def _gather_indexer_rows(
             peer,
             group=group,
         )
-        parts = (
-            (sent, peer_rows_first)
-            if rank == 0
-            else (peer_rows_first, sent)
-        )
+        parts = (sent, peer_rows_first) if rank == 0 else (peer_rows_first, sent)
         return mx.concatenate(parts, axis=0).swapaxes(0, 1)
 
     max_rows = max(stop - start for start, stop in ranges)
@@ -2156,9 +2136,7 @@ def _fused_sparse_decode_attention(
     try:
         from omlx.custom_kernels.decode_fast import fast as decode_fast
 
-        return decode_fast.sparse_attn_decode(
-            q_scaled, local_kv, pooled_sq, sinks
-        )
+        return decode_fast.sparse_attn_decode(q_scaled, local_kv, pooled_sq, sinks)
     except Exception as exc:
         _DEEPSEEK_V4_FUSED_SPARSE_DECODE_FAILED = True
         logging.getLogger(__name__).warning(
@@ -2408,9 +2386,7 @@ def _sparse_pooled_attention(
     pooled_sq = pooled.squeeze(1)
     if exact_local and local_mask is None and pooled_mask is None and sinks is not None:
         if not _DEEPSEEK_V4_FUSED_SPARSE_DECODE_DISABLED:
-            fused = _fused_sparse_decode_attention(
-                q_scaled, local_kv, pooled_sq, sinks
-            )
+            fused = _fused_sparse_decode_attention(q_scaled, local_kv, pooled_sq, sinks)
             if fused is not None:
                 return fused
         return _dspark_sparse_exact_attention(
@@ -2586,9 +2562,7 @@ class DeepseekV4MoE(nn.Module):
             activation=LimitedSwiGLU(config.swiglu_limit),
         )
         try:
-            self.switch_mlp._omlx_dsv4f_exact_config = _dsv4f_exact_config(
-                config, 4
-            )
+            self.switch_mlp._omlx_dsv4f_exact_config = _dsv4f_exact_config(config, 4)
         except (AttributeError, TypeError, ValueError):
             # Future/partial configs fail closed before the tuned path can
             # create a graph.
@@ -2616,7 +2590,6 @@ class DeepseekV4MoE(nn.Module):
 
 
 class Compressor(nn.Module):
-
     def __init__(self, config: ModelArgs, compress_ratio: int, head_dim: int):
         super().__init__()
         self.compress_ratio = compress_ratio
@@ -2953,9 +2926,7 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
-        self._m2_mma_score = _dsv4f_mma_score_enabled(
-            config, compress_ratio
-        )
+        self._m2_mma_score = _dsv4f_mma_score_enabled(config, compress_ratio)
         self._nax_indexer_score = _dsv4f_nax_indexer_score_enabled(
             config, compress_ratio
         )
@@ -3036,9 +3007,7 @@ class Indexer(nn.Module):
             q = projected_q
 
         pmask = (
-            pool_cache.make_mask(total_rows, offset)
-            if pool_cache is not None
-            else None
+            pool_cache.make_mask(total_rows, offset) if pool_cache is not None else None
         )
         if row_sharded and pmask is not None:
             pmask = pmask[..., start:stop, :]
@@ -3099,9 +3068,7 @@ class Indexer(nn.Module):
                         weights,
                         pool_cache,
                         query_offset=(
-                            int(query_offset)
-                            if isinstance(query_offset, int)
-                            else -1
+                            int(query_offset) if isinstance(query_offset, int) else -1
                         ),
                         topk=self.index_topk,
                         ratio=_mask_ratio,
@@ -3142,8 +3109,7 @@ class Indexer(nn.Module):
                         and pooled.shape[1] >= 64
                     )
                     _use_mma_wm4_wn1 = (
-                        _use_mma
-                        and glm_fast.dsa_indexer_mma_wm4_wn1_eligible()
+                        _use_mma and glm_fast.dsa_indexer_mma_wm4_wn1_eligible()
                     )
                     # M5 TensorOps score tile: exact DS4F fingerprint at
                     # construction, then the narrow runtime domain here.
@@ -3153,9 +3119,7 @@ class Indexer(nn.Module):
                     # flow. The native primitive itself demotes to Steel if the
                     # optional NAX library/pipeline cannot load.
                     _nax_rank_safe = (
-                        row_group is None
-                        or int(row_group.size()) <= 1
-                        or row_sharded
+                        row_group is None or int(row_group.size()) <= 1 or row_sharded
                     )
                     _use_nax = (
                         self._nax_indexer_score
@@ -3560,6 +3524,70 @@ def _b1_cache_offset(cache: Any, batch_size: int) -> Any:
     return cache.offset
 
 
+def _canonical_wide_attention_prefill(
+    module: nn.Module,
+    x: mx.array,
+    cache: Any,
+    *,
+    standard_mask: bool,
+    call: Any,
+) -> Optional[mx.array]:
+    """Run a 2K outer tile as two exact 1K attention/cache transactions.
+
+    HyperConnection and attention are the chunk-sensitive arithmetic frontier.
+    Keeping only those boundaries at 1K lets the surrounding block retain 2K
+    routed-MoE/GEMM scheduling without changing the established 1K result.
+    """
+
+    if (
+        not _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL
+        or getattr(_DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE, "active", False)
+        or getattr(module, "training", False)
+        or is_dspark_verify_armed()
+        or not standard_mask
+        or cache is None
+        or x.ndim != 3
+        or tuple(x.shape) != (1, 2048, 4096)
+        or x.dtype != mx.bfloat16
+        or int(getattr(module, "compress_ratio", 0)) not in (4, 128)
+    ):
+        return None
+
+    global _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED
+    if not _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED:
+        _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_LOGGED = True
+        logging.getLogger(__name__).info(
+            "deepseek_v4: preserving the 1K HC/attention arithmetic frontier "
+            "inside a 2K outer prefill tile"
+        )
+
+    outputs = []
+    _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE.active = True
+    try:
+        for start in (0, 1024):
+            part = x[:, start : start + 1024]
+            first = cache[0] if hasattr(cache, "caches") else cache
+            mask = create_attention_mask(
+                part,
+                first,
+                window_size=module.config.sliding_window,
+                return_array=True,
+            )
+            output = call(
+                part,
+                mask,
+                cache,
+                _standard_mask=True,
+            )
+            # A true outer 1K step materializes its cache before the next model
+            # call. Preserve that dependency boundary inside the wide tile.
+            mx.eval(output, cache.state)
+            outputs.append(output)
+    finally:
+        _DEEPSEEK_V4_CANONICAL_WIDE_PREFILL_STATE.active = False
+    return mx.concatenate(outputs, axis=1)
+
+
 class LocalAttention(nn.Module):
     """DeepSeek V4 attention with no KV compression."""
 
@@ -3742,6 +3770,15 @@ class CompressedAttention(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        canonical = _canonical_wide_attention_prefill(
+            self,
+            x,
+            cache,
+            standard_mask=_standard_mask,
+            call=self.__call__,
+        )
+        if canonical is not None:
+            return canonical
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
@@ -3959,6 +3996,15 @@ class SparseCompressedAttention(nn.Module):
         *,
         _standard_mask: bool = False,
     ) -> mx.array:
+        canonical = _canonical_wide_attention_prefill(
+            self,
+            x,
+            cache,
+            standard_mask=_standard_mask,
+            call=self.__call__,
+        )
+        if canonical is not None:
+            return canonical
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
@@ -4072,9 +4118,7 @@ class SparseCompressedAttention(nn.Module):
                 ]
                 out = _batched_m1_attention(q, key_rows, self.scale, sinks)
             else:
-                index_q = _project_verify_q_b(
-                    self.indexer.wq_b, q_residual
-                ).reshape(
+                index_q = _project_verify_q_b(self.indexer.wq_b, q_residual).reshape(
                     B,
                     L,
                     self.indexer.n_heads,
