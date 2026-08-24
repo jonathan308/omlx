@@ -58,6 +58,7 @@ def test_output_chain_accepts_qualified_m1024_and_m2048_rows():
         ROOT / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_output_chain.cpp"
     ).read_text()
     assert "tokens != 1024 && tokens != 2048" in source
+    assert "K != 2048" in source
     assert "Shape{1, x.shape(2), kHidden}" in source
 
 

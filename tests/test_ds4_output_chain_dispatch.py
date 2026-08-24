@@ -1,4 +1,4 @@
-"""Strict production gates for the exact DS4 3:5 output projection chain."""
+"""Strict production gates for the exact DS4 output projection chain."""
 
 from __future__ import annotations
 
@@ -80,8 +80,8 @@ def _eligible(monkeypatch, **overrides):
     return dm._attention_output_chain_native_inputs(attn, prepared)
 
 
-@pytest.mark.parametrize("k", (1536, 2560, 4096))
-def test_signed_3x5_shapes_are_eligible(monkeypatch, k):
+@pytest.mark.parametrize("k", (1536, 2048, 2560, 4096))
+def test_signed_tp_and_single_shapes_are_eligible(monkeypatch, k):
     assert _eligible(monkeypatch, k=k) is not None
 
 
@@ -96,7 +96,6 @@ def test_single_m3_m2048_shape_is_eligible(monkeypatch):
         {"training": True},
         {"verify": True},
         {"fingerprint": False},
-        {"k": 2048},
         {"shape": (1, 8, 512, 1536)},
         {"dtype": mx.float16},
         {"o_a_bits": 4},

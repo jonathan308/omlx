@@ -758,8 +758,10 @@ def _attention_output_chain_native_inputs(
         or tuple(prepared.shape)
         not in (
             (1, 8, 1024, 1536),
+            (1, 8, 1024, 2048),
             (1, 8, 1024, 2560),
             (1, 8, 1024, 4096),
+            (1, 8, 2048, 2048),
             (1, 8, 2048, 4096),
         )
     ):
