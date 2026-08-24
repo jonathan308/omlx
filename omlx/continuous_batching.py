@@ -62,6 +62,7 @@ def continuous_batch_budget(
     mixed_prefill_quantum: int = DEFAULT_MIXED_PREFILL_QUANTUM,
     min_mixed_quantum: int = MIN_MIXED_PREFILL_QUANTUM,
     grid: int = MIXED_PREFILL_GRID,
+    decode_rows_per_pressure_tier: int = 1,
 ) -> ContinuousBatchBudget:
     """Plan one exact scheduler turn without reducing idle throughput.
 
@@ -86,7 +87,9 @@ def continuous_batch_budget(
     grid = max(1, int(grid))
     base = min(configured, max_prompt, max(1, int(mixed_prefill_quantum)))
     floor = min(base, max(grid, int(min_mixed_quantum)))
-    quantum = max(floor, base // _decode_pressure_divisor(decode_rows))
+    rows_per_tier = max(1, int(decode_rows_per_pressure_tier))
+    pressure_rows = (decode_rows + rows_per_tier - 1) // rows_per_tier
+    quantum = max(floor, base // _decode_pressure_divisor(pressure_rows))
     quantum = max(grid, (quantum // grid) * grid)
     quantum = min(configured, max_prompt, quantum)
     return ContinuousBatchBudget(

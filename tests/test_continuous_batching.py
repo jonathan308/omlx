@@ -58,3 +58,17 @@ def test_malformed_or_nonpositive_env_quantum_falls_back(monkeypatch, raw):
 def test_positive_env_quantum_is_accepted(monkeypatch):
     monkeypatch.setenv("OMLX_TEST_BATCH_QUANTUM", "640")
     assert _positive_env_int("OMLX_TEST_BATCH_QUANTUM", 512) == 640
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    ((1, 1024), (2, 1024), (3, 512), (4, 512)),
+)
+def test_ds4_two_decode_rows_share_one_pressure_tier(rows, expected):
+    budget = _budget(
+        rows,
+        quantum=1024,
+        decode_rows_per_pressure_tier=2,
+    )
+    assert budget.active_decode_rows == rows
+    assert budget.prefill_quantum == expected

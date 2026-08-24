@@ -134,10 +134,10 @@ _RANK_ENV_DEFAULTS = (
     # Yield long prompt work back to live decode after one bounded DS4 slice.
     # The hostfile value keeps both TP ranks on the same scheduler decision.
     ("OMLX_DSV4_PREFILL_YIELD", "1"),
-    # Shared continuous-batching policy. Mirrored B1/B2/B4 decode rows turn
-    # this base into 512/256/128 prompt quanta; exporting both values keeps
-    # tensor ranks in lockstep when an operator overrides either knob.
+    # Generic schedulers retain their 512/256/128 B1/B2/B4 policy. DS4's
+    # physical TP path has its own live-qualified 1024/1024/512 schedule.
     ("OMLX_CONTENDED_PREFILL_CHUNK", "512"),
+    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "1024"),
     ("OMLX_MIXED_PREFILL_MIN_QUANTUM", "128"),
     ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
     # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off

@@ -17,7 +17,9 @@ from itertools import islice
 from typing import Any
 
 from ..continuous_batching import (
-    DEFAULT_MIXED_PREFILL_QUANTUM,
+    _positive_env_int as _positive_batch_env_int,
+)
+from ..continuous_batching import (
     continuous_batch_budget,
 )
 from .performance import ExecutionSettings
@@ -28,6 +30,7 @@ _DSV4_ADAPTIVE_PREFILL_AFTER_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_AFTER"
 _DSV4_ADAPTIVE_PREFILL_STEP_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_STEP"
 _DSV4_ADAPTIVE_PREFILL_MAX_BASE_ENV = "OMLX_DSV4_ADAPTIVE_PREFILL_MAX_BASE"
 _DSV4_PREFILL_YIELD_ENV = "OMLX_DSV4_PREFILL_YIELD"
+_DSV4_MIXED_PREFILL_CHUNK_ENV = "OMLX_DSV4_MIXED_PREFILL_CHUNK"
 _DSV4_PREFILL_ASYNC_DEPTH_ENV = "OMLX_DSV4_PREFILL_ASYNC_DEPTH"
 _CLUSTER_PREFILL_SHAPE_WARMUP_ENV = "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP"
 _DSV4_PREFILL_STEP_TRACE_ENV = "OMLX_DSV4_PREFILL_STEP_TRACE"
@@ -229,6 +232,7 @@ def _deepseek_v4_outer_prefill_step(
     *,
     long_after: int,
     kernel_step: int,
+    mixed_quantum: int = 1024,
 ) -> int:
     """Choose the DS4 outer scheduler slice for this exact batch turn.
 
@@ -239,7 +243,7 @@ def _deepseek_v4_outer_prefill_step(
     expensive 1024-token calls before returning control to an active decode.
 
     Cap only that *outer* slice when this turn contains both decode and
-    long-prompt work. The shared continuous-batching policy selects 512/256/128
+    long-prompt work. The DS4 continuous-batching policy selects 1024/1024/512
     prompt tokens for B1/B2/B4 decode pressure. Idle long prompts retain the
     wider outer slice and allocator reuse. The decision uses only mirrored
     batch structure and full request lengths -- never local clocks -- so TP
@@ -322,8 +326,14 @@ def _deepseek_v4_outer_prefill_step(
             max_prompt_tokens=configured,
             mixed_prefill_quantum=min(
                 kernel_step,
-                DEFAULT_MIXED_PREFILL_QUANTUM,
+                max(1, int(mixed_quantum)),
             ),
+            # The physical TP2 B2 path still has one local prompt row and one
+            # synchronized model call. Treat each pair of decoder rows as one
+            # pressure tier so DS4 retains its efficient 1024-token kernel at
+            # B1/B2 and uses 512 at B3/B4. Generic schedulers keep one row per
+            # tier and their existing 512/256/128 policy.
+            decode_rows_per_pressure_tier=2,
         )
         return budget.prefill_quantum
     return configured
@@ -894,6 +904,10 @@ def install_runtime_optimizations(
         execution,
         pipeline_parallel=pipeline_parallel,
     )
+    mixed_prefill_quantum = _positive_batch_env_int(
+        _DSV4_MIXED_PREFILL_CHUNK_ENV,
+        1024,
+    )
     raw_indexer_owner = os.environ.get(
         "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", ""
     ).strip().lower()
@@ -1157,7 +1171,7 @@ def install_runtime_optimizations(
             active=outer_prefill_yield_active,
             reason=(
                 "mixed DS4 turns process one prompt row; long rows use shared "
-                "512/256/128-token budgets at B1/B2/B4"
+                "1024/1024/512-token budgets at B1/B2/B4"
                 if outer_prefill_yield_active
                 else (
                     "DS4 contended-prefill yielding is disabled by the operator"
@@ -1547,6 +1561,7 @@ def install_runtime_optimizations(
             instance,
             long_after=adaptive_prefill_after,
             kernel_step=adaptive_prefill_step,
+            mixed_quantum=mixed_prefill_quantum,
         )
         if effective_step >= int(previous_step) and not mixed_prompt_rows:
             return original_batch_next(instance, *args, **kwargs)
