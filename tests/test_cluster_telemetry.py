@@ -10,6 +10,7 @@ import pytest
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
+    _capture_prompt_boundary_cache,
     RuntimeTelemetry,
     _TelemetryQueue,
     _agreed_snapshot_capacity_charge,
@@ -99,6 +100,42 @@ def test_generated_token_normalization_rejects_non_scalar_and_high_bit():
         _python_token_id([1, 2])
     with pytest.raises(ValueError, match="signed int32"):
         _python_token_id(2**31)
+
+
+def test_prompt_boundary_capture_uses_the_pre_decode_cache_key():
+    class PromptCache:
+        def __init__(self):
+            self.insertions = []
+
+        def insert_cache(self, model, tokens, cache, *, cache_type):
+            self.insertions.append((model, tokens, cache, cache_type))
+
+    class BatchGenerator:
+        def extract_cache(self, uids):
+            assert uids == [17]
+            return {17: (["prompt-cache"], [1, 2, 3])}
+
+    prompt_cache = PromptCache()
+    response = SimpleNamespace(uid=17, end_of_prompt=True)
+
+    assert _capture_prompt_boundary_cache(
+        prompt_cache,
+        "model-key",
+        BatchGenerator(),
+        response,
+    ) == 3
+    assert prompt_cache.insertions == [
+        ("model-key", [1, 2, 3], ["prompt-cache"], "user")
+    ]
+
+
+def test_prompt_boundary_capture_ignores_non_boundary_responses():
+    assert _capture_prompt_boundary_cache(
+        object(),
+        "model-key",
+        object(),
+        SimpleNamespace(uid=17, end_of_prompt=False),
+    ) == 0
 
 
 def test_telemetry_calculates_ttft_prefill_and_decode_rates():

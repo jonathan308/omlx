@@ -148,6 +148,45 @@ def _python_token_id(value: Any) -> int:
     return token
 
 
+def _capture_prompt_boundary_cache(
+    prompt_cache: Any,
+    model_key: Any,
+    batch_generator: Any,
+    response: Any,
+) -> int:
+    """Store an immutable prompt-side cache before assistant decode mutates it.
+
+    DS4 has sliding-window layers whose post-decode state cannot be trimmed
+    back through assistant tokens. Capturing at ``end_of_prompt`` is the one
+    point where MLX-LM exposes an exact prompt prefix on every rank.
+    """
+
+    if not bool(getattr(response, "end_of_prompt", False)):
+        return 0
+    uid = getattr(response, "uid", None)
+    if uid is None or prompt_cache is None or model_key is None:
+        return 0
+    try:
+        extracted = batch_generator.extract_cache([uid]).get(uid)
+    except Exception:
+        return 0
+    if (
+        not isinstance(extracted, tuple)
+        or len(extracted) != 2
+        or not isinstance(extracted[1], list)
+        or not extracted[1]
+    ):
+        return 0
+    cache, cache_key = extracted
+    prompt_cache.insert_cache(
+        model_key,
+        cache_key[:],
+        cache,
+        cache_type="user",
+    )
+    return len(cache_key)
+
+
 class MarkerWriter(Protocol):
     """Small RuntimeMarker surface used by the telemetry observer."""
 
@@ -1780,7 +1819,11 @@ def install_server_telemetry(
                 return
             processed, total = int(progress[0]), int(progress[1])
             absolute = len(full) - total + processed
-            if absolute > 0 and absolute % snapshot_step == 0:
+            if (
+                ssd_store is not None
+                and absolute > 0
+                and absolute % snapshot_step == 0
+            ):
                 model = getattr(snapshot_ctx, "model", None)
                 if model is not None:
                     try:
@@ -1864,8 +1907,21 @@ def install_server_telemetry(
                     processed_tokens=progress[0],
                     total_tokens=progress[1],
                 )
-                if ssd_store is not None:
-                    self._omlx_snapshot_boundary(response)
+                captured = _capture_prompt_boundary_cache(
+                    getattr(snapshot_ctx, "prompt_cache", None),
+                    getattr(snapshot_ctx, "model_key", None),
+                    self,
+                    response,
+                )
+                if captured and os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1":
+                    logger.warning(
+                        "Captured prompt-boundary cache rank=%s tokens=%s",
+                        rank,
+                        captured,
+                    )
+                # This routine also retires the per-UID token bookkeeping at
+                # end_of_prompt; it is not only an SSD-cache operation.
+                self._omlx_snapshot_boundary(response)
             telemetry.observe_batch_step(
                 prompt_responses=len(prompt_responses),
                 generation_responses=len(generation_responses),
@@ -2184,6 +2240,8 @@ def install_server_telemetry(
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
             tokenized = super()._tokenize(tokenizer, request, args)
+            snapshot_ctx.prompt_cache = self.prompt_cache
+            snapshot_ctx.model_key = self.model_provider.model_key
             if prefill_guard is None:
                 return tokenized
 
