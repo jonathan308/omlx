@@ -11,7 +11,7 @@ import shutil
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -110,6 +110,7 @@ class RuntimeTelemetry:
         self._heartbeat_interval = float(heartbeat_interval)
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._maintenance_callback: Any | None = None
         self._lock = threading.Lock()
         self._started_at = float(self._clock())
         self._last_step_finished_at = self._started_at
@@ -165,8 +166,16 @@ class RuntimeTelemetry:
         # A coordinator cancel request is picked up here even when no
         # request event is driving publishes (e.g. a wedged handler).
         self.poll_cancel_requests(min_interval=0.0)
+        maintenance = self._maintenance_callback
+        if maintenance is not None:
+            maintenance()
         with self._lock:
             self._publish_locked(now, force=True)
+
+    def set_maintenance_callback(self, callback: Any | None) -> None:
+        """Install the rank-local, heartbeat-driven maintenance poll."""
+
+        self._maintenance_callback = callback
 
     def start_heartbeat(self) -> None:
         """Begin refreshing the marker on a fixed interval. Idempotent."""
@@ -1479,6 +1488,105 @@ def install_server_telemetry(
             request._omlx_transport_request_id = request_id
         return original_handle_completion(handler, request, stop_words)
 
+    def clear_rank_caches(*, clear_ssd: bool, clear_hot: bool) -> dict[str, Any]:
+        active = telemetry.active_request_count()
+        if active:
+            raise RuntimeError(f"requests are active ({active})")
+        deleted = 0
+        cleared = 0
+        if clear_ssd and ssd_store is not None:
+            deleted = ssd_store.clear(timeout=30.0)
+        if clear_hot:
+            for cache in tuple(prompt_cache_instances):
+                before = len(cache)
+                cache.trim_to(n_sequences=0, n_bytes=0)
+                cleared += before
+        memory_entries = sum(len(cache) for cache in prompt_cache_instances)
+        memory_bytes = sum(cache.nbytes for cache in prompt_cache_instances)
+        disk_entries = len(ssd_store) if ssd_store is not None else 0
+        disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
+        telemetry.observe_cache_state(
+            entries=memory_entries + disk_entries,
+            nbytes=memory_bytes + disk_bytes,
+            memory_entries=memory_entries,
+            memory_bytes=memory_bytes,
+            ssd_entries=disk_entries,
+            ssd_bytes=disk_bytes,
+            **ssd_store_observability(),
+        )
+        return {
+            "status": "ok",
+            "rank": rank,
+            "ssd_deleted": deleted,
+            "hot_cleared": cleared,
+        }
+
+    def write_maintenance_ack(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
+        os.replace(temporary, path)
+
+    maintenance_epoch_floor = time.time_ns()
+    maintenance_last_epoch = maintenance_epoch_floor
+    maintenance_request_path = (
+        Path(marker_path).parent / f"{marker_deployment_id}-cache-clear.json"
+        if marker_path is not None and marker_deployment_id
+        else None
+    )
+    maintenance_ack_path = (
+        Path(marker_path).parent
+        / f"{marker_deployment_id}-cache-clear-rank-{rank}.json"
+        if marker_path is not None and marker_deployment_id
+        else None
+    )
+
+    def poll_cache_maintenance() -> None:
+        nonlocal maintenance_last_epoch
+        path = maintenance_request_path
+        ack_path = maintenance_ack_path
+        if path is None or ack_path is None or not path.is_file():
+            return
+        try:
+            if path.stat().st_size > _MAX_CANCEL_FILE_BYTES:
+                return
+            request = json.loads(path.read_text(encoding="utf-8"))
+            epoch = int(request.get("epoch", 0))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        if (
+            epoch <= maintenance_last_epoch
+            or epoch < maintenance_epoch_floor
+            or request.get("deployment_id") != marker_deployment_id
+            or request.get("plan_hash") != marker_plan_hash
+        ):
+            return
+        maintenance_last_epoch = epoch
+        try:
+            result = clear_rank_caches(
+                clear_ssd=bool(request.get("ssd")),
+                clear_hot=bool(request.get("hot")),
+            )
+            ack = result | {"epoch": epoch}
+        except Exception as exc:
+            ack = {
+                "status": "error",
+                "rank": rank,
+                "epoch": epoch,
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+        write_maintenance_ack(ack_path, ack)
+        with suppress(OSError):
+            path.unlink()
+
+    telemetry.set_maintenance_callback(poll_cache_maintenance)
+
     def maintenance_do_post(handler: Any) -> Any:
         """Private rank-local cache maintenance endpoint.
 
@@ -1502,52 +1610,19 @@ def install_server_telemetry(
             handler.end_headers()
             handler.wfile.write(b'{"error":"invalid maintenance token"}')
             return None
-        active = telemetry.active_request_count()
-        if active:
-            handler._set_completion_headers(409)
-            handler.end_headers()
-            handler.wfile.write(
-                json.dumps({"error": "requests are active", "active": active}).encode()
-            )
-            return None
         clear_ssd, clear_hot = selected
-        deleted = 0
-        cleared = 0
         try:
-            if clear_ssd and ssd_store is not None:
-                deleted = ssd_store.clear(timeout=30.0)
-            if clear_hot:
-                for cache in tuple(prompt_cache_instances):
-                    before = len(cache)
-                    cache.trim_to(n_sequences=0, n_bytes=0)
-                    cleared += before
-            memory_entries = sum(len(cache) for cache in prompt_cache_instances)
-            memory_bytes = sum(cache.nbytes for cache in prompt_cache_instances)
-            disk_entries = len(ssd_store) if ssd_store is not None else 0
-            disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
-            telemetry.observe_cache_state(
-                entries=memory_entries + disk_entries,
-                nbytes=memory_bytes + disk_bytes,
-                memory_entries=memory_entries,
-                memory_bytes=memory_bytes,
-                ssd_entries=disk_entries,
-                ssd_bytes=disk_bytes,
-                **ssd_store_observability(),
+            result = clear_rank_caches(
+                clear_ssd=clear_ssd,
+                clear_hot=clear_hot,
             )
-        except TimeoutError as exc:
-            handler._set_completion_headers(503)
+        except (RuntimeError, TimeoutError) as exc:
+            status = 409 if "requests are active" in str(exc) else 503
+            handler._set_completion_headers(status)
             handler.end_headers()
             handler.wfile.write(json.dumps({"error": str(exc)}).encode())
             return None
-        body = json.dumps(
-            {
-                "status": "ok",
-                "rank": rank,
-                "ssd_deleted": deleted,
-                "hot_cleared": cleared,
-            },
-            separators=(",", ":"),
-        ).encode()
+        body = json.dumps(result, separators=(",", ":")).encode()
         handler._set_completion_headers(200)
         handler.end_headers()
         handler.wfile.write(body)
