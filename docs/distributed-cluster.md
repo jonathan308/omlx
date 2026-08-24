@@ -95,6 +95,10 @@ same Thunderbolt RDMA device is rejected with an actionable 409. This fence is
 temporary but intentional: physical testing reproduced lost RDMA completions
 with concurrent communicators, while the same subgroup operations passed
 cleanly after the resident communicator was stopped.
+Each inference rank and synthetic performance worker also holds a kernel-owned
+`flock` lease for the device. The lease releases automatically on crash or
+SIGKILL, so it prevents cross-process races without creating a stale-lock
+recovery problem.
 
 ## Requirements
 
