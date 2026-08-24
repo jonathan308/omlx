@@ -35,6 +35,11 @@ class RuntimeCapability:
     os_name: str = "darwin"
     os_version: str = "unknown"
     python_executable: str = ""
+    # Content identifiers, not mutable paths.  TP layout qualifications use
+    # them to reject a vector after either the collective library or a custom
+    # kernel bundle changes without a package-version bump.
+    jaccl_identifier: str = ""
+    kernel_identifier: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -46,6 +51,8 @@ class RuntimeCapability:
             "os_name": self.os_name,
             "os_version": self.os_version,
             "python_executable": self.python_executable,
+            "jaccl_identifier": self.jaccl_identifier,
+            "kernel_identifier": self.kernel_identifier,
         }
 
 

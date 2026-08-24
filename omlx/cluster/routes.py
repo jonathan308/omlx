@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -19,7 +20,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
 from fastapi.responses import PlainTextResponse
@@ -116,6 +117,7 @@ from .staging import (
     InsufficientDiskError,
     home_relative_model_path,
     index_shards,
+    model_identity_digest,
     model_staging_inventory,
     plan_staging,
     remote_file_sizes,
@@ -124,7 +126,13 @@ from .staging import (
     stage_files_from_source,
     stage_manifest,
 )
-from .strategy_benchmarks import get_strategy_benchmark_store
+from .strategy_benchmarks import context_bucket, get_strategy_benchmark_store
+from .tp_qualifications import (
+    TPQualificationKey,
+    TPQualificationProvenance,
+    get_tp_layout_qualification_store,
+    node_fingerprints_from_statuses,
+)
 from .supervisor import run_worker_smoke
 from .transport import (
     LinkAuthorizationCancelledError,
@@ -145,6 +153,7 @@ from .worker_bundle import (
 
 router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
+logger = logging.getLogger(__name__)
 
 _get_engine_pool: Any | None = None
 
@@ -508,6 +517,15 @@ class ClusterDeploymentRequest(BaseModel):
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    # Server-issued ID of the exact hardware/runtime qualification used by the
+    # preview. Activation re-probes and resolves it again; arbitrary vectors
+    # never cross the public request schema.
+    tp_qualification_id: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     prompt_cache_ssd: bool | None = None
     prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
     # ``placement_signature`` from the /plan response the user was shown. The
@@ -783,6 +801,15 @@ def _placement_signature(plan: dict[str, Any]) -> str:
             rows = rows | cache_contract
         else:
             rows = {"rows": rows, **cache_contract}
+    qualification = plan.get("tensor_parallel_qualification")
+    if qualification is not None:
+        if isinstance(rows, dict):
+            rows = rows | {"tensor_parallel_qualification": qualification}
+        else:
+            rows = {
+                "rows": rows,
+                "tensor_parallel_qualification": qualification,
+            }
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -854,6 +881,7 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
         ("mtp_num_draft_tokens", None),
         ("prompt_cache_ssd", False),
         ("prompt_cache_ssd_max_bytes", DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES),
+        ("tensor_parallel_qualification", None),
     ):
         before = approved.get(field, default)
         after = launched.get(field, default)
@@ -918,10 +946,222 @@ def _operator_qualified_tp_shard_weights(
             f"{tensor_parallel_size} comma-separated positive integers in "
             "rank order"
         )
-    return (tuple(int(part) for part in parts),)
+    weights = tuple(int(part) for part in parts)
+    logger.warning(
+        "%s is forcing experimental TP shard weights %s; this override "
+        "takes precedence over persisted exact-match qualifications",
+        _QUALIFIED_TP_SHARD_WEIGHTS_ENV,
+        weights,
+    )
+    return (weights,)
 
 
-def _create_cluster_plan(request: ClusterPlanRequest):
+def _qualification_statuses(
+    hosts: Sequence[ClusterHostRequest],
+) -> dict[str, dict[str, Any]]:
+    """Current exact runtime evidence in the posted rank order.
+
+    Qualification lookup is an optimization and callers decide whether an
+    unavailable peer is a warning or a hard activation failure.  This helper
+    itself stays strict: a partial result must never look like a match.
+    """
+
+    statuses: dict[str, dict[str, Any]] = {}
+    for host in hosts:
+        if host.ssh in {"127.0.0.1", "localhost", "::1"}:
+            statuses[host.node_id] = {
+                "runtime_compatible": True,
+                "status": collect_cluster_status().to_dict(),
+            }
+            continue
+        statuses[host.node_id] = probe_remote_host(
+            host.ssh,
+            python_executable=host.python_executable or sys.executable,
+        )
+    return statuses
+
+
+def _tp_qualification_key(
+    *,
+    model_path: str,
+    nodes: Sequence[ClusterPlanNodeRequest],
+    statuses: dict[str, dict[str, Any]],
+    backend: str,
+    tensor_parallel_size: int,
+    target_context_tokens: int,
+    execution_profile_name: str,
+    auto_tune: bool,
+    sampling_rank_only: bool,
+    mtp_enabled: bool,
+    mtp_num_draft_tokens: int | None,
+) -> TPQualificationKey:
+    root = Path(model_path).expanduser()
+    if not root.is_dir():
+        raise ValueError("the complete model is unavailable for qualification")
+    ordered_statuses = []
+    for node in nodes:
+        status = statuses.get(node.node_id)
+        if not isinstance(status, dict):
+            raise ValueError(
+                f"runtime qualification evidence is unavailable for {node.node_id}"
+            )
+        ordered_statuses.append(status)
+    defaults = execution_profile(
+        execution_profile_name,
+        auto_tune=auto_tune,
+        sampling_rank_only=sampling_rank_only,
+    )
+    return TPQualificationKey(
+        model_identity=model_identity_digest(root),
+        nodes=node_fingerprints_from_statuses(
+            [node.node_id for node in nodes],
+            ordered_statuses,
+            backend=backend,
+        ),
+        backend=backend,
+        tensor_parallel_size=tensor_parallel_size,
+        context_bucket=context_bucket(target_context_tokens),
+        execution_profile=execution_profile_name,
+        microbatch_size=defaults.pipeline_microbatch_size,
+        decode_concurrency=defaults.decode_concurrency,
+        prompt_concurrency=defaults.prompt_concurrency,
+        prefill_step_size=defaults.prefill_step_size,
+        auto_tune=auto_tune,
+        mtp_enabled=mtp_enabled,
+        mtp_depth=(mtp_num_draft_tokens or 3) if mtp_enabled else None,
+    )
+
+
+def _resolve_tp_layout_qualification(
+    *,
+    model_path: str | None,
+    nodes: Sequence[ClusterPlanNodeRequest],
+    statuses: dict[str, dict[str, Any]] | None,
+    backend: str,
+    tensor_parallel_size: int,
+    target_context_tokens: int,
+    execution_profile_name: str,
+    auto_tune: bool,
+    sampling_rank_only: bool,
+    mtp_enabled: bool,
+    mtp_num_draft_tokens: int | None,
+    expected_qualification_id: str | None = None,
+    allow_persistent: bool = True,
+) -> tuple[
+    tuple[tuple[int, ...], ...] | None,
+    TPQualificationProvenance | None,
+    dict[str, Any],
+]:
+    """Environment override first, then one exact persisted record."""
+
+    override = _operator_qualified_tp_shard_weights(
+        tensor_parallel_size=tensor_parallel_size,
+        node_count=len(nodes),
+    )
+    if override is not None:
+        provenance = TPQualificationProvenance.environment(override[0])
+        return (
+            override,
+            provenance,
+            {
+                "matched": True,
+                "source": "environment_override",
+                "qualification_id": provenance.qualification_id,
+                "shard_weights": list(override[0]),
+                "reason": provenance.reason,
+            },
+        )
+    if tensor_parallel_size <= 1:
+        return None, None, {
+            "matched": False,
+            "source": "not_applicable",
+            "reason": "tensor layout qualification requires tensor parallelism",
+        }
+    if tensor_parallel_size != len(nodes):
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "persisted layout qualification currently requires pure TP",
+        }
+    if not allow_persistent:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "the approved preview did not name a TP qualification",
+        }
+    if not model_path or statuses is None:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": "complete model and live rank fingerprints are required",
+        }
+    try:
+        key = _tp_qualification_key(
+            model_path=model_path,
+            nodes=nodes,
+            statuses=statuses,
+            backend=backend,
+            tensor_parallel_size=tensor_parallel_size,
+            target_context_tokens=target_context_tokens,
+            execution_profile_name=execution_profile_name,
+            auto_tune=auto_tune,
+            sampling_rank_only=sampling_rank_only,
+            mtp_enabled=mtp_enabled,
+            mtp_num_draft_tokens=mtp_num_draft_tokens,
+        )
+        if (
+            expected_qualification_id is not None
+            and key.qualification_id != expected_qualification_id
+        ):
+            return None, None, {
+                "matched": False,
+                "source": "equal_fallback",
+                "qualification_id": key.qualification_id,
+                "reason": (
+                    "live model/hardware/runtime fingerprint no longer matches "
+                    "the approved qualification"
+                ),
+            }
+        store = get_tp_layout_qualification_store()
+        record = store.lookup(key)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "reason": f"TP qualification unavailable: {exc}",
+        }
+    if record is None:
+        decision = store.decision(key)
+        if expected_qualification_id is not None:
+            decision["reason"] = (
+                "the approved TP qualification is missing, corrupt, "
+                "inexact, or no longer promotable"
+            )
+        return None, None, decision
+    if (
+        expected_qualification_id is not None
+        and record.qualification_id != expected_qualification_id
+    ):
+        return None, None, {
+            "matched": False,
+            "source": "equal_fallback",
+            "qualification_id": record.qualification_id,
+            "reason": "the exact record differs from the approved qualification",
+        }
+    provenance = TPQualificationProvenance.from_record(record)
+    return (
+        (record.shard_weights,),
+        provenance,
+        store.decision(key),
+    )
+
+
+def _create_cluster_plan(
+    request: ClusterPlanRequest,
+    *,
+    qualified_tensor_shard_weights: tuple[tuple[int, ...], ...] | None = None,
+    tensor_parallel_qualification: TPQualificationProvenance | None = None,
+):
     if (
         request.tensor_parallel_size > 1
         and request.tensor_parallel_size != len(request.nodes)
@@ -960,6 +1200,19 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 "RAM-proportional allocation is a pipeline-only rule; tensor "
                 "parallelism uses the hybrid planner (allocation='balanced')"
             )
+        # The coordinator-only environment remains an explicit experimental
+        # escape hatch and takes precedence over a persisted record selected
+        # by the route.  It receives unqualified provenance so the plan and
+        # approval signature cannot present it as a proven layout.
+        override = _operator_qualified_tp_shard_weights(
+            tensor_parallel_size=request.tensor_parallel_size,
+            node_count=len(nodes),
+        )
+        if override is not None:
+            qualified_tensor_shard_weights = override
+            tensor_parallel_qualification = (
+                TPQualificationProvenance.environment(override[0])
+            )
         plan = plan_hybrid(
             model,
             nodes,
@@ -969,12 +1222,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
-            qualified_tensor_shard_weights=(
-                _operator_qualified_tp_shard_weights(
-                    tensor_parallel_size=request.tensor_parallel_size,
-                    node_count=len(nodes),
-                )
-            ),
+            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+            tensor_parallel_qualification=tensor_parallel_qualification,
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
@@ -1037,6 +1286,8 @@ class ClusterAutoconfigureRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
 
 
 def _measured_link_profiles(
@@ -1253,6 +1504,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         execution_profile=request.execution_profile,
         prompt_cache_ssd=request.prompt_cache_ssd,
         prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
@@ -1323,6 +1576,13 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             if request.strategy != "pipeline"
             else None
         )
+        qualification_provenance = (
+            TPQualificationProvenance.environment(
+                qualified_tensor_shard_weights[0]
+            )
+            if qualified_tensor_shard_weights is not None
+            else None
+        )
         choice = choose_parallelism(
             model,
             nodes,
@@ -1345,10 +1605,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             if host.ssh in {"127.0.0.1", "localhost", "::1"}:
                 peer_statuses[host.node_id] = {
                     "runtime_compatible": True,
-                    "status": {
-                        "runtime": {},
-                        "node": {"power": detect_low_power_mode().to_dict()},
-                    },
+                    "status": collect_cluster_status().to_dict(),
                 }
                 continue
             try:
@@ -1418,6 +1675,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         )
     ordered_hosts = list(request.hosts)
     ordered_request_nodes = list(request.nodes)
+    ordered_budgets = list(nodes)
     if grouped_host_order:
         by_ssh = {host.ssh: host for host in request.hosts}
         ordered_hosts = [by_ssh[ssh] for ssh in grouped_host_order if ssh in by_ssh]
@@ -1449,6 +1707,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             qualified_tensor_shard_weights=(
                 qualified_tensor_shard_weights
+                if choice.tensor_parallel_size > 1
+                else None
+            ),
+            tensor_parallel_qualification=(
+                qualification_provenance
                 if choice.tensor_parallel_size > 1
                 else None
             ),
@@ -1508,6 +1771,58 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         else:
             fabric_blocker = fabric_error or "the cluster route could not be read"
 
+    # The final backend and rank order are now known.  Only here can an exact
+    # persisted heterogeneous layout be matched safely; a vector is rank
+    # ordered, so looking it up before topology placement would apply the
+    # right numbers to the wrong Macs.
+    (
+        qualified_tensor_shard_weights,
+        qualification_provenance,
+        qualification_decision,
+    ) = _resolve_tp_layout_qualification(
+        model_path=request.model_path,
+        nodes=ordered_request_nodes,
+        statuses=peer_statuses if peer_statuses else None,
+        backend=backend,
+        tensor_parallel_size=choice.tensor_parallel_size,
+        target_context_tokens=request.target_context_tokens,
+        execution_profile_name=request.execution_profile,
+        auto_tune=request.auto_tune,
+        sampling_rank_only=request.sampling_rank_only,
+        mtp_enabled=request.mtp_enabled,
+        mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+    )
+    if choice.tensor_parallel_size > 1 and qualified_tensor_shard_weights is not None:
+        try:
+            qualified_plan = plan_hybrid(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                tensor_parallel_qualification=qualification_provenance,
+            )
+        except PlanningError as exc:
+            if (
+                qualification_provenance is not None
+                and qualification_provenance.source == "persistent"
+            ):
+                qualification_decision = {
+                    "matched": False,
+                    "source": "equal_fallback",
+                    "qualification_id": (
+                        qualification_provenance.qualification_id
+                    ),
+                    "reason": f"qualified layout no longer fits: {exc}",
+                }
+                qualified_tensor_shard_weights = None
+                qualification_provenance = None
+            else:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        else:
+            choice = replace(choice, plan=qualified_plan)
+
     performance_probe: dict[str, Any] = {
         "ok": False,
         "status": "disabled",
@@ -1532,6 +1847,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         and request.auto_tune
         and request.model_path
         and len(activation_hosts) >= 2
+        and qualification_provenance is None
     ):
         try:
             probe_execution = _execution_for_request(
@@ -1649,6 +1965,11 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     staging_ready = staging is None or bool(staging.get("ready"))
 
     plan_contract = choice.plan.to_dict()
+    if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+        plan_contract.update(
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
     # False deliberately retains the legacy placement signature. True is a
     # material launch-mode choice because every rank creates a persistent,
     # plan-scoped SSD snapshot store and must therefore be explicitly signed.
@@ -1680,6 +2001,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             str(size): outcome.to_dict()
             for size, outcome in sorted(measurements.items())
         },
+        "tp_layout_qualification": qualification_decision,
         "performance_probe": performance_probe,
         "staging": staging,
         "strategies": STRATEGIES,
@@ -1710,6 +2032,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "prompt_cache_ssd_max_bytes": request.prompt_cache_ssd_max_bytes,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
+            "mtp_enabled": request.mtp_enabled,
+            "mtp_num_draft_tokens": request.mtp_num_draft_tokens,
+            "tp_qualification_id": (
+                qualification_provenance.qualification_id
+                if qualification_provenance is not None
+                and qualification_provenance.source == "persistent"
+                else None
+            ),
             "ring_connections_per_ip": (
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
@@ -3024,7 +3354,44 @@ def _create_deployment(
         prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
         path_map=request.path_map,
     )
-    plan = _create_cluster_plan(plan_request)
+    qualified_tensor_shard_weights = None
+    qualification_provenance = None
+    if request.tp_qualification_id is not None:
+        try:
+            statuses = _qualification_statuses(request.hosts)
+        except (DistributedLaunchError, OSError, RuntimeError, ValueError) as exc:
+            raise PlanningError(
+                f"could not revalidate the approved TP qualification: {exc}"
+            ) from exc
+        (
+            qualified_tensor_shard_weights,
+            qualification_provenance,
+            qualification_decision,
+        ) = _resolve_tp_layout_qualification(
+            model_path=str(model_path),
+            nodes=request.nodes,
+            statuses=statuses,
+            backend=request.backend,
+            tensor_parallel_size=request.tensor_parallel_size,
+            target_context_tokens=request.target_context_tokens,
+            execution_profile_name=request.execution_profile,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+            expected_qualification_id=request.tp_qualification_id,
+        )
+        if qualification_provenance is None:
+            raise PlanningError(str(qualification_decision["reason"]))
+    plan = (
+        _create_cluster_plan(
+            plan_request,
+            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+            tensor_parallel_qualification=qualification_provenance,
+        )
+        if qualification_provenance is not None
+        else _create_cluster_plan(plan_request)
+    )
     execution = _execution_for_request(
         request,
         plan.assignments,
@@ -3034,7 +3401,15 @@ def _create_deployment(
         execution.pipeline_microbatch_size != requested_microbatch
     ):
         plan_request.pipeline_microbatch_size = execution.pipeline_microbatch_size
-        plan = _create_cluster_plan(plan_request)
+        plan = (
+            _create_cluster_plan(
+                plan_request,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                tensor_parallel_qualification=qualification_provenance,
+            )
+            if qualification_provenance is not None
+            else _create_cluster_plan(plan_request)
+        )
     if len(request.hosts) != len(request.nodes):
         raise ValueError("host count must match node budget count")
     node_ids = [node.node_id.strip() for node in request.nodes]
@@ -3085,6 +3460,9 @@ def _create_deployment(
         mtp_enabled=request.mtp_enabled,
         mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
+        tensor_parallel_qualification=getattr(
+            plan, "tensor_parallel_qualification", None
+        ),
     )
     plan_payload = plan.to_dict()
     if request.mtp_enabled or request.mtp_num_draft_tokens is not None:

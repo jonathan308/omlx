@@ -25,6 +25,7 @@ from .planner import (
     normalize_memory_guard_tier,
     normalize_node_role,
 )
+from .tp_qualifications import TPQualificationProvenance
 
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 
@@ -474,6 +475,7 @@ class ClusterDeployment:
     # ``model`` — the pre-v2 same-absolute-path requirement. Entries override
     # only the nodes they name; the coordinator path stays the fallback.
     path_map: dict[str, str] = field(default_factory=dict)
+    tensor_parallel_qualification: TPQualificationProvenance | None = None
 
     def __post_init__(self) -> None:
         if _NODE_ID.fullmatch(self.deployment_id) is None:
@@ -552,6 +554,19 @@ class ClusterDeployment:
                 raise ValueError(
                     "tensor-parallel group members must hold the same layer range"
                 )
+        qualification = self.tensor_parallel_qualification
+        if qualification is not None:
+            if self.tensor_parallel_size != len(self.hosts):
+                raise ValueError(
+                    "tensor layout qualification currently requires pure TP"
+                )
+            weights = tuple(
+                item.tensor_parallel_shard_weight for item in assignments
+            )
+            if weights != qualification.shard_weights:
+                raise ValueError(
+                    "deployment TP weights do not match qualification provenance"
+                )
         if self.performance_profiles:
             if len(self.performance_profiles) != len(self.hosts):
                 raise ValueError(
@@ -623,7 +638,7 @@ class ClusterDeployment:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": DEPLOYMENT_SCHEMA_VERSION,
             "deployment_id": self.deployment_id,
             "model": self.model,
@@ -642,6 +657,11 @@ class ClusterDeployment:
             "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
             "path_map": dict(sorted(self.path_map.items())),
         }
+        if self.tensor_parallel_qualification is not None:
+            result["tensor_parallel_qualification"] = (
+                self.tensor_parallel_qualification.to_dict()
+            )
+        return result
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ClusterDeployment:
@@ -693,26 +713,38 @@ class ClusterDeployment:
             # Schema 1 payloads predate per-node paths; they decode to the
             # empty map, which is the shared-path behavior they ran with.
             path_map=validate_model_path_map(payload.get("path_map")),
+            tensor_parallel_qualification=(
+                TPQualificationProvenance.from_dict(
+                    payload["tensor_parallel_qualification"]
+                )
+                if payload.get("tensor_parallel_qualification") is not None
+                else None
+            ),
         )
 
     def encode_worker_plan(self) -> str:
         """Encode the small trusted plan as a bounded command-line argument."""
 
+        worker_payload = {
+            "schema_version": DEPLOYMENT_SCHEMA_VERSION,
+            "plan_hash": self.plan_hash,
+            "assignments": [
+                assignment.to_dict() for assignment in self.assignments
+            ],
+            "performance_profiles": [
+                profile.to_dict() for profile in self.performance_profiles
+            ],
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "mtp_enabled": self.mtp_enabled,
+            "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
+            "path_map": dict(sorted(self.path_map.items())),
+        }
+        if self.tensor_parallel_qualification is not None:
+            worker_payload["tensor_parallel_qualification"] = (
+                self.tensor_parallel_qualification.to_dict()
+            )
         raw = json.dumps(
-            {
-                "schema_version": DEPLOYMENT_SCHEMA_VERSION,
-                "plan_hash": self.plan_hash,
-                "assignments": [
-                    assignment.to_dict() for assignment in self.assignments
-                ],
-                "performance_profiles": [
-                    profile.to_dict() for profile in self.performance_profiles
-                ],
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "mtp_enabled": self.mtp_enabled,
-                "mtp_num_draft_tokens": self.mtp_num_draft_tokens,
-                "path_map": dict(sorted(self.path_map.items())),
-            },
+            worker_payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -763,6 +795,11 @@ def _decode_worker_payload(encoded: str) -> dict[str, Any]:
         char not in "0123456789abcdef" for char in plan_hash
     ):
         raise ValueError("pipeline plan hash is invalid")
+    qualification = payload.get("tensor_parallel_qualification")
+    if qualification is not None:
+        payload["tensor_parallel_qualification"] = (
+            TPQualificationProvenance.from_dict(qualification).to_dict()
+        )
     return payload
 
 
@@ -795,6 +832,16 @@ def decode_worker_contract(
     tensor_parallel_size = int(payload.get("tensor_parallel_size", 1))
     if not 1 <= tensor_parallel_size <= len(parsed):
         raise ValueError("tensor_parallel_size must be between 1 and the assignment count")
+    qualification_payload = payload.get("tensor_parallel_qualification")
+    if qualification_payload is not None:
+        qualification = TPQualificationProvenance.from_dict(qualification_payload)
+        ordered = tuple(sorted(parsed, key=lambda item: item.rank))
+        if tensor_parallel_size != len(ordered) or tuple(
+            item.tensor_parallel_shard_weight for item in ordered
+        ) != qualification.shard_weights:
+            raise ValueError(
+                "worker TP weights do not match qualification provenance"
+            )
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
 
 

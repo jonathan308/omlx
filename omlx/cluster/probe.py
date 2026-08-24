@@ -636,6 +636,9 @@ def collect_cluster_status(
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=UTC)
 
+    from .tp_qualifications import local_runtime_artifact_identifiers
+
+    artifact_identifiers = local_runtime_artifact_identifiers()
     return ClusterStatus(
         collected_at=timestamp.isoformat(),
         hostname=socket.gethostname(),
@@ -652,6 +655,8 @@ def collect_cluster_status(
             os_name=platform.system().lower() or "unknown",
             os_version=platform.release() or "unknown",
             python_executable=_advertised_python_executable(),
+            jaccl_identifier=artifact_identifiers["jaccl_identifier"],
+            kernel_identifier=artifact_identifiers["kernel_identifier"],
         ),
         transport_state=transport_state,
         rdma=RDMACapability(

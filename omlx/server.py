@@ -2176,11 +2176,15 @@ def init_server(
         get_device_registry,
     )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
+    from .cluster.tp_qualifications import (
+        configure_tp_layout_qualification_store,
+    )
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+    configure_tp_layout_qualification_store(base_path)
     # Cluster v2: stable node identity + trusted device inventory. Best
     # effort — a failure here must never block local inference. Configured
     # before the pairing manager so pairing approvals persist into the real

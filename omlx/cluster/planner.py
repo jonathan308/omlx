@@ -23,6 +23,7 @@ from .tensor_strategies import (
     native_shard_is_layer_local,
     supports_model_type,
 )
+from .tp_qualifications import TPQualificationProvenance
 
 _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
 _MAX_SAFETENSORS_INDEX_BYTES = 16 * 1024 * 1024
@@ -467,6 +468,11 @@ class ShardPlan:
     # is deliberately excluded from ``plan_hash``. Empty means every node
     # loads the shared coordinator path — the legacy behavior.
     path_map: dict[str, str] = field(default_factory=dict)
+    # Present only when an unequal TP vector came from a persisted exact-match
+    # qualification or the explicit experimental environment override.  The
+    # provenance is part of ``plan_hash``; the same vector from an unqualified
+    # source is therefore not silently interchangeable with a proven record.
+    tensor_parallel_qualification: TPQualificationProvenance | None = None
 
     @property
     def max_context_tokens(self) -> int:
@@ -527,6 +533,10 @@ class ShardPlan:
         }
         if self.path_map:
             result["path_map"] = dict(sorted(self.path_map.items()))
+        if self.tensor_parallel_qualification is not None:
+            result["tensor_parallel_qualification"] = (
+                self.tensor_parallel_qualification.to_dict()
+            )
         return result
 
 
@@ -2256,6 +2266,7 @@ def plan_hybrid(
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     qualified_tensor_shard_weights: Sequence[Sequence[int]] | None = None,
+    tensor_parallel_qualification: TPQualificationProvenance | None = None,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
@@ -2284,6 +2295,10 @@ def plan_hybrid(
         raise PlanningError("pipeline_stages must be at least 1")
 
     if tensor_parallel_size == 1:
+        if tensor_parallel_qualification is not None:
+            raise PlanningError(
+                "tensor layout qualification requires tensor parallelism"
+            )
         # There is no hybrid axis in this case. Delegating is more than a
         # shortcut: `_tp_stage_budget` normalises each stage to its usable
         # capacity for real TP groups, while the ordinary pipeline planner
@@ -2351,6 +2366,10 @@ def plan_hybrid(
     # An asymmetric vector enters a signed plan only after a matched full-model
     # calibration explicitly qualifies it and passes it here.
     if qualified_tensor_shard_weights is None:
+        if tensor_parallel_qualification is not None:
+            raise PlanningError(
+                "tensor layout provenance requires qualified shard weights"
+            )
         stage_shard_weights = [
             _equal_tensor_shard_weights(model, tensor_parallel_size)
             for _group in stage_groups
@@ -2388,6 +2407,18 @@ def plan_hybrid(
                     f"sum to the model's {units} exact shard units"
                 )
             stage_shard_weights.append(weights)
+
+    if tensor_parallel_qualification is not None:
+        if pipeline_stages != 1:
+            raise PlanningError(
+                "tensor layout qualification currently supports pure TP only"
+            )
+        if tuple(stage_shard_weights[0]) != tuple(
+            tensor_parallel_qualification.shard_weights
+        ):
+            raise PlanningError(
+                "tensor layout qualification vector does not match the plan"
+            )
 
     # A performance split is useful only if the larger shard still fits. For
     # the executable pure-TP topology the layer range is already known, so
@@ -2561,6 +2592,10 @@ def plan_hybrid(
         "workload_profile": workload_profile,
         "microbatch_size": microbatch_size,
     }
+    if tensor_parallel_qualification is not None:
+        hash_payload["tensor_parallel_qualification"] = (
+            tensor_parallel_qualification.to_dict()
+        )
     plan_hash = hashlib.sha256(
         json.dumps(hash_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -2575,4 +2610,5 @@ def plan_hybrid(
         tensor_parallel_size=tensor_parallel_size,
         pipeline_stages=pipeline_stages,
         target_context_tokens=context_tokens,
+        tensor_parallel_qualification=tensor_parallel_qualification,
     )
