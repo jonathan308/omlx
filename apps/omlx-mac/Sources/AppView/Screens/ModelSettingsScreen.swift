@@ -1269,6 +1269,17 @@ private struct ExperimentalSection: View {
                                   isNumeric: true, range: 1024...262_144,
                                   step: 64, width: 190)
                     }
+                    Row(label: String(localized: "settings.experimental.qwen_ane.tail_padding.label",
+                                      defaultValue: "Pad Intermediate Tails From",
+                                      comment: "Row label for the Qwen ANE intermediate tail threshold"),
+                        sublabel: String(localized: "settings.experimental.qwen_ane.tail_padding.sub",
+                                         defaultValue: "Residual projection blocks at least this large are zero-padded to the ANE shape. Zero disables padding; Tune ANE Split calculates the crossover.",
+                                         comment: "Sublabel explaining Qwen ANE intermediate tail padding")) {
+                        TextInput(text: vm.bindProfile($vm.qwen35AnePrefillTailPaddingMinTokens),
+                                  placeholder: "0", mono: true,
+                                  isNumeric: true, range: 0...262_143,
+                                  step: 1, width: 190)
+                    }
                     Row(label: String(localized: "settings.experimental.qwen_ane.mlp_fraction.label",
                                       defaultValue: "MLP on ANE",
                                       comment: "Row label for the Qwen MLP ANE workload fraction"),
@@ -1752,13 +1763,17 @@ private struct ExperimentalSection: View {
         _ recommendation: ANETuningRecommendationDTO
     ) -> String {
         if !recommendation.enabled {
-            return String(
-                format: "GPU-only recommended (%.1f tok/s)",
-                recommendation.processingTps
-            )
+            guard let tps = recommendation.processingTps else {
+                return "GPU-only recommended"
+            }
+            return String(format: "GPU-only recommended (%.1f tok/s)", tps)
         }
         let mlp = Int(((recommendation.mlpFraction ?? 0) * 100).rounded())
-        var parts = ["MLP ANE \(mlp)%"]
+        var parts = [
+            recommendation.fusedDown == true
+                ? "Fused MLP per ANE \(mlp)%"
+                : "MLP ANE \(mlp)%"
+        ]
         if recommendation.gdnEnabled {
             let gdn = Int(((recommendation.gdnFraction ?? 0) * 100).rounded())
             parts.append("GDN ANE \(gdn)%")
@@ -1771,12 +1786,15 @@ private struct ExperimentalSection: View {
             let gdn = Int(((recommendation.cpuGdnFraction ?? 0) * 100).rounded())
             parts.append("CPU \(gate)%/\(down)%/\(gdn)%")
         }
-        return String(
-            format: "%@ · %.1f tok/s (%+.1f%%)",
-            parts.joined(separator: " · "),
-            recommendation.processingTps,
-            recommendation.speedupPercent
-        )
+        if let threshold = recommendation.tailPaddingMinTokens, threshold > 0 {
+            parts.append("Pad tails ≥\(threshold)")
+        }
+        let summary = parts.joined(separator: " · ")
+        guard let tps = recommendation.processingTps,
+              let speedup = recommendation.speedupPercent else {
+            return summary
+        }
+        return String(format: "%@ · %.1f tok/s (%+.1f%%)", summary, tps, speedup)
     }
 
     private func aneCandidateResultText(
