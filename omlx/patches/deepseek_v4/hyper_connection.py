@@ -21,6 +21,9 @@ _VERIFY_HC_PRENORM = os.getenv(
 _PREFILL_HC_PRENORM = os.getenv(
     "OMLX_DSV4_PREFILL_HC_PRENORM", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DECODE_HC_PRENORM = os.getenv(
+    "OMLX_DSV4_DECODE_HC_PRENORM", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _VERIFY_HC_PRENORM_LOGGED = False
 
 
@@ -484,11 +487,13 @@ class HyperConnection(nn.Module):
         weight = getattr(norm, "weight", None)
         norm_eps = getattr(norm, "eps", None)
         qualified_shape = tuple(x.shape) in (
+            (1, 1, 4, 4096),
             (1, 6, 4, 4096),
             (1, 1024, 4, 4096),
         )
         enabled_shape = bool(
-            (_VERIFY_HC_PRENORM and tuple(x.shape) == (1, 6, 4, 4096))
+            (_DECODE_HC_PRENORM and tuple(x.shape) == (1, 1, 4, 4096))
+            or (_VERIFY_HC_PRENORM and tuple(x.shape) == (1, 6, 4, 4096))
             or (_PREFILL_HC_PRENORM and tuple(x.shape) == (1, 1024, 4, 4096))
         )
         if not (

@@ -110,3 +110,44 @@ def test_prefill_hc_prenorm_is_forwarded_default_off(monkeypatch):
     assert "OMLX_DSV4_PREFILL_HC_PRENORM=0" in deployment._hostfile_envs()
     monkeypatch.setenv("OMLX_DSV4_PREFILL_HC_PRENORM", "1")
     assert "OMLX_DSV4_PREFILL_HC_PRENORM=1" in deployment._hostfile_envs()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_decode_hc_prenorm_is_bit_exact(monkeypatch):
+    monkeypatch.setattr(hc, "_DECODE_HC_PRENORM", True)
+    module = hc.HyperConnection(_config())
+    module.eval()
+    norm = nn.RMSNorm(4096, eps=1e-6)
+    mx.random.seed(2026082403)
+    module.fn = mx.random.normal((24, 16384)).astype(mx.float32) * 0.01
+    module.base = mx.random.normal((24,)).astype(mx.float32) * 0.01
+    module.scale = mx.array((0.9, 1.1, 0.8), dtype=mx.float32)
+    norm.weight = mx.random.normal((4096,)).astype(mx.bfloat16)
+    value = mx.random.normal((1, 1, 4, 4096)).astype(mx.bfloat16)
+
+    collapsed, post, comb = module(value)
+    normalized = norm(collapsed)
+    fused = module.call_with_norm(value, norm)
+    assert fused is not None
+    fused_collapsed, fused_normalized, fused_post, fused_comb = fused
+    mx.eval(
+        collapsed,
+        normalized,
+        post,
+        comb,
+        fused_collapsed,
+        fused_normalized,
+        fused_post,
+        fused_comb,
+    )
+    assert mx.array_equal(fused_collapsed, collapsed).item()
+    assert mx.array_equal(fused_normalized, normalized).item()
+    assert mx.array_equal(fused_post, post).item()
+    assert mx.array_equal(fused_comb, comb).item()
+
+
+def test_decode_hc_prenorm_is_forwarded_default_off(monkeypatch):
+    monkeypatch.delenv("OMLX_DSV4_DECODE_HC_PRENORM", raising=False)
+    assert "OMLX_DSV4_DECODE_HC_PRENORM=0" in deployment._hostfile_envs()
+    monkeypatch.setenv("OMLX_DSV4_DECODE_HC_PRENORM", "1")
+    assert "OMLX_DSV4_DECODE_HC_PRENORM=1" in deployment._hostfile_envs()

@@ -235,6 +235,29 @@ def test_fine_detail_taxonomy_covers_the_unattributed_verify_hotset():
     }
 
 
+def test_fine_detail_brackets_prefill_attention_implementations():
+    source = inspect.getsource(
+        __import__(
+            "benchmarks.bench_ds4_tp_stage_profile",
+            fromlist=["DS4LayerInstrumentation"],
+        ).DS4LayerInstrumentation.__enter__
+    )
+    for symbol in (
+        "scaled_dot_product_attention",
+        "wsdpa_prefill",
+        "wsdpa_topk_prefill",
+    ):
+        assert f'"{symbol}"' in source
+
+
+def test_decode_profile_warms_cache_with_production_prefill_chunks():
+    from benchmarks.bench_ds4_tp_stage_profile import _warm_layer_cache
+
+    source = inspect.getsource(_warm_layer_cache)
+    assert "step = min(1024" in source
+    assert "step = shape.tokens" not in source
+
+
 def test_profiler_is_not_imported_or_dispatched_by_production_code():
     root = Path(__file__).parents[1]
     symbol = "bench_ds4_tp_stage_profile"

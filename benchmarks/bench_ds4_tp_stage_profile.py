@@ -699,6 +699,12 @@ class DS4LayerInstrumentation:
                 "_batched_m1_attention",
                 "attention_core",
             )
+            for symbol in (
+                "scaled_dot_product_attention",
+                "wsdpa_prefill",
+                "wsdpa_topk_prefill",
+            ):
+                self._patch_symbol(dsv4, symbol, "attention_core")
             self._patch_symbol(
                 dsv4,
                 "_project_attention_output",
@@ -829,7 +835,11 @@ def _warm_layer_cache(
     import mlx.core as mx
 
     remaining = shape.prefix_tokens
-    step = shape.tokens
+    # Reproduce the serving scheduler's canonical prefill frontier regardless
+    # of the measured call width. Using ``shape.tokens`` made a B=1 decode
+    # profile warm an 8K cache through 8,192 one-token forwards, which was both
+    # prohibitively slow and unlike production's 1K prompt chunks.
+    step = min(1024, max(1, remaining))
     iteration = 0
     while remaining > 0:
         width = min(step, remaining)
