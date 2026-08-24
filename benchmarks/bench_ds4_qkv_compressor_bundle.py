@@ -367,11 +367,19 @@ def run_stock_probe(model: Path, layer: int, rows: int, cycles: int) -> dict[str
     # At M=1024, ratio-4's 1024-row and 256-row pairs must remain separate;
     # ratio-128's 512->1024 concat changes MLX's GEMM reduction geometry.
     if rows == 1:
-        dense_groups = [mx.concatenate(dense, axis=0)] if dense else []
+        dense_members = [dense] if dense else []
     elif ratio == 4:
-        dense_groups = [mx.concatenate(dense[:2], axis=0), mx.concatenate(dense[2:], axis=0)]
+        dense_members = (
+            [dense[:2], dense[2:]]
+            if rows == 1024
+            else [dense[:2], [dense[2]], [dense[3]]]
+        )
     else:
-        dense_groups = dense
+        dense_members = [[weight] for weight in dense]
+    dense_groups = [
+        mx.concatenate(group, axis=0) if len(group) > 1 else group[0]
+        for group in dense_members
+    ]
     mx.eval(*q_a, *raw_kv, *q_pair, *dense, *dense_groups)
     x = mx.random.normal((rows, HIDDEN)).astype(mx.bfloat16)
     mx.eval(x)
@@ -401,7 +409,9 @@ def run_stock_probe(model: Path, layer: int, rows: int, cycles: int) -> dict[str
                 outputs.append(packed[:, cursor : cursor + weight.shape[0]])
                 cursor += weight.shape[0]
         elif ratio == 4:
-            for packed, group in zip((x @ value.T for value in dense_groups), (dense[:2], dense[2:])):
+            for packed, group in zip(
+                (x @ value.T for value in dense_groups), dense_members
+            ):
                 cursor = 0
                 for weight in group:
                     outputs.append(packed[:, cursor : cursor + weight.shape[0]])

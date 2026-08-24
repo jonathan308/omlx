@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fail-closed contracts for the lossless DS4 M=1024 projection bundle."""
+"""Fail-closed contracts for the lossless DS4 projection bundle."""
 
 from __future__ import annotations
 
@@ -106,6 +106,12 @@ def test_prefill_contract_is_shared_by_single_node_and_tp2(monkeypatch):
     assert tp2 is not None and len(tp2) == 6
     assert qkv_bundle.eligible_modules(_attention(_Group(3)), x) is None
 
+    monkeypatch.setattr(qkv_bundle, "device_name", lambda: "Apple M3 Ultra")
+    local_m2048 = qkv_bundle.eligible_modules(
+        _attention(), _Array((1, 2048, 4096), mx.bfloat16)
+    )
+    assert local_m2048 is not None and len(local_m2048) == 6
+
 
 def test_prefill_contract_rejects_every_unqualified_boundary(monkeypatch):
     _enable_contract(monkeypatch)
@@ -113,9 +119,14 @@ def test_prefill_contract_rejects_every_unqualified_boundary(monkeypatch):
     attn = _attention()
 
     assert qkv_bundle.eligible_modules(attn, x) is not None
-    assert (
-        qkv_bundle.eligible_modules(attn, _Array((1, 2048, 4096), mx.bfloat16)) is None
-    )
+    assert qkv_bundle.eligible_modules(
+        attn, _Array((1, 1536, 4096), mx.bfloat16)
+    ) is None
+    monkeypatch.setattr(qkv_bundle, "device_name", lambda: "Apple M5 Max")
+    assert qkv_bundle.eligible_modules(
+        attn, _Array((1, 2048, 4096), mx.bfloat16)
+    ) is None
+    monkeypatch.setattr(qkv_bundle, "device_name", lambda: "Apple M3 Ultra")
     assert (
         qkv_bundle.eligible_modules(attn, _Array((1, 1024, 4096), mx.float16)) is None
     )
@@ -168,3 +179,6 @@ def test_packer_preserves_checkpoint_formats_and_has_no_requantization_path():
     assert "banks.qkv_weight[1024:]" in pack_source
     assert 'mode="mxfp8"' in project_source
     assert project_source.count("mx.split") == 3
+    assert "x.shape[1] == 2048" not in project_source
+    assert "banks.index_compressor_weight[:256]" in project_source
+    assert "banks.index_compressor_weight[256:]" in project_source

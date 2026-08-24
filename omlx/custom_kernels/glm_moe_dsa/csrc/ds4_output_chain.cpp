@@ -16,7 +16,6 @@ namespace {
 using namespace mlx::core;
 
 constexpr int kGroups = 8;
-constexpr int kTokens = 1024;
 constexpr int kORank = 1024;
 constexpr int kHidden = 4096;
 constexpr int kOBInput = kGroups * kORank;
@@ -86,8 +85,10 @@ bool unsupported_o_a(const array &x, const array &o_a_weight,
     return true;
   }
   const int K = x.shape(3);
+  const int tokens = x.shape(2);
   return (K != 1536 && K != 2560 && K != 4096) ||
-         x.shape() != Shape{1, kGroups, kTokens, K} ||
+         (tokens != 1024 && tokens != 2048) ||
+         x.shape() != Shape{1, kGroups, tokens, K} ||
          o_a_weight.shape() != Shape{kGroups, kORank, K / kValuesPerU32} ||
          o_a_scales.shape() != Shape{kGroups, kORank, K / kGroupSize};
 }
@@ -116,6 +117,7 @@ public:
     output.set_data(allocator::malloc(output.nbytes()));
 
     const int K = x.shape(3);
+    const int tokens = x.shape(2);
     const int bm = o_a_bm(variant_);
     auto library = device.get_library("omlx_glm_kernels", current_binary_dir());
     std::string kernel_name;
@@ -130,10 +132,10 @@ public:
     encoder.set_output_array(output, 3);
     encoder.set_bytes(K, 4);
     encoder.set_bytes(kORank, 5);
-    encoder.set_bytes(kTokens, 6);
+    encoder.set_bytes(tokens, 6);
     encoder.set_bytes(kGroups, 7);
     encoder.dispatch_threadgroups(
-        MTL::Size(kORank / kBN, kTokens / bm, kGroups), MTL::Size(32, 2, 2));
+        MTL::Size(kORank / kBN, tokens / bm, kGroups), MTL::Size(32, 2, 2));
   }
 
   DEFINE_NAME(DS4OutputOAInterleavedPrimitive)
@@ -174,10 +176,12 @@ public:
       return true;
     }
     const int K = x.shape(3);
+    const int tokens = x.shape(2);
     if (K != 1536 && K != 2560 && K != 4096) {
       return true;
     }
-    return x.shape() != Shape{1, kGroups, kTokens, K} ||
+    return (tokens != 1024 && tokens != 2048) ||
+           x.shape() != Shape{1, kGroups, tokens, K} ||
            o_a_weight.shape() != Shape{kGroups, kORank, K / kValuesPerU32} ||
            o_a_scales.shape() != Shape{kGroups, kORank, K / kGroupSize} ||
            o_b_weight.shape() != Shape{kHidden, kOBInput / kValuesPerU32} ||
@@ -205,16 +209,17 @@ public:
     // This allocation is the mandatory BF16 rounding boundary, not a second
     // transposed copy.  The command encoder owns it until both dispatches
     // finish, so no graph-visible O-A tensor survives the primitive.
-    array o_mid({1, kTokens, kOBInput}, bfloat16, nullptr, {});
+    const int tokens = x.shape(2);
+    array o_mid({1, tokens, kOBInput}, bfloat16, nullptr, {});
     o_mid.set_data(allocator::malloc(o_mid.nbytes()));
 
     const auto tile = chain_tile(variant_);
     const int o_a_k = x.shape(3);
     const int o_a_n = kORank;
-    const int o_a_m = kTokens;
+    const int o_a_m = tokens;
     const int o_b_k = kOBInput;
     const int o_b_n = kHidden;
-    const int o_b_m = kTokens;
+    const int o_b_m = tokens;
 
     auto library = device.get_library("omlx_glm_kernels", current_binary_dir());
     auto &encoder = metal::get_command_encoder(stream);
@@ -276,7 +281,8 @@ mx::array ds4_output_oa_interleaved(const mx::array &x,
   if (unsupported_o_a(x, o_a_weight, o_a_scales, variant, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_output_oa_interleaved] unsupported shape; "
-           "requires BF16 x [1,8,1024,K] with K in {1536,2560,4096} and MXFP8 "
+           "requires BF16 x [1,8,M,K], M in {1024,2048}, K in "
+           "{1536,2560,4096}, and MXFP8 "
            "O-A [8,1024,K/4]; got "
         << x.shape() << ", " << o_a_weight.shape() << ", " << o_a_scales.shape()
         << ".";
@@ -284,7 +290,7 @@ mx::array ds4_output_oa_interleaved(const mx::array &x,
   }
   std::vector<array> inputs = {x, o_a_weight, o_a_scales};
   return array(
-      Shape{1, kTokens, kOBInput}, bfloat16,
+      Shape{1, x.shape(2), kOBInput}, bfloat16,
       std::make_shared<DS4OutputOAInterleavedPrimitive>(stream, variant),
       std::move(inputs));
 }
@@ -300,7 +306,8 @@ mx::array ds4_output_projection_chain(const mx::array &x,
           x, o_a_weight, o_a_scales, o_b_weight, o_b_scales, variant, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_output_projection_chain] unsupported "
-           "shape; requires BF16 x [1,8,1024,K] with K in {1536,2560,4096}, "
+           "shape; requires BF16 x [1,8,M,K], M in {1024,2048}, K in "
+           "{1536,2560,4096}, "
            "MXFP8 O-A [8,1024,K/4], and MXFP8 O-B [4096,2048]; got "
         << x.shape() << ", " << o_a_weight.shape() << ", " << o_a_scales.shape()
         << ", " << o_b_weight.shape() << ", " << o_b_scales.shape() << ".";
@@ -309,7 +316,7 @@ mx::array ds4_output_projection_chain(const mx::array &x,
   std::vector<array> inputs = {x, o_a_weight, o_a_scales, o_b_weight,
                                o_b_scales};
   return array(
-      Shape{1, kTokens, kHidden}, bfloat16,
+      Shape{1, x.shape(2), kHidden}, bfloat16,
       std::make_shared<DS4OutputProjectionChainPrimitive>(stream, variant),
       std::move(inputs));
 }

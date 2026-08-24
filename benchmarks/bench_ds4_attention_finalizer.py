@@ -21,7 +21,7 @@ from typing import Any
 
 TOKENS = 1024
 HEAD_DIM = 512
-SUPPORTED_HEADS = (24, 32, 40)
+SUPPORTED_HEADS = (24, 32, 40, 64)
 
 
 def byte_ledger(heads: int) -> dict[str, float]:
@@ -321,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--layer", type=int, default=2)
     parser.add_argument("--heads", type=int, nargs="+", default=SUPPORTED_HEADS)
+    parser.add_argument("--tokens", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--offset", type=int, default=8192)
     parser.add_argument(
         "--rope-family", choices=("local", "compressed"), default="compressed"
@@ -334,7 +335,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global TOKENS
     args = parse_args()
+    TOKENS = args.tokens
     report: dict[str, Any] = {"analysis": analysis_report()}
     if args.model is not None:
         report["gpu_gate"] = run_gate(args)

@@ -85,6 +85,10 @@ def test_signed_3x5_shapes_are_eligible(monkeypatch, k):
     assert _eligible(monkeypatch, k=k) is not None
 
 
+def test_single_m3_m2048_shape_is_eligible(monkeypatch):
+    assert _eligible(monkeypatch, k=4096, shape=(1, 8, 2048, 4096)) is not None
+
+
 @pytest.mark.parametrize(
     "override",
     (

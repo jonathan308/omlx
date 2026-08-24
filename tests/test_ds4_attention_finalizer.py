@@ -13,10 +13,11 @@ from omlx.custom_kernels.glm_moe_dsa import fast
 
 
 def test_intermediate_traffic_ledger_matches_all_tp_head_shapes():
-    assert SUPPORTED_HEADS == (24, 32, 40)
+    assert SUPPORTED_HEADS == (24, 32, 40, 64)
     assert byte_ledger(24)["candidate_removed_mib"] == 50.0
     assert byte_ledger(32)["candidate_removed_mib"] == 66.0
     assert byte_ledger(40)["candidate_removed_mib"] == 82.0
+    assert byte_ledger(64)["candidate_removed_mib"] == 130.0
 
 
 def test_contract_requires_exact_boundaries_and_1_10x_combined():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lossless M=1024 DeepSeek-V4 Q/KV/compressor projection bundle.
+"""Lossless DeepSeek-V4 Q/KV/compressor projection bundle.
 
 This is the exact GPU alternative to the ANE attention-input experiment.  It
 never dequantizes or requantizes checkpoint weights.  Q-A and raw-KV retain
@@ -119,11 +119,13 @@ def eligible_modules(attn: Any, x: mx.array) -> tuple[Any, ...] | None:
         not ENABLED
         or getattr(attn, "training", False)
         or is_dspark_verify_armed()
-        or tuple(x.shape) != (1, 1024, 4096)
+        or tuple(x.shape) not in ((1, 1024, 4096), (1, 2048, 4096))
         or x.dtype != mx.bfloat16
         or int(getattr(attn, "compress_ratio", -1)) != 4
         or not device_qualified()
     ):
+        return None
+    if x.shape[1] == 2048 and device_name() != "Apple M3 Ultra":
         return None
     cached = getattr(attn, "_omlx_qkv_prefill_modules", None)
     if isinstance(cached, tuple) and len(cached) == 6:
@@ -288,16 +290,23 @@ def project_banks(x: mx.array, banks: QKVPrefillBanks) -> tuple[mx.array, ...]:
     else:
         compressor_kv = x @ banks.compressor_weight[:1024].T
         compressor_gate = x @ banks.compressor_weight[1024:].T
-    index_compressor = x @ banks.index_compressor_weight.T
+    if x.shape[1] == 1024:
+        index_compressor = x @ banks.index_compressor_weight.T
+        index_kv, index_gate = mx.split(index_compressor, (256,), axis=-1)
+    else:
+        # M=2048 changes MLX's reduction geometry when the two 256-row banks
+        # become N=512. Keep those two exact stock GEMMs while still grouping
+        # Q-A/raw-KV and the main M3 compressor pair (4 vs 6 dispatches).
+        index_kv = x @ banks.index_compressor_weight[:256].T
+        index_gate = x @ banks.index_compressor_weight[256:].T
     q_a, raw_kv = mx.split(qkv, (1024,), axis=-1)
-    index_kv, index_gate = mx.split(index_compressor, (256,), axis=-1)
     return q_a, raw_kv, compressor_kv, compressor_gate, index_kv, index_gate
 
 
 def prefill_qkv_projection_bundle(
     attn: Any, x: mx.array
 ) -> tuple[mx.array, ...] | None:
-    """Return the exact M=1024 bundle or leave the existing path untouched."""
+    """Return an exact qualified bundle or leave the path untouched."""
 
     modules = eligible_modules(attn, x)
     if modules is None or getattr(attn, "_omlx_qkv_prefill_failed", False):
@@ -315,9 +324,16 @@ def prefill_qkv_projection_bundle(
     global _LOGGED
     if not _LOGGED:
         _LOGGED = True
+        tokens = int(x.shape[1]) if hasattr(x, "shape") else 1024
+        dispatches = (
+            4
+            if tokens == 2048
+            else (3 if device_name() == "Apple M3 Ultra" else 4)
+        )
         logger.info(
-            "DS4 exact M=1024 Q/KV/compressor bundle active "
+            "DS4 exact M=%d Q/KV/compressor bundle active "
             "(original MXFP8/BF16 storage; %d dispatches)",
-            3 if device_name() == "Apple M3 Ultra" else 4,
+            tokens,
+            dispatches,
         )
     return outputs

@@ -301,6 +301,7 @@ def run_rank(
 
 
 def main() -> int:
+    global TOKENS
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+", default=[2])
@@ -310,8 +311,10 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--cycles", type=int, default=12)
     parser.add_argument("--parity-seeds", type=int, default=3)
+    parser.add_argument("--tokens", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
+    TOKENS = args.tokens
 
     if not fast.has_symbol("ds4_output_projection_chain") or not fast.has_symbol(
         "ds4_output_oa_interleaved"

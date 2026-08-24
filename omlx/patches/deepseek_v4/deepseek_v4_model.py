@@ -762,6 +762,7 @@ def _attention_output_chain_native_inputs(
             (1, 8, 1024, 1536),
             (1, 8, 1024, 2560),
             (1, 8, 1024, 4096),
+            (1, 8, 2048, 4096),
         )
     ):
         return None
@@ -832,8 +833,9 @@ def _project_attention_output_chain(
         _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = True
         logging.getLogger(__name__).info(
             "deepseek_v4: using exact BF16 O-A/O-B prefill chain "
-            "(M=1024, H=%d, BM64/BK32/BN64; "
+            "(M=%d, H=%d, BM64/BK32/BN64; "
             "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0 disables)",
+            prepared.shape[2],
             prepared.shape[-1] // 64,
         )
     o_a_weight, o_a_scales, o_b_weight, o_b_scales = native_inputs
@@ -883,7 +885,7 @@ def _attention_finalizer_native_inputs(
     prefill_route = bool(
         _DEEPSEEK_V4_ATTN_FINALIZER_PREFILL
         and not verify_armed
-        and tokens == 1024
+        and tokens in (1024, 2048)
     )
     if (
         not (verify_route or prefill_route)
@@ -892,11 +894,11 @@ def _attention_finalizer_native_inputs(
         or not 0 <= offset <= 0x7FFFFFFF
     ):
         return None
-    supported_heads = (24, 32, 40, 64) if verify_route else (24, 32, 40)
+    supported_heads = (24, 32, 40, 64)
     if (
         q_raw.ndim != 4
         or q_raw.shape[0] != 1
-        or q_raw.shape[1] not in (6, 1024)
+        or q_raw.shape[1] not in (6, 1024, 2048)
         or q_raw.shape[2] not in supported_heads
         or q_raw.shape[3] != 512
         or q_raw.dtype != mx.bfloat16

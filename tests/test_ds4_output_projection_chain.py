@@ -45,12 +45,20 @@ def test_native_chain_owns_one_ephemeral_intermediate_then_o_b():
         ROOT / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_output_chain.cpp"
     ).read_text()
     allocation = source.index(
-        "array o_mid({1, kTokens, kOBInput}, bfloat16, nullptr, {})"
+        "array o_mid({1, tokens, kOBInput}, bfloat16, nullptr, {})"
     )
     temporary = source.index("encoder.add_temporary(o_mid)")
     o_a = source.index('"ds4_output_oa_interleaved_bfloat16_t_bm"', temporary)
     o_b = source.index('"ds4_projection_mxfp8_qmm_t_bfloat16_t_bm"', o_a)
     assert allocation < temporary < o_a < o_b
+
+
+def test_output_chain_accepts_qualified_m1024_and_m2048_rows():
+    source = (
+        ROOT / "omlx/custom_kernels/glm_moe_dsa/csrc/ds4_output_chain.cpp"
+    ).read_text()
+    assert "tokens != 1024 && tokens != 2048" in source
+    assert "Shape{1, x.shape(2), kHidden}" in source
 
 
 def test_output_chain_symbols_are_built_with_default_off_model_seam():

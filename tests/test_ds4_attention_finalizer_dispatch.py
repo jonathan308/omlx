@@ -44,7 +44,7 @@ class _RoPE:
         return self.freqs
 
 
-def _eligible_fixture(monkeypatch, dm, heads=24):
+def _eligible_fixture(monkeypatch, dm, heads=24, tokens=1024):
     monkeypatch.setattr(dm, "_DEEPSEEK_V4_ATTN_FINALIZER_PREFILL", True)
     monkeypatch.setattr(dm, "is_dspark_verify_armed", lambda: False)
     monkeypatch.setattr(glm_fast, "is_native_available", lambda: True)
@@ -60,8 +60,8 @@ def _eligible_fixture(monkeypatch, dm, heads=24):
         rope=_RoPE(),
         config=SimpleNamespace(rms_norm_eps=1e-6),
     )
-    q_raw = _Tensor((1, 1024, heads, 512), mx.bfloat16)
-    kv_raw = _Tensor((1, 1024, 512), mx.bfloat16)
+    q_raw = _Tensor((1, tokens, heads, 512), mx.bfloat16)
+    kv_raw = _Tensor((1, tokens, 512), mx.bfloat16)
     return attn, q_raw, kv_raw
 
 
@@ -76,9 +76,11 @@ def test_proven_m1024_head_shapes_are_eligible_only_when_enabled(
     assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192) is None
 
 
-def test_h64_is_verify_only_until_single_node_prefill_is_qualified(monkeypatch, dm):
-    attn, q_raw, kv_raw = _eligible_fixture(monkeypatch, dm, heads=64)
-    assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192) is None
+def test_single_m3_h64_m2048_prefill_is_eligible(monkeypatch, dm):
+    attn, q_raw, kv_raw = _eligible_fixture(
+        monkeypatch, dm, heads=64, tokens=2048
+    )
+    assert dm._attention_finalizer_native_inputs(attn, q_raw, kv_raw, 8192)
 
 
 @pytest.mark.parametrize(

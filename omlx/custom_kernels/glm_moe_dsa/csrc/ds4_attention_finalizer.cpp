@@ -151,12 +151,14 @@ array ds4_q_head_rms_rope(const array &q, const array &freqs, int offset,
       (q.shape(2) == 24 || q.shape(2) == 32 || q.shape(2) == 40 ||
        q.shape(2) == 64);
   const bool tokens_supported =
-      q.ndim() == 4 && (q.shape(1) == 6 || q.shape(1) == 1024);
+      q.ndim() == 4 &&
+      (q.shape(1) == 6 || q.shape(1) == 1024 || q.shape(1) == 2048);
   if (!common_supported(q, freqs, offset, stream) || !heads_supported ||
       !tokens_supported || q.shape(0) != 1 || q.shape(3) != kHeadDim) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_q_head_rms_rope] unsupported shape; "
-           "requires BF16 q [1,M,H,512], M in {6,1024}, H in {24,32,40,64}, FP32 freqs "
+           "requires BF16 q [1,M,H,512], M in {6,1024,2048}, "
+           "H in {24,32,40,64}, FP32 freqs "
            "[256], non-negative scalar offset; got "
         << q.shape() << ", " << freqs.shape() << ".";
     throw std::invalid_argument(msg.str());
@@ -177,13 +179,15 @@ array ds4_kv_rms_rope(const array &kv, const array &weight, const array &freqs,
                       StreamOrDevice s) {
   auto stream = to_stream(s);
   const bool shape_supported = kv.ndim() == 3 && kv.shape(0) == 1 &&
-      (kv.shape(1) == 6 || kv.shape(1) == 1024) && kv.shape(2) == kHeadDim;
+      (kv.shape(1) == 6 || kv.shape(1) == 1024 || kv.shape(1) == 2048) &&
+      kv.shape(2) == kHeadDim;
   if (!common_supported(kv, freqs, offset, stream) || !shape_supported ||
       weight.shape() != Shape{kHeadDim} || weight.dtype() != bfloat16 ||
       !row_contiguous(weight)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.ds4_kv_rms_rope] unsupported shape; requires "
-           "BF16 kv [1,M,512], M in {6,1024}, BF16 weight [512], FP32 freqs [256], "
+           "BF16 kv [1,M,512], M in {6,1024,2048}, BF16 weight [512], "
+           "FP32 freqs [256], "
            "non-negative scalar offset; got "
         << kv.shape() << ", " << weight.shape() << ", " << freqs.shape() << ".";
     throw std::invalid_argument(msg.str());
