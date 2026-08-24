@@ -124,6 +124,12 @@ At source `5575294f13fad2a2985ac2746ea5fcf6223c911b`:
 - both active ranks report the same plan hash, measured shard bytes, request
   counters and completion state.
 
+The upstream-rc3 integration branch `feat/cluster-v2-beta-pr` at `f10ad8cf`
+then passed 1,770/1,770 Cluster v2 tests, 1,072/1,072 conflict-focused tests,
+and the complete repository gate (**11,803 passed, 62 skipped, 77 deselected**).
+The full native extension stack also rebuilt successfully from that tree on
+both qualification Macs.
+
 ## Gates before calling a public build stable Beta
 
 The feature PR can be reviewed before release packaging, but the stable-Beta
