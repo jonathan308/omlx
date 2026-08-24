@@ -512,6 +512,28 @@ def test_supervisor_warms_jaccl_before_model_weight_loading(monkeypatch):
     assert calls[0][1]["python_executable"] == supervisor.python_executable
 
 
+def test_supervisor_retries_transient_jaccl_warmup(monkeypatch):
+    deployment = _jaccl_deployment()
+    supervisor = launch.DistributedJobSupervisor(deployment, preflight=False)
+    calls = []
+
+    def probe(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            raise DistributedLaunchError(
+                "performance probe did not return every cluster rank: "
+                "[jaccl] Changing queue pair to RTR failed with errno 96"
+            )
+        return {"world_size": 2}
+
+    monkeypatch.setattr(launch, "run_cluster_performance_probe", probe)
+    monkeypatch.setattr(launch.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("OMLX_CLUSTER_WARM_JACCL_ATTEMPTS", "3")
+
+    assert supervisor._warm_selected_fabric() == {"world_size": 2}
+    assert len(calls) == 3
+
+
 def test_supervisor_skips_jaccl_warmup_for_ring_or_operator_override(monkeypatch):
     calls = []
     monkeypatch.setattr(

@@ -61,6 +61,10 @@ _JACCL_NO_PROGRESS_RE = re.compile(
     r"\[jaccl\]\s+(?P<reason>[^\r\n]*made no progress[^\r\n]*)",
     re.IGNORECASE,
 )
+_JACCL_TRANSIENT_PROBE_RE = re.compile(
+    r"queue pair|\bRTR\b|couldn't connect|connection attempt",
+    re.IGNORECASE,
+)
 _REBOOT_REQUIRED_GUIDANCE = (
     "A distributed rank survived SIGKILL and may be stuck in the macOS "
     "Metal driver. Reboot this Mac before starting another distributed launch."
@@ -1546,7 +1550,9 @@ def run_cluster_performance_probe(
             backend=deployment.backend,
         )
     except ValueError as exc:
-        raise DistributedLaunchError(str(exc)) from exc
+        detail = (completed.stderr.strip() or completed.stdout.strip())[-2000:]
+        suffix = f": {detail}" if detail else ""
+        raise DistributedLaunchError(f"{exc}{suffix}") from exc
     promotable = all(profile.promotable for profile in profiles)
     reasons = tuple(
         dict.fromkeys(
@@ -2944,12 +2950,39 @@ class DistributedJobSupervisor:
         ).strip().lower() in {"1", "true", "on", "yes"}
         if not enabled or not self.deployment.backend.startswith("jaccl"):
             return None
-        result = run_cluster_performance_probe(
-            self.deployment,
-            timeout=min(60.0, self.load_timeout),
-            python_executable=self.python_executable,
-            cwd=self.cwd,
-        )
+        try:
+            attempts = int(
+                os.environ.get("OMLX_CLUSTER_WARM_JACCL_ATTEMPTS", "3")
+            )
+        except ValueError:
+            attempts = 3
+        attempts = min(5, max(1, attempts))
+        result: dict[str, Any] | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                result = run_cluster_performance_probe(
+                    self.deployment,
+                    timeout=min(60.0, self.load_timeout),
+                    python_executable=self.python_executable,
+                    cwd=self.cwd,
+                )
+                break
+            except DistributedLaunchError as exc:
+                transient = bool(_JACCL_TRANSIENT_PROBE_RE.search(str(exc)))
+                if not transient or attempt == attempts:
+                    raise
+                delay = min(4.0, float(attempt))
+                logger.warning(
+                    "JACCL fabric warmup attempt %d/%d hit a transient queue "
+                    "setup failure; retrying in %.1fs: %s",
+                    attempt,
+                    attempts,
+                    delay,
+                    str(exc)[-500:],
+                )
+                time.sleep(delay)
+        if result is None:  # pragma: no cover - defensive loop invariant
+            raise DistributedLaunchError("JACCL fabric warmup produced no result")
         logger.info(
             "Warmed %s fabric before model load: ranks=%s",
             self.deployment.backend,

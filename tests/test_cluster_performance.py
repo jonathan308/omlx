@@ -11,7 +11,7 @@ import mlx.core as mx
 import pytest
 
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
-from omlx.cluster.launch import run_cluster_performance_probe
+from omlx.cluster.launch import DistributedLaunchError, run_cluster_performance_probe
 from omlx.cluster.performance import (
     ExecutionSettings,
     NodePerformanceProfile,
@@ -383,6 +383,19 @@ def test_cluster_performance_probe_marks_low_power_records_unpromotable():
     assert report["unqualified_ranks"] == [1]
     assert "Low Power Mode" in report["qualification_reason"]
     assert report["profiles"][1]["promotable"] is False
+
+
+def test_cluster_performance_probe_includes_rank_worker_diagnostic_on_missing_rank():
+    def runner(argv, *, timeout, env):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="oMLX performance probe failed: ValueError: [jaccl] Changing queue pair to RTR failed with errno 96",
+            stderr="",
+        )
+
+    with pytest.raises(DistributedLaunchError, match="queue pair.*RTR"):
+        run_cluster_performance_probe(_deployment(), runner=runner)
 
 
 class _ValidatedPipeline:
