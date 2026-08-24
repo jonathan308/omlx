@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for rank-local, end-to-end distributed inference telemetry."""
 
+import json
 import threading
 import time
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +84,49 @@ class _Queue:
     def put(self, item, *args, **kwargs):
         self.items.append((item, args, kwargs))
         return "queued"
+
+
+def test_private_rank_cache_clear_endpoint_is_plan_authenticated(tmp_path):
+    import mlx_lm.server as mlx_server
+
+    class Marker(_Marker):
+        payload = {"deployment_id": "dep", "plan_hash": "p" * 64}
+        path = None
+
+    class Handler:
+        path = "/omlx/internal/cache/ssd/clear"
+
+        def __init__(self, token):
+            self.headers = {"X-oMLX-Plan-Hash": token}
+            self.wfile = BytesIO()
+            self.status = None
+
+        def _set_completion_headers(self, status):
+            self.status = status
+
+        def end_headers(self):
+            return None
+
+    with install_server_telemetry(
+        Marker(),
+        heartbeat_interval=0,
+        ssd_cache_dir=str(tmp_path),
+        ssd_cache_persistent=True,
+        ssd_write_behind=True,
+    ):
+        allowed = Handler("p" * 64)
+        mlx_server.APIHandler.do_POST(allowed)
+        denied = Handler("wrong")
+        mlx_server.APIHandler.do_POST(denied)
+
+    assert allowed.status == 200
+    assert json.loads(allowed.wfile.getvalue()) == {
+        "status": "ok",
+        "rank": 0,
+        "ssd_deleted": 0,
+        "hot_cleared": 0,
+    }
+    assert denied.status == 403
 
 
 def test_generated_token_is_normalized_for_logprob_indexing():

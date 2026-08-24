@@ -1426,6 +1426,25 @@ class SSDPromptSnapshotStore:
         writer.join(timeout=max(0.0, deadline - time.monotonic()))
         return not writer.is_alive()
 
+    def clear(self, timeout: float = 30.0) -> int:
+        """Drain accepted writes, then atomically forget every snapshot.
+
+        A live distributed cache clear must update both the files and this
+        process's in-memory manifest. Deleting files from the coordinator GUI
+        alone leaves peer stores advertising stale boundaries and allows a
+        later deployment to restore them. Pending write-behind work is drained
+        first so it cannot repopulate the directory immediately after clear.
+        """
+
+        if not self.flush(timeout=timeout):
+            raise TimeoutError("prompt snapshot writes did not drain before clear")
+        with self._lock:
+            count = len(self._index)
+            self._clear_directory()
+            self._serialisable = True
+            self._persist_index_locked()
+            return count
+
     def present_boundaries(self, model: Any, tokens: list[int]) -> tuple[int, ...]:
         """Boundaries whose whole chain is on disk, longest first.
 

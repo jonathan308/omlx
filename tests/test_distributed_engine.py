@@ -51,7 +51,58 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
         base_url="http://127.0.0.1:1",
         transport=httpx.MockTransport(handler),
     )
+    engine._supervisor.port = 8001
     return engine
+
+
+@pytest.mark.asyncio
+async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"status": "ok", "rank": 0, "ssd_deleted": 3, "hot_cleared": 0},
+        )
+
+    remote_calls = []
+
+    def remote(ssh_target, command, timeout):
+        remote_calls.append((ssh_target, command, timeout))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"status": "ok", "rank": 1, "ssd_deleted": 5, "hot_cleared": 0}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(distributed, "_run_cluster_ssh", remote)
+    engine = _ready_engine(handler)
+    try:
+        result = await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
+
+    assert result["ssd_deleted"] == 8
+    assert len(result["ranks"]) == 2
+    assert requests[0].url.path == "/omlx/internal/cache/ssd/clear"
+    assert requests[0].headers["X-oMLX-Plan-Hash"] == "d" * 64
+    assert remote_calls[0][0] == "peer.local"
+    assert "/omlx/internal/cache/ssd/clear" in remote_calls[0][1]
+    assert "X-oMLX-Plan-Hash" in remote_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_distributed_cache_clear_refuses_active_requests():
+    engine = _ready_engine(lambda _request: httpx.Response(200, json={}))
+    engine._active_requests = 1
+    try:
+        with pytest.raises(DistributedInferenceError, match="requests are active"):
+            await engine.clear_prompt_caches(ssd=True)
+    finally:
+        await engine._client.aclose()
 
 
 def test_text_backbone_only_contract_is_explicit_and_default_off():

@@ -335,6 +335,27 @@ def test_pooling_delta_chain_survives_a_rank_restart(tmp_path):
     _assert_pooling_equal(restored[0], pool)
 
 
+def test_clear_drains_write_behind_and_resets_persistent_manifest(tmp_path):
+    tokens = list(range(STEP))
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=STEP,
+        persistent=True,
+        write_behind=True,
+        pending_max_bytes=1024 * 1024,
+    )
+    assert store.put(MODEL, tokens, _kv())
+    assert store.clear(timeout=5) == 1
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert store.present_boundaries(MODEL, tokens) == ()
+    assert store.close(timeout=5)
+
+    reopened = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert len(reopened) == 0
+    assert reopened.present_boundaries(MODEL, tokens) == ()
+
+
 def test_corrupt_pooling_delta_range_fails_closed_and_unpoisons_manifest(tmp_path):
     step = 4
     tokens = list(range(2 * step))
