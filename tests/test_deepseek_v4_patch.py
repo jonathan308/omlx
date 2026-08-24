@@ -2680,6 +2680,73 @@ class TestDS4NAXIndexerScoreDispatch:
         bad.index_topk = 256
         assert not dm._dsv4f_mma_score_enabled(bad, 4)
 
+    @pytest.mark.parametrize(
+        "architecture,expected",
+        (("applegpu_g15d", True), ("applegpu_g17s", False)),
+    )
+    def test_mma_partition_is_forwarded_only_on_g15d(
+        self, applied_patch, monkeypatch, architecture, expected
+    ):
+        import mlx.core as mx
+
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        dm = sys.modules["mlx_lm.models.deepseek_v4"]
+        B, L, H, D, N = 1, 64, 64, 128, 513
+        pooled = mx.zeros((B, N, D), dtype=mx.bfloat16)
+        cache = dm.PoolingCache(4)
+        cache.pooled = pooled
+        indexer = SimpleNamespace(
+            n_heads=H,
+            head_dim=D,
+            index_topk=512,
+            compressor=lambda x, pool_cache, offset: pooled,
+            scale=D**-0.5,
+            _m2_mma_score=True,
+            _nax_indexer_score=False,
+            row_sharding_group=None,
+        )
+        monkeypatch.setattr(dm, "native_indexer_available", lambda: True)
+        monkeypatch.setattr(dm, "native_indexer_disabled", lambda: False)
+        monkeypatch.setattr(fast, "_EXT_MMA_SCORE", True)
+        monkeypatch.setattr(fast, "_EXT_MMA_WM4", True)
+        monkeypatch.setattr(
+            fast.mx,
+            "device_info",
+            lambda: {"architecture": architecture},
+        )
+        monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+        seen = []
+
+        def scores(q, k, weights, **kwargs):
+            seen.append(kwargs.get("use_wm4_wn1"))
+            return mx.zeros((B, 1, q.shape[2], k.shape[2]), dtype=q.dtype)
+
+        monkeypatch.setattr(fast, "dsa_indexer_scores_mma", scores)
+        monkeypatch.setattr(
+            fast,
+            "dsa_topk_indices",
+            lambda scores, topk, **kwargs: mx.broadcast_to(
+                mx.arange(topk, dtype=mx.uint32)[None, None, None],
+                (B, 1, scores.shape[2], topk),
+            ),
+        )
+        x = mx.zeros((B, L, 8), dtype=mx.bfloat16)
+        q = mx.zeros((B, H, L, D), dtype=mx.bfloat16)
+        weights = mx.zeros((B, L, H), dtype=mx.bfloat16)
+        out = dm.Indexer.__call__(
+            indexer,
+            x,
+            q_residual=x,
+            position_rope=None,
+            pool_cache=cache,
+            offset=2048,
+            projected_q=q,
+            projected_weights=weights,
+        )
+        assert out.shape == (B, L, 512)
+        assert seen == [expected]
+
     @staticmethod
     def _run_projected_indexer(dm, monkeypatch, *, group=None):
         import mlx.core as mx

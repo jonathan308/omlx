@@ -2896,6 +2896,10 @@ class Indexer(nn.Module):
                         and q.dtype == mx.bfloat16
                         and pooled.shape[1] >= 64
                     )
+                    _use_mma_wm4_wn1 = (
+                        _use_mma
+                        and glm_fast.dsa_indexer_mma_wm4_wn1_eligible()
+                    )
                     # M5 TensorOps score tile: exact DS4F fingerprint at
                     # construction, then the narrow runtime domain here.
                     # In heterogeneous TP, only row-sharded prefill may use a
@@ -2934,7 +2938,8 @@ class Indexer(nn.Module):
                         logging.getLogger(__name__).info(
                             "deepseek_v4: DSV4F v25 MMA indexer score "
                             "kernel active (zero-per-head-barrier, "
-                            "lossless qualified Apple GPU path)"
+                            "lossless qualified Apple GPU path, partition=%s)",
+                            "WM4xWN1" if _use_mma_wm4_wn1 else "WM2xWN2",
                         )
                     if _use_mma:
                         scores4 = glm_fast.dsa_indexer_scores_mma(
@@ -2943,6 +2948,7 @@ class Indexer(nn.Module):
                             weights,
                             mask_ratio=_mask_ratio,
                             mask_q_offset=_mask_q_offset,
+                            use_wm4_wn1=_use_mma_wm4_wn1,
                         )
                     else:
                         scores4 = glm_fast.dsa_indexer_scores(
