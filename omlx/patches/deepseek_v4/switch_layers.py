@@ -81,6 +81,7 @@ _DEEPSEEK_MXFP4_NAX_BLOCKS = os.environ.get(
     "OMLX_DSV4_NAX_MOE_BLOCKS", "0"
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED = False
+_DEEPSEEK_MXFP4_NAX_BLOCKS_REJECTION_LOGGED = False
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -621,6 +622,31 @@ class SwitchGLU(nn.Module):
         """Preflight exact DS4F M5 rank-1 4/8 or 5/8 BF16 contracts."""
 
         tp_contract = getattr(self, "_omlx_dsv4f_moe_tp", None)
+
+        def reject(reason: str) -> bool:
+            global _DEEPSEEK_MXFP4_NAX_BLOCKS_REJECTION_LOGGED
+            if (
+                _DEEPSEEK_MXFP4_NAX_BLOCKS
+                and not _DEEPSEEK_MXFP4_NAX_BLOCKS_REJECTION_LOGGED
+            ):
+                _DEEPSEEK_MXFP4_NAX_BLOCKS_REJECTION_LOGGED = True
+                logging.getLogger(__name__).warning(
+                    "DeepSeek V4 M5 NAX routed-MoE prefill requested but "
+                    "ineligible (%s): tp=%r request=%r indices=%r/%s "
+                    "scores=%r/%s sorted=%r/%s input_dtype=%s",
+                    reason,
+                    tp_contract,
+                    request_shape,
+                    tuple(indices.shape),
+                    indices.dtype,
+                    tuple(scores.shape) if scores is not None else None,
+                    getattr(scores, "dtype", None),
+                    tuple(x_sorted.shape),
+                    x_sorted.dtype,
+                    original_dtype,
+                )
+            return False
+
         nax_enabled = bool(
             _DEEPSEEK_MXFP4_NAX_BLOCKS
             or (
@@ -635,7 +661,7 @@ class SwitchGLU(nn.Module):
             or not getattr(self, "_omlx_dsv4f_exact_config", False)
             or tp_contract not in {(2, 1, (3, 5)), (2, 1, (4, 4))}
         ):
-            return False
+            return reject("execution contract")
         if (
             request_shape != (1, 1024, 4096)
             or tuple(indices.shape) != (1, 1024, 6)
@@ -647,10 +673,10 @@ class SwitchGLU(nn.Module):
             or x_sorted.dtype != mx.bfloat16
             or original_dtype != mx.bfloat16
         ):
-            return False
+            return reject("request shape or dtype")
         activation_limit = getattr(self.activation, "limit", None)
         if activation_limit != 10.0 or getattr(self.activation, "fp32", False):
-            return False
+            return reject("activation contract")
 
         projections = (self.up_proj, self.gate_proj, self.down_proj)
         if not all(
@@ -664,7 +690,7 @@ class SwitchGLU(nn.Module):
             and projection["scales"].dtype == mx.uint8
             for projection in projections
         ):
-            return False
+            return reject("quantization metadata")
         up, gate, down = projections
         local_intermediate = 1280 if tp_contract == (2, 1, (3, 5)) else 1024
         if (
@@ -678,19 +704,20 @@ class SwitchGLU(nn.Module):
             or tuple(down["scales"].shape)
             != (256, 4096, local_intermediate // 32)
         ):
-            return False
+            return reject("projection shape")
 
         try:
             exact_device = mx.device_info().get("device_name") == "Apple M5 Max"
         except Exception:
-            return False
-        return bool(
+            return reject("device query")
+        eligible = bool(
             exact_device
             and is_nax_available()
             and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks_nax")
             and glm_fast.ds4_projection_nax_kernels_built()
             and glm_fast.ds4_projection_nax_device_available()
         )
+        return eligible if eligible else reject("device or native artifact")
 
     def __call__(self, x, indices, scores=None) -> mx.array:
         if self._can_use_mxfp4_full_decode(x, indices, scores):
