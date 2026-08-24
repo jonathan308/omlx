@@ -108,6 +108,11 @@ def _reference(args, activation_limit: float = 10.0):
     [
         ("float16", 1, "uint32"),
         ("bfloat16", 1, "uint32"),
+        # Fixed-depth DS4 verification is six rows (one target row plus five
+        # drafts). Keep the real B=6 geometry in the parity matrix; B=1 alone
+        # can hide batch-stride and ordered-accumulation bugs in the native
+        # kernel.
+        ("bfloat16", 6, "uint32"),
         ("float16", 4, "int32"),
         ("bfloat16", 4, "int32"),
     ],
@@ -136,6 +141,21 @@ def test_deepseek_mxfp4_full_decode_is_exact_on_asymmetric_tp_tails(
     mx = pytest.importorskip("mlx.core")
     fast = _native_fast()
     args = _fixture(mx.bfloat16, tokens, mx.uint32, hidden_dims=hidden_dims)
+
+    reference = _reference(args)
+    candidate = fast.deepseek_mxfp4_full_decode(*args, 10.0)
+    mx.eval(reference, candidate)
+
+    assert mx.array_equal(candidate, reference).item()
+
+
+@pytest.mark.parametrize("rows", (1, 2, 4))
+def test_deepseek_mxfp4_full_decode_row_probe_is_exact(monkeypatch, rows):
+    """The isolated row-tile probe must preserve the stock B1 boundary."""
+    mx = pytest.importorskip("mlx.core")
+    fast = _native_fast()
+    args = _fixture(mx.bfloat16, 1, mx.uint32, hidden_dims=768)
+    monkeypatch.setenv("OMLX_DSV4_FULL_DECODE_ROWS", str(rows))
 
     reference = _reference(args)
     candidate = fast.deepseek_mxfp4_full_decode(*args, 10.0)

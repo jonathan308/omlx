@@ -1200,8 +1200,17 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
     // The 3:5 TP rank-0 slice has enough independent output rows to keep the
     // measured M3 Ultra GPU occupied without coarsening two results into each
     // simdgroup. Keep the established two-row tile on every other GPU/shape.
-    const int result_rows =
+    // The established shape/device choice remains the default.  The
+    // environment override is an isolated decode-kernel probe only; no
+    // model dispatch sets it, so production keeps the qualified schedule.
+    int result_rows =
         I == 768 && d.get_architecture() == "applegpu_g15d" ? 1 : 2;
+    if (const char* override_rows = std::getenv("OMLX_DSV4_FULL_DECODE_ROWS")) {
+      const int requested = std::atoi(override_rows);
+      if (requested == 1 || requested == 2 || requested == 4) {
+        result_rows = requested;
+      }
+    }
 
     std::string kname;
     concatenate(
@@ -1210,6 +1219,8 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
         glm_type_name(x.dtype()));
     if (result_rows == 1) {
       concatenate(kname, "_r1");
+    } else if (result_rows == 4) {
+      concatenate(kname, "_r4");
     }
     auto kernel = d.get_kernel(kname, lib);
     compute_encoder.set_compute_pipeline_state(kernel);
@@ -1237,6 +1248,8 @@ class DeepseekMxfp4FullDecodePrimitive : public Primitive {
         glm_type_name(x.dtype()));
     if (result_rows == 1) {
       concatenate(kname, "_r1");
+    } else if (result_rows == 4) {
+      concatenate(kname, "_r4");
     }
     kernel = d.get_kernel(kname, lib);
     compute_encoder.set_compute_pipeline_state(kernel);

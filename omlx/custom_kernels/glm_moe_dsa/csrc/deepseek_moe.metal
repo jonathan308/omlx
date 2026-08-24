@@ -1393,6 +1393,11 @@ template <typename T, int ROWS, int TOPK>
       type,                                                                    \
       1)                                                                       \
   instantiate_kernel(                                                         \
+      "deepseek_mxfp4_pair_swiglu_decode_" #type "_r4",                     \
+      deepseek_mxfp4_pair_swiglu_decode,                                      \
+      type,                                                                    \
+      4)                                                                       \
+  instantiate_kernel(                                                         \
       "deepseek_mxfp4_down_score_sum_decode_" #type,                         \
       deepseek_mxfp4_down_score_sum_decode,                                   \
       type,                                                                    \
@@ -1403,6 +1408,12 @@ template <typename T, int ROWS, int TOPK>
       deepseek_mxfp4_down_score_sum_decode,                                   \
       type,                                                                    \
       1,                                                                       \
+      6)                                                                       \
+  instantiate_kernel(                                                         \
+      "deepseek_mxfp4_down_score_sum_decode_" #type "_r4",                 \
+      deepseek_mxfp4_down_score_sum_decode,                                   \
+      type,                                                                    \
+      4,                                                                       \
       6)
 
 instantiate_deepseek_mxfp4_full_decode(float16_t);

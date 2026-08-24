@@ -322,6 +322,15 @@ def main() -> int:
     stock_pair_stats = summarize(timings["stock_pair"])
     stock_down_stats = summarize(timings["stock_down"])
     speedup = stock_stats["median_ms"] / candidate_stats["median_ms"]
+    # MTP verification is a fixed B=6 workload. Report effective rows/ms in
+    # addition to dispatch latency so a B=6 run cannot be mistaken for a
+    # one-token decode result when comparing candidate kernels.
+    stock_stats["effective_tokens_per_ms"] = (
+        args.tokens / stock_stats["median_ms"]
+    )
+    candidate_stats["effective_tokens_per_ms"] = (
+        args.tokens / candidate_stats["median_ms"]
+    )
     passed = exact and speedup >= args.min_speedup
     print(
         json.dumps(
@@ -332,6 +341,7 @@ def main() -> int:
                 "shard_weights": shard_weights,
                 "shards": shard_names,
                 "tokens": args.tokens,
+                "mtp_fixed_depth_geometry": args.tokens == 6,
                 "dtype": args.dtype,
                 "shapes": {
                     "up": list(up_weight.shape),
