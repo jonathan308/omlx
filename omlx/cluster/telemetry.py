@@ -308,6 +308,12 @@ class RuntimeTelemetry:
                 for sample in self._requests.values()
             )
 
+    def active_request_count(self) -> int:
+        """Current rank-local requests, for quiescence-gated maintenance."""
+
+        with self._lock:
+            return len(self._requests)
+
     def make_cancel_vote(self, uids: Any) -> dict[str, Any]:
         """Create the next rank-zero-owned, monotonically ordered cancel vote."""
 
@@ -1044,6 +1050,7 @@ def install_server_telemetry(
     original_generation_context = mlx_server.GenerationContext
     original_time_budget = mlx_server.TimeBudget
     original_handle_completion = mlx_server.APIHandler.handle_completion
+    original_do_post = mlx_server.APIHandler.do_POST
     cancellation_state = threading.local()
     marker_path = getattr(marker, "path", None)
     marker_payload = getattr(marker, "payload", None)
@@ -1066,6 +1073,7 @@ def install_server_telemetry(
     )
 
     snapshot_ctx = threading.local()
+    prompt_cache_instances: list[Any] = []
     snapshot_step = max(1, int(prefill_step_size))
     ssd_store = None
     if ssd_cache_dir:
@@ -1471,6 +1479,80 @@ def install_server_telemetry(
             request._omlx_transport_request_id = request_id
         return original_handle_completion(handler, request, stop_words)
 
+    def maintenance_do_post(handler: Any) -> Any:
+        """Private rank-local cache maintenance endpoint.
+
+        The public coordinator invokes this on every rank. It is bound to
+        loopback by the worker, authenticated with the signed plan hash, and
+        refuses to race a live request. Keeping the store clear in-process is
+        essential: deleting only coordinator files leaves peer manifests and
+        write-behind queues able to resurrect stale snapshots.
+        """
+
+        modes = {
+            "/omlx/internal/cache/ssd/clear": (True, False),
+            "/omlx/internal/cache/hot/clear": (False, True),
+            "/omlx/internal/cache/all/clear": (True, True),
+        }
+        selected = modes.get(handler.path)
+        if selected is None:
+            return original_do_post(handler)
+        if handler.headers.get("X-oMLX-Plan-Hash") != marker_plan_hash:
+            handler._set_completion_headers(403)
+            handler.end_headers()
+            handler.wfile.write(b'{"error":"invalid maintenance token"}')
+            return None
+        active = telemetry.active_request_count()
+        if active:
+            handler._set_completion_headers(409)
+            handler.end_headers()
+            handler.wfile.write(
+                json.dumps({"error": "requests are active", "active": active}).encode()
+            )
+            return None
+        clear_ssd, clear_hot = selected
+        deleted = 0
+        cleared = 0
+        try:
+            if clear_ssd and ssd_store is not None:
+                deleted = ssd_store.clear(timeout=30.0)
+            if clear_hot:
+                for cache in tuple(prompt_cache_instances):
+                    before = len(cache)
+                    cache.trim_to(n_sequences=0, n_bytes=0)
+                    cleared += before
+            memory_entries = sum(len(cache) for cache in prompt_cache_instances)
+            memory_bytes = sum(cache.nbytes for cache in prompt_cache_instances)
+            disk_entries = len(ssd_store) if ssd_store is not None else 0
+            disk_bytes = ssd_store.nbytes if ssd_store is not None else 0
+            telemetry.observe_cache_state(
+                entries=memory_entries + disk_entries,
+                nbytes=memory_bytes + disk_bytes,
+                memory_entries=memory_entries,
+                memory_bytes=memory_bytes,
+                ssd_entries=disk_entries,
+                ssd_bytes=disk_bytes,
+                **ssd_store_observability(),
+            )
+        except TimeoutError as exc:
+            handler._set_completion_headers(503)
+            handler.end_headers()
+            handler.wfile.write(json.dumps({"error": str(exc)}).encode())
+            return None
+        body = json.dumps(
+            {
+                "status": "ok",
+                "rank": rank,
+                "ssd_deleted": deleted,
+                "hot_cleared": cleared,
+            },
+            separators=(",", ":"),
+        ).encode()
+        handler._set_completion_headers(200)
+        handler.end_headers()
+        handler.wfile.write(body)
+        return None
+
     def snapshotting_stream_generate(*args: Any, **kwargs: Any) -> Any:
         """Deposit a snapshot at each prefill boundary before it is overwritten.
 
@@ -1516,6 +1598,7 @@ def install_server_telemetry(
     mlx_server.GenerationContext = CoordinatedGenerationContext
     mlx_server.TimeBudget = PrefillCancellationTimeBudget
     mlx_server.APIHandler.handle_completion = request_correlated_handle_completion
+    mlx_server.APIHandler.do_POST = maintenance_do_post
     if ssd_store is not None:
         mlx_server.stream_generate = snapshotting_stream_generate
     # Started here rather than by the caller: this block is exactly the span
@@ -1532,6 +1615,7 @@ def install_server_telemetry(
         mlx_server.GenerationContext = original_generation_context
         mlx_server.TimeBudget = original_time_budget
         mlx_server.APIHandler.handle_completion = original_handle_completion
+        mlx_server.APIHandler.do_POST = original_do_post
         mlx_server.stream_generate = original_stream_generate
         if ssd_store is not None and not ssd_cache_persistent:
             # Legacy process-lifetime mode: a hard crash skips this and the

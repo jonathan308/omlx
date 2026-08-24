@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for rank-local, end-to-end distributed inference telemetry."""
 
+import json
 import threading
 import time
+from io import BytesIO
 from types import SimpleNamespace
 
 from omlx.cluster.performance import execution_profile

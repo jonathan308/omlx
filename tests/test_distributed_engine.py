@@ -50,6 +50,7 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
         base_url="http://127.0.0.1:1",
         transport=httpx.MockTransport(handler),
     )
+    engine._supervisor.port = 8001
     return engine
 
 

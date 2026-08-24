@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import shlex
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -276,6 +277,87 @@ class DistributedBatchedEngine(BatchedEngine):
         """Return the bounded launcher/rank state used by the admin UI."""
 
         return self._supervisor.status().to_dict()
+
+    async def clear_prompt_caches(
+        self,
+        *,
+        ssd: bool = False,
+        hot: bool = False,
+    ) -> dict[str, Any]:
+        """Quiescence-gated cache clear executed on every inference rank."""
+
+        if not ssd and not hot:
+            return {"status": "ok", "ranks": [], "ssd_deleted": 0, "hot_cleared": 0}
+        if not self._loaded or self._client is None or self._supervisor.port is None:
+            raise DistributedInferenceError("distributed engine is not loaded")
+        async with self._active_lock:
+            if self._active_requests:
+                raise DistributedInferenceError(
+                    "distributed cache clear refused while requests are active"
+                )
+        mode = "all" if ssd and hot else "ssd" if ssd else "hot"
+        path = f"/omlx/internal/cache/{mode}/clear"
+        headers = {"X-oMLX-Plan-Hash": self.deployment.plan_hash}
+
+        async def clear_rank_zero() -> dict[str, Any]:
+            response = await self._client.post(path, headers=headers)
+            if response.status_code >= 400:
+                raise DistributedInferenceError(
+                    "rank 0 cache clear failed: "
+                    f"HTTP {response.status_code} {response.text[:300]}"
+                )
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                raise DistributedInferenceError("rank 0 returned invalid cache-clear JSON")
+            return payload
+
+        def clear_remote(rank: int, ssh_target: str) -> dict[str, Any]:
+            url = f"http://127.0.0.1:{self._supervisor.port}{path}"
+            command = shlex.join(
+                [
+                    "/usr/bin/curl",
+                    "-fsS",
+                    "--max-time",
+                    "40",
+                    "-X",
+                    "POST",
+                    "-H",
+                    f"X-oMLX-Plan-Hash: {self.deployment.plan_hash}",
+                    url,
+                ]
+            )
+            completed = _run_cluster_ssh(
+                ssh_target,
+                command,
+                timeout=45.0,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise DistributedInferenceError(
+                    f"rank {rank} cache clear failed over SSH: {detail[:300]}"
+                )
+            try:
+                payload = json.loads(completed.stdout)
+            except json.JSONDecodeError as exc:
+                raise DistributedInferenceError(
+                    f"rank {rank} returned invalid cache-clear JSON"
+                ) from exc
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                raise DistributedInferenceError(
+                    f"rank {rank} returned an invalid cache-clear result"
+                )
+            return payload
+
+        tasks = [clear_rank_zero()]
+        for rank, host in enumerate(self.deployment.hosts[1:], start=1):
+            tasks.append(asyncio.to_thread(clear_remote, rank, host.ssh))
+        reports = await asyncio.gather(*tasks)
+        return {
+            "status": "ok",
+            "ranks": reports,
+            "ssd_deleted": sum(int(item.get("ssd_deleted", 0)) for item in reports),
+            "hot_cleared": sum(int(item.get("hot_cleared", 0)) for item in reports),
+        }
 
     async def start(self) -> None:
         if self._loaded:
