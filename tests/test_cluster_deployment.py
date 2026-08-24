@@ -130,6 +130,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_OUTPUT_CHAIN_PREFILL",
         "OMLX_DSV4_HC_RESIDUAL_OVERLAP",
         "OMLX_DSV4_NAX_MOE_BLOCKS",
+        "OMLX_DSV4_COMBINED_MOE_PREFILL",
         "OMLX_TP_MOE_SHARD_WEIGHTS",
         "OMLX_TP_NON_MOE_SHARD_WEIGHTS",
         "OMLX_CLUSTER_VOCAB_PARALLEL",
@@ -183,6 +184,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0" in envs
     assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=0" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=0" in envs
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=0" in envs
     assert "OMLX_TP_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_TP_NON_MOE_SHARD_WEIGHTS=" in envs
     assert "OMLX_CLUSTER_VOCAB_PARALLEL=auto" in envs
@@ -216,6 +218,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "1")
     monkeypatch.setenv("OMLX_DSV4_NAX_MOE_BLOCKS", "1")
+    monkeypatch.setenv("OMLX_DSV4_COMBINED_MOE_PREFILL", "1")
     monkeypatch.setenv("OMLX_TP_MOE_SHARD_WEIGHTS", "4,4")
     deployment = _deployment()
 
@@ -255,6 +258,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=1" in envs
     assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=1" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=1" in envs
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=1" in envs
     assert envs.count("OMLX_TP_MOE_SHARD_WEIGHTS=4,4") == 1
     # Untouched knobs keep their tuned defaults.
     assert "MLX_MAX_MB_PER_BUFFER=512" in envs

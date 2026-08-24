@@ -49,6 +49,11 @@ def _eligible(monkeypatch, **overrides):
     monkeypatch.setattr(
         sl, "_DEEPSEEK_MXFP4_NAX_BLOCKS", overrides.pop("enabled", True)
     )
+    monkeypatch.setattr(
+        sl,
+        "_DEEPSEEK_MXFP4_COMBINED",
+        overrides.pop("combined", False),
+    )
     verify = overrides.pop("verify", False)
     monkeypatch.setattr(sl, "is_dspark_verify_armed", lambda: verify)
     nax_available = overrides.pop("nax_available", True)
@@ -123,6 +128,13 @@ def test_only_exact_enabled_m5_rank1_3x5_shape_is_eligible(monkeypatch):
     assert _eligible(monkeypatch)
 
 
+def test_combined_switch_selects_the_same_exact_m5_rank1_contract(monkeypatch):
+    assert _eligible(monkeypatch, enabled=False, combined=True)
+    assert not _eligible(
+        monkeypatch, enabled=False, combined=True, tp=(2, 0, (3, 5))
+    )
+
+
 @pytest.mark.parametrize(
     "override",
     (
@@ -166,6 +178,12 @@ def test_preflight_precedes_block_plan_and_all_candidate_invocations():
     down_call = source.rindex(f"glm_fast.{SYMBOL}")
     assert preflight < legacy_cast < plan < pair_call < down_call
     assert "except" not in source[preflight:down_call]
+
+
+def test_combined_m5_path_uses_separate_nax_projections_not_fused_pair():
+    source = inspect.getsource(sl.SwitchGLU.__call__)
+    assert source.count(f"glm_fast.{SYMBOL}") == 3
+    assert "deepseek_mxfp4_gather_qmm_pair_blocks_nax" not in source
 
 
 def test_exact_config_and_tp_fingerprints_are_attached_by_model_and_shard():

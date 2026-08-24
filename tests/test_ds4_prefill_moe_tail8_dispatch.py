@@ -29,19 +29,37 @@ class _Projection:
 
 def _eligible(monkeypatch, **overrides):
     monkeypatch.setattr(sl, "_DEEPSEEK_MXFP4_TAIL8", overrides.pop("enabled", True))
+    combined = overrides.pop("combined", False)
+    monkeypatch.setattr(sl, "_DEEPSEEK_MXFP4_COMBINED", combined)
+    verify = overrides.pop("verify", False)
+    monkeypatch.setattr(sl, "is_dspark_verify_armed", lambda: verify)
     nax = overrides.pop("nax", False)
     monkeypatch.setattr(sl, "is_nax_available", lambda: nax)
     missing = overrides.pop("missing_symbol", None)
     monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: name != missing)
     monkeypatch.setattr(sl, "QuantizedSwitchLinear", _Projection)
 
+    intermediate = 768 if combined else 1024
     layer = SimpleNamespace(
         training=overrides.pop("training", False),
-        up_proj=_Projection((256, 1024, 512), (256, 1024, 128)),
-        gate_proj=_Projection((256, 1024, 512), (256, 1024, 128)),
-        down_proj=_Projection((256, 4096, 128), (256, 4096, 32)),
+        _omlx_dsv4f_exact_config=overrides.pop("fingerprint", combined),
+        _omlx_dsv4f_moe_tp=overrides.pop("tp", (2, 0, (3, 5))),
+        up_proj=_Projection(
+            (256, intermediate, 512), (256, intermediate, 128)
+        ),
+        gate_proj=_Projection(
+            (256, intermediate, 512), (256, intermediate, 128)
+        ),
+        down_proj=_Projection(
+            (256, 4096, intermediate // 8),
+            (256, 4096, intermediate // 32),
+        ),
         activation=SimpleNamespace(limit=10.0, fp32=False),
     )
+    if combined:
+        monkeypatch.setattr(
+            sl.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"}
+        )
     block_plan = (
         _Tensor((448, 3), mx.int32),
         _Tensor((1,), mx.int32),
@@ -62,6 +80,19 @@ def _eligible(monkeypatch, **overrides):
         ("mxfp4", "mxfp4", "mxfp4"),
         True,
         block_plan,
+    )
+
+
+def test_combined_switch_accepts_only_exact_m3_rank0_three_five_slice(monkeypatch):
+    assert _eligible(monkeypatch, combined=True, enabled=False)
+    assert not _eligible(
+        monkeypatch, combined=True, enabled=False, tp=(2, 1, (3, 5))
+    )
+    assert not _eligible(
+        monkeypatch, combined=True, enabled=False, fingerprint=False
+    )
+    assert not _eligible(
+        monkeypatch, combined=True, enabled=False, verify=True
     )
 
 
@@ -106,3 +137,7 @@ def test_cluster_hostfile_carries_explicit_default_off_value(monkeypatch):
     assert "OMLX_DSV4_MOE_TAIL8=0" in deployment._hostfile_envs()
     monkeypatch.setenv("OMLX_DSV4_MOE_TAIL8", "1")
     assert "OMLX_DSV4_MOE_TAIL8=1" in deployment._hostfile_envs()
+    monkeypatch.delenv("OMLX_DSV4_COMBINED_MOE_PREFILL", raising=False)
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=0" in deployment._hostfile_envs()
+    monkeypatch.setenv("OMLX_DSV4_COMBINED_MOE_PREFILL", "1")
+    assert "OMLX_DSV4_COMBINED_MOE_PREFILL=1" in deployment._hostfile_envs()

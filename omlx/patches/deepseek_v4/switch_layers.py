@@ -67,6 +67,13 @@ _DEEPSEEK_MXFP4_TAIL8 = os.environ.get(
     "OMLX_DSV4_MOE_TAIL8", "0"
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_TAIL8_LOGGED = False
+# One rollback switch for the proven asymmetric 3:5 pair.  When enabled on
+# both ranks, M3 rank 0 uses the 3/8 tail8 path and M5 rank 1 uses the
+# separate expert-blocked NAX projections.  Every other model, rank, shape,
+# and device continues through the existing gates below.
+_DEEPSEEK_MXFP4_COMBINED = os.environ.get(
+    "OMLX_DSV4_COMBINED_MOE_PREFILL", "0"
+).strip().lower() in ("1", "true", "on")
 # Exact M=1024 M5 Max rank-1 5/8 expert-blocked TensorOps path. The physical
 # layer gate cleared every BF16 boundary at 1.513x composed, but production
 # remains explicit opt-in until the full distributed cold-prefill A/B clears.
@@ -531,7 +538,13 @@ class SwitchGLU(nn.Module):
         use_f16_moe,
         block_plan,
     ) -> bool:
-        if not _DEEPSEEK_MXFP4_TAIL8 or self.training or is_nax_available():
+        combined = _DEEPSEEK_MXFP4_COMBINED
+        if (
+            (not combined and not _DEEPSEEK_MXFP4_TAIL8)
+            or self.training
+            or is_nax_available()
+            or (combined and is_dspark_verify_armed())
+        ):
             return False
         if request_shape != (1, 1024, 4096) or indices.shape != (1, 1024, 6):
             return False
@@ -544,6 +557,23 @@ class SwitchGLU(nn.Module):
             or block_plan is None
         ):
             return False
+        if combined:
+            try:
+                exact_device = (
+                    mx.device_info().get("device_name") == "Apple M3 Ultra"
+                )
+            except Exception:
+                return False
+            if (
+                not exact_device
+                or not getattr(self, "_omlx_dsv4f_exact_config", False)
+                or getattr(self, "_omlx_dsv4f_moe_tp", None)
+                != (2, 0, (3, 5))
+            ):
+                return False
+            intermediate = 768
+        else:
+            intermediate = 1024
         projections = (self.up_proj, self.gate_proj, self.down_proj)
         if not all(
             isinstance(projection, QuantizedSwitchLinear)
@@ -552,12 +582,12 @@ class SwitchGLU(nn.Module):
             return False
         up, gate, down = projections
         if (
-            up["weight"].shape != (256, 1024, 512)
-            or up["scales"].shape != (256, 1024, 128)
+            up["weight"].shape != (256, intermediate, 512)
+            or up["scales"].shape != (256, intermediate, 128)
             or gate["weight"].shape != up["weight"].shape
             or gate["scales"].shape != up["scales"].shape
-            or down["weight"].shape != (256, 4096, 128)
-            or down["scales"].shape != (256, 4096, 32)
+            or down["weight"].shape != (256, 4096, intermediate // 8)
+            or down["scales"].shape != (256, 4096, intermediate // 32)
         ):
             return False
         block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
@@ -591,7 +621,7 @@ class SwitchGLU(nn.Module):
         """Preflight the exact DS4F M5 rank-1 5/8 BF16 contract."""
 
         if (
-            not _DEEPSEEK_MXFP4_NAX_BLOCKS
+            not (_DEEPSEEK_MXFP4_NAX_BLOCKS or _DEEPSEEK_MXFP4_COMBINED)
             or self.training
             or is_dspark_verify_armed()
             or not getattr(self, "_omlx_dsv4f_exact_config", False)
@@ -775,7 +805,8 @@ class SwitchGLU(nn.Module):
                 logging.getLogger(__name__).info(
                     "DeepSeek V4 exact M5 NAX BM32 routed-MoE prefill active "
                     "(rank=1, TP=3:5, M=1024; "
-                    "OMLX_DSV4_NAX_MOE_BLOCKS=0 disables)"
+                    "OMLX_DSV4_NAX_MOE_BLOCKS=0 and "
+                    "OMLX_DSV4_COMBINED_MOE_PREFILL=0 disable)"
                 )
             block_meta, block_count = nax_block_plan
             x_up = glm_fast.deepseek_mxfp4_gather_qmm_blocks_nax(

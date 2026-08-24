@@ -167,6 +167,10 @@ _RANK_ENV_DEFAULTS = (
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.
     ("OMLX_DSV4_MOE_TAIL8", "0"),
+    # Combined asymmetric 3:5 routed-MoE prefill: M3 rank 0 tail8 plus
+    # separate M5 rank 1 expert-blocked NAX projections. One rollback value
+    # must reach every rank; exact local device/shape/rank gates decide use.
+    ("OMLX_DSV4_COMBINED_MOE_PREFILL", "0"),
     # Exact M=1024 M5 TensorOps O-A projection for the 40-head 5/8 shard.
     # Default-off until the full TP A/B clears; exporting the value prevents
     # coordinator/worker capability decisions from diverging.

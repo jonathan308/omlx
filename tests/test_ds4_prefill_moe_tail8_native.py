@@ -42,6 +42,7 @@ def test_tail8_native_source_is_fixed_shape_and_production_default_off():
     assert "MICRO_BM = 8" in metal
     assert "if (rows > 24)" in metal
     assert '"OMLX_DSV4_MOE_TAIL8", "0"' in switch
+    assert '"OMLX_DSV4_COMBINED_MOE_PREFILL", "0"' in switch
     assert PAIR in switch
     assert DOWN in switch
 
