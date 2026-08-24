@@ -663,7 +663,12 @@ def _rdma_fabric_caps(caps: "PeerCaps", runner: Callable[..., Any] = subprocess.
         return
     rdma_ctl = "/usr/bin/rdma_ctl"
     ibv_devices = "/usr/bin/ibv_devices"
-    if not (os.path.exists(rdma_ctl) and os.path.exists(ibv_devices)):
+    # A custom runner is the injectable capability surface used by probes and
+    # tests on Macs whose base image does not ship RDMA tools. Only the real
+    # subprocess path requires those absolute executables to exist locally.
+    if runner is subprocess.run and not (
+        os.path.exists(rdma_ctl) and os.path.exists(ibv_devices)
+    ):
         return
     try:
         status = runner(  # noqa: S603 - fixed system executable

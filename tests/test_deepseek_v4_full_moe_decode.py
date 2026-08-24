@@ -260,4 +260,9 @@ def test_switchglu_full_decode_accepts_served_asymmetric_tp_width(monkeypatch):
     monkeypatch.setattr(
         switch_layers, "_DEEPSEEK_MXFP4_FULL_DECODE_MAX_TOKENS", 1
     )
+    monkeypatch.setattr(
+        switch_layers.glm_fast,
+        "has_symbol",
+        lambda name: name == "deepseek_mxfp4_full_decode",
+    )
     assert switch._can_use_mxfp4_full_decode(x, indices, scores)

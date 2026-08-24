@@ -247,6 +247,11 @@ def test_no_unreachable_functions_in_the_cluster_package():
         # Settings write path for cluster.json; the admin settings endpoint
         # that calls it lands with the cluster settings UI.
         ("discovery.py", "save_cluster_name"),
+        # Synthetic rank probes may nominate an asymmetric vector for operator
+        # diagnostics, but production deliberately consumes only persisted
+        # full-model parity qualifications. Keep the candidate generator
+        # testable without pretending it is a launch path.
+        ("planner.py", "_tensor_shard_weights"),
     }
 
     sources = {

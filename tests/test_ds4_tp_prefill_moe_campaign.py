@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import itertools
 import json
 from pathlib import Path
@@ -9,11 +10,11 @@ import pytest
 from benchmarks.bench_ds4_tp_prefill_moe_campaign import (
     ExpertBlock,
     Shape,
+    analysis_report,
     bf16,
     bf16_bits,
     deterministic_expert_map,
     materialization_ledger,
-    analysis_report,
     reference_top6_scalar,
     roofline,
     sorted_route_top6_scalar,
@@ -136,8 +137,40 @@ def test_isolated_metal_prototype_keeps_shared_x_and_ordered_non_atomic_tail():
     assert "atomic_" not in native
 
 
+def _python_references_exact_symbol(source: str, symbol: str) -> bool:
+    tree = ast.parse(source)
+    return any(
+        (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value == symbol
+        )
+        or (isinstance(node, ast.Name) and node.id == symbol)
+        or (isinstance(node, ast.Attribute) and node.attr == symbol)
+        for node in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("fast.has_symbol('rejected_kernel')", True),
+        ("fast.rejected_kernel(x)", True),
+        ('fast.has_symbol("rejected_kernel_tail8")', False),
+    ),
+)
+def test_exact_native_symbol_reference_ignores_longer_qualified_names(
+    source,
+    expected,
+):
+    assert _python_references_exact_symbol(source, "rejected_kernel") is expected
+
+
 def test_phase_a_native_symbol_is_isolated_from_production_dispatch():
     root = Path(__file__).parents[1]
+    # Match the exact Phase-A symbol, independent of quote style or whether a
+    # caller accesses the binding as a Python attribute. Do not confuse it
+    # with the separately qualified ``...blocks_tail8`` production symbol.
     symbol = "deepseek_mxfp4_gather_qmm_pair_swiglu_blocks"
     allowed = {
         root / "omlx/custom_kernels/glm_moe_dsa/fast.py",
@@ -148,7 +181,9 @@ def test_phase_a_native_symbol_is_isolated_from_production_dispatch():
     }
     production_hits = []
     for path in (root / "omlx").rglob("*.py"):
-        if path not in allowed and symbol in path.read_text():
+        if path in allowed:
+            continue
+        if _python_references_exact_symbol(path.read_text(), symbol):
             production_hits.append(path)
     assert production_hits == []
 
