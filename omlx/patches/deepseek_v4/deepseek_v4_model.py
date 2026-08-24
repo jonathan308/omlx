@@ -1610,6 +1610,22 @@ _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS = os.getenv(
     # all-gather to the larger 640-row shard outweighed the score imbalance.
     "OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS = tuple(
+        int(value)
+        for value in os.getenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS", "").split(",")
+        if value.strip()
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS = ()
+try:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL = max(
+        0,
+        int(os.getenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "16000")),
+    )
+except ValueError:
+    _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL = 16000
+_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED = False
 # JACCL's two-rank all-gather lost a completion during the 100K lifetime
 # gate.  DS4 row parallelism does not need a general collective here: each
 # rank already knows the peer's exact row shape and both need only exchange
@@ -1769,28 +1785,49 @@ def _weighted_row_ranges(
 def _indexer_row_ranges(
     length: int,
     group: mx.distributed.Group,
+    pooled_tokens: Optional[int] = None,
 ) -> Tuple[Tuple[int, int], ...]:
-    """Use qualified TP compute weights, otherwise preserve equal splitting."""
+    """Use explicit long-context compute weights or preserve equal splitting."""
 
-    weights = (
-        _tp_partition_weights(group)
-        if _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS
-        else None
+    size = int(group.size())
+    explicit = _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS
+    explicit_active = (
+        len(explicit) == size
+        and all(weight > 0 for weight in explicit)
+        and pooled_tokens is not None
+        and pooled_tokens >= _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL
     )
+    weights = explicit if explicit_active else None
+    if weights is None and _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS:
+        weights = _tp_partition_weights(group)
     if weights is None:
-        return _balanced_row_ranges(length, int(group.size()))
-    return _weighted_row_ranges(length, weights)
+        return _balanced_row_ranges(length, size)
+    ranges = _weighted_row_ranges(length, weights)
+    if explicit_active:
+        global _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED
+        if not _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED:
+            _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_LOGGED = True
+            logging.getLogger(__name__).info(
+                "deepseek_v4: long-context indexer rows use explicit "
+                "weights=%s ranges=%s pool=%d (min_pool=%d)",
+                weights,
+                ranges,
+                pooled_tokens,
+                _DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL,
+            )
+    return ranges
 
 
 def _gather_indexer_rows(
     local_indices: mx.array,
     total_rows: int,
     group: Any,
+    pooled_tokens: Optional[int] = None,
 ) -> mx.array:
     """Reassemble uneven row shards after exact per-row top-k selection."""
 
     size = int(group.size())
-    ranges = _indexer_row_ranges(total_rows, group)
+    ranges = _indexer_row_ranges(total_rows, group, pooled_tokens)
     rank = int(group.rank()) if hasattr(group, "rank") else -1
     row_counts = tuple(stop - start for start, stop in ranges)
     # For unequal TP2 rows, rank zero's reconstruction depends on send before
@@ -2842,7 +2879,7 @@ class Indexer(nn.Module):
         )
         query_offset = offset
         if row_sharded:
-            ranges = _indexer_row_ranges(L, row_group)
+            ranges = _indexer_row_ranges(L, row_group, int(pooled.shape[1]))
             start, stop = ranges[int(row_group.rank())]
             x = x[:, start:stop]
             q_residual = q_residual[:, start:stop]
@@ -2930,7 +2967,10 @@ class Indexer(nn.Module):
                     if hierarchical_indices is not None:
                         indices = (
                             _gather_indexer_rows(
-                                hierarchical_indices, total_rows, row_group
+                                hierarchical_indices,
+                                total_rows,
+                                row_group,
+                                int(pooled.shape[1]),
                             )
                             if row_sharded
                             else hierarchical_indices
@@ -3040,7 +3080,12 @@ class Indexer(nn.Module):
                     )[:, 0]
                     indices = mx.sort(indices, axis=-1)
                     indices = (
-                        _gather_indexer_rows(indices, total_rows, row_group)
+                        _gather_indexer_rows(
+                            indices,
+                            total_rows,
+                            row_group,
+                            int(pooled.shape[1]),
+                        )
                         if row_sharded
                         else indices
                     )
@@ -3120,7 +3165,12 @@ class Indexer(nn.Module):
             )
         indices = _fp32_topk_indices(scores, k)
         indices = (
-            _gather_indexer_rows(indices, total_rows, row_group)
+            _gather_indexer_rows(
+                indices,
+                total_rows,
+                row_group,
+                int(pooled.shape[1]),
+            )
             if row_sharded
             else indices
         )

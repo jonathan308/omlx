@@ -103,6 +103,11 @@ _RANK_ENV_DEFAULTS = (
     # all_gather. The first 3:5/30K live gate was slower, so retain the exact
     # implementation only as an operator A/B and ship equal row counts.
     ("OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"),
+    # Optional long-context query-row balance independent of tensor weight
+    # ownership. Empty preserves equal rows; the pool threshold prevents a
+    # heterogeneous qualification from perturbing short prompts.
+    ("OMLX_DSV4_INDEXER_ROW_WEIGHTS", ""),
+    ("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "16000"),
     # Below 2K pooled entries the fixed top-k exchange can cost more than the
     # saved score work; the threshold turns the split on where context taper
     # begins instead of perturbing short-prompt performance.

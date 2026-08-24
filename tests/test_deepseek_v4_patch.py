@@ -2394,7 +2394,7 @@ class TestIndexerFallbackTiling:
         monkeypatch.setattr(
             dm,
             "_gather_indexer_rows",
-            lambda local, total_rows, group: local,
+            lambda local, total_rows, group, pooled_tokens=None: local,
         )
         indexer.row_sharding_group = Group(0)
         first = indexer(x, q_residual, rope, None, 0)
@@ -2451,6 +2451,37 @@ class TestIndexerFallbackTiling:
         assert gathered.tolist() == [
             [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
         ]
+
+    def test_tensor_prefill_explicit_rows_activate_only_after_pool_threshold(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS", (9, 7))
+        monkeypatch.setattr(
+            dm,
+            "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS_MIN_POOL",
+            16000,
+        )
+        group = SimpleNamespace(size=lambda: 2)
+
+        assert dm._indexer_row_ranges(1024, group, 15999) == (
+            (0, 512),
+            (512, 1024),
+        )
+        assert dm._indexer_row_ranges(1024, group, 16000) == (
+            (0, 576),
+            (576, 1024),
+        )
+
+    def test_tensor_prefill_invalid_explicit_rows_fail_closed_to_balanced(
+        self, applied_patch, monkeypatch
+    ):
+        _mx, dm = self._reduce_and_ref()
+        group = SimpleNamespace(size=lambda: 2)
+
+        for weights in ((9,), (9, 0), (9, -1)):
+            monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_ROW_WEIGHTS", weights)
+            assert dm._indexer_row_ranges(8, group, 20000) == ((0, 4), (4, 8))
 
     def test_tensor_prefill_weighted_row_gather_preserves_sequence_order(
         self, applied_patch, monkeypatch
