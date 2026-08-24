@@ -9,9 +9,11 @@ general oMLX result.
 
 ## Beta 1 qualification topology
 
-The Beta 1 qualification snapshot below was captured from clean source commit
-`6ebc22a822e3b50fe3c3d59acf1da62e8694f5dc`. It records accepted end-to-end
-observations; it is not a statistical claim beyond the identified runs.
+The Qwen qualification snapshot below was captured from clean source commit
+`6ebc22a822e3b50fe3c3d59acf1da62e8694f5dc`. The current lossless DS4 snapshot
+was captured from clean source commit
+`5575294f13fad2a2985ac2746ea5fcf6223c911b`. They record accepted end-to-end
+observations; neither is a statistical claim beyond the identified runs.
 
 For this snapshot, **cold prefix** means `prefix-miss` on an already loaded
 deployment. It does not mean `cold-process`, does not include model-load time,
@@ -45,14 +47,16 @@ Apple Silicon setup:
 | Interconnect | Direct Thunderbolt 5 link |
 | Collective backend | JACCL Thunderbolt RDMA |
 | Model | DeepSeek-V4-Flash-0731-MXFP4-MLX (DS4 MXFP4) |
-| Tensor-parallel split | 3:5 (M3 Ultra:M5 Max) |
+| Tensor-parallel split | Equal `4:4` (M3 Ultra:M5 Max) |
 | Speculative verification | MTP fixed depth 5, when explicitly enabled |
 
-The 3:5 notation describes the signed tensor-parallel partition, not a machine
-count. Results from a single-rank microbenchmark, a modeled JACCL transfer, or
-only one of the two machines must say so; those results are not end-to-end
-two-host measurements. Record whether the direct TB5/JACCL path was physically
-active and measured rather than inferred from a bandwidth model.
+The equal split is deliberate. A `3:5` candidate was faster (about 826 tok/s
+average at 30K) but changed a deterministic greedy completion on the parity
+corpus, so its exact runtime key is persisted as rejected and Automatic falls
+back to `4:4`. Results from a single-rank microbenchmark, a modeled JACCL
+transfer, or only one of the two machines must say so; those results are not
+end-to-end two-host measurements. Record whether the direct TB5/JACCL path was
+physically active and measured rather than inferred from a bandwidth model.
 
 ### Accepted Beta 1 measurements
 
@@ -67,12 +71,12 @@ request.
 | Qwen TP2 `1:1` | Exact-prompt repeat | `hot-prefix-hit` (rank prompt LRU), fixed prompt | not applicable | not applicable | 30,004/30,005 tokens cached; TTFT 19.92 s -> 0.67 s |
 | Qwen TP2 `1:1` | Concurrent decode | `concurrent-4`, independent prompts, non-MTP | 216.3 aggregate | not recorded here | 4 x 512 output tokens; 2,048 tokens in 9.469 s |
 | Qwen TP2 `1:1` | In-flight cancellation | cold-prefix prefill | not applicable | not applicable | Both ranks stopped at 26,624 processed tokens and returned ready |
-| DS4 TP2 `3:5` | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 841.51 | 846.90 | Non-MTP prefill |
-| DS4 TP2 `3:5` | 100K prefill | cold-prefix (`prefix-miss`), single-stream | 771.77 | 773.86 | Non-MTP prefill |
-| DS4 TP2 `3:5` | 250K prefill | cold-prefix (`prefix-miss`), single-stream | 621.79 | 622.74 | Non-MTP prefill |
-| DS4 TP2 `3:5` | Decode | `prefix-miss`, single-stream, non-MTP | approximately 30-32 | not recorded here | B1 |
-| DS4 TP2 `3:5` | Decode | `prefix-miss`, single-stream, MTP depth 5 | 75.93 | not recorded here | B1 |
-| DS4 TP2 `3:5` | Concurrent decode | `concurrent-4`, non-MTP | 69.3 aggregate | not recorded here | B4 |
+| DS4 TP2 `4:4` | 30K prefill (`metal`) | cold-prefix (`prefix-miss`), single-stream | 742.17 | not recorded here | Non-MTP, promoted equal-M3 output-chain + routed-MoE tail kernels |
+| DS4 TP2 `4:4` | 30K prefill (`hello`) | cold-prefix (`prefix-miss`), single-stream | 722.80 | not recorded here | Same gate and identical completion hash; two-prompt average 732.49 |
+| DS4 TP2 `4:4` | 100K prefill (`world`) | cold-prefix (`prefix-miss`), single-stream | 684.66 | not recorded here | Identical completion hash; 6.5% taper from the matched 30K prompt |
+| DS4 TP2 `4:4` | Decode | `prefix-miss`, single-stream, non-MTP | approximately 29-31 | approximately 30 | B1; exact M=1 HC continuation remained off after a flat physical A/B |
+| DS4 TP2 `4:4` | Decode | `prefix-miss`, single-stream, MTP fixed depth 5 | 79.8-80.6 raw | approximately 77-80 | High-acceptance prompts; acceptance-dependent chat cases are lower |
+| DS4 TP2 `4:4` | Concurrent decode | `concurrent-4`, non-MTP | 63.74 aggregate | not recorded here | Four distinct request rows and equal hashes |
 | DS4 single M3 Ultra | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 481.02 | not applicable | Accepted single-node kernel stack; no distributed transport |
 
 The Qwen parity set used deterministic greedy requests with thinking disabled:
@@ -141,7 +145,7 @@ At minimum, a performance-bearing prerelease should link raw evidence for:
 4. warm-process, SSD-prefix-hit, single-stream;
 5. warm-process, prefix-miss, concurrent-N;
 6. warm-process, prefix-hit, concurrent-N;
-7. the same declared DS4/MTP depth-5 and 3:5 TP configuration used for a DS4
+7. the same declared DS4/MTP depth-5 and lossless `4:4` TP configuration used for a DS4
    headline comparison;
 8. the same declared Qwen non-MTP and 1:1 TP configuration used for a Qwen
    headline comparison, with Qwen MTP marked `not qualified` until separately

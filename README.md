@@ -176,19 +176,20 @@ Web UI at `/admin` for real-time monitoring, model management, chat, benchmark, 
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX Admin Dashboard" width="720">
 </p>
 
-### Experimental Multi-Mac Inference
+### Cluster v2 Multi-Mac Inference
 
-Source builds can split one downloaded language model across unequal-memory Macs
-using MLX pipeline ranks over Ring or Thunderbolt RDMA/JACCL. The Cluster
-dashboard handles read-only peer discovery, strict SSH/runtime verification,
-byte-aware unequal shard planning, measured compute/link rebalancing,
-headroom-aware execution tuning, activation, and a live shard/performance map
-on both Macs. Interactive, balanced, and throughput profiles expose coalesced
-batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
-and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
-security boundaries, current limitations, and the physical-hardware validation
-checklist.
+The Cluster v2 Beta candidate discovers and pairs Macs, verifies Thunderbolt
+RDMA or an explicit TCP fallback, inventories and stages a model, recommends
+tensor/pipeline placement, signs the exact shard plan, and serves it through the
+normal APIs and dashboard. Tensor ranks retain only their tensor slices in
+memory; pipeline ranks retain only their layer ranges. Per-node model paths,
+progressive loading, memory guards, tiered rank caches, targeted cancellation,
+orphan recovery, continuous batching, independent request metrics and signed
+replanning are part of the same lifecycle.
+
+See [Distributed inference across Macs](docs/distributed-cluster.md) for setup
+and security boundaries, and the [Cluster v2 Beta contract](docs/cluster-v2-beta.md)
+for the complete feature-PR evidence and release gates.
 
 ### Vision-Language Models
 

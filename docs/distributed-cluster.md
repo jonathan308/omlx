@@ -1,11 +1,14 @@
 # Distributed inference across Macs
 
-Status: experimental, source-build preview
+Status: Cluster v2 Beta candidate (source build; release qualification remains
+mandatory)
 
-oMLX can run one downloaded MLX model across two unequal-memory Macs while
-preserving its existing OpenAI-compatible API. The first implementation uses
-contiguous pipeline stages: each rank loads only its assigned transformer
-layers, while rank zero remains the API coordinator.
+oMLX can run one downloaded MLX model across a capability-matched group of
+Macs while preserving its existing OpenAI-compatible API. Automatic planning
+chooses tensor parallelism for supported models and fast links, contiguous
+pipeline stages for capacity-oriented or non-TP models, or a capability-gated
+TP x pipeline factorization. Rank zero remains the API coordinator; it never
+silently loads a second full local model when a distributed launch fails.
 
 Experimental Mac + NVIDIA execution is available through the outer MLX Ring
 compatibility path. See the [heterogeneous model-pool guide](heterogeneous-cluster.md)
@@ -15,15 +18,24 @@ gateway.
 
 The implementation currently provides:
 
-- read-only Thunderbolt, RDMA interface, IP, route, memory, and runtime probes;
-- untrusted Bonjour suggestions for Macs advertising SSH;
+- stable node identities plus untrusted Bonjour, IPv6 multicast, manual-IP,
+  persisted-pair and opportunistic Tailscale control-plane discovery;
+- read-only Thunderbolt, RDMA interface, IP, route, memory, power, runtime,
+  kernel and JACCL fingerprint probes;
+- consent-based pairing, persistent 0600 device records, signed short-lived
+  enrollment, automatic key exchange and changed-host-key refusal;
 - GUI-generated, ten-minute, single-use CUDA worker enrollment with pinned
   bootstrap/source digests and pinned SSH identities;
 - prompt-free SSH trust-on-first-use: new peer aliases are recorded in the
   user's `known_hosts`, while changed keys are still refused;
-- exact oMLX, MLX, MLX-LM, cluster-protocol, remote model-path, and bounded
-  model-manifest preflight (config/tokenizer metadata plus weight headers);
-- safetensors-header planning across unequal memory budgets;
+- exact oMLX, MLX, MLX-LM, cluster-protocol, per-node model-path, import and
+  bounded model-manifest preflight (config/tokenizer/processor metadata plus
+  weight headers);
+- unioned model inventory, resumable staging, per-node path mapping, complete
+  sidecar copying and safetensors-header planning across unequal budgets;
+- architecture-aware tensor sharding, progressive post-slice materialization,
+  load-time memory guards and signed per-rank residency verification, so a TP
+  rank retains its shard rather than a full in-memory checkpoint;
 - bounded per-rank MLX compute and collective calibration, followed by
   performance-aware shard rebalancing when every rank reports valid results;
 - Ring, JACCL, and JACCL Ring launch through MLX's official launcher;
@@ -33,8 +45,10 @@ The implementation currently provides:
   concurrency, prefill, coalesced-batch, prompt-cache, and KV limits;
 - native MLX-LM asynchronous next-token dispatch, multi-connection Ring tuning,
   cache affinity, and a capability-gated experimental token-only output path;
-- completion, streaming, usage, disconnect cancellation, and error propagation
+- completion, chat, Responses, Anthropic Messages, streaming, usage, targeted
+  disconnect cancellation, bounded failure propagation and orphan recovery
   through the normal oMLX engine interface;
+- rank-unanimous hot/SSD prompt snapshot reuse and all-rank cache clearing;
 - a Cluster dashboard on every Mac with a full live shard map, local-rank
   highlighting, memory headroom, rank-local KV ownership, TTFT, prefill tok/s,
   per-request and aggregate decode tok/s, pipeline utilization, prompt-cache hit
@@ -61,9 +75,13 @@ DistributedBatchedEngine
 private rank-0 MLX-LM HTTP endpoint (127.0.0.1, random port)
      |
      v
-MLX pipeline group ───────── Thunderbolt RDMA / JACCL ───────── rank 1
-  late layers + KV                                             early layers + KV
+rank 0 tensor shard ───────── Thunderbolt RDMA / JACCL ───────── rank 1 tensor shard
+ every layer + local KV                                         every layer + local KV
 ```
+
+For a pipeline plan, replace each tensor shard above with its signed contiguous
+layer range. For a hybrid plan, each stage owns a layer range and each rank
+inside that stage owns one tensor shard of those layers.
 
 The cluster runtime lives outside oMLX's main MLX scheduler process. This keeps
 the existing API adapters and model lifecycle intact while allowing MLX-LM to
@@ -105,7 +123,8 @@ recovery problem.
 On every Mac:
 
 1. Run the same oMLX build and matching MLX/MLX-LM versions.
-2. Keep the downloaded model at the same absolute path.
+2. Make the model available on each selected Mac. Paths may differ; the signed
+   deployment carries a per-node path map and staging copies missing files.
 3. Enable Remote Login and use key-based SSH for the coordinator account.
 4. Pair the Macs in oMLX. The first connection records a new hostname or
    Thunderbolt address without prompting; an identity change is still refused.
@@ -124,9 +143,9 @@ restart. Reconnect the Thunderbolt cable and verify both `rdma_ctl status` and
 `ibv_devices` before starting the cluster. oMLX does not attempt this
 Recovery-only change remotely.
 
-Rank zero is the Mac whose dashboard activates the deployment. It owns the
-late pipeline layers and the private inference coordinator. For a 256 GiB Mac
-paired with a 128 GiB Mac, rank zero should normally be the larger machine.
+Rank zero is the Mac whose dashboard activates the deployment and owns the
+private inference coordinator. Its layer/tensor ownership comes from the
+signed plan; do not infer ownership from RAM size or rank number.
 
 For an Ubuntu/Debian CUDA worker, no oMLX desktop installation is required.
 Use **Cluster > Add a CUDA worker** on the coordinator and paste its generated
@@ -144,15 +163,18 @@ enabled.
 ### Automatic Peer Discovery
 
 
-oMLX uses Bonjour/mDNS to discover nearby Macs advertising SSH or the oMLX
-specific `_omlx._tcp` service. The discovery is read-only and never implies
-trust. Discovered peers appear under **Detected nearby** with their hostname
-and service type.
+oMLX combines Bonjour/mDNS with an IPv6 multicast fallback designed for
+multi-interface and Thunderbolt Macs. Persisted paired addresses are probed at
+the fast heartbeat cadence, and Tailscale addresses may recover the reliable
+control channel when macOS denies ordinary application TCP on the direct
+Thunderbolt subnet. Tailscale never substitutes for the signed JACCL/RDMA data
+path. Discovery is untrusted and never implies pairing; **Add by IP** remains
+available when local-network permission or multicast is unavailable.
 
-For manual pairing, generate a shared pairing secret on one Mac and copy it to
-the other. Enter the same secret on both dashboards before generating and
-exchanging the short-lived SSH key tokens. The secret authenticates the token
-with HMAC-SHA256; an unkeyed or altered token is rejected.
+Pairing presents the joining Mac and a short-lived approval code. Approval
+exchanges the cluster key and SSH identity through authenticated endpoints;
+wrong, expired, replayed or altered tokens are rejected. The legacy manual key
+exchange remains available only as an advanced recovery path.
 
 ### CUDA Worker Enrollment
 
@@ -179,19 +201,23 @@ future one-gateway hierarchical Ring-to-NCCL supernode.
 
 On the coordinator:
 
-1. Connect the Thunderbolt cable. A nearby Mac should appear under
-   **Detected nearby** or via the QR code pairing.
-2. Select the peer or enter its SSH hostname. **Check peer** records a new host
-   alias automatically, refuses a changed key, and requires a non-interactive
-   SSH login key.
-3. Select **Downloaded model**, choose its local directory, set a reserve for
-   KV/activations, and build the unequal plan.
-4. Select JACCL, JACCL Ring, or the TCP Ring fallback and choose an execution
-   profile. Leave **Auto benchmark & tune** enabled to calibrate both Macs and
-   the selected link before the final shard plan is stored.
-5. Review the final measured shard map, then activate.
-6. Load or request that model through the normal oMLX API. If it was already
-   loaded locally, unload it first so the new deployment applies.
+1. Connect the Thunderbolt cable and open **Cluster**. Nearby Macs appear
+   automatically; otherwise use **Add by IP**.
+2. Pair the Mac and approve its displayed identity. The wizard establishes the
+   enrolled SSH control path without asking for an inference password.
+3. Let the automatic checks verify reachability, exact versions, model/import
+   readiness, Thunderbolt and RDMA. If RDMA is disabled, follow the displayed
+   Recovery instructions; choosing TCP ring remains explicit.
+4. Select any model in the unioned cluster inventory. Missing checkpoint and
+   sidecar files are staged before activation, including different per-node
+   paths.
+5. Leave strategy on **Automatic** or choose Tensor/Pipeline. Automatic inspects
+   model capabilities, per-node memory and measured fabric, then returns a
+   signed shard recommendation. Unequal tensor vectors require exact persisted
+   parity qualification; otherwise the plan safely uses equal tensor shards.
+6. Review every rank's layer range, tensor share, memory, context reservation,
+   backend and cache policy, then activate. The normal dashboard and APIs use
+   the clustered model; no separate inference endpoint is required.
 
 
 
@@ -204,8 +230,9 @@ also differ when the model cannot be divided evenly.
 TTFT, prefill tok/s, and decode tok/s are end-to-end pipeline measurements.
 They describe the cooperating cluster, not independent per-rank speeds.
 Layer range, planned weights, headroom, and KV ownership remain rank-specific.
-Activation is lazy: it records an approved deployment and starts ranks when
-oMLX next loads that model.
+Activation records the approved deployment. Loading from either the normal
+model control or the first request starts its signed ranks; a one-action replan
+quiesces, unloads, replaces the signed placement and reloads.
 
 Deactivation prevents future distributed loads. An already-loaded engine
 continues until the normal unload lifecycle so an admin click cannot interrupt
@@ -346,16 +373,22 @@ authenticated admin command before it is executed.
 - Nemotron-H receives a worker-local compatibility hook for its hybrid
   Mamba/attention cache layout and is covered by the real two-rank pipeline
   smoke test.
-- DFlash, SpecPrefill, MTP, VLM MTP, TurboQuant KV, thinking budgets, guided
-  grammar, and `logit_bias` are rejected for a distributed deployment rather
-  than ignored.
-- The first GUI activation flow intentionally supports two Macs. The schema,
-  planner, launcher, and runtime support up to 64 ranks; a multi-peer GUI is
-  follow-up work.
+- Distributed MTP is qualified only for pure-TP DeepSeek V4/DSpark deployments.
+  DFlash, SpecPrefill, VLM MTP, TurboQuant KV, guided grammar and `logit_bias`
+  are rejected rather than ignored when their distributed contract is absent.
+- The inventory, wizard, schema, planner, launcher and runtime accept multiple
+  peers. Adding or removing a Mac while a model is resident performs a signed
+  replan and reload; live elastic resharding is not a Beta claim.
+- Qwen3 text, the Qwen3.8 text backbone and DeepSeek V4 have physical TP2
+  evidence. A unified VLM may explicitly expose a text-backbone-only contract;
+  image, video and audio input then fails with an actionable 400 rather than
+  being silently discarded.
 - Performance calibration is synthetic and intended for relative partitioning.
   Validate final throughput with the real model and workload.
-- Cross-host JACCL/TB5 execution must still be validated on physical hardware.
-  The repository tests do not claim that a loopback run proves RDMA.
+- Cross-host JACCL/TB5 TP2 is physically validated on an M3 Ultra plus M5 Max.
+  Repository tests still do not make a new hardware topology proven: every
+  additional device count, model and hybrid TP x pipeline layout needs its own
+  physical gate.
 
 ## Verification
 
