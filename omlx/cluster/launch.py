@@ -1550,7 +1550,11 @@ def run_cluster_performance_probe(
             backend=deployment.backend,
         )
     except ValueError as exc:
-        detail = (completed.stderr.strip() or completed.stdout.strip())[-2000:]
+        detail = "\n".join(
+            part
+            for part in (completed.stderr.strip(), completed.stdout.strip())
+            if part
+        )[-2000:]
         suffix = f": {detail}" if detail else ""
         raise DistributedLaunchError(f"{exc}{suffix}") from exc
     promotable = all(profile.promotable for profile in profiles)

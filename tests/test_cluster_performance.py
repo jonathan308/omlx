@@ -391,7 +391,7 @@ def test_cluster_performance_probe_includes_rank_worker_diagnostic_on_missing_ra
             argv,
             0,
             stdout="oMLX performance probe failed: ValueError: [jaccl] Changing queue pair to RTR failed with errno 96",
-            stderr="",
+            stderr="[WARN] Node with rank 1 exited with code 1",
         )
 
     with pytest.raises(DistributedLaunchError, match="queue pair.*RTR"):
