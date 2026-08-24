@@ -133,6 +133,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_ATTN_FINALIZER_VERIFY",
         "OMLX_DSV4_OUTPUT_CHAIN_PREFILL",
         "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE",
+        "OMLX_DSV4_VERIFY_HC_PRENORM",
         "OMLX_DSV4_HC_RESIDUAL_OVERLAP",
         "OMLX_DSV4_NAX_MOE_BLOCKS",
         "OMLX_DSV4_COMBINED_MOE_PREFILL",
@@ -192,6 +193,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_ATTN_FINALIZER_VERIFY=0" in envs
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=0" in envs
     assert "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=0" in envs
+    assert "OMLX_DSV4_VERIFY_HC_PRENORM=0" in envs
     assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=0" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=0" in envs
     assert "OMLX_DSV4_COMBINED_MOE_PREFILL=0" in envs
@@ -231,6 +233,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_ATTN_FINALIZER_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "1")
+    monkeypatch.setenv("OMLX_DSV4_VERIFY_HC_PRENORM", "1")
     monkeypatch.setenv("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "1")
     monkeypatch.setenv("OMLX_DSV4_NAX_MOE_BLOCKS", "1")
     monkeypatch.setenv("OMLX_DSV4_COMBINED_MOE_PREFILL", "1")
@@ -276,6 +279,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_ATTN_FINALIZER_PREFILL=1" in envs
     assert "OMLX_DSV4_OUTPUT_CHAIN_PREFILL=1" in envs
     assert "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=1" in envs
+    assert "OMLX_DSV4_VERIFY_HC_PRENORM=1" in envs
     assert "OMLX_DSV4_HC_RESIDUAL_OVERLAP=1" in envs
     assert "OMLX_DSV4_NAX_MOE_BLOCKS=1" in envs
     assert "OMLX_DSV4_COMBINED_MOE_PREFILL=1" in envs

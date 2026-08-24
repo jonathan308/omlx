@@ -4405,9 +4405,13 @@ class DeepseekV4Block(nn.Module):
     ) -> mx.array:
         overlap_hc = _can_overlap_hc_residual(self, h)
         residual = h
-        x, post, comb = self.attn_hc(h)
+        fused_hc = self.attn_hc.call_with_norm(h, self.attn_norm)
+        if fused_hc is None:
+            x, post, comb = self.attn_hc(h)
+            attn_input = self.attn_norm(x)
+        else:
+            x, attn_input, post, comb = fused_hc
         residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
-        attn_input = self.attn_norm(x)
         x = self.attn(
             attn_input,
             mask=mask,
@@ -4421,9 +4425,13 @@ class DeepseekV4Block(nn.Module):
         )
 
         residual = h
-        x, post, comb = self.ffn_hc(h)
+        fused_hc = self.ffn_hc.call_with_norm(h, self.ffn_norm)
+        if fused_hc is None:
+            x, post, comb = self.ffn_hc(h)
+            x = self.ffn_norm(x)
+        else:
+            _collapsed, x, post, comb = fused_hc
         residual_branch = hc_residual_branch(residual, comb) if overlap_hc else None
-        x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return (
             hc_merge_branch(x, post, residual_branch)

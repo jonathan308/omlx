@@ -210,6 +210,9 @@ _RANK_ENV_DEFAULTS = (
     # grouped view instead of materializing M one-row slices + concatenate.
     # Default-off until the physical equal-TP2 decode gate clears.
     ("OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"),
+    # Exact M=6 HC sinkhorn/collapse continuation into MLX's weighted
+    # 4096-wide RMSNorm topology. Default-off pending physical TP2 decode.
+    ("OMLX_DSV4_VERIFY_HC_PRENORM", "0"),
     # Split the exact FP32 HyperConnection residual branch so Metal can fill
     # communication bubbles without changing collective or arithmetic order.
     ("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"),

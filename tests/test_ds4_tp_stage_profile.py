@@ -230,6 +230,7 @@ def test_fine_detail_taxonomy_covers_the_unattributed_verify_hotset():
         "norms",
         "attention_qkv_bank",
         "attention_q_b",
+        "attention_core",
         "attention_output",
     }
 

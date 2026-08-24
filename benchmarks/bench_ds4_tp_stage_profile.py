@@ -71,6 +71,7 @@ FINE_DETAIL_CATEGORIES = (
     "norms",
     "attention_qkv_bank",
     "attention_q_b",
+    "attention_core",
     "attention_output",
 )
 PROFILE_SCHEMA_VERSION = 1
@@ -692,6 +693,11 @@ class DS4LayerInstrumentation:
                 dsv4,
                 "_project_verify_q_b",
                 "attention_q_b",
+            )
+            self._patch_symbol(
+                dsv4,
+                "_batched_m1_attention",
+                "attention_core",
             )
             self._patch_symbol(
                 dsv4,
