@@ -6,8 +6,8 @@
   </picture>
 </p>
 
-<h1 align="center">oMLX</h1>
-<p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
+<h1 align="center">oMLX Fusion</h1>
+<p align="center"><b>High-performance inference for one Mac or a cluster of Macs</b><br>Universal model serving, continuous batching, tiered caching, and distributed MLX execution.</p>
 
 <p align="center">
 <a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
@@ -42,6 +42,16 @@
 
 ---
 
+> [!IMPORTANT]
+> **oMLX Fusion is the performance and clustering development fork of
+> [oMLX](https://github.com/jundot/omlx).** Development releases are
+> prereleases for testers. Current work covers progressive shard loading,
+> signed heterogeneous tensor placement, JACCL/Thunderbolt RDMA, distributed
+> cancellation and cache lifecycle, and model-specific kernels that also
+> accelerate single-Mac serving. See the
+> [benchmark provenance rules](docs/benchmark-provenance.md) before comparing
+> throughput numbers.
+
 <p align="center">
   <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
 </p>
@@ -54,7 +64,7 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
+Download a signed development `.dmg` from [oMLX Fusion Releases](https://github.com/jonathan308/omlx-fusion/releases), drag it to Applications, and approve the prerelease warning. The app includes in-app auto-update, so future upgrades are just one click. The macOS app also installs a lightweight `~/.omlx/bin/omlx` CLI shim so terminal commands and Apple Shortcuts can control the app-managed server.
 
 ### Homebrew
 
@@ -81,8 +91,8 @@ brew install jundot/omlx/omlx --HEAD --with-custom-kernel
 ### From Source
 
 ```bash
-git clone https://github.com/jundot/omlx.git
-cd omlx
+git clone https://github.com/jonathan308/omlx-fusion.git
+cd omlx-fusion
 pip install -e .          # Core only
 pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
 
