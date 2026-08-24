@@ -8,6 +8,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
 from omlx.cluster.deployment import (
@@ -350,10 +352,112 @@ def test_qualification_provenance_changes_plan_and_approval_signatures():
         tensor_parallel_qualification=plan_a.tensor_parallel_qualification,
     )
     restored = ClusterDeployment.from_dict(deployment.to_dict())
-    assert restored.tensor_parallel_qualification == plan_a.tensor_parallel_qualification
+    assert (
+        restored.tensor_parallel_qualification
+        == plan_a.tensor_parallel_qualification
+    )
     plan_hash, assignments, _profiles, tp_size = decode_worker_contract(
         deployment.encode_worker_plan()
     )
     assert plan_hash == plan_a.plan_hash
     assert assignments == plan_a.assignments
     assert tp_size == 2
+
+
+def _qualification_request() -> dict:
+    return {
+        "model_path": "/models/ds4",
+        "backend": "jaccl",
+        "nodes": [
+            {"node_id": "studio", "capacity_bytes": 256 * 1024**3},
+            {"node_id": "m5", "capacity_bytes": 128 * 1024**3},
+        ],
+        "hosts": [
+            {"node_id": "studio", "ssh": "127.0.0.1", "ips": ["10.0.0.1"]},
+            {"node_id": "m5", "ssh": "m5.local", "ips": ["10.0.0.2"]},
+        ],
+        "tensor_parallel_size": 2,
+        "target_context_tokens": 32768,
+        "execution_profile": "throughput",
+        "auto_tune": True,
+        "sampling_rank_only": True,
+        "mtp_enabled": False,
+        "shard_weights": [3, 5],
+        "equal_control": {
+            "prefill_tokens_per_second": 737.0,
+            "decode_tokens_per_second": 30.5,
+            "samples": 3,
+            "output_sha256": "a" * 64,
+        },
+        "candidate": {
+            "prefill_tokens_per_second": 870.0,
+            "decode_tokens_per_second": 31.1,
+            "samples": 3,
+            "output_sha256": "a" * 64,
+        },
+        "reason": "matched physical A/B",
+    }
+
+
+def _client() -> TestClient:
+    app = FastAPI()
+    app.include_router(routes.router)
+    return TestClient(app)
+
+
+def test_admin_route_records_live_keyed_tp_qualification(tmp_path, monkeypatch):
+    store = configure_tp_layout_qualification_store(tmp_path)
+    model = ModelLayout(
+        source="synthetic-qualified",
+        fixed_weight_bytes=100,
+        layer_weight_bytes=(8_000, 8_000),
+        tensor_parallel_heads=8,
+        tensor_parallel_divisors=(8,),
+        tensor_parallel_shard_units=8,
+        supports_tensor_parallel=True,
+    )
+    budgets = [
+        NodeBudget("studio", 1_000_000, rank=0),
+        NodeBudget("m5", 1_000_000, rank=1),
+    ]
+    monkeypatch.setattr(routes, "_qualification_statuses", lambda _hosts: {})
+    monkeypatch.setattr(routes, "_tp_qualification_key", lambda **_kwargs: _key())
+    monkeypatch.setattr(routes, "_model_and_nodes", lambda _request: (model, budgets))
+
+    response = _client().post(
+        "/admin/api/cluster/tp-layout-qualifications",
+        json=_qualification_request(),
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["shard_weights"] == [3, 5]
+    assert store.lookup(_key()) is not None
+    listed = _client().get(
+        "/admin/api/cluster/tp-layout-qualifications"
+    ).json()
+    assert len(listed["qualifications"]) == 1
+
+
+def test_admin_route_rejects_non_parity_or_weak_candidate(tmp_path):
+    configure_tp_layout_qualification_store(tmp_path)
+    mismatch = _qualification_request()
+    mismatch["candidate"]["output_sha256"] = "b" * 64
+
+    response = _client().post(
+        "/admin/api/cluster/tp-layout-qualifications",
+        json=mismatch,
+    )
+
+    assert response.status_code == 400
+    assert "output hash differs" in response.json()["detail"]
+
+    weak = _qualification_request()
+    weak["candidate"]["prefill_tokens_per_second"] = 740.0
+    response = _client().post(
+        "/admin/api/cluster/tp-layout-qualifications",
+        json=weak,
+    )
+    assert response.status_code == 400
+    assert "promotion policy" in response.json()["detail"]

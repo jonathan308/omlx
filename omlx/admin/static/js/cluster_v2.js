@@ -37,6 +37,8 @@
 //     POST   /admin/api/cluster/deployments     — activate an approved plan
 //     DELETE /admin/api/cluster/deployments/{id}— deactivate
 //     POST   /admin/api/cluster/replan           — signed preview/apply reload
+//     GET    /admin/api/cluster/tp-layout-qualifications — exact heterogeneous
+//           TP evidence and store health
 //
 // State machine (wizardState()): empty → discovering → device_card → pairing →
 // checks → plan → active, with error as an overlay state (banner + toasts,
@@ -68,6 +70,7 @@ function clusterV2Wizard() {
         runtime: '/admin/api/cluster/runtime',
         deployments: '/admin/api/cluster/deployments',
         replan: '/admin/api/cluster/replan',
+        tpQualifications: '/admin/api/cluster/tp-layout-qualifications',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
     };
@@ -270,6 +273,8 @@ function clusterV2Wizard() {
         confirmDeactivateFor: '',
         executionReplan: null,
         executionReplanBusy: false,
+        tpQualifications: null,
+        tpQualificationsError: '',
 
         // ---- feedback ----------------------------------------------------------
         toasts: [],
@@ -284,6 +289,7 @@ function clusterV2Wizard() {
         // =====================================================================
         init() {
             this.tick();
+            this.refreshTpQualifications();
             this.pollTimer = setInterval(() => this.tick(), CLUSTER_V2_POLL_MS);
         },
 
@@ -396,6 +402,19 @@ function clusterV2Wizard() {
                 this.runtimeLoaded = false;
                 this.runtimeError =
                     error?.message || 'Cluster runtime status is unavailable';
+            }
+        },
+
+        async refreshTpQualifications() {
+            try {
+                this.tpQualifications = await this.apiFetch(
+                    CLUSTER_V2_API.tpQualifications,
+                );
+                this.tpQualificationsError = '';
+            } catch (error) {
+                this.tpQualifications = null;
+                this.tpQualificationsError =
+                    error?.message || 'TP qualification evidence is unavailable';
             }
         },
 
@@ -2052,11 +2071,59 @@ function clusterV2Wizard() {
             return (this.plan?.tensor_parallel_size || 1) > 1;
         },
 
-        tensorShareLabel() {
+        tensorShareLabel(assignment = null) {
+            const rows = this.planAssignments();
+            const weights = rows.map((row) =>
+                Number(row.tensor_parallel_shard_weight || 1),
+            );
+            const total = weights.reduce((sum, value) => sum + value, 0);
+            const weight = Number(
+                assignment?.tensor_parallel_shard_weight || 0,
+            );
+            if (assignment && total > 0 && new Set(weights).size > 1) {
+                return `${weight}/${total} tensor rows`;
+            }
             return t('cluster.v2.split.tensor_share').replace(
                 '{count}',
                 String(this.plan?.tensor_parallel_size || 1),
             );
+        },
+
+        tensorSharePercent(assignment) {
+            const rows = this.planAssignments();
+            const total = rows.reduce(
+                (sum, row) =>
+                    sum + Number(row.tensor_parallel_shard_weight || 1),
+                0,
+            );
+            return total > 0
+                ? (100 * Number(assignment?.tensor_parallel_shard_weight || 1)) /
+                      total
+                : 0;
+        },
+
+        tensorQualification() {
+            const value = this.plan?.tensor_parallel_qualification;
+            return value && typeof value === 'object' ? value : null;
+        },
+
+        tensorQualificationIsPersistent() {
+            return this.tensorQualification()?.source === 'persistent';
+        },
+
+        tensorQualificationLabel() {
+            const qualification = this.tensorQualification();
+            const weights = this.planAssignments().map((assignment) =>
+                Number(assignment.tensor_parallel_shard_weight || 1),
+            );
+            const vector = weights.join(':');
+            if (qualification?.source === 'persistent') {
+                return `Performance-qualified ${vector} split`;
+            }
+            if (qualification?.source === 'environment_override') {
+                return `Experimental ${vector} override`;
+            }
+            return `Equal ${vector} safe fallback`;
         },
 
         tensorCaptionLabel() {

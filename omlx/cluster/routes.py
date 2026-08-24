@@ -9,6 +9,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -129,8 +130,10 @@ from .staging import (
 )
 from .strategy_benchmarks import context_bucket, get_strategy_benchmark_store
 from .tp_qualifications import (
+    TPLayoutQualification,
     TPQualificationKey,
     TPQualificationProvenance,
+    TPRateEvidence,
     get_tp_layout_qualification_store,
     node_fingerprints_from_statuses,
 )
@@ -558,6 +561,41 @@ class ClusterDeploymentRequest(BaseModel):
     # Cluster v2: node_id → absolute model path on that node. Nodes not listed
     # load ``model_path`` — the pre-v2 shared-path behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
+
+
+class ClusterTPRateEvidenceRequest(BaseModel):
+    """Aggregated full-model rate evidence for one TP layout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prefill_tokens_per_second: float = Field(gt=0.0, le=1e9)
+    decode_tokens_per_second: float = Field(gt=0.0, le=1e9)
+    samples: int = Field(ge=2, le=10_000)
+    output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ClusterTPLayoutQualificationRequest(BaseModel):
+    """Persist matched, parity-proven evidence for one asymmetric TP vector."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str = Field(min_length=1, max_length=4096)
+    backend: Literal["ring", "jaccl", "jaccl-ring"]
+    nodes: list[ClusterPlanNodeRequest] = Field(min_length=2, max_length=64)
+    hosts: list[ClusterHostRequest] = Field(min_length=2, max_length=64)
+    tensor_parallel_size: int = Field(ge=2, le=64)
+    target_context_tokens: int = Field(ge=1, le=1_048_576)
+    execution_profile: Literal["interactive", "balanced", "throughput"] = (
+        "balanced"
+    )
+    auto_tune: bool = True
+    sampling_rank_only: bool = True
+    mtp_enabled: bool = False
+    mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
+    shard_weights: list[int] = Field(min_length=2, max_length=64)
+    equal_control: ClusterTPRateEvidenceRequest
+    candidate: ClusterTPRateEvidenceRequest
+    reason: str = Field(default="matched full-model qualification", max_length=2000)
 
 
 class ClusterPeerProbeRequest(BaseModel):
@@ -3228,6 +3266,161 @@ async def cluster_pipeline_smoke(
         return await asyncio.to_thread(run_local_pipeline_smoke, timeout=timeout)
     except (CollectiveSmokeError, OSError, RuntimeError, TimeoutError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _tp_layout_candidate_clears_promotion(
+    profile: str,
+    equal: ClusterTPRateEvidenceRequest,
+    candidate: ClusterTPRateEvidenceRequest,
+) -> tuple[bool, str]:
+    """Require a useful gain without hiding a material regression."""
+
+    prefill_ratio = (
+        candidate.prefill_tokens_per_second / equal.prefill_tokens_per_second
+    )
+    decode_ratio = (
+        candidate.decode_tokens_per_second / equal.decode_tokens_per_second
+    )
+    if profile == "throughput":
+        accepted = prefill_ratio >= 1.03 and decode_ratio >= 0.95
+    elif profile == "interactive":
+        accepted = decode_ratio >= 1.03 and prefill_ratio >= 0.95
+    else:
+        accepted = (
+            min(prefill_ratio, decode_ratio) >= 0.98
+            and math.sqrt(prefill_ratio * decode_ratio) >= 1.02
+        )
+    reason = (
+        f"prefill {prefill_ratio:.4f}x, decode {decode_ratio:.4f}x "
+        f"under the {profile} policy"
+    )
+    return accepted, reason
+
+
+@router.get("/tp-layout-qualifications")
+async def list_tp_layout_qualifications() -> dict[str, Any]:
+    """Return exact-match heterogeneous TP records and store health."""
+
+    try:
+        return get_tp_layout_qualification_store().to_dict()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/tp-layout-qualifications")
+async def qualify_tp_layout(
+    request: ClusterTPLayoutQualificationRequest,
+) -> dict[str, Any]:
+    """Promote one matched full-model A/B into the signed layout store."""
+
+    if request.tensor_parallel_size != len(request.nodes):
+        raise HTTPException(
+            status_code=400,
+            detail="TP layout qualification currently requires pure TP on every node",
+        )
+    node_ids = [node.node_id.strip() for node in request.nodes]
+    host_ids = [host.node_id.strip() for host in request.hosts]
+    if host_ids != node_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="qualification hosts must exactly match rank-ordered nodes",
+        )
+    if len(request.shard_weights) != request.tensor_parallel_size:
+        raise HTTPException(
+            status_code=400,
+            detail="qualification shard vector does not match TP size",
+        )
+    if request.equal_control.output_sha256 != request.candidate.output_sha256:
+        raise HTTPException(
+            status_code=400,
+            detail="candidate output hash differs from the matched equal control",
+        )
+    accepted, performance_reason = _tp_layout_candidate_clears_promotion(
+        request.execution_profile,
+        request.equal_control,
+        request.candidate,
+    )
+    if not accepted:
+        raise HTTPException(
+            status_code=400,
+            detail=f"candidate did not clear TP promotion policy: {performance_reason}",
+        )
+
+    try:
+        _validate_cluster_hosts(request.hosts)
+        statuses = await asyncio.to_thread(
+            _qualification_statuses,
+            request.hosts,
+        )
+        key = _tp_qualification_key(
+            model_path=request.model_path,
+            nodes=request.nodes,
+            statuses=statuses,
+            backend=request.backend,
+            tensor_parallel_size=request.tensor_parallel_size,
+            target_context_tokens=request.target_context_tokens,
+            execution_profile_name=request.execution_profile,
+            auto_tune=request.auto_tune,
+            sampling_rank_only=request.sampling_rank_only,
+            mtp_enabled=request.mtp_enabled,
+            mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        )
+        model, budgets = _model_and_nodes(
+            ClusterPlanRequest(
+                model_path=request.model_path,
+                nodes=request.nodes,
+                execution_profile=request.execution_profile,
+                tensor_parallel_size=request.tensor_parallel_size,
+                target_context_tokens=request.target_context_tokens,
+                mtp_enabled=request.mtp_enabled,
+                mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+            )
+        )
+        # Validate adapter shard units and per-node memory fit before storing
+        # evidence. The exact record will be revalidated again at every use.
+        plan_hybrid(
+            model,
+            budgets,
+            tensor_parallel_size=request.tensor_parallel_size,
+            workload_profile=request.execution_profile,
+            context_tokens=request.target_context_tokens,
+            qualified_tensor_shard_weights=(tuple(request.shard_weights),),
+        )
+        record = TPLayoutQualification(
+            key=key,
+            shard_weights=tuple(request.shard_weights),
+            equal_control=TPRateEvidence(
+                request.equal_control.prefill_tokens_per_second,
+                request.equal_control.decode_tokens_per_second,
+                request.equal_control.samples,
+            ),
+            candidate=TPRateEvidence(
+                request.candidate.prefill_tokens_per_second,
+                request.candidate.decode_tokens_per_second,
+                request.candidate.samples,
+            ),
+            exact=True,
+            parity_sha256=request.candidate.output_sha256,
+            promotable=True,
+            reason=f"{request.reason.strip()}; {performance_reason}",
+            qualified_at=datetime.now(UTC).isoformat(),
+        )
+        store = get_tp_layout_qualification_store()
+        await asyncio.to_thread(store.record, record)
+    except HTTPException:
+        raise
+    except (OSError, PlanningError, RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "qualification_id": record.qualification_id,
+        "record_digest": record.record_digest,
+        "shard_weights": list(record.shard_weights),
+        "exact": record.exact,
+        "promotable": record.promotable,
+        "reason": record.reason,
+    }
 
 
 @router.post("/plan")

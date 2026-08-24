@@ -782,9 +782,9 @@
                             <span class="text-[10px] text-neutral-500"
                                   x-text="planIsTensor() ? backendLabel() : planTotalLayers() + ' layers total · ' + backendLabel()"></span>
                         </div>
-                        <!-- Tensor split: every Mac holds a 1/N slice of EVERY
-                             layer, so equal-width segments with TP ranks
-                             instead of contiguous layer ranges. -->
+                        <!-- Tensor split: every Mac holds a slice of EVERY
+                             layer. Segment widths use the signed shard vector;
+                             equal fallback stays visually equal. -->
                         <template x-if="planIsTensor()">
                             <div class="h-12 flex overflow-hidden rounded-xl border border-neutral-200 bg-neutral-100"
                                  data-cluster-v2-split-bar-tensor>
@@ -792,14 +792,19 @@
                                     <div class="cluster-v2-tensor-segment h-full flex items-center justify-center px-2 border-r border-white last:border-r-0 transition-[width] duration-700 ease-out"
                                          :class="'cluster-v2-tensor-segment--' + (index % 5)"
                                          :data-tensor-tone="index % 5"
-                                         :style="'width: ' + (100 / Math.max(planAssignments().length, 1)) + '%'"
-                                         :title="planNodeName(assignment) + ' · ' + tensorShareLabel()">
+                                         :style="'width: ' + tensorSharePercent(assignment) + '%'"
+                                         :title="planNodeName(assignment) + ' · ' + tensorShareLabel(assignment)">
                                         <span class="text-[10px] sm:text-xs font-semibold truncate"
                                               x-text="planNodeName(assignment) + ' · rank ' + (assignment.tensor_parallel_rank ?? index)"></span>
                                     </div>
                                 </template>
                             </div>
                         </template>
+                        <div x-show="planIsTensor()" x-cloak
+                             class="mt-2 inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold"
+                             :class="tensorQualificationIsPersistent() ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : (tensorQualification() ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-neutral-200 bg-neutral-50 text-neutral-600')"
+                             x-text="tensorQualificationLabel()"
+                             data-cluster-v2-tp-qualification></div>
                         <template x-if="!planIsTensor()">
                             <div class="h-12 flex overflow-hidden rounded-xl border border-neutral-200 bg-neutral-100">
                                 <template x-for="(assignment, index) in planAssignments()" :key="assignment.rank">
@@ -825,7 +830,7 @@
                                     <div class="text-xs font-semibold text-neutral-900 truncate"
                                          x-text="planNodeName(assignment)"></div>
                                     <div class="text-[10px] text-neutral-500 mt-0.5 font-mono"
-                                         x-text="planIsTensor() ? tensorShareLabel() : 'layers [' + assignment.start_layer + ', ' + assignment.end_layer + ')'"></div>
+                                         x-text="planIsTensor() ? tensorShareLabel(assignment) : 'layers [' + assignment.start_layer + ', ' + assignment.end_layer + ')'"></div>
                                 </div>
                             </template>
                         </div>

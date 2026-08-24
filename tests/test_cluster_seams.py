@@ -23,7 +23,10 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _CLUSTER = _REPO / "omlx" / "cluster"
-_DASHBOARD_JS = _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js"
+_DASHBOARD_JS = (
+    _REPO / "omlx" / "admin" / "static" / "js" / "dashboard.js",
+    _REPO / "omlx" / "admin" / "static" / "js" / "cluster_v2.js",
+)
 
 _PREFIX = "/admin/api/cluster"
 # Template literals interpolate with ${...}, which may contain calls and nested
@@ -47,12 +50,17 @@ def _js_called_paths() -> set[str]:
     """Cluster URLs the dashboard builds, normalised to their route shape."""
 
     called = set()
-    for match in _CLUSTER_URL.finditer(_DASHBOARD_JS.read_text()):
-        path = match.group("path").split("?")[0]
-        # Any interpolated segment stands for a path parameter.
-        path = re.sub(r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}", "{parameter}", path)
-        path = path.rstrip("/") if path not in ("", "/") else path
-        called.add(_PREFIX + path)
+    for source in _DASHBOARD_JS:
+        for match in _CLUSTER_URL.finditer(source.read_text()):
+            path = match.group("path").split("?")[0]
+            # Any interpolated segment stands for a path parameter.
+            path = re.sub(
+                r"\$\{[^{}]*(?:\([^)]*\))?[^{}]*\}",
+                "{parameter}",
+                path,
+            )
+            path = path.rstrip("/") if path not in ("", "/") else path
+            called.add(_PREFIX + path)
     return called
 
 
@@ -61,7 +69,7 @@ def test_every_cluster_url_the_dashboard_calls_is_a_real_route():
 
     missing = _js_called_paths() - _registered_routes()
     assert not missing, (
-        f"dashboard.js calls cluster endpoints that are not registered: "
+        f"dashboard scripts call cluster endpoints that are not registered: "
         f"{sorted(missing)}"
     )
 
@@ -95,7 +103,7 @@ def test_fetch_calls_never_use_a_params_option():
     the suite stayed green.
     """
 
-    source = _DASHBOARD_JS.read_text()
+    source = "\n".join(path.read_text() for path in _DASHBOARD_JS)
     offenders = []
     for index, line in enumerate(source.splitlines(), start=1):
         if re.search(r"^\s*params:\s*\{", line):

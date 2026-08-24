@@ -76,6 +76,7 @@ ALLOWED_ENDPOINTS = {
     "/admin/api/cluster/runtime",
     "/admin/api/cluster/deployments",
     "/admin/api/cluster/replan",
+    "/admin/api/cluster/tp-layout-qualifications",
 }
 
 
@@ -1505,7 +1506,12 @@ def test_split_bar_has_a_tensor_variant_and_width_transitions():
 
     assert "data-cluster-v2-split-bar-tensor" in template
     assert "planIsTensor()" in template
-    assert "tensorShareLabel()" in template
+    assert "tensorShareLabel(assignment)" in template
+    assert "tensorSharePercent(assignment)" in template
+    assert "data-cluster-v2-tp-qualification" in template
+    assert "Performance-qualified" in javascript
+    assert "Experimental" in javascript
+    assert "Equal" in javascript
     assert template.count("transition-[width] duration-700 ease-out") >= 2
     # The contiguous-range bar is untouched for pipeline plans.
     assert "assignment.layer_count / Math.max(planTotalLayers(), 1)" in template
