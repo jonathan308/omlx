@@ -61,6 +61,47 @@ _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
 
 _CLUSTER_RANK_STATE_DIR = "~/.omlx/cluster/runtime"
 
+# mlx-lm ships explicit outer wrappers for these multimodal families that
+# discard vision weights in ``sanitize()`` and serve the language model with a
+# native, layer-local ``Model.shard()`` implementation.  A distributed
+# deployment may therefore expose their exact language backbone without
+# pretending images are supported.  Keep this allow-list narrow: adding a
+# model type is a load/parity commitment, not a filename heuristic.
+_CLUSTER_TEXT_BACKBONE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def _config_supports_cluster_text_backbone(config: object) -> bool:
+    if not isinstance(config, dict):
+        return False
+    model_type = str(config.get("model_type") or "").lower().replace("-", "_")
+    if model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES:
+        return False
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict) or not text_config:
+        return False
+    architectures = config.get("architectures")
+    return isinstance(architectures, list) and any(
+        isinstance(name, str) and "ForConditionalGeneration" in name
+        for name in architectures
+    )
+
+
+def _entry_supports_cluster_text_backbone(entry: "EngineEntry") -> bool:
+    if (
+        entry.engine_type != "vlm"
+        or entry.config_model_type not in _CLUSTER_TEXT_BACKBONE_MODEL_TYPES
+    ):
+        return False
+    config_path = Path(entry.model_path).expanduser() / "config.json"
+    try:
+        if config_path.stat().st_size > 4 * 1024**2:
+            return False
+        return _config_supports_cluster_text_backbone(
+            json.loads(config_path.read_text())
+        )
+    except (OSError, ValueError):
+        return False
+
 
 def _cluster_rank_resident_bytes(
     *,
@@ -365,7 +406,10 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or (
+            entry.engine_type != "batched"
+            and not _entry_supports_cluster_text_backbone(entry)
+        ):
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -921,7 +965,9 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if entry.engine_type != "batched" and not (
+            _entry_supports_cluster_text_backbone(entry)
+        ):
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
                 "Distributed cluster inference currently supports text LLM "
@@ -959,7 +1005,9 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if entry.engine_type != "batched" and not (
+                _entry_supports_cluster_text_backbone(entry)
+            ):
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
@@ -973,6 +1021,40 @@ class EnginePool:
             raise ValueError(f"cluster model config is unreadable: {exc}") from exc
         if not isinstance(config, dict):
             raise ValueError("cluster model config.json must contain an object")
+
+        # A remote-only stage bypasses normal local model discovery, but it
+        # must not bypass the same engine classification.  In particular, a
+        # staged VLM still carries its vision configuration even when rank
+        # zero owns only part of the weights. Registering it as a synthetic
+        # BatchedEngine entry would evade resolve_cluster_model_id's text-only
+        # guard and fail much later inside the distributed worker, unless it
+        # is one of the explicitly proven text-backbone wrappers above.
+        from .model_discovery import _has_vision_subconfig, detect_model_type
+
+        detected_model_type = detect_model_type(path)
+        config_candidates = [config]
+        config_candidates.extend(
+            value
+            for key in ("model", "text_config", "language_config", "llm_config")
+            if isinstance((value := config.get(key)), dict)
+        )
+        carries_vision = any(
+            _has_vision_subconfig(candidate) for candidate in config_candidates
+        )
+        # Some text-only families are intentionally served through mlx-vlm
+        # locally (for example MiniMax-M3), so ``detect_model_type == vlm`` is
+        # not alone proof that a remote stage contains vision weights.  A
+        # non-empty vision sub-config is the fail-closed distributed boundary;
+        # other unambiguously non-generative/audio engines remain ineligible.
+        text_backbone = _config_supports_cluster_text_backbone(config)
+        if (
+            (carries_vision and not text_backbone)
+            or detected_model_type not in {"llm", "vlm"}
+        ):
+            raise ValueError(
+                "Distributed cluster inference currently supports text LLM "
+                f"models only; staged model is {detected_model_type}."
+            )
 
         base_id = path.name or "cluster-model"
         model_id = base_id
@@ -2479,7 +2561,18 @@ class EnginePool:
             # Check if DFlash is enabled -- takes priority over engine type
             # since DFlash has its own model loading pipeline
             engine = None
-            deployment = deployment if effective_type == "batched" else None
+            cluster_text_backbone = _entry_supports_cluster_text_backbone(entry)
+            deployment = (
+                deployment
+                if effective_type == "batched" or cluster_text_backbone
+                else None
+            )
+            if deployment is not None and cluster_text_backbone:
+                logger.info(
+                    "Distributed inference will serve the exact text backbone "
+                    "of multimodal model %s; image/video inputs remain disabled",
+                    model_id,
+                )
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)

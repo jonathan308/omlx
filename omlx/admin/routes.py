@@ -5371,16 +5371,43 @@ def _build_active_models_data() -> dict:
             )
 
         if cluster_metrics is not None:
-            # Synthesize scheduler-shaped prefill/generate rows from rank
-            # zero's most recent request sample so the existing sub-row
-            # rendering applies unchanged.
-            last = cluster_metrics.get("last_request")
-            if isinstance(last, dict) and last.get("status") == "running":
-                progress = last.get("prefill_progress")
+            # Synthesize scheduler-shaped rows from every active rank-zero
+            # request sample.  Older markers expose only ``last_request``;
+            # retain that as a compatibility fallback, but never collapse a
+            # current concurrent batch to whichever request happened to
+            # publish last.
+            active_samples = cluster_metrics.get("active_request_metrics")
+            if isinstance(active_samples, list):
+                samples = [
+                    sample
+                    for sample in active_samples
+                    if isinstance(sample, dict)
+                    and sample.get("status") == "running"
+                ]
+            else:
+                samples = []
+            using_legacy_sample = not samples
+            if using_legacy_sample:
+                last = cluster_metrics.get("last_request")
+                samples = (
+                    [last]
+                    if isinstance(last, dict) and last.get("status") == "running"
+                    else []
+                )
+
+            for index, sample in enumerate(samples):
+                request_id = sample.get("request_id")
+                if request_id is None:
+                    request_id = (
+                        "rank0"
+                        if using_legacy_sample
+                        else f"rank0-{index + 1}"
+                    )
+                progress = sample.get("prefill_progress")
                 if isinstance(progress, dict) and progress.get("active"):
                     prefilling.append(
                         {
-                            "request_id": "rank0",
+                            "request_id": request_id,
                             "processed": progress.get("processed", 0),
                             "total": progress.get("total", 0),
                             "speed": progress.get("speed", 0.0),
@@ -5389,17 +5416,17 @@ def _build_active_models_data() -> dict:
                             "detail": "cluster prefill",
                         }
                     )
-                elif last.get("decode_tps"):
+                elif sample.get("decode_tps"):
                     generating.append(
                         {
-                            "request_id": "rank0",
-                            "elapsed_seconds": last.get("elapsed_seconds"),
-                            "generated_tokens": last.get("completion_tokens", 0),
-                            "tokens_per_second": last.get("decode_tps", 0.0),
+                            "request_id": request_id,
+                            "elapsed_seconds": sample.get("elapsed_seconds"),
+                            "generated_tokens": sample.get("completion_tokens", 0),
+                            "tokens_per_second": sample.get("decode_tps", 0.0),
                             "last_activity_age_seconds": cluster_live.get(
                                 "age_seconds"
                             ),
-                            "prompt_tokens": last.get("prompt_tokens", 0),
+                            "prompt_tokens": sample.get("prompt_tokens", 0),
                             "max_tokens": None,
                         }
                     )

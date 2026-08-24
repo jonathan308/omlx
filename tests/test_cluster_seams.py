@@ -144,6 +144,7 @@ def test_worker_contract_round_trips_with_tensor_parallelism():
         fixed_weight_bytes=1 * 1024**3,
         layer_weight_bytes=(2 * 1024**3,) * 8,
         tensor_parallel_heads=16,
+        supports_tensor_parallel=True,
     )
     nodes = [
         planner.NodeBudget(

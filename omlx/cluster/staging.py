@@ -167,8 +167,11 @@ def shards_for_stage(
 # Files a model needs besides its weights. Tiny, so always staged.
 _SIDECAR_GLOBS = (
     "*.json",
+    "*.jsonl",
     "*.txt",
     "*.model",
+    "*.tiktoken",
+    "*.py",
     "tokenizer*",
     "*.jinja",
 )

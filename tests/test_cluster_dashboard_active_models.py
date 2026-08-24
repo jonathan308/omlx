@@ -391,6 +391,60 @@ def test_active_models_distributed_row_shows_prefill_progress():
     ]
 
 
+def test_active_models_distributed_preserves_each_concurrent_request_rate():
+    live = {
+        "metrics": _metrics_payload(
+            active_requests=2,
+            active_request_metrics=[
+                {
+                    "request_id": 11,
+                    "status": "running",
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 0,
+                    "elapsed_seconds": 1.5,
+                    "decode_tps": 0.0,
+                    "prefill_progress": {
+                        "active": True,
+                        "processed": 600,
+                        "total": 1000,
+                        "speed": 420.0,
+                        "eta": 0.95,
+                        "elapsed": 1.5,
+                    },
+                },
+                {
+                    "request_id": 12,
+                    "status": "running",
+                    "prompt_tokens": 128,
+                    "completion_tokens": 30,
+                    "elapsed_seconds": 2.0,
+                    "decode_tps": 21.5,
+                    "prefill_progress": {"active": False},
+                },
+            ],
+            # Must not replace the two active rows with this newest sample.
+            last_request={
+                "request_id": 99,
+                "status": "running",
+                "completion_tokens": 1,
+                "decode_tps": 999.0,
+                "prefill_progress": {"active": False},
+            },
+        )["metrics"],
+        "updated_at": datetime.now(UTC).isoformat(),
+        "age_seconds": 0.2,
+        "stale": False,
+    }
+
+    model = _build_active_models(_ClusterPool(live))["models"][0]
+
+    assert model["active_requests"] == 2
+    assert [row["request_id"] for row in model["prefilling"]] == [11]
+    assert model["prefilling"][0]["speed"] == 420.0
+    assert [row["request_id"] for row in model["generating"]] == [12]
+    assert model["generating"][0]["tokens_per_second"] == 21.5
+
+
 def test_active_models_distributed_stale_marker_renders_idle():
     live = {
         "metrics": _metrics_payload(

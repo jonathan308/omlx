@@ -1925,6 +1925,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             optimized_plan = _build_performance_plan(
                 model,
                 measured_budgets,
+                model_path=request.model_path,
                 tensor_parallel_size=choice.tensor_parallel_size,
                 workload_profile=request.execution_profile,
                 microbatch_size=probe_execution.pipeline_microbatch_size,

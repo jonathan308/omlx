@@ -2323,6 +2323,10 @@ def plan_hybrid(
     # has loaded its weights. shard() does n_heads //= N and n_kv_heads //= N,
     # and most mlx-lm architectures do not implement shard() at all.
     if tensor_parallel_size > 1:
+        if not model.supports_tensor_parallel:
+            raise PlanningError(
+                "this model architecture does not support tensor parallelism"
+            )
         incompatible = tuple(
             value
             for value in model.tensor_parallel_divisors

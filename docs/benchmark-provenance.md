@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # Benchmark hardware and result provenance
 
 Performance numbers published for this fork must identify the source commit,
@@ -62,7 +64,7 @@ request.
 | --- | --- | --- | ---: | ---: | --- |
 | Qwen TP2 `1:1` | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 1,533.73 | 1,537.15 | Direct completion |
 | Qwen TP2 `1:1` | Decode | `prefix-miss`, single-stream, non-MTP | 56.83 | 56.46 | Same 30K request |
-| Qwen TP2 `1:1` | Exact-prompt repeat | `hot-prefix-hit`, fixed prompt | not applicable | not applicable | 30,004/30,005 tokens cached; TTFT 19.92 s -> 0.67 s |
+| Qwen TP2 `1:1` | Exact-prompt repeat | `hot-prefix-hit` (rank prompt LRU), fixed prompt | not applicable | not applicable | 30,004/30,005 tokens cached; TTFT 19.92 s -> 0.67 s |
 | Qwen TP2 `1:1` | Concurrent decode | `concurrent-4`, independent prompts, non-MTP | 216.3 aggregate | not recorded here | 4 x 512 output tokens; 2,048 tokens in 9.469 s |
 | Qwen TP2 `1:1` | In-flight cancellation | cold-prefix prefill | not applicable | not applicable | Both ranks stopped at 26,624 processed tokens and returned ready |
 | DS4 TP2 `3:5` | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 841.51 | 846.90 | Non-MTP prefill |
@@ -118,6 +120,11 @@ in-memory reuse, an eviction/spill into the SSD tier, a subsequent SSD restore,
 and reuse after process restart when persistence is being claimed. Report cache
 hit tokens and cache-source telemetry alongside timing. A warm Metal pipeline
 with a new KV cache is `warm-process / prefix-miss`, not a fully cold run.
+
+For a distributed deployment, `hot-prefix-hit` means the rank-local MLX-LM
+prompt LRU and `ssd-prefix-hit` means the durable, rank-unanimous prompt-snapshot
+tier. Those are not the local scheduler's paged hot/SSD KV-cache implementation;
+public results must name which engine and cache implementation produced the hit.
 
 For cancellation or steering measurements, also record time from client action
 to stopped token production, whether the request had entered prefill or decode,

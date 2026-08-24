@@ -622,6 +622,9 @@ def test_parse_rsync_progress_lines():
 
 def test_allow_patterns_cover_whole_model_without_layer_range(tmp_path):
     root = _model(tmp_path / "source")
+    (root / "modeling_custom.py").write_text("CUSTOM_MODEL = True\n")
+    (root / "tokenizer.tiktoken").write_text("token 1\n")
+    (root / "chat_examples.jsonl").write_text('{"role":"user"}\n')
 
     patterns = allow_patterns_for_shard(root)
 
@@ -629,6 +632,9 @@ def test_allow_patterns_cover_whole_model_without_layer_range(tmp_path):
     assert "model-00002.safetensors" in patterns
     assert "model-shared.safetensors" in patterns
     assert "config.json" in patterns
+    assert "modeling_custom.py" in patterns
+    assert "tokenizer.tiktoken" in patterns
+    assert "chat_examples.jsonl" in patterns
 
 
 def test_allow_patterns_reject_inverted_range(tmp_path):

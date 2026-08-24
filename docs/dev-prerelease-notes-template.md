@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # oMLX 0.6.4 Beta 1 release-candidate notes
 
 > This is a readiness record, not a published release announcement. The
@@ -43,7 +45,7 @@ rates are listed separately instead of being blended.
 | --- | --- | --- |
 | Cold-prefix prefill | Approximately 30K input tokens, `prefix-miss`, single stream | 1,533.73 API tok/s; 1,537.15 rank-marker tok/s |
 | Decode during that run | `prefix-miss`, single stream, non-MTP | 56.83 API tok/s; 56.46 rank-marker tok/s |
-| Exact-prompt repeat | 30,005-token fixed prompt, `hot-prefix-hit` | 30,004 cached tokens; TTFT 19.92 s -> 0.67 s |
+| Exact-prompt repeat | 30,005-token fixed prompt, `hot-prefix-hit` in the rank prompt LRU | 30,004 cached tokens; TTFT 19.92 s -> 0.67 s |
 | In-flight cancel | Cancellation during cold-prefix prefill | Both ranks stopped at 26,624 processed tokens and returned to ready |
 | Concurrent decode | Four independent streams, 512 output tokens each, non-MTP | 2,048 tokens in 9.469 s; 216.3 aggregate tok/s |
 | Greedy functional parity | Six cases, thinking disabled | 4/6 token-exact; 2/6 semantically equivalent |
@@ -87,8 +89,9 @@ publication requirements.
   model never remains stale in the cluster dashboard.
 - Cancel in-flight requests during both prefill and decode; capture the request
   ID, processed-token count, cancel-to-stop latency, and both rank states.
-- Exercise hot and SSD-tier prefix reuse, including spill, restore, and process
-  restart; report cached-token counts and cache source.
+- Exercise the distributed rank-local prompt LRU and durable SSD prompt-snapshot
+  tier, including restore and process restart; report cached-token counts and
+  cache source. This is distinct from the local engine's paged hot/SSD KV tier.
 - Run independent concurrent prompts and report each request's throughput as
   well as aggregate throughput.
 - Qualify additional text-only model families without model-specific split or

@@ -1072,6 +1072,47 @@ def test_cluster_plan_route_refuses_hybrid_tp_the_worker_cannot_run(monkeypatch)
     assert "must use every detected node" in response.json()["detail"]
 
 
+def test_cluster_plan_route_rejects_explicit_tp_for_unsupported_model(monkeypatch):
+    gib = 1024**3
+
+    from omlx.cluster.planner import ModelLayout
+
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=1 * gib,
+            layer_weight_bytes=(2 * gib,) * 8,
+            tensor_parallel_heads=32,
+            supports_tensor_parallel=False,
+        ),
+    )
+
+    response = _client().post(
+        "/admin/api/cluster/plan",
+        json={
+            "model_path": "/models/unsupported",
+            "nodes": [
+                {
+                    "node_id": "studio",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+                {
+                    "node_id": "mobile",
+                    "capacity_bytes": 128 * gib,
+                    "reserve_bytes": 8 * gib,
+                },
+            ],
+            "tensor_parallel_size": 2,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "does not support tensor parallelism" in response.json()["detail"]
+
+
 def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch):
     from omlx.cluster.planner import ModelLayout
     from omlx.cluster.registry import configure_cluster_registry
