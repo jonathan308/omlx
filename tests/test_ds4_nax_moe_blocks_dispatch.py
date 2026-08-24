@@ -139,6 +139,18 @@ def test_exact_enabled_m5_rank1_equal_shape_is_eligible(monkeypatch):
     )
 
 
+def test_runtime_empty_equal_vector_and_int32_indices_are_eligible(monkeypatch):
+    assert _eligible(
+        monkeypatch,
+        tp=(2, 1, ()),
+        indices_dtype=mx.int32,
+        up_weight_shape=(256, 1024, 512),
+        up_scale_shape=(256, 1024, 128),
+        down_weight_shape=(256, 4096, 128),
+        down_scale_shape=(256, 4096, 32),
+    )
+
+
 def test_combined_flag_does_not_enable_equal_shape(monkeypatch):
     assert not _eligible(
         monkeypatch,
@@ -177,7 +189,7 @@ def test_combined_switch_selects_the_same_exact_m5_rank1_contract(monkeypatch):
         {"sorted_shape": (6144, 1, 4096), "sorted_dtype": mx.float16},
         {"original_dtype": mx.float16},
         {"scores_shape": (1, 1024, 1)},
-        {"indices_dtype": mx.int32},
+        {"indices_dtype": mx.int16},
         {"scores_dtype": mx.bfloat16},
         {"activation_limit": 0.0},
         {"activation_fp32": True},

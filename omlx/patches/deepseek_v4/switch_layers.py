@@ -659,13 +659,17 @@ class SwitchGLU(nn.Module):
             or self.training
             or is_dspark_verify_armed()
             or not getattr(self, "_omlx_dsv4f_exact_config", False)
-            or tp_contract not in {(2, 1, (3, 5)), (2, 1, (4, 4))}
+            or tp_contract not in {
+                (2, 1, ()),
+                (2, 1, (3, 5)),
+                (2, 1, (4, 4)),
+            }
         ):
             return reject("execution contract")
         if (
             request_shape != (1, 1024, 4096)
             or tuple(indices.shape) != (1, 1024, 6)
-            or indices.dtype != mx.uint32
+            or indices.dtype not in (mx.int32, mx.uint32)
             or scores is None
             or tuple(scores.shape) != tuple(indices.shape)
             or scores.dtype != mx.float32
