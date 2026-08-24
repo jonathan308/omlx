@@ -364,6 +364,7 @@ class DistributedBatchedEngine(BatchedEngine):
         mode = "all" if ssd and hot else "ssd" if ssd else "hot"
         path = f"/omlx/internal/cache/{mode}/clear"
         headers = {"X-oMLX-Plan-Hash": self.deployment.plan_hash}
+        maintenance_epoch = time.time_ns()
 
         async def clear_rank_zero() -> dict[str, Any]:
             response = await self._client.post(path, headers=headers)
@@ -378,18 +379,59 @@ class DistributedBatchedEngine(BatchedEngine):
             return payload
 
         def clear_remote(rank: int, ssh_target: str) -> dict[str, Any]:
-            url = f"http://127.0.0.1:{self._supervisor.port}{path}"
+            state_root = str(self._supervisor.state_dir).rstrip("/") or "."
+            request_path = (
+                f"{state_root}/{self.deployment.deployment_id}-cache-clear.json"
+            )
+            ack_path = (
+                f"{state_root}/{self.deployment.deployment_id}"
+                f"-cache-clear-rank-{rank}.json"
+            )
+            request_payload = json.dumps(
+                {
+                    "epoch": maintenance_epoch,
+                    "deployment_id": self.deployment.deployment_id,
+                    "plan_hash": self.deployment.plan_hash,
+                    "ssd": bool(ssd),
+                    "hot": bool(hot),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            script = r"""
+import json, os, sys, time
+from pathlib import Path
+request_path = Path(sys.argv[1]).expanduser()
+ack_path = Path(sys.argv[2]).expanduser()
+payload = json.loads(sys.argv[3])
+request_path.parent.mkdir(parents=True, exist_ok=True)
+temporary = request_path.with_name(request_path.name + '.tmp')
+descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+    json.dump(payload, stream, separators=(',', ':'), sort_keys=True)
+os.replace(temporary, request_path)
+deadline = time.monotonic() + 40.0
+while time.monotonic() < deadline:
+    try:
+        if ack_path.is_file() and ack_path.stat().st_size <= 65536:
+            ack = json.loads(ack_path.read_text(encoding='utf-8'))
+            if int(ack.get('epoch', 0)) == int(payload['epoch']):
+                print(json.dumps(ack, separators=(',', ':'), sort_keys=True))
+                raise SystemExit(0)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    time.sleep(0.1)
+print('rank cache-clear acknowledgement timed out', file=sys.stderr)
+raise SystemExit(2)
+""".strip()
             command = shlex.join(
                 [
-                    "/usr/bin/curl",
-                    "-fsS",
-                    "--max-time",
-                    "40",
-                    "-X",
-                    "POST",
-                    "-H",
-                    f"X-oMLX-Plan-Hash: {self.deployment.plan_hash}",
-                    url,
+                    "python3",
+                    "-c",
+                    script,
+                    request_path,
+                    ack_path,
+                    request_payload,
                 ]
             )
             completed = _run_cluster_ssh(

@@ -90,8 +90,8 @@ async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
     assert requests[0].url.path == "/omlx/internal/cache/ssd/clear"
     assert requests[0].headers["X-oMLX-Plan-Hash"] == "d" * 64
     assert remote_calls[0][0] == "peer.local"
-    assert "/omlx/internal/cache/ssd/clear" in remote_calls[0][1]
-    assert "X-oMLX-Plan-Hash" in remote_calls[0][1]
+    assert "engine-test-cache-clear.json" in remote_calls[0][1]
+    assert '"ssd":true' in remote_calls[0][1]
 
 
 @pytest.mark.asyncio

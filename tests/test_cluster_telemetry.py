@@ -129,6 +129,46 @@ def test_private_rank_cache_clear_endpoint_is_plan_authenticated(tmp_path):
     assert denied.status == 403
 
 
+def test_peer_cache_clear_marker_is_heartbeat_acknowledged(tmp_path, monkeypatch):
+    import mlx.core as mx
+
+    class Group:
+        rank = staticmethod(lambda: 1)
+        size = staticmethod(lambda: 2)
+
+    class Marker(_Marker):
+        payload = {"deployment_id": "dep", "plan_hash": "p" * 64}
+        path = tmp_path / "dep-rank-1.json"
+
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    request_path = tmp_path / "dep-cache-clear.json"
+    ack_path = tmp_path / "dep-cache-clear-rank-1.json"
+    with install_server_telemetry(Marker(), heartbeat_interval=0) as telemetry:
+        epoch = time.time_ns()
+        request_path.write_text(
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "deployment_id": "dep",
+                    "plan_hash": "p" * 64,
+                    "ssd": True,
+                    "hot": False,
+                }
+            )
+        )
+        telemetry.heartbeat()
+
+    ack = json.loads(ack_path.read_text())
+    assert ack == {
+        "status": "ok",
+        "rank": 1,
+        "epoch": epoch,
+        "ssd_deleted": 0,
+        "hot_cleared": 0,
+    }
+    assert not request_path.exists()
+
+
 def test_generated_token_is_normalized_for_logprob_indexing():
     class Scalar:
         def item(self):
