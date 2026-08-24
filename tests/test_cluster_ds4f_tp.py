@@ -293,6 +293,39 @@ def test_ds4f_moe_override_keeps_outer_attention_and_shared_split(
             assert layer.ffn.switch_mlp.down_proj.weight.shape[2] == 64
 
 
+def test_ds4f_canonical_down_shards_up_gate_unequally_but_down_equally(
+    dsv4, monkeypatch
+):
+    monkeypatch.delenv("OMLX_TP_SHARD_WEIGHTS", raising=False)
+    monkeypatch.delenv("OMLX_TP_MOE_SHARD_WEIGHTS", raising=False)
+    monkeypatch.setenv("OMLX_DSV4_MOE_CANONICAL_DOWN", "1")
+    for rank in (0, 1):
+        model = _tiny_ds4f(dsv4, heads=8, moe_intermediate=128)
+        group = _FakeGroup(rank, 2)
+        model.shard(group)
+        for layer in model.model.pipeline_layers:
+            routed = layer.ffn.switch_mlp
+            expected_up = 32 if rank == 0 else 96
+            assert routed.gate_proj.weight.shape[1] == expected_up
+            assert routed.up_proj.weight.shape[1] == expected_up
+            assert routed.down_proj.weight.shape[2] == 64
+            assert routed._omlx_dsv4f_canonical_down is True
+            assert routed.sharding_group is group
+
+
+def test_real_ds4f_canonical_down_derives_three_five_up_gate(dsv4, monkeypatch):
+    monkeypatch.delenv("OMLX_TP_MOE_SHARD_WEIGHTS", raising=False)
+    monkeypatch.setenv("OMLX_DSV4_MOE_CANONICAL_DOWN", "1")
+    args = SimpleNamespace(
+        num_attention_heads=64,
+        o_groups=8,
+        moe_intermediate_size=2048,
+    )
+    assert dsv4._validated_ds4_moe_tp_weights(
+        args, _FakeGroup(0, 2), None
+    ) == (3, 5)
+
+
 def test_ds4f_non_moe_override_keeps_routed_banks_on_equal_outer_plan(
     dsv4, monkeypatch
 ):
