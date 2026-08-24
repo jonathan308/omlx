@@ -8,10 +8,17 @@ import threading
 import time
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+    load_prompt_cache,
+)
 
 from omlx.cluster.performance import DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
 from omlx.cluster.prompt_snapshot_cache import (
+    PoolingCacheDeltaSnapshot,
     SSDPromptSnapshotStore,
     agreed_boundary,
     candidate_boundaries,
@@ -77,6 +84,23 @@ def _pooling(ratio=4, tokens=10, dim=8, with_prev=True):
                 0,
             )
     return cache
+
+
+def _feed_pooling(cache, count, *, offset=0, dim=8, with_prev=True):
+    """Advance one PoolingCache without replacing its append-only history."""
+
+    kv = mx.random.normal((1, count, dim))
+    gate = mx.random.normal((1, count, dim))
+    ready_kv, ready_gate, _ = cache.accumulate_windows(kv, gate, offset)
+    windows = ready_kv.shape[1] // cache.ratio
+    if windows:
+        cache.update_and_fetch(mx.random.normal((1, windows, dim)))
+        if with_prev:
+            cache.store_prev(
+                ready_kv.reshape(1, windows, cache.ratio, dim),
+                ready_gate.reshape(1, windows, cache.ratio, dim),
+                0,
+            )
 
 
 def _assert_pooling_equal(restored, original):
@@ -229,6 +253,142 @@ def test_a_pooling_cache_round_trips_every_slot(tmp_path):
 
     assert restored is not None
     _assert_pooling_equal(restored[0], original)
+
+
+def test_pooling_deltas_grow_linearly_and_carry_absolute_ranges(tmp_path):
+    """Each boundary stores one fixed-size pooled slab, not all prior rows."""
+
+    step = 128
+    boundaries = tuple(range(step, 6 * step + 1, step))
+    tokens = list(range(boundaries[-1]))
+    store = SSDPromptSnapshotStore(tmp_path, step=step)
+    pool = PoolingCache(4)
+
+    for boundary in boundaries:
+        _feed_pooling(pool, step, offset=boundary - step, dim=256)
+        assert store.put(MODEL, tokens[:boundary], [pool])
+        key = store._chain_keys(MODEL, tuple(tokens[:boundary]))[-1]
+        raw = load_prompt_cache(str(store._path(key)))[0]
+        assert isinstance(raw, PoolingCacheDeltaSnapshot)
+        assert (raw.source_start, raw.source_end) == (boundary - step, boundary)
+        assert (raw.pool_start, raw.pool_end) == (
+            (boundary - step) // pool.ratio,
+            boundary // pool.ratio,
+        )
+
+    sizes = [path.stat().st_size for path in tmp_path.glob("*.safetensors")]
+    assert len(sizes) == len(boundaries)
+    # Header digit growth is tiny; cumulative snapshots would make the last
+    # payload roughly six times the first.
+    assert max(sizes) < 1.05 * min(sizes)
+
+
+def test_pooling_delta_chain_rebuilds_remainders_and_empty_slots(tmp_path):
+    """Non-aligned boundaries preserve both overlap carries and None slots."""
+
+    step = 5
+    tokens = list(range(3 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step)
+    overlap = PoolingCache(4)
+    simple = PoolingCache(8)
+
+    for boundary in (5, 10, 15):
+        _feed_pooling(overlap, step, offset=boundary - step, with_prev=True)
+        _feed_pooling(simple, step, offset=boundary - step, with_prev=False)
+        assert store.put(
+            MODEL,
+            tokens[:boundary],
+            [CacheList(overlap, simple)],
+        )
+
+    restored = store.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    restored_overlap, restored_simple = restored[0].caches
+    assert overlap.remainder == 3
+    assert simple.remainder == 7
+    _assert_pooling_equal(restored_overlap, overlap)
+    _assert_pooling_equal(restored_simple, simple)
+    assert restored_simple.prev_win_kv is None
+    assert restored_simple.prev_win_gate is None
+
+
+def test_pooling_delta_chain_survives_a_rank_restart(tmp_path):
+    step = 5
+    tokens = list(range(3 * step))
+    first = SSDPromptSnapshotStore(
+        tmp_path,
+        step=step,
+        persistent=True,
+        write_behind=True,
+        max_pending_writes=3,
+        pending_max_bytes=1024 * 1024,
+    )
+    pool = PoolingCache(4)
+    for boundary in (5, 10, 15):
+        _feed_pooling(pool, step, offset=boundary - step)
+        assert first.put(MODEL, tokens[:boundary], [pool])
+    assert first.close(timeout=5)
+
+    second = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    restored = second.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    _assert_pooling_equal(restored[0], pool)
+
+
+def test_corrupt_pooling_delta_range_fails_closed_and_unpoisons_manifest(tmp_path):
+    step = 4
+    tokens = list(range(2 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    pool = PoolingCache(4)
+    for boundary in (4, 8):
+        _feed_pooling(pool, step, offset=boundary - step)
+        assert store.put(MODEL, tokens[:boundary], [pool])
+
+    deepest_key = store._chain_keys(MODEL, tuple(tokens))[-1]
+    path = store._path(deepest_key)
+    arrays, metadata = mx.load(str(path), return_metadata=True)
+    # pool_start for a top-level delta is metadata slot five. Turn [1,2)
+    # into the overlapping [0,2) while leaving the tensor bytes untouched.
+    assert metadata["0.0.5"] == "1"
+    metadata["0.0.5"] = "0"
+    mx.save_safetensors(str(path), arrays, metadata)
+
+    assert store.load(MODEL, tokens, len(tokens)) is None
+    assert len(store) == 0
+    manifest = json.loads((tmp_path / "index.json").read_text())
+    assert manifest["entries"] == []
+
+
+def test_legacy_cumulative_pooling_snapshot_seeds_a_new_delta_chain(
+    tmp_path, monkeypatch
+):
+    """An on-disk pre-upgrade boundary remains reusable after extension."""
+
+    step = 5
+    tokens = list(range(2 * step))
+    store = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    pool = PoolingCache(4)
+    _feed_pooling(pool, step)
+
+    # Simulate the pre-delta writer, which used PoolingCacheSnapshot and put
+    # the whole cumulative pooled tensor in each boundary file.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            PoolingCacheDeltaSnapshot,
+            "from_cache",
+            classmethod(lambda _cls, _inner, **_kwargs: None),
+        )
+        assert store.put(MODEL, tokens[:step], [pool])
+    legacy = store.load(MODEL, tokens[:step], step)
+    assert legacy is not None
+    _assert_pooling_equal(legacy[0], pool)
+
+    _feed_pooling(pool, step, offset=step)
+    assert store.put(MODEL, tokens, [pool])
+    restarted = SSDPromptSnapshotStore(tmp_path, step=step, persistent=True)
+    restored = restarted.load(MODEL, tokens, len(tokens))
+    assert restored is not None
+    _assert_pooling_equal(restored[0], pool)
 
 
 def test_the_deepseek_layer_shape_round_trips(tmp_path):

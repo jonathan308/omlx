@@ -13,10 +13,10 @@ serialises through its declared ``state`` / ``meta_state``.
 A boundary file holds what that boundary added, mirroring the local paged SSD
 cache's policy: plain ``KVCache`` members store only their newest step-sized
 slab (positionally immutable, so a chain holds one copy of the KV rather than
-one cumulative copy per boundary), while non-sliceable members (rotating
-windows, recurrent slots, pooling state) store their full state at that
-boundary, which is the only representation they have and is what makes every
-boundary an independent restore point for them.
+one cumulative copy per boundary). Rotating windows and recurrent slots keep
+their exact state at each boundary. PoolingCache keeps those boundary-local
+carry slots plus only the append-only pooled rows added by that segment; chain
+restore validates and joins their absolute ranges.
 
 Each rank keeps its own directory holding its own layer-slice snapshots. The
 keys are a hash of ``(model, prefix tokens)`` and are therefore identical across
@@ -51,10 +51,13 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from omlx.cache.pooling_delta import POOLING_CACHE_DELTA_FORMAT_VERSION
 
 from .performance import DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
 
@@ -66,6 +69,272 @@ logger = logging.getLogger(__name__)
 _MAX_ENTRIES_DEFAULT = 512
 _MAX_PENDING_WRITES_DEFAULT = 2
 _PENDING_MAX_BYTES_DEFAULT = 512 * 1024 * 1024
+
+# This marker is deliberately independent of the Python class name.  The
+# class name lets mlx-lm find the deserialiser, while the marker/version below
+# is the durable wire contract that the chain assembler validates before it
+# trusts any absolute range metadata.
+_POOLING_DELTA_WIRE_MARKER = "omlx.cluster.pooling-cache-delta"
+
+
+def _slot_layout(state: tuple[Any, ...]) -> str:
+    """Encode every PoolingCache state slot without storing empty leaves."""
+
+    layout = []
+    for value in state:
+        if value is None:
+            layout.append({"kind": "none"})
+            continue
+        shape = [int(dim) for dim in value.shape]
+        layout.append(
+            {
+                "kind": "empty" if int(value.size) == 0 else "array",
+                "shape": shape,
+                "dtype": str(value.dtype),
+            }
+        )
+    return json.dumps(layout, separators=(",", ":"), sort_keys=True)
+
+
+def _pool_schema(value: Any) -> str:
+    """Stable pooled-row schema, excluding its append-only sequence axis."""
+
+    if value is None:
+        return "none"
+    shape = [int(dim) for dim in value.shape]
+    if len(shape) < 2:
+        raise ValueError("PoolingCache pooled state has no sequence axis")
+    return json.dumps(
+        {
+            "dtype": str(value.dtype),
+            "shape_without_sequence": [shape[0], *shape[2:]],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _validate_pooling_state_layout(state: tuple[Any, ...]) -> None:
+    if len(state) not in (3, 5):
+        raise ValueError("PoolingCache state must have three or five slots")
+    if (state[0] is None) != (state[1] is None):
+        raise ValueError("PoolingCache remainder KV/gate slots disagree")
+    if len(state) == 5 and (state[3] is None) != (state[4] is None):
+        raise ValueError("PoolingCache previous-window KV/gate slots disagree")
+
+
+class PoolingCacheDeltaSnapshot:
+    """Versioned wire record for one absolute PoolingCache pooled-row delta.
+
+    Remainder and overlap-carry slots are the exact state at ``source_end``;
+    only the append-only pooled slot is sliced to ``[pool_start:pool_end]``.
+    ``from_state`` intentionally returns another instance of this carrier,
+    rather than a live PoolingCache: a single segment is incomplete and must
+    never escape without the chain assembler validating and joining it.
+    """
+
+    def __init__(
+        self,
+        state: tuple[Any, ...],
+        *,
+        ratio: int,
+        source_start: int,
+        source_end: int,
+        pool_start: int,
+        pool_end: int,
+        pool_schema: str,
+    ) -> None:
+        _validate_pooling_state_layout(state)
+        self._wire_state = state
+        self.ratio = int(ratio)
+        self.source_start = int(source_start)
+        self.source_end = int(source_end)
+        self.pool_start = int(pool_start)
+        self.pool_end = int(pool_end)
+        self.pool_schema = str(pool_schema)
+        self.state_arity = len(state)
+        self.layout = _slot_layout(state)
+
+    @classmethod
+    def from_cache(
+        cls,
+        inner: Any,
+        *,
+        source_start: int,
+        source_end: int,
+    ) -> PoolingCacheDeltaSnapshot | None:
+        """Return a compact record only when absolute geometry is provable."""
+
+        try:
+            import mlx.core as mx
+
+            ratio = int(inner.ratio)
+            state = tuple(inner.state)
+            _validate_pooling_state_layout(state)
+            if ratio <= 0 or source_start < 0 or source_end <= source_start:
+                return None
+            pool_start = source_start // ratio
+            pool_end = source_end // ratio
+            pooled = state[2]
+            if pooled is None:
+                if pool_end != 0:
+                    return None
+                delta = None
+            else:
+                if len(pooled.shape) < 2 or int(pooled.shape[1]) != pool_end:
+                    return None
+                delta = pooled[:, pool_start:pool_end]
+                # A bare view pins the entire cumulative allocation until an
+                # async writer has copied it.  Materialise the small range now.
+                if hasattr(mx, "contiguous"):
+                    delta = mx.contiguous(delta)
+            compacted = list(state)
+            compacted[2] = delta
+            return cls(
+                tuple(compacted),
+                ratio=ratio,
+                source_start=source_start,
+                source_end=source_end,
+                pool_start=pool_start,
+                pool_end=pool_end,
+                pool_schema=_pool_schema(pooled),
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # An unfamiliar PoolingCache variant stays a cumulative snapshot;
+            # correctness is more important than forcing compaction.
+            return None
+
+    @property
+    def state(self) -> tuple[Any, ...]:
+        import mlx.core as mx
+
+        kept = tuple(
+            value
+            for value in self._wire_state
+            if value is not None and int(value.size) > 0
+        )
+        return kept or (mx.zeros((1,), dtype=mx.uint8),)
+
+    @property
+    def meta_state(self) -> tuple[str, ...]:
+        return (
+            _POOLING_DELTA_WIRE_MARKER,
+            POOLING_CACHE_DELTA_FORMAT_VERSION,
+            str(self.ratio),
+            str(self.source_start),
+            str(self.source_end),
+            str(self.pool_start),
+            str(self.pool_end),
+            str(self.state_arity),
+            self.pool_schema,
+            self.layout,
+        )
+
+    @classmethod
+    def from_state(cls, state: Any, meta_state: Any) -> PoolingCacheDeltaSnapshot:
+        import mlx.core as mx
+
+        if not isinstance(meta_state, (list, tuple)) or len(meta_state) != 10:
+            raise ValueError("invalid PoolingCache delta metadata layout")
+        (
+            marker,
+            version,
+            ratio_text,
+            source_start_text,
+            source_end_text,
+            pool_start_text,
+            pool_end_text,
+            arity_text,
+            pool_schema,
+            layout_text,
+        ) = meta_state
+        if marker != _POOLING_DELTA_WIRE_MARKER:
+            raise ValueError("invalid PoolingCache delta wire marker")
+        if version != POOLING_CACHE_DELTA_FORMAT_VERSION:
+            raise ValueError("unsupported PoolingCache delta wire version")
+        try:
+            ratio = int(ratio_text)
+            source_start = int(source_start_text)
+            source_end = int(source_end_text)
+            pool_start = int(pool_start_text)
+            pool_end = int(pool_end_text)
+            state_arity = int(arity_text)
+            layout = json.loads(layout_text)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("corrupt PoolingCache delta metadata") from error
+        if (
+            ratio <= 0
+            or source_start < 0
+            or source_end <= source_start
+            or pool_start < 0
+            or pool_end < pool_start
+            or state_arity not in (3, 5)
+            or not isinstance(layout, list)
+            or len(layout) != state_arity
+        ):
+            raise ValueError("unsafe PoolingCache delta ranges or layout")
+
+        arrays = list(state) if isinstance(state, (list, tuple)) else [state]
+        substantive = sum(
+            1
+            for spec in layout
+            if isinstance(spec, dict) and spec.get("kind") == "array"
+        )
+        if substantive and len(arrays) != substantive:
+            raise ValueError("PoolingCache delta tensor count disagrees with layout")
+        if not substantive and len(arrays) != 1:
+            raise ValueError("PoolingCache delta placeholder is missing")
+
+        rebuilt = []
+        array_position = 0
+        for spec in layout:
+            if not isinstance(spec, dict) or spec.get("kind") not in {
+                "none",
+                "empty",
+                "array",
+            }:
+                raise ValueError("invalid PoolingCache delta slot descriptor")
+            kind = spec["kind"]
+            if kind == "none":
+                rebuilt.append(None)
+                continue
+            try:
+                shape = tuple(int(dim) for dim in spec["shape"])
+                dtype_text = str(spec["dtype"])
+                dtype = getattr(mx, dtype_text.rsplit(".", 1)[-1])
+            except (AttributeError, KeyError, TypeError, ValueError) as error:
+                raise ValueError("invalid PoolingCache delta tensor schema") from error
+            if any(dim < 0 for dim in shape):
+                raise ValueError("negative PoolingCache delta tensor dimension")
+            if kind == "empty":
+                if all(dim > 0 for dim in shape):
+                    raise ValueError("empty PoolingCache delta slot has nonempty shape")
+                rebuilt.append(mx.zeros(shape, dtype=dtype))
+                continue
+            value = arrays[array_position]
+            array_position += 1
+            if tuple(int(dim) for dim in value.shape) != shape or value.dtype != dtype:
+                raise ValueError("PoolingCache delta tensor disagrees with schema")
+            rebuilt.append(value)
+        if array_position != substantive:
+            raise ValueError("unused PoolingCache delta tensors")
+
+        rebuilt_state = tuple(rebuilt)
+        _validate_pooling_state_layout(rebuilt_state)
+        obj = cls(
+            rebuilt_state,
+            ratio=ratio,
+            source_start=source_start,
+            source_end=source_end,
+            pool_start=pool_start,
+            pool_end=pool_end,
+            pool_schema=str(pool_schema),
+        )
+        # Preserve the original layout string exactly after it has been
+        # validated; a re-encode must match or the metadata was noncanonical.
+        if obj.layout != layout_text or obj.state_arity != state_arity:
+            raise ValueError("noncanonical PoolingCache delta layout")
+        return obj
 
 
 @dataclass
@@ -79,7 +348,7 @@ class _FrozenPromptSnapshot:
 
 
 class PoolingCacheSnapshot:
-    """Serialisation stand-in for the DeepSeek sparse-attention pool cache.
+    """Legacy cumulative stand-in for the DeepSeek sparse-attention pool cache.
 
     ``save_prompt_cache`` serialises through ``state`` / ``meta_state`` and
     reconstructs via ``globals()[name].from_state`` inside
@@ -89,8 +358,10 @@ class PoolingCacheSnapshot:
     in-process state contract is load-bearing for the paged-cache handlers, so
     rather than changing the class this stand-in presents the same cache in
     wire form (arrays-only state, with the slot layout encoded as a flag
-    string), and its ``from_state`` hands back a real ``PoolingCache``, so a
-    restored snapshot is indistinguishable from the cache it was taken from.
+    string), and its ``from_state`` hands back a real ``PoolingCache``. New
+    aligned writes use ``PoolingCacheDeltaSnapshot``; this carrier remains the
+    safe fallback for unfamiliar geometry and the migration base for existing
+    persistent files.
     """
 
     def __init__(self, inner: Any) -> None:
@@ -280,7 +551,12 @@ def _register_snapshot_classes() -> None:
 
     import mlx_lm.models.cache as cache_module
 
-    for snapshot_class in (PoolingCacheSnapshot, EmptyLeafSnapshot, KVCacheSegment):
+    for snapshot_class in (
+        PoolingCacheSnapshot,
+        PoolingCacheDeltaSnapshot,
+        EmptyLeafSnapshot,
+        KVCacheSegment,
+    ):
         name = snapshot_class.__name__
         if getattr(cache_module, name, None) is not snapshot_class:
             setattr(cache_module, name, snapshot_class)
@@ -310,6 +586,14 @@ def _wrap_for_save(
 
     def wrap(entry: Any) -> Any:
         if pooling_class is not None and isinstance(entry, pooling_class):
+            if boundary > 0:
+                delta = PoolingCacheDeltaSnapshot.from_cache(
+                    entry,
+                    source_start=segment_start,
+                    source_end=boundary,
+                )
+                if delta is not None:
+                    return delta
             return PoolingCacheSnapshot(entry)
         if isinstance(entry, CacheList):
             members = [wrap(m) for m in entry.caches]
@@ -1199,9 +1483,18 @@ class SSDPromptSnapshotStore:
         try:
             files = [load_prompt_cache(str(self._path(key))) for key in chain]
             assembled = _assemble_chain(files, boundary)
-        except Exception:
+        except Exception as error:
+            logger.info("Rejecting corrupt prompt snapshot chain: %s", error)
+            with self._lock:
+                self._discard_chain_locked(chain)
             return None
         if assembled is None:
+            # A syntactically valid safetensors file can still carry a gap,
+            # overlap, mixed schema or corrupt absolute PoolingCache range.
+            # Remove the rejected chain from the durable index so duplicate
+            # detection cannot keep returning a poisoned boundary forever.
+            with self._lock:
+                self._discard_chain_locked(chain)
             return None
         with self._lock:
             for key in chain:
@@ -1209,6 +1502,22 @@ class SSDPromptSnapshotStore:
                     self._index.move_to_end(key)
             self._persist_index_locked()
         return assembled
+
+    def _discard_chain_locked(self, keys: list[str]) -> None:
+        """Forget an invalid chain atomically, including shared manifest rows."""
+
+        changed = False
+        for key in keys:
+            entry = self._index.pop(key, None)
+            if entry is None:
+                continue
+            self._nbytes -= entry.nbytes
+            self._capacity_bytes -= entry.capacity_charge_bytes
+            with suppress(OSError):
+                self._path(key).unlink()
+            changed = True
+        if changed:
+            self._persist_index_locked()
 
     def _evict_locked(self) -> None:
         while len(self._index) > self.max_entries or (
@@ -1232,6 +1541,161 @@ class SSDPromptSnapshotStore:
             self._path(key).unlink()
 
 
+def _assemble_pooling_delta_chain(
+    members: list[Any], expected_source_ends: list[int]
+) -> Any | None:
+    """Validate and rebuild one PoolingCache absolute-range delta chain.
+
+    A run of legacy cumulative PoolingCache snapshots may precede the first
+    versioned delta after an in-place upgrade.  It is accepted as a base only
+    when its ratio, absolute pooled length and tensor schema agree with the new
+    records.  A cumulative snapshot after a delta, or any other schema mix,
+    fails closed rather than guessing which state is authoritative.
+    """
+
+    import mlx.core as mx
+
+    from omlx.patches.deepseek_v4.cache_extras import PoolingCache
+
+    delta_positions = [
+        position
+        for position, member in enumerate(members)
+        if isinstance(member, PoolingCacheDeltaSnapshot)
+    ]
+    if not delta_positions:
+        return members[-1]
+    first_delta = delta_positions[0]
+    if any(
+        not isinstance(member, PoolingCache) for member in members[:first_delta]
+    ) or any(
+        not isinstance(member, PoolingCacheDeltaSnapshot)
+        for member in members[first_delta:]
+    ):
+        return None
+
+    ratio: int | None = None
+    concrete_pool_schema: str | None = None
+    base_pooled = None
+    pool_cursor = 0
+    previous_source_end = 0
+
+    # Cumulative V1/V2 snapshots are still readable and can seed a chain
+    # written by the new binary after a persistent rank restart.
+    for position, member in enumerate(members[:first_delta]):
+        try:
+            member_ratio = int(member.ratio)
+            state = tuple(member.state)
+            _validate_pooling_state_layout(state)
+            expected_end = int(expected_source_ends[position])
+            expected_pool_end = expected_end // member_ratio
+            pooled = state[2]
+            pooled_length = 0 if pooled is None else int(pooled.shape[1])
+            schema = _pool_schema(pooled)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        if member_ratio <= 0 or pooled_length != expected_pool_end:
+            return None
+        if ratio is None:
+            ratio = member_ratio
+        elif member_ratio != ratio:
+            return None
+        if schema != "none":
+            if concrete_pool_schema is None:
+                concrete_pool_schema = schema
+            elif schema != concrete_pool_schema:
+                return None
+        base_pooled = pooled
+        pool_cursor = pooled_length
+        previous_source_end = expected_end
+
+    pooled_parts = [] if base_pooled is None else [base_pooled]
+    final_state: tuple[Any, ...] | None = None
+    state_arity: int | None = None
+    for position in range(first_delta, len(members)):
+        member = members[position]
+        expected_source_end = int(expected_source_ends[position])
+        expected_source_start = (
+            0 if position == 0 else int(expected_source_ends[position - 1])
+        )
+        try:
+            state = tuple(member._wire_state)
+            _validate_pooling_state_layout(state)
+            observed_schema = _pool_schema(state[2])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None
+        if (
+            member.source_start != expected_source_start
+            or member.source_end != expected_source_end
+            or member.source_start != previous_source_end
+            or member.pool_start != member.source_start // member.ratio
+            or member.pool_end != member.source_end // member.ratio
+            or member.pool_start != pool_cursor
+        ):
+            return None
+        if ratio is None:
+            ratio = member.ratio
+        elif member.ratio != ratio:
+            return None
+        if state_arity is None:
+            state_arity = member.state_arity
+        elif member.state_arity != state_arity:
+            return None
+        if member.state_arity != len(state) or member.pool_schema != observed_schema:
+            return None
+        if observed_schema != "none":
+            if concrete_pool_schema is None:
+                concrete_pool_schema = observed_schema
+            elif observed_schema != concrete_pool_schema:
+                return None
+        elif member.pool_end != 0:
+            # Once any pooled row exists, even a zero-row delta retains its
+            # typed empty slice. None would be an incompatible/corrupt layout.
+            return None
+
+        delta_length = member.pool_end - member.pool_start
+        pooled_delta = state[2]
+        if pooled_delta is None:
+            if delta_length != 0 or member.pool_schema != "none":
+                return None
+        else:
+            if int(pooled_delta.shape[1]) != delta_length:
+                return None
+            if delta_length:
+                pooled_parts.append(pooled_delta)
+        pool_cursor = member.pool_end
+        previous_source_end = member.source_end
+        final_state = state
+
+    if ratio is None or final_state is None:
+        return None
+    if pool_cursor != int(expected_source_ends[-1]) // ratio:
+        return None
+    if pooled_parts:
+        try:
+            pooled = (
+                pooled_parts[0]
+                if len(pooled_parts) == 1
+                else mx.concatenate(pooled_parts, axis=1)
+            )
+        except Exception:
+            return None
+        if int(pooled.shape[1]) != pool_cursor:
+            return None
+    else:
+        # Before the first completed pool window, preserve whether the live
+        # cache represented its pooled slot as None or as a typed empty array.
+        pooled = final_state[2]
+
+    rebuilt_state = list(final_state)
+    rebuilt_state[2] = pooled
+    try:
+        cache = PoolingCache(ratio)
+        cache.state = tuple(rebuilt_state)
+    except Exception:
+        return None
+    return cache
+
+
 def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:
     """Stitch one restorable cache list out of a chain of boundary files.
 
@@ -1243,9 +1707,20 @@ def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:
     import mlx.core as mx
     from mlx_lm.models.cache import CacheList, KVCache
 
+    if not files or boundary <= 0 or boundary % len(files) != 0:
+        return None
+    step = boundary // len(files)
+    expected_source_ends = [(position + 1) * step for position in range(len(files))]
+
     def stitch(members: list[Any]) -> Any | None:
         deepest = members[-1]
-        if isinstance(deepest, CacheList):
+        if any(isinstance(entry, CacheList) for entry in members):
+            if not all(isinstance(entry, CacheList) for entry in members):
+                return None
+            if any(
+                len(entry.caches) != len(deepest.caches) for entry in members
+            ):
+                return None
             rebuilt = []
             for position in range(len(deepest.caches)):
                 member = stitch([entry.caches[position] for entry in members])
@@ -1266,6 +1741,8 @@ def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:
             cache.values = values
             cache.offset = boundary
             return cache
+        if any(isinstance(member, PoolingCacheDeltaSnapshot) for member in members):
+            return _assemble_pooling_delta_chain(members, expected_source_ends)
         return deepest
 
     length = len(files[-1])
