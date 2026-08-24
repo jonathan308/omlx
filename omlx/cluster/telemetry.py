@@ -302,6 +302,87 @@ class RuntimeTelemetry:
                 for sample in self._requests.values()
             )
 
+    def make_cancel_vote(self, uids: Any) -> dict[str, Any]:
+        """Create the next rank-zero-owned, monotonically ordered cancel vote."""
+
+        try:
+            candidates = tuple(uids)
+        except TypeError as exc:
+            raise RuntimeError("distributed cancel vote UIDs are not iterable") from exc
+        normalized: list[int] = []
+        for uid in candidates:
+            if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+                raise RuntimeError("distributed cancel vote contains an invalid UID")
+            if uid not in normalized:
+                normalized.append(uid)
+        if not normalized or len(normalized) > _MAX_TARGETED_CANCEL_REQUESTS:
+            raise RuntimeError("distributed cancel vote has an invalid UID count")
+        with self._lock:
+            epoch = max(
+                self._accepted_cancel_vote_epoch + 1,
+                self._last_cancel_epoch,
+                1,
+            )
+        return {
+            "kind": _CANCEL_VOTE_KIND,
+            "schema_version": _CANCEL_VOTE_SCHEMA_VERSION,
+            "epoch": epoch,
+            "uids": normalized,
+        }
+
+    def accept_cancel_vote(self, vote: Any) -> tuple[int, list[int]]:
+        """Validate one shared cancel epoch before any rank mutates its batch."""
+
+        if (
+            not isinstance(vote, dict)
+            or vote.get("kind") != _CANCEL_VOTE_KIND
+            or vote.get("schema_version") != _CANCEL_VOTE_SCHEMA_VERSION
+        ):
+            raise RuntimeError("distributed cancel vote envelope is invalid")
+        epoch = vote.get("epoch")
+        uids = vote.get("uids")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
+            raise RuntimeError("distributed cancel vote epoch is invalid")
+        if not isinstance(uids, list):
+            raise RuntimeError("distributed cancel vote UID list is invalid")
+        normalized: list[int] = []
+        for uid in uids:
+            if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+                raise RuntimeError("distributed cancel vote contains an invalid UID")
+            if uid in normalized:
+                raise RuntimeError("distributed cancel vote contains duplicate UIDs")
+            normalized.append(uid)
+        if not normalized or len(normalized) > _MAX_TARGETED_CANCEL_REQUESTS:
+            raise RuntimeError("distributed cancel vote has an invalid UID count")
+        with self._lock:
+            if epoch <= self._accepted_cancel_vote_epoch:
+                raise RuntimeError(
+                    "distributed cancel vote epoch did not advance: "
+                    f"previous={self._accepted_cancel_vote_epoch}, received={epoch}"
+                )
+            self._accepted_cancel_vote_epoch = epoch
+        return epoch, normalized
+
+    def drain_cancel_boundary(self, epoch: int, uids: Any) -> None:
+        """Drain rank-local Metal work for a validated shared cancellation."""
+
+        with self._lock:
+            generator = self._batch_generator
+        drain = getattr(generator, "_omlx_drain_cancel_boundary", None)
+        if not callable(drain):
+            raise RuntimeError("distributed cancel vote has no live batch generator")
+        drain(epoch, uids)
+
+    def arm_cancel_boundary(self, epoch: int, uids: Any) -> None:
+        """Allow exactly the agreed UID removal after the rank rendezvous."""
+
+        with self._lock:
+            generator = self._batch_generator
+        arm = getattr(generator, "_omlx_arm_cancel_boundary", None)
+        if not callable(arm):
+            raise RuntimeError("distributed cancel vote has no live batch generator")
+        arm(epoch, uids)
+
     def observe_token(self, request_id: int) -> None:
         now = float(self._clock())
         with self._lock:
@@ -1033,10 +1114,23 @@ def install_server_telemetry(
             return uids
 
         def remove(self, uids: Any) -> Any:
-            telemetry.cancel_uids(uids)
-            for uid in uids:
+            uid_values = list(uids)
+            if world_size > 1:
+                prepared = self._omlx_prepared_cancel_vote
+                if prepared is None or prepared[1] != tuple(uid_values):
+                    raise RuntimeError(
+                        "distributed UID removal was not armed by the shared "
+                        "cancel epoch"
+                    )
+                self._omlx_prepared_cancel_vote = None
+            # Mutate the MLX-LM batch first. Only then publish cancellation and
+            # wake the HTTP collector; an exception during cache filtering must
+            # not advertise a request as safely removed when its graph remains.
+            result = super().remove(uid_values)
+            for uid in uid_values:
                 self._omlx_tokens.pop(uid, None)
-            return super().remove(uids)
+            telemetry.cancel_uids(uid_values)
+            return result
 
         def _omlx_snapshot_boundary(self, response: Any) -> None:
             """Save the batched prompt cache when prefill crosses a boundary.
@@ -1214,6 +1308,25 @@ def install_server_telemetry(
             return super().__next__()
 
     class TelemetryResponseGenerator(original):
+        @staticmethod
+        def _finish_shared_cancel_vote(shared: Any) -> Any:
+            if not (
+                isinstance(shared, dict)
+                and shared.get("kind") == _CANCEL_VOTE_KIND
+            ):
+                return shared
+            epoch, uids = telemetry.accept_cancel_vote(shared)
+            telemetry.drain_cancel_boundary(epoch, uids)
+            if control_plane is not None:
+                # TCP sendall is not a rendezvous: rank zero can otherwise
+                # filter its caches while the worker is still draining an
+                # indexer gather from the just-finished prompt chunk.
+                control_plane.barrier()
+            # ``remove`` is fail-closed in TP mode and accepts only this exact
+            # epoch/list after every peer completed the rendezvous.
+            telemetry.arm_cancel_boundary(epoch, uids)
+            return uids
+
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
@@ -1224,6 +1337,8 @@ def install_server_telemetry(
             # UID on only one rank.
             if int(getattr(self, "_rank", 0)) == 0 and isinstance(obj, list):
                 obj = telemetry.merge_requested_cancel_uids(obj)
+                if obj:
+                    obj = telemetry.make_cancel_vote(obj)
             if control_plane is not None:
                 return control_plane.broadcast_object(obj)
             return super()._share_object(obj)
