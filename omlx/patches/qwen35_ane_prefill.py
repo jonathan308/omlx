@@ -113,7 +113,11 @@ def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 def _eligible_affine_linear(
     linear: Any, dtype: mx.Dtype, *, bits: int, group_size: int
 ) -> bool:
-    if not isinstance(linear, nn.QuantizedLinear):
+    # TP replaces dense projections with MLX's quantized distributed modules.
+    # They expose the same packed affine carriers, so structural validation is
+    # authoritative; restricting this to QuantizedLinear silently disabled all
+    # dense-M3.8 ANE work after sharding.
+    if not isinstance(linear, nn.Module):
         return False
     weight = getattr(linear, "weight", None)
     scales = getattr(linear, "scales", None)
@@ -219,7 +223,22 @@ def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
     )
     if x.shape[-2] < _route_min_tokens_for_bits(bits, min_tokens, q8_min_tokens):
         return linear(x)
-    return _linear_qmm(linear, x, variant)
+    return _finish_distributed_linear(linear, _linear_qmm(linear, x, variant))
+
+
+def _finish_distributed_linear(linear: Any, output: mx.array) -> mx.array:
+    """Apply the collective owned by a sharded-to-all projection."""
+
+    try:
+        from mlx.nn.layers.distributed import QuantizedShardedToAllLinear
+    except ImportError:
+        return output
+    if not isinstance(linear, QuantizedShardedToAllLinear):
+        return output
+    output = mx.distributed.all_sum(output, group=linear.group)
+    if "bias" in linear:
+        output = output + linear["bias"]
+    return output
 
 
 def configure_qwen35_ane_prefill_scheduler(
@@ -732,7 +751,7 @@ def _post_ane_linear(
     if cpu_state is not None:
         from omlx.custom_kernels.qwen35_prefill import fast
 
-        return fast.qwen35_cpu_fp16_affine_qmm_t(
+        output = fast.qwen35_cpu_fp16_affine_qmm_t(
             x,
             cpu_state.weight,
             cpu_state.gpu_weight,
@@ -744,6 +763,7 @@ def _post_ane_linear(
             cpu_threads,
             cpu_shared_resource,
         )
+        return _finish_distributed_linear(linear, output)
 
     from omlx.patches.qwen35_q4_mlp import _linear_qmm
 
@@ -751,7 +771,7 @@ def _post_ane_linear(
         q8_min_tokens = int(os.environ.get(q8_threshold_env, "16384"))
         if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
             return linear(x)
-    return _linear_qmm(linear, x, variant)
+    return _finish_distributed_linear(linear, _linear_qmm(linear, x, variant))
 
 
 def _register_gdn_module(gdn: Any) -> None:
