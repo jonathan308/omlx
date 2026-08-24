@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,11 +9,14 @@ import pytest
 from benchmarks.bench_ds4_tp_stage_profile import (
     CATEGORIES,
     DS4TPShape,
+    FINE_DETAIL_CATEGORIES,
     TimingRecorder,
     amdahl_table,
     modeled_collective_ms,
     normalize_to_observed_wall,
     optimization_scenarios,
+    parse_args,
+    profile_real_layers,
     projected_tps,
     required_group_speedup,
 )
@@ -41,6 +46,17 @@ def test_collective_model_counts_two_activation_reductions_per_layer():
     assert report["total_ms"] == pytest.approx(
         report["activation_ms"] + report["indexer_ms"]
     )
+
+
+def test_m6_verify_collective_geometry_has_no_short_context_indexer_exchange():
+    shape = DS4TPShape(rank=1, tokens=6, prefix_tokens=65)
+    report = modeled_collective_ms(shape, bandwidth_gbps=6.2, latency_us=30)
+
+    assert shape.route_rows == 36
+    assert report["activation_all_sum_calls"] == 86
+    assert report["activation_payload_bytes"] == 6 * 4096 * 2
+    assert report["indexer_all_gather_calls"] == 0
+    assert report["total_ms"] == pytest.approx(3.2617858064516128)
 
 
 def test_observed_normalization_preserves_wall_and_builds_amdahl_rows():
@@ -178,9 +194,54 @@ def test_invalid_shape_and_fraction_contracts_fail_closed():
         )
 
 
+def test_verify_and_fine_attribution_are_explicit_cli_modes(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["profile", "--model", "/tmp/model"])
+    defaults = parse_args()
+    assert defaults.dspark_verify is False
+    assert defaults.fine_detail is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["profile", "--model", "/tmp/model", "--dspark-verify", "--fine-detail"],
+    )
+    enabled = parse_args()
+    assert enabled.dspark_verify is True
+    assert enabled.fine_detail is True
+
+
+def test_verify_profile_arms_exact_dispatch_and_rollback_inside_finally():
+    source = inspect.getsource(profile_real_layers)
+    arm_undo = source.index("cache_rollback.set_undo_armed(True)")
+    arm_verify = source.index("set_dspark_verify_armed(True)")
+    finally_block = source.index("finally:", arm_verify)
+    disarm_verify = source.index("set_dspark_verify_armed(False)", finally_block)
+    disarm_undo = source.index(
+        "cache_rollback.set_undo_armed(False)", disarm_verify
+    )
+    assert arm_undo < arm_verify < finally_block < disarm_verify < disarm_undo
+
+
+def test_fine_detail_taxonomy_covers_the_unattributed_verify_hotset():
+    assert set(FINE_DETAIL_CATEGORIES) == {
+        "router",
+        "shared_moe",
+        "hyperconnection",
+        "norms",
+        "attention_qkv_bank",
+        "attention_q_b",
+        "attention_output",
+    }
+
+
 def test_profiler_is_not_imported_or_dispatched_by_production_code():
     root = Path(__file__).parents[1]
     symbol = "bench_ds4_tp_stage_profile"
     assert all(
         symbol not in path.read_text() for path in (root / "omlx").rglob("*.py")
+    )
+    head_symbol = "bench_ds4_mtp_vocab_head_tiles"
+    assert all(
+        head_symbol not in path.read_text()
+        for path in (root / "omlx").rglob("*.py")
     )

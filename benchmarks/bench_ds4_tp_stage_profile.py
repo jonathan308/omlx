@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Isolated rank-local DeepSeek-V4 TP prefill stage profiler.
+"""Isolated rank-local DeepSeek-V4 TP prefill/verify stage profiler.
 
 This harness is deliberately absent from the serving path.  It lazy-loads one
 real checkpoint layer for each DS4 attention schedule, slices those layers to
@@ -63,6 +63,15 @@ INDEXER_PROJECTION_DETAILS = (
 PROJECTION_DETAIL_CATEGORIES = (
     *ATTENTION_PROJECTION_DETAILS,
     *INDEXER_PROJECTION_DETAILS,
+)
+FINE_DETAIL_CATEGORIES = (
+    "router",
+    "shared_moe",
+    "hyperconnection",
+    "norms",
+    "attention_qkv_bank",
+    "attention_q_b",
+    "attention_output",
 )
 PROFILE_SCHEMA_VERSION = 1
 
@@ -557,10 +566,12 @@ class DS4LayerInstrumentation:
         recorder: TimingRecorder,
         *,
         projection_detail: bool = False,
+        fine_detail: bool = False,
     ) -> None:
         self.layer = layer
         self.recorder = recorder
         self.projection_detail = projection_detail
+        self.fine_detail = fine_detail
         self._stack = ExitStack()
         self._module_categories: dict[int, str] = {}
         self._patched_classes: set[type] = set()
@@ -599,6 +610,8 @@ class DS4LayerInstrumentation:
         self._stack.callback(setattr, owner, name, original)
 
     def __enter__(self):
+        import mlx_lm.models.deepseek_v4 as dsv4
+
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
         attn = self.layer.attn
@@ -661,6 +674,30 @@ class DS4LayerInstrumentation:
             self._patch_symbol(glm_fast, symbol, "routed_moe_pair")
         for symbol in self._DIRECT_DOWN_SYMBOLS:
             self._patch_symbol(glm_fast, symbol, "routed_moe_down")
+        if self.fine_detail:
+            self._register(self.layer.ffn.gate, "router")
+            self._register(self.layer.ffn.shared_experts, "shared_moe")
+            self._register(self.layer.attn_hc, "hyperconnection")
+            self._register(self.layer.ffn_hc, "hyperconnection")
+            self._register(self.layer.attn_norm, "norms")
+            self._register(self.layer.ffn_norm, "norms")
+            for symbol in ("hc_expand", "hc_residual_branch", "hc_merge_branch"):
+                self._patch_symbol(dsv4, symbol, "hyperconnection")
+            self._patch_symbol(
+                dsv4,
+                "_verify_q_a_kv_bank",
+                "attention_qkv_bank",
+            )
+            self._patch_symbol(
+                dsv4,
+                "_project_verify_q_b",
+                "attention_q_b",
+            )
+            self._patch_symbol(
+                dsv4,
+                "_project_attention_output",
+                "attention_output",
+            )
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -808,6 +845,8 @@ def profile_real_layers(
     warmup: int,
     cycles: int,
     projection_detail: bool = False,
+    dspark_verify: bool = False,
+    fine_detail: bool = False,
 ) -> dict[str, Any]:
     """Run full real-block forwards and return per-layer category medians."""
 
@@ -816,6 +855,9 @@ def profile_real_layers(
     if warmup < 0 or cycles < 1:
         raise ValueError("warmup must be non-negative and cycles positive")
     model, selected, ratios = _load_real_layers(model_dir, layers, shape)
+    if dspark_verify:
+        for layer in selected:
+            layer.attn._omlx_decode_consistent = True
     barrier_overhead = _measure_barrier_overhead()
     layer_reports: dict[str, Any] = {}
 
@@ -831,6 +873,7 @@ def profile_real_layers(
                 layer,
                 recorder,
                 projection_detail=projection_detail,
+                fine_detail=fine_detail,
             ):
                 for cycle in range(warmup + cycles):
                     cache = _new_layer_cache(model, position)
@@ -851,10 +894,21 @@ def profile_real_layers(
                     started = time.perf_counter_ns()
                     recorder.active = True
                     try:
+                        if dspark_verify:
+                            from mlx_lm.models.deepseek_v4 import (
+                                set_dspark_verify_armed,
+                            )
+                            from omlx.patches.mlx_lm_mtp import cache_rollback
+
+                            cache_rollback.set_undo_armed(True)
+                            set_dspark_verify_armed(True)
                         output = _layer_call(layer, cache, h, ids)
                         mx.eval(output, cache.state)
                         mx.synchronize()
                     finally:
+                        if dspark_verify:
+                            set_dspark_verify_armed(False)
+                            cache_rollback.set_undo_armed(False)
                         recorder.active = False
                     total_ms = max(
                         0.0,
@@ -873,6 +927,10 @@ def profile_real_layers(
                     details = {
                         category: raw_components.get(category, 0.0)
                         for category in PROJECTION_DETAIL_CATEGORIES
+                    }
+                    fine_details = {
+                        category: raw_components.get(category, 0.0)
+                        for category in FINE_DETAIL_CATEGORIES
                     }
                     if projection_detail:
                         components = {
@@ -905,6 +963,7 @@ def profile_real_layers(
                                 "total_ms": total_ms,
                                 "components_ms": components,
                                 "projection_details_ms": details,
+                                "fine_details_ms": fine_details,
                                 "calls": dict(recorder.calls),
                             }
                         )
@@ -931,6 +990,13 @@ def profile_real_layers(
                     )
                     for category in PROJECTION_DETAIL_CATEGORIES
                 },
+                "median_fine_details_ms": {
+                    category: statistics.median(
+                        sample["fine_details_ms"].get(category, 0.0)
+                        for sample in samples
+                    )
+                    for category in FINE_DETAIL_CATEGORIES
+                },
             }
 
     ratio_counts: defaultdict[int, int] = defaultdict(int)
@@ -950,6 +1016,9 @@ def profile_real_layers(
     representative_projection_ms = {
         category: 0.0 for category in PROJECTION_DETAIL_CATEGORIES
     }
+    representative_fine_ms = {
+        category: 0.0 for category in FINE_DETAIL_CATEGORIES
+    }
     for ratio, count in ratio_counts.items():
         reports = by_ratio[ratio]
         for category in COMPUTE_CATEGORIES:
@@ -960,6 +1029,10 @@ def profile_real_layers(
             representative_projection_ms[category] += count * statistics.mean(
                 report["median_projection_details_ms"][category]
                 for report in reports
+            )
+        for category in FINE_DETAIL_CATEGORIES:
+            representative_fine_ms[category] += count * statistics.mean(
+                report["median_fine_details_ms"][category] for report in reports
             )
     return {
         "schema_version": PROFILE_SCHEMA_VERSION,
@@ -974,7 +1047,10 @@ def profile_real_layers(
         },
         "representative_stage_compute_ms": representative_stage_ms,
         "representative_stage_projection_ms": representative_projection_ms,
+        "representative_stage_fine_ms": representative_fine_ms,
         "projection_detail": projection_detail,
+        "dspark_verify": dspark_verify,
+        "fine_detail": fine_detail,
     }
 
 
@@ -1023,6 +1099,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--projection-detail", action="store_true")
+    parser.add_argument("--fine-detail", action="store_true")
+    parser.add_argument(
+        "--dspark-verify",
+        action="store_true",
+        help="arm the exact DSpark target-verification path for the measured call",
+    )
     parser.add_argument("--baseline-tps", type=float, default=628.76)
     parser.add_argument("--target-tps", type=float, default=1000.0)
     parser.add_argument("--collective-bandwidth-gbps", type=float, default=6.2)
@@ -1048,6 +1130,8 @@ def main() -> None:
         warmup=args.warmup,
         cycles=args.cycles,
         projection_detail=args.projection_detail,
+        dspark_verify=args.dspark_verify,
+        fine_detail=args.fine_detail,
     )
     collectives = modeled_collective_ms(
         shape,
