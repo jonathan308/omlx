@@ -9,10 +9,18 @@ repo_root=${OMLX_DEV_REPO:-${script_path:h:h}}
 venv_root=${OMLX_DEV_VENV:-${HOME}/omlx-v2-build}
 state_root=${OMLX_DEV_STATE_DIR:-${HOME}/.omlx/run}
 env_file=${OMLX_DEV_ENV_FILE:-${HOME}/.omlx/dev-server.env}
-pid_file=${state_root}/dev-server.pid
+if [[ -f "${env_file}" ]]; then
+  set -a
+  source "${env_file}"
+  set +a
+fi
 log_file=${OMLX_DEV_LOG:-${venv_root}/serve.log}
 host=${OMLX_DEV_HOST:-0.0.0.0}
 port=${OMLX_DEV_PORT:-8000}
+label=${OMLX_DEV_LAUNCH_LABEL:-com.omlx.fusion.dev}
+launch_agents=${HOME}/Library/LaunchAgents
+plist_file=${launch_agents}/${label}.plist
+launch_target=gui/${UID}/${label}
 
 die() {
   print -u2 -- "omlx-dev: $*"
@@ -24,13 +32,12 @@ tracked_head() {
 }
 
 server_pid() {
-  if [[ -s "${pid_file}" ]]; then
-    local pid
-    pid=$(<"${pid_file}")
-    if [[ "${pid}" == <-> ]] && kill -0 "${pid}" 2>/dev/null; then
-      print -- "${pid}"
-      return 0
-    fi
+  local pid
+  pid=$(launchctl print "${launch_target}" 2>/dev/null |
+    awk '/^[[:space:]]*pid = / { print $3; exit }')
+  if [[ "${pid}" == <-> ]] && kill -0 "${pid}" 2>/dev/null; then
+    print -- "${pid}"
+    return 0
   fi
   return 1
 }
@@ -55,30 +62,63 @@ verify_worktree() {
   fi
 }
 
+write_launch_agent() {
+  mkdir -p "${launch_agents}" "${state_root}" "${log_file:h}"
+  local run_at_load='<false/>'
+  [[ "${OMLX_DEV_RUN_AT_LOAD:-0}" == "1" ]] && run_at_load='<true/>'
+  local temporary=${plist_file}.tmp.$$
+  command cat >"${temporary}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${script_path}</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${repo_root}</string>
+  <key>RunAtLoad</key>
+  ${run_at_load}
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>${log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>${log_file}</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "${temporary}" >/dev/null
+  mv -f "${temporary}" "${plist_file}"
+}
+
+run_server() {
+  cd "${repo_root}"
+  exec "${venv_root}/bin/omlx" serve --host "${host}" --port "${port}"
+}
+
 start_server() {
   if pid=$(server_pid); then
     print -- "oMLX dev server already running (pid ${pid})"
     return 0
   fi
   verify_worktree
-  mkdir -p "${state_root}" "${log_file:h}"
-  (
-    cd "${repo_root}"
-    if [[ -f "${env_file}" ]]; then
-      set -a
-      source "${env_file}"
-      set +a
-    fi
-    nohup "${venv_root}/bin/omlx" serve --host "${host}" --port "${port}" \
-      >>"${log_file}" 2>&1 &
-    print -- $! >"${pid_file}"
-  )
+  write_launch_agent
+  launchctl bootout "${launch_target}" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/${UID}" "${plist_file}"
+  launchctl kickstart -k "${launch_target}"
 
   local attempts=0
   while (( attempts < 60 )); do
     if curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
       local pid
-      pid=$(<"${pid_file}")
+      pid=$(server_pid)
       print -- "oMLX dev server ready (pid ${pid}, HEAD $(tracked_head))"
       return 0
     fi
@@ -91,11 +131,11 @@ start_server() {
 stop_server() {
   local pid
   if ! pid=$(server_pid); then
-    rm -f "${pid_file}"
+    launchctl bootout "${launch_target}" >/dev/null 2>&1 || true
     print -- "oMLX dev server is not running"
     return 0
   fi
-  kill -TERM "${pid}"
+  launchctl bootout "${launch_target}"
   local attempts=0
   while kill -0 "${pid}" 2>/dev/null && (( attempts < 60 )); do
     sleep 0.5
@@ -104,7 +144,6 @@ stop_server() {
   if kill -0 "${pid}" 2>/dev/null; then
     die "server pid ${pid} did not stop within 30 seconds"
   fi
-  rm -f "${pid_file}"
   print -- "oMLX dev server stopped"
 }
 
@@ -121,6 +160,7 @@ status_server() {
 }
 
 case "${1:-status}" in
+  run) run_server ;;
   start) start_server ;;
   stop) stop_server ;;
   restart)
