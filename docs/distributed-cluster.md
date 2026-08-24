@@ -89,6 +89,13 @@ mixed-backend topology today. Automatic hybrid selection also remains hidden
 unless the loaded MLX runtime explicitly reports backend subgroup support;
 stock Ring and stock JACCL builds do not implement `Group.split`.
 
+oMLX currently admits one live JACCL communicator per Mac. Starting a second
+distributed model or an auto-tuning probe while another communicator owns the
+same Thunderbolt RDMA device is rejected with an actionable 409. This fence is
+temporary but intentional: physical testing reproduced lost RDMA completions
+with concurrent communicators, while the same subgroup operations passed
+cleanly after the resident communicator was stopped.
+
 ## Requirements
 
 On every Mac:

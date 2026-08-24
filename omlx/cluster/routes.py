@@ -4381,6 +4381,30 @@ async def cluster_deployments():
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _live_jaccl_deployments(
+    *,
+    state_dir: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Deployment IDs currently owning this Mac's JACCL/RDMA device."""
+
+    if state_dir is None:
+        state_dir = os.environ.get(
+            "OMLX_CLUSTER_STATE_DIR",
+            "~/.omlx/cluster/runtime",
+        )
+    runtime = read_runtime_markers(state_dir)
+    return tuple(
+        sorted(
+            {
+                str(job["deployment_id"])
+                for job in runtime.get("jobs", ())
+                if job.get("live") is True
+                and str(job.get("backend", "")).startswith("jaccl")
+            }
+        )
+    )
+
+
 async def _activate_and_report(
     request: ClusterDeploymentRequest,
 ) -> dict[str, Any]:
@@ -4422,6 +4446,21 @@ async def _activate_and_report(
                     "subgroup runtime on every rank or choose pure TP/pipeline."
                 ),
             )
+        live_jaccl = _live_jaccl_deployments()
+        other_jaccl = tuple(
+            item for item in live_jaccl if item != deployment.deployment_id
+        )
+        if deployment.backend.startswith("jaccl") and other_jaccl:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Thunderbolt RDMA is already owned by live deployment "
+                    f"{', '.join(other_jaccl)}. oMLX permits one JACCL "
+                    "communicator per Mac until Apple's driver passes the "
+                    "multi-communicator lost-completion soak. Deactivate or "
+                    "re-plan that deployment first."
+                ),
+            )
         # Before anything touches another Mac: is this the plan the user was
         # shown? Preview and activation posted different node objects for
         # months, and the second one dropped the split cap and the role, so the
@@ -4461,7 +4500,26 @@ async def _activate_and_report(
             "status": "disabled",
             "reason": "automatic tuning disabled",
         }
-        if deployment.execution.auto_tune:
+        same_jaccl_is_live = (
+            deployment.backend.startswith("jaccl")
+            and deployment.deployment_id in live_jaccl
+        )
+        if deployment.execution.auto_tune and same_jaccl_is_live:
+            # A re-plan may reuse the deployment ID while its old engine is
+            # serving. Launching a second JACCL performance communicator before
+            # prepare_cluster_reload tears the first one down physically
+            # reproduces Apple's lost-completion failure. Keep the signed plan;
+            # the next cold activation can measure it safely.
+            performance_probe = {
+                "ok": False,
+                "status": "communicator_busy",
+                "reason": (
+                    "automatic tuning skipped because this deployment already "
+                    "owns the JACCL/RDMA device"
+                ),
+                "plan_changed": False,
+            }
+        elif deployment.execution.auto_tune:
             if deployment.performance_profiles:
                 # The one-click path measured these ranks before model staging
                 # and signed the resulting placement. Re-running a noisy probe
