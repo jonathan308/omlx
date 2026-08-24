@@ -193,6 +193,9 @@ _RANK_ENV_DEFAULTS = (
     # Exact M=1024 M3-family MXFP4 route-tail kernels. Keep both ranks on the
     # same explicit A/B value; default remains off pending the TP2 model gate.
     ("OMLX_DSV4_MOE_TAIL8", "0"),
+    # Exact equal-TP2 M3 route-tail kernels. M5 keeps NAX; unequal/single
+    # topologies retain the explicit legacy gate above.
+    ("OMLX_DSV4_MOE_TAIL8_EQUAL_TP", "1"),
     # Combined asymmetric 3:5 routed-MoE prefill: M3 rank 0 tail8 plus
     # separate M5 rank 1 expert-blocked NAX projections. One rollback value
     # must reach every rank; exact local device/shape/rank gates decide use.

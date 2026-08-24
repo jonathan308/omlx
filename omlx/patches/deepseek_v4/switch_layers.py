@@ -66,6 +66,9 @@ _DEEPSEEK_MXFP4_FULL_DECODE_LOGGED = False
 _DEEPSEEK_MXFP4_TAIL8 = os.environ.get(
     "OMLX_DSV4_MOE_TAIL8", "0"
 ).strip().lower() in ("1", "true", "on")
+_DEEPSEEK_MXFP4_TAIL8_EQUAL_TP = os.environ.get(
+    "OMLX_DSV4_MOE_TAIL8_EQUAL_TP", "1"
+).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_TAIL8_LOGGED = False
 # One rollback switch for the proven asymmetric 3:5 pair.  When enabled on
 # both ranks, M3 rank 0 uses the 3/8 tail8 path and M5 rank 1 uses the
@@ -540,8 +543,17 @@ class SwitchGLU(nn.Module):
         block_plan,
     ) -> bool:
         combined = _DEEPSEEK_MXFP4_COMBINED
+        try:
+            equal_default = bool(
+                _DEEPSEEK_MXFP4_TAIL8_EQUAL_TP
+                and not combined
+                and getattr(self, "_omlx_dsv4f_moe_tp", None) == (2, 0, ())
+                and mx.device_info().get("device_name") == "Apple M3 Ultra"
+            )
+        except Exception:
+            equal_default = False
         if (
-            (not combined and not _DEEPSEEK_MXFP4_TAIL8)
+            (not combined and not _DEEPSEEK_MXFP4_TAIL8 and not equal_default)
             or self.training
             or is_nax_available()
             or (combined and is_dspark_verify_armed())
