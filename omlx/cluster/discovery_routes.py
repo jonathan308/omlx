@@ -201,7 +201,7 @@ async def cluster_add_manual_peer(
     service.add_manual(ip, port)
     # Probe synchronously (bounded by the configured probe timeout) so the
     # caller learns immediately whether the address answers as an oMLX node.
-    await asyncio.to_thread(service.probe_now)
+    await asyncio.to_thread(service.probe_candidate_now, ip, port)
     peer = next(
         (
             p
