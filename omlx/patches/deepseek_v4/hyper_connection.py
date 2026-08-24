@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import logging
 import os
 from typing import Tuple
 
@@ -17,6 +18,7 @@ _COMPILED_HC_DECODE_PRODUCER = os.getenv(
 _VERIFY_HC_PRENORM = os.getenv(
     "OMLX_DSV4_VERIFY_HC_PRENORM", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_VERIFY_HC_PRENORM_LOGGED = False
 
 
 @mx.compile
@@ -494,6 +496,14 @@ class HyperConnection(nn.Module):
             and float(norm_eps) == 1e-6
         ):
             return None
+        global _VERIFY_HC_PRENORM_LOGGED
+        if not _VERIFY_HC_PRENORM_LOGGED:
+            _VERIFY_HC_PRENORM_LOGGED = True
+            logging.getLogger(__name__).info(
+                "deepseek_v4: using exact M=6 FP32-HC sinkhorn/collapse -> "
+                "weighted RMSNorm continuation "
+                "(OMLX_DSV4_VERIFY_HC_PRENORM=0 disables)"
+            )
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
         mixes = decode_matmul(z, self.fn.T)

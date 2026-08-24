@@ -255,6 +255,26 @@ def test_distributed_mtp_can_qualify_coordinated_adaptive_depth(
     assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
 
 
+def test_distributed_mtp_can_qualify_lockstep_acceptance_depth(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4"})
+    )
+    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "5")
+    monkeypatch.setenv("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "1")
+
+    fixed = _configure_distributed_mtp(
+        tmp_path,
+        enabled=True,
+        depth=5,
+        tensor_parallel_size=2,
+    )
+
+    assert fixed is None
+    assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
+
+
 def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
 

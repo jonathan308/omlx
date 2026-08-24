@@ -85,6 +85,9 @@ _RANK_ENV_DEFAULTS = (
     # every TP rank enters the same collective graph. Production stays on its
     # signed fixed depth until physical parity/throughput qualification.
     ("OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", "0"),
+    # Deterministic accepted-prefix depth controller. Unlike the measured
+    # controller it uses no rank-local clock and needs no depth broadcast.
+    ("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.

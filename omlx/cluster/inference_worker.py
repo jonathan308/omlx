@@ -664,7 +664,10 @@ def _configure_distributed_mtp(
     adaptive = os.environ.get(
         "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
-    if adaptive:
+    lockstep = os.environ.get(
+        "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if adaptive or lockstep:
         os.environ.pop("OMLX_MTP_FIXED_DEPTH", None)
         return None
     fixed_depth = depth or 3

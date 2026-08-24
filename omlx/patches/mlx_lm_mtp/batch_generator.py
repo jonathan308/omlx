@@ -483,6 +483,7 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
 _ROWWISE_BATCH_MTP_ENV = "OMLX_MTP_ROWWISE_BATCH"
 
 _FIXED_DEPTH_ENV = "OMLX_MTP_FIXED_DEPTH"
+_LOCKSTEP_DEPTH_ENV = "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH"
 
 
 def _fixed_depth_override(max_depth: int) -> Optional[int]:
@@ -500,6 +501,15 @@ def _fixed_depth_override(max_depth: int) -> Optional[int]:
         return max(1, min(max_depth, int(raw)))
     except ValueError:
         return None
+
+
+def _lockstep_depth_enabled() -> bool:
+    return os.environ.get(_LOCKSTEP_DEPTH_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _rowwise_batch_mtp_enabled() -> bool:
@@ -2228,6 +2238,54 @@ class _DepthController:
         return best_d
 
 
+class _LockstepAcceptanceDepthController:
+    """Zero-collective distributed depth adaptation from accepted prefixes.
+
+    Every rank starts at the signed maximum and observes the same ``used`` /
+    ``accepted`` pair because the coordinator already broadcasts the exact
+    MTP decision packet. A rejection keeps one probe beyond the accepted
+    prefix; a full accept climbs one level. No local clock, cost sample, random
+    choice, or rank capability enters the decision, so ``cur`` remains
+    identical without another scalar broadcast.
+    """
+
+    rank_lockstep = True
+
+    def __init__(self, max_depth: int):
+        self.max_depth = max(1, int(max_depth))
+        self.cur = self.max_depth
+        self.cycles = 0
+
+    def observe(
+        self,
+        used: int,
+        accepted: int,
+        cycle_ms: float,
+        time_sample: bool = True,
+    ) -> None:
+        del cycle_ms, time_sample
+        self.cycles += 1
+        used = max(1, min(int(used), self.max_depth))
+        accepted = max(0, min(int(accepted), used))
+        if accepted == used:
+            self.cur = min(self.max_depth, used + 1)
+        else:
+            self.cur = max(1, min(self.max_depth, accepted + 1))
+
+    def should_exit(self) -> bool:
+        return False
+
+
+def _new_depth_controller(model: Any, max_depth: int) -> Any:
+    if _lockstep_depth_enabled():
+        return _LockstepAcceptanceDepthController(max_depth)
+    return _DepthController(
+        max_depth,
+        marginal_ms=getattr(model, "_omlx_mtp_marginal_ms", None),
+        exit_margin=_effective_loop_tax(model),
+    )
+
+
 # Draft sampler for stochastic (temp > 0) decoding. A sharper distribution
 # than the target: the 1-layer head's noisy tail otherwise gets sampled and
 # rejected, collapsing acceptance on high-entropy content. Exactness holds
@@ -2294,7 +2352,9 @@ def _dspark_next_drafts(
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
     depth = state.controller.cur if state.controller is not None else state.depth
-    if state.controller is not None:
+    if state.controller is not None and not getattr(
+        state.controller, "rank_lockstep", False
+    ):
         depth = _mtp_sync_depth(gen_batch, depth)
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
@@ -2395,7 +2455,9 @@ def _chain_next_drafts(
     procs = _proc_list(gen_batch)
 
     depth = state.controller.cur if state.controller is not None else state.depth
-    if state.controller is not None:
+    if state.controller is not None and not getattr(
+        state.controller, "rank_lockstep", False
+    ):
         depth = _mtp_sync_depth(gen_batch, depth)
     if depth == 0 and not state.mtp_cache:
         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
@@ -2566,12 +2628,8 @@ def _post_init_mtp(gen_batch: Any) -> None:
             if fixed is not None:
                 state.depth = fixed
             else:
-                state.controller = _DepthController(
-                    depth,
-                    marginal_ms=getattr(
-                        gen_batch.model, "_omlx_mtp_marginal_ms", None
-                    ),
-                    exit_margin=_effective_loop_tax(gen_batch.model),
+                state.controller = _new_depth_controller(
+                    gen_batch.model, depth
                 )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
@@ -2867,12 +2925,12 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
 
     token_id, logprobs_1d, source = state.queue.popleft()
     _bump_emit_stat(state, source)
-    if (
-        state.chain
-        and state.controller is not None
-        and _mtp_sync_flag(gen_batch, state.controller.should_exit())
-        and not state.queue
-    ):
+    should_exit = False
+    if state.chain and state.controller is not None:
+        should_exit = state.controller.should_exit()
+        if not getattr(state.controller, "rank_lockstep", False):
+            should_exit = _mtp_sync_flag(gen_batch, should_exit)
+    if should_exit and not state.queue:
         # Emit this cycle's token either way; on a successful handoff the
         # next next() call runs the standard step with _next_tokens set.
         _park_mtp_to_standard(gen_batch, state)
