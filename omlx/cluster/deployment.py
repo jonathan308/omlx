@@ -99,6 +99,10 @@ _RANK_ENV_DEFAULTS = (
     ("OMLX_DSV4_HIERARCHICAL_MIN_POOL", "16000"),
     ("OMLX_DSV4_HIERARCHICAL_REFRESH_POOL", "2048"),
     ("OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION", "0.30"),
+    # Native exact-bound postprocess for the opt-in hierarchy. It fuses the
+    # BF16 approximate sheet's FP32 error bound and 16-row reduction, but stays
+    # separately rollbackable until physical real-key/full-model gates pass.
+    ("OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER", "0"),
     # Weighted row shards require padding every rank to the largest shard for
     # all_gather. The first 3:5/30K live gate was slower, so retain the exact
     # implementation only as an operator A/B and ship equal row counts.

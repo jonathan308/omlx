@@ -104,6 +104,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_HIERARCHICAL_MIN_POOL",
         "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL",
         "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION",
+        "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER",
         "OMLX_DSV4_INDEXER_ROW_WEIGHTS",
         "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL",
         "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL",
@@ -160,6 +161,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_HIERARCHICAL_MIN_POOL=16000" in envs
     assert "OMLX_DSV4_HIERARCHICAL_REFRESH_POOL=2048" in envs
     assert "OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION=0.30" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS=" in envs
     assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL=16000" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" in envs
@@ -203,6 +205,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_GATHER_P2P", "1")
     monkeypatch.setenv("OMLX_DSV4_NATIVE_INDEXER", "0")
+    monkeypatch.setenv("OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER", "1")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS", "9,7")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL", "20000")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
@@ -241,6 +244,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_INDEXER_GATHER_P2P=1" in envs
     assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" not in envs
     assert "OMLX_DSV4_NATIVE_INDEXER=0" in envs
+    assert "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS=9,7" in envs
     assert "OMLX_DSV4_INDEXER_ROW_WEIGHTS_MIN_POOL=20000" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs

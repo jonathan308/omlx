@@ -40,12 +40,133 @@ _TRACE = os.getenv("OMLX_DSV4_HIERARCHICAL_TRACE", "0").strip().lower() in (
     "on",
     "yes",
 )
+_NATIVE_UPPER_ENABLED = os.getenv(
+    "OMLX_DSV4_HIERARCHICAL_NATIVE_UPPER", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _NUMERIC_ABS_GUARD = 0.02
 _NUMERIC_REL_GUARD = 0.005
+# The native pass rounds the same FP32 terms explicitly but may be compiled
+# with a different contraction choice than MLX's elementwise graph. Add a
+# small outward-only margin so its upper bound can never fall below the proven
+# Python reference due solely to one FP32 ULP.
+_NATIVE_OUTWARD_GUARD = 1e-4
 _STATE_ATTR = "_omlx_dsv4_hierarchical_indexer_state"
 _SUCCESS_LOGGED = False
 _FALLBACK_LOGGED = False
 _TRACE_REASONS: set[str] = set()
+_GROUP_UPPER_KERNEL = None
+_NATIVE_UPPER_FAILED = False
+
+
+_GROUP_UPPER_SOURCE = r"""
+    const uint index = thread_position_in_grid.x;
+    const uint rows = uint(params[0]);
+    const uint pool = uint(params[1]);
+    const uint groups = rows / uint(GROUP_ROWS);
+    const uint total = groups * pool;
+    if (index >= total) {
+        return;
+    }
+
+    const uint group = index / pool;
+    const uint key = index - group * pool;
+    const uint row_start = group * uint(GROUP_ROWS);
+    const float kr = key_residual[key];
+    const float kn = key_norm[key];
+    const float ke = key_error[key];
+    const float abs_guard = guards[0];
+    const float rel_guard = guards[1];
+    const float outward_guard = guards[2];
+
+    float best = -INFINITY;
+    #pragma unroll
+    for (uint local_row = 0; local_row < uint(GROUP_ROWS); ++local_row) {
+        const uint row = row_start + local_row;
+        const float score = float(approximate[(uint64_t)row * pool + key]);
+        const float rr = row_residual[row];
+        const float re = row_error[row];
+        const float rn = row_norm[row];
+        const float bound0 = rr * kr;
+        const float bound1 = re * kn;
+        const float bound2 = (rn + re) * ke;
+        const float upper = score + bound0 + bound1 + bound2
+            + abs_guard + rel_guard * metal::abs(score) + outward_guard;
+        best = metal::max(best, upper);
+    }
+    group_upper[index] = best;
+"""
+
+
+def _group_upper_kernel():
+    global _GROUP_UPPER_KERNEL
+    if _GROUP_UPPER_KERNEL is None:
+        _GROUP_UPPER_KERNEL = mx.fast.metal_kernel(
+            name="omlx_dsv4_hierarchical_group_upper",
+            input_names=[
+                "approximate",
+                "row_residual",
+                "row_error",
+                "row_norm",
+                "key_residual",
+                "key_norm",
+                "key_error",
+                "params",
+                "guards",
+            ],
+            output_names=["group_upper"],
+            source=_GROUP_UPPER_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    return _GROUP_UPPER_KERNEL
+
+
+def _native_group_upper(
+    approximate: mx.array,
+    residual_factor: mx.array,
+    coordinate_error_factor: mx.array,
+    coordinate_norm_factor: mx.array,
+    state: "_LowRankState",
+) -> mx.array | None:
+    """Fuse the certified FP32 error bound and 16-row maximum in Metal."""
+
+    global _NATIVE_UPPER_FAILED
+    if not _NATIVE_UPPER_ENABLED or _NATIVE_UPPER_FAILED:
+        return None
+    rows, pool = map(int, approximate.shape)
+    if rows < _GROUP_ROWS or rows % _GROUP_ROWS != 0 or pool < 1:
+        return None
+    try:
+        params = mx.array([rows, pool], dtype=mx.int32)
+        guards = mx.array(
+            [_NUMERIC_ABS_GUARD, _NUMERIC_REL_GUARD, _NATIVE_OUTWARD_GUARD],
+            dtype=mx.float32,
+        )
+        (group_upper,) = _group_upper_kernel()(
+            inputs=[
+                approximate,
+                residual_factor,
+                coordinate_error_factor,
+                coordinate_norm_factor,
+                state.key_orthogonal_residual,
+                state.key_coordinate_norm,
+                state.key_coordinate_error,
+                params,
+                guards,
+            ],
+            template=[("T", approximate.dtype), ("GROUP_ROWS", _GROUP_ROWS)],
+            grid=(((rows // _GROUP_ROWS) * pool + 255) // 256 * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows // _GROUP_ROWS, pool)],
+            output_dtypes=[mx.float32],
+        )
+        return group_upper
+    except Exception:
+        _NATIVE_UPPER_FAILED = True
+        logger.warning(
+            "DS4 native hierarchical upper-bound pass failed; using MLX graph",
+            exc_info=True,
+        )
+        return None
 
 
 @dataclass
@@ -223,13 +344,13 @@ def hierarchical_topk(
             quantized_q.astype(mx.float32), axis=-1
         )
 
-        approximate = kernels.dsa_indexer_scores_mma(
+        approximate_bf16 = kernels.dsa_indexer_scores_mma(
             quantized_q.transpose(1, 0, 2)[None],
             state.key_projection[None, None],
             weights,
             mask_ratio=ratio,
             mask_q_offset=query_offset,
-        )[0, 0].astype(mx.float32)
+        )[0, 0]
 
         # Exact dot-error bound for orthogonal PCA residuals plus BF16
         # coordinate quantization:
@@ -244,22 +365,31 @@ def hierarchical_topk(
         coordinate_norm_factor = mx.sum(
             abs_weights * q_coordinate_norm, axis=1
         )
-        error_bound = (
-            residual_factor[:, None] * state.key_orthogonal_residual[None]
-            + coordinate_error_factor[:, None] * state.key_coordinate_norm[None]
-            + (coordinate_norm_factor + coordinate_error_factor)[:, None]
-            * state.key_coordinate_error[None]
+        group_upper = _native_group_upper(
+            approximate_bf16,
+            residual_factor,
+            coordinate_error_factor,
+            coordinate_norm_factor,
+            state,
         )
-        upper = (
-            approximate
-            + error_bound
-            + _NUMERIC_ABS_GUARD
-            + _NUMERIC_REL_GUARD * mx.abs(approximate)
-        )
-
-        group_upper = mx.max(
-            upper.reshape(groups, _GROUP_ROWS, pool_length), axis=1
-        )
+        if group_upper is None:
+            approximate = approximate_bf16.astype(mx.float32)
+            error_bound = (
+                residual_factor[:, None] * state.key_orthogonal_residual[None]
+                + coordinate_error_factor[:, None]
+                * state.key_coordinate_norm[None]
+                + (coordinate_norm_factor + coordinate_error_factor)[:, None]
+                * state.key_coordinate_error[None]
+            )
+            upper = (
+                approximate
+                + error_bound
+                + _NUMERIC_ABS_GUARD
+                + _NUMERIC_REL_GUARD * mx.abs(approximate)
+            )
+            group_upper = mx.max(
+                upper.reshape(groups, _GROUP_ROWS, pool_length), axis=1
+            )
         candidates = mx.sort(
             mx.argpartition(-group_upper, candidate_count - 1, axis=-1)[
                 :, :candidate_count

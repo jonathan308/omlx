@@ -55,8 +55,11 @@ def test_disabled_hierarchical_index_is_a_noop(monkeypatch):
     )
 
 
-def test_certified_hierarchical_indices_match_full_scan(monkeypatch):
+@pytest.mark.parametrize("native_upper", (False, True))
+def test_certified_hierarchical_indices_match_full_scan(monkeypatch, native_upper):
     monkeypatch.setattr(hi, "_ENABLED", True)
+    monkeypatch.setattr(hi, "_NATIVE_UPPER_ENABLED", native_upper)
+    monkeypatch.setattr(hi, "_NATIVE_UPPER_FAILED", False)
     monkeypatch.setattr(hi, "_MIN_POOL", 1024)
     monkeypatch.setattr(hi, "_REFRESH_POOL", 4096)
     # Keep all but one key so this unit test targets the mapping/tie/certificate
@@ -99,3 +102,47 @@ def test_derived_key_projection_extends_without_basis_refresh(monkeypatch):
     assert second.basis_pool_length == 768
     assert second.projected_pool_length == 1024
     assert second.key_projection.shape == (1024, 48)
+
+
+@pytest.mark.parametrize("rows,pooled", ((16, 513), (32, 2048)))
+def test_native_group_upper_is_outward_from_python_bound(
+    monkeypatch, rows, pooled
+):
+    monkeypatch.setattr(hi, "_NATIVE_UPPER_ENABLED", True)
+    monkeypatch.setattr(hi, "_NATIVE_UPPER_FAILED", False)
+    _, keys, _ = _fixture(rows=rows, pooled=pooled)
+    state = hi._state_for_cache(SimpleNamespace(), keys)
+    mx.random.seed(20260826 + rows)
+    approximate = mx.random.uniform(-2, 2, (rows, pooled)).astype(mx.bfloat16)
+    residual = mx.random.uniform(0, 0.2, (rows,)).astype(mx.float32)
+    error = mx.random.uniform(0, 0.02, (rows,)).astype(mx.float32)
+    norm = mx.random.uniform(0, 3, (rows,)).astype(mx.float32)
+
+    actual = hi._native_group_upper(
+        approximate,
+        residual,
+        error,
+        norm,
+        state,
+    )
+    assert actual is not None
+    approximate_f = approximate.astype(mx.float32)
+    error_bound = (
+        residual[:, None] * state.key_orthogonal_residual[None]
+        + error[:, None] * state.key_coordinate_norm[None]
+        + (norm + error)[:, None] * state.key_coordinate_error[None]
+    )
+    reference = mx.max(
+        (
+            approximate_f
+            + error_bound
+            + hi._NUMERIC_ABS_GUARD
+            + hi._NUMERIC_REL_GUARD * mx.abs(approximate_f)
+        ).reshape(rows // hi._GROUP_ROWS, hi._GROUP_ROWS, pooled),
+        axis=1,
+    )
+    mx.eval(actual, reference)
+
+    delta = actual - reference
+    assert bool(mx.all(delta >= 0).item())
+    assert float(mx.max(delta).item()) < 5e-4
