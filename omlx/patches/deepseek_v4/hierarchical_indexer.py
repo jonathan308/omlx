@@ -51,6 +51,8 @@ _NUMERIC_REL_GUARD = 0.005
 # Python reference due solely to one FP32 ULP.
 _NATIVE_OUTWARD_GUARD = 1e-4
 _STATE_ATTR = "_omlx_dsv4_hierarchical_indexer_state"
+_MISS_BACKOFF_ATTR = "_omlx_dsv4_hierarchical_miss_backoff"
+_MISS_BACKOFF_MAX_MULTIPLIER = 8
 _SUCCESS_LOGGED = False
 _FALLBACK_LOGGED = False
 _TRACE_REASONS: set[str] = set()
@@ -178,6 +180,54 @@ class _LowRankState:
     key_coordinate_norm: mx.array
     basis_pool_length: int
     projected_pool_length: int
+
+
+@dataclass(frozen=True)
+class _MissBackoff:
+    next_pool_length: int
+    last_pool_length: int
+    streak: int
+
+
+def _miss_backoff_active(pool_cache: Any, pool_length: int) -> bool:
+    """Skip a known-miss layer until its next bounded basis-refresh retry."""
+
+    state = getattr(pool_cache, _MISS_BACKOFF_ATTR, None)
+    if not isinstance(state, _MissBackoff):
+        return False
+    if pool_length < state.last_pool_length:
+        # Cache reset/shorter restore: the old request cannot suppress a new
+        # prefix's first certificate attempt.
+        delattr(pool_cache, _MISS_BACKOFF_ATTR)
+        return False
+    return pool_length < state.next_pool_length
+
+
+def _record_certificate_miss(pool_cache: Any, pool_length: int) -> _MissBackoff:
+    previous = getattr(pool_cache, _MISS_BACKOFF_ATTR, None)
+    streak = (
+        previous.streak + 1
+        if isinstance(previous, _MissBackoff)
+        and pool_length >= previous.next_pool_length
+        else 1
+    )
+    multiplier = min(
+        1 << min(streak - 1, 3),
+        _MISS_BACKOFF_MAX_MULTIPLIER,
+    )
+    delay = max(1, _REFRESH_POOL) * multiplier
+    state = _MissBackoff(
+        next_pool_length=pool_length + delay,
+        last_pool_length=pool_length,
+        streak=streak,
+    )
+    setattr(pool_cache, _MISS_BACKOFF_ATTR, state)
+    return state
+
+
+def _clear_certificate_miss(pool_cache: Any) -> None:
+    if hasattr(pool_cache, _MISS_BACKOFF_ATTR):
+        delattr(pool_cache, _MISS_BACKOFF_ATTR)
 
 
 def _trace_once(reason: str) -> None:
@@ -311,10 +361,18 @@ def hierarchical_topk(
         )
         return None
 
+    pool_length = int(pooled.shape[1])
+    if _miss_backoff_active(pool_cache, pool_length):
+        backoff = getattr(pool_cache, _MISS_BACKOFF_ATTR)
+        _trace_once(
+            "certificate_backoff "
+            f"streak={backoff.streak} next_pool={backoff.next_pool_length}"
+        )
+        return None
+
     try:
         state = _state_for_cache(pool_cache, pooled)
         rows = int(q.shape[2])
-        pool_length = int(pooled.shape[1])
         groups = rows // _GROUP_ROWS
         candidate_count = max(
             topk + 1,
@@ -443,6 +501,7 @@ def hierarchical_topk(
         certificate = cutoff > selected_upper_floor[:, None]
         mx.eval(mapped, certificate)
         if not bool(mx.all(certificate).item()):
+            backoff = _record_certificate_miss(pool_cache, pool_length)
             global _FALLBACK_LOGGED
             if not _FALLBACK_LOGGED:
                 _FALLBACK_LOGGED = True
@@ -453,10 +512,12 @@ def hierarchical_topk(
                     candidate_count,
                 )
             _trace_once(
-                f"certificate_miss pool={pool_length} candidates={candidate_count}"
+                f"certificate_miss pool={pool_length} candidates={candidate_count} "
+                f"retry={backoff.next_pool_length} streak={backoff.streak}"
             )
             return None
 
+        _clear_certificate_miss(pool_cache)
         global _SUCCESS_LOGGED
         if not _SUCCESS_LOGGED:
             _SUCCESS_LOGGED = True

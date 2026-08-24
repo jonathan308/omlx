@@ -146,3 +146,64 @@ def test_native_group_upper_is_outward_from_python_bound(
     delta = actual - reference
     assert bool(mx.all(delta >= 0).item())
     assert float(mx.max(delta).item()) < 5e-4
+
+
+def test_certificate_miss_backoff_retries_on_exponential_refresh_boundaries(
+    monkeypatch,
+):
+    monkeypatch.setattr(hi, "_REFRESH_POOL", 2048)
+    cache = SimpleNamespace()
+
+    first = hi._record_certificate_miss(cache, 16000)
+    assert first == hi._MissBackoff(18048, 16000, 1)
+    assert hi._miss_backoff_active(cache, 18047)
+    assert not hi._miss_backoff_active(cache, 18048)
+
+    second = hi._record_certificate_miss(cache, 18048)
+    assert second == hi._MissBackoff(22144, 18048, 2)
+    third = hi._record_certificate_miss(cache, 22144)
+    assert third == hi._MissBackoff(30336, 22144, 3)
+    fourth = hi._record_certificate_miss(cache, 30336)
+    assert fourth == hi._MissBackoff(46720, 30336, 4)
+    fifth = hi._record_certificate_miss(cache, 46720)
+    assert fifth == hi._MissBackoff(63104, 46720, 5)
+
+    hi._clear_certificate_miss(cache)
+    assert not hi._miss_backoff_active(cache, 46721)
+
+
+def test_certificate_miss_backoff_clears_when_cache_shrinks():
+    cache = SimpleNamespace()
+    setattr(cache, hi._MISS_BACKOFF_ATTR, hi._MissBackoff(20000, 18000, 2))
+
+    assert not hi._miss_backoff_active(cache, 4096)
+    assert not hasattr(cache, hi._MISS_BACKOFF_ATTR)
+
+
+def test_hierarchy_backoff_skips_before_state_or_gpu_work(monkeypatch):
+    monkeypatch.setattr(hi, "_ENABLED", True)
+    monkeypatch.setattr(hi, "_MIN_POOL", 1024)
+    q, keys, weights = _fixture(rows=16, pooled=2048)
+    cache = SimpleNamespace()
+    setattr(cache, hi._MISS_BACKOFF_ATTR, hi._MissBackoff(4096, 2048, 1))
+    monkeypatch.setattr(
+        hi,
+        "_state_for_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("backoff must skip before derived-state work")
+        ),
+    )
+
+    assert (
+        hi.hierarchical_topk(
+            q,
+            keys,
+            weights,
+            cache,
+            query_offset=8192,
+            topk=512,
+            ratio=4,
+            kernels=fast,
+        )
+        is None
+    )
