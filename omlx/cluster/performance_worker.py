@@ -60,7 +60,7 @@ def _collective_measurements(
     return float(latency), float(bandwidth)
 
 
-def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+def _run_probe(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
 
     from .jaccl_side_channel import init_cluster_group
@@ -108,6 +108,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "samples": args.iterations,
         "measured_at": datetime.now(UTC).isoformat(),
     }
+
+
+def run_probe(args: argparse.Namespace) -> dict[str, Any]:
+    if not os.environ.get("MLX_JACCL_COORDINATOR"):
+        return _run_probe(args)
+
+    from .jaccl_lease import acquire_jaccl_communicator_lease
+
+    with acquire_jaccl_communicator_lease(
+        deployment_id="performance-probe",
+        state_dir=os.environ.get(
+            "OMLX_CLUSTER_STATE_DIR",
+            "~/.omlx/cluster/runtime",
+        ),
+    ):
+        return _run_probe(args)
 
 
 def build_parser() -> argparse.ArgumentParser:

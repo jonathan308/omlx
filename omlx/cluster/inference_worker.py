@@ -26,6 +26,7 @@ from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
 )
+from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
 from .memory_guard import (
     admission_budget,
@@ -1192,6 +1193,14 @@ def run_worker(args: argparse.Namespace) -> int:
     )
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
+    jaccl_lease = (
+        acquire_jaccl_communicator_lease(
+            deployment_id=args.deployment_id,
+            state_dir=args.state_dir,
+        )
+        if init_backend == "jaccl"
+        else None
+    )
     from .jaccl_side_channel import init_cluster_group
 
     group = init_cluster_group(mx, backend=init_backend, strict=True)
@@ -1517,6 +1526,8 @@ def run_worker(args: argparse.Namespace) -> int:
         marker.stop_heartbeat()
         if not preserve_failure_marker:
             marker.remove()
+        if jaccl_lease is not None:
+            jaccl_lease.close()
     return 0
 
 
