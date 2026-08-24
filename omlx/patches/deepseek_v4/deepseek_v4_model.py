@@ -791,6 +791,16 @@ def _attention_output_chain_native_inputs(
     o_b_weight = o_b.get("weight")
     o_b_scales = o_b.get("scales")
     k = int(prepared.shape[-1])
+    if k == 2048:
+        try:
+            # Equal TP2's K2048 classic chain is bit-exact and faster on M3
+            # Ultra. M5 stock dispatches O-A/O-B through NAX TensorOps; the
+            # classic chain changes that arithmetic frontier and is ~3x
+            # slower, so that peer must retain its canonical stock graph.
+            if str(mx.device_info().get("device_name") or "") != "Apple M3 Ultra":
+                return None
+        except Exception:
+            return None
     if (
         o_a_weight is None
         or o_a_scales is None

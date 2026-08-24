@@ -89,6 +89,13 @@ def test_single_m3_m2048_shape_is_eligible(monkeypatch):
     assert _eligible(monkeypatch, k=4096, shape=(1, 8, 2048, 4096)) is not None
 
 
+def test_equal_k2048_chain_is_m3_only(monkeypatch):
+    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M5 Max"})
+    assert _eligible(monkeypatch, k=2048) is None
+    monkeypatch.setattr(dm.mx, "device_info", lambda: {"device_name": "Apple M3 Ultra"})
+    assert _eligible(monkeypatch, k=2048) is not None
+
+
 @pytest.mark.parametrize(
     "override",
     (
