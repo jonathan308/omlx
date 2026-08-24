@@ -347,6 +347,10 @@ def test_corrupt_pooling_delta_range_fails_closed_and_unpoisons_manifest(tmp_pat
     deepest_key = store._chain_keys(MODEL, tuple(tokens))[-1]
     path = store._path(deepest_key)
     arrays, metadata = mx.load(str(path), return_metadata=True)
+    # ``mx.load`` is lazy. Materialize the payload before overwriting its
+    # backing file or save_safetensors can truncate the source first and then
+    # fail while evaluating arrays that still map that now-empty file.
+    mx.eval(*arrays.values())
     # pool_start for a top-level delta is metadata slot five. Turn [1,2)
     # into the overlapping [0,2) while leaving the tensor bytes untouched.
     assert metadata["0.0.5"] == "1"
