@@ -323,6 +323,10 @@ def test_sanitizer_alias_collision_falls_back_before_any_tensor_read(
     _write_checkpoint(tmp_path, config)
     path = tmp_path / "model.safetensors"
     tensors = dict(mx.load(str(path)))
+    # mx.load is lazy and these arrays still map ``path``. Materialize every
+    # value before save_safetensors replaces that same backing file; otherwise
+    # Python 3.13 runners can truncate it before the deferred reads execute.
+    mx.eval(*tensors.values())
     tensors["model.embed_tokens.weight"] = tensors["embed.weight"]
     mx.save_safetensors(str(path), tensors)
     (tmp_path / "model.safetensors.index.json").write_text(
