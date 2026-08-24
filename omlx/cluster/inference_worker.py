@@ -655,10 +655,18 @@ def _configure_distributed_mtp(
             "distributed MTP is not validated for model type "
             f"{model_type or 'unknown'!r}"
         )
-    # The single-node adaptive controller selects depth from local wall time.
-    # Heterogeneous ranks can therefore choose different verify widths and
-    # enter a different collective sequence. Keep the signed depth identical
-    # until depth selection itself is a coordinated distributed decision.
+    # Qualification gate for coordinated adaptive depth. The MTP runtime
+    # broadcasts rank zero's selected depth before building every draft chain
+    # (and broadcasts its exit decision before parking), so heterogeneous
+    # local timing estimates cannot change the collective sequence. Keep the
+    # signed fixed-depth profile as the production default until the adaptive
+    # path clears a physical multi-rank throughput/parity gate.
+    adaptive = os.environ.get(
+        "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if adaptive:
+        os.environ.pop("OMLX_MTP_FIXED_DEPTH", None)
+        return None
     fixed_depth = depth or 3
     os.environ["OMLX_MTP_FIXED_DEPTH"] = str(fixed_depth)
     return fixed_depth

@@ -80,6 +80,11 @@ _RANK_ENV_DEFAULTS = (
     # Prompt-cache structure tracing is operator-only. It must reach every
     # rank because cache reuse is a synchronized prefill decision.
     ("OMLX_CLUSTER_CACHE_TRACE", "0"),
+    # Qualification gate for rank-zero-coordinated adaptive MTP depth. The
+    # coordinator broadcasts the selected verify width and park decision, so
+    # every TP rank enters the same collective graph. Production stays on its
+    # signed fixed depth until physical parity/throughput qualification.
+    ("OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
