@@ -206,6 +206,10 @@ _RANK_ENV_DEFAULTS = (
     # Exact two-dispatch O-A→BF16→O-B prefill chain for signed 3:5 TP shapes.
     # Both ranks receive one value; exact shape/config guards decide locally.
     ("OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"),
+    # Exact DSpark verify graph simplification: prepare all M O-A rows as one
+    # grouped view instead of materializing M one-row slices + concatenate.
+    # Default-off until the physical equal-TP2 decode gate clears.
+    ("OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"),
     # Split the exact FP32 HyperConnection residual branch so Metal can fill
     # communication bubbles without changing collective or arithmetic order.
     ("OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"),

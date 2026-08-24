@@ -451,6 +451,10 @@ _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL = os.getenv(
     "OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_OUTPUT_CHAIN_PREFILL_LOGGED = False
+_DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE = os.getenv(
+    "OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED = False
 _DEEPSEEK_V4_HC_RESIDUAL_OVERLAP = os.getenv(
     "OMLX_DSV4_HC_RESIDUAL_OVERLAP", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
@@ -1072,22 +1076,42 @@ def _ane_stacked_q(
     return _ane_linear(attn_linear, value), None
 
 
+def _prepare_attention_output(attn: nn.Module, row: mx.array) -> mx.array:
+    """Map (B,H,M,D) attention rows to grouped O-A input (B,G,M,K)."""
+
+    batch, _, length, _ = row.shape
+    row = row.reshape(batch, attn.o_groups, -1, length, attn.head_dim)
+    return row.transpose(0, 1, 3, 2, 4).flatten(-2)
+
+
 def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx.array:
     out = attn.rope(out, offset, inverse=True)
-
-    def prepare(row: mx.array) -> mx.array:
-        batch, _, length, _ = row.shape
-        row = row.reshape(batch, attn.o_groups, -1, length, attn.head_dim)
-        return row.transpose(0, 1, 3, 2, 4).flatten(-2)
 
     def finish(row: mx.array) -> mx.array:
         return row.transpose(0, 2, 1, 3).flatten(-2)
 
     if is_dspark_verify_armed():
-        prepared = mx.concatenate(
-            [prepare(out[:, :, idx : idx + 1]) for idx in range(out.shape[2])],
-            axis=2,
-        )
+        if _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE:
+            # This view is element-for-element identical to concatenating M
+            # independently prepared one-row views, but avoids six slice
+            # graphs plus a materializing concatenate in depth-5 verify.
+            prepared = _prepare_attention_output(attn, out)
+            global _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED
+            if not _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED:
+                _DEEPSEEK_V4_VERIFY_BATCHED_OA_PREPARE_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "deepseek_v4: using exact batched O-A verify preparation "
+                    "(M=%d; OMLX_DSV4_VERIFY_BATCHED_OA_PREPARE=0 disables)",
+                    out.shape[2],
+                )
+        else:
+            prepared = mx.concatenate(
+                [
+                    _prepare_attention_output(attn, out[:, :, idx : idx + 1])
+                    for idx in range(out.shape[2])
+                ],
+                axis=2,
+            )
         from omlx.patches.deepseek_v4.verify_qmv import (
             eligible as qmv_eligible,
             exact_verify_qmv,
@@ -1110,7 +1134,7 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
             if qmv_eligible(attn.wo_b, projected)
             else attn.wo_b(projected)
         )
-    prepared = prepare(out)
+    prepared = _prepare_attention_output(attn, out)
     native_chain = _project_attention_output_chain(attn, prepared)
     if native_chain is not None:
         return native_chain
