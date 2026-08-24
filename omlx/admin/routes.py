@@ -149,6 +149,18 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # DeepSeek-V4 hybrid ANE prefill
+    deepseek_ane_prefill_enabled: bool | None = None
+    deepseek_ane_prefill_sequence_length: int | None = None
+    deepseek_ane_prefill_tail_padding_min_tokens: int | None = None
+    deepseek_ane_prefill_down_enabled: bool | None = None
+    deepseek_ane_prefill_down_fraction: float | None = None
+    deepseek_ane_prefill_wo_a_enabled: bool | None = None
+    deepseek_ane_prefill_wo_a_fraction: float | None = None
+    deepseek_ane_prefill_cpu_enabled: bool | None = None
+    deepseek_ane_prefill_cpu_fraction: float | None = None
+    deepseek_ane_prefill_cpu_threads: int | None = None
+    deepseek_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -2454,6 +2466,94 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    # DeepSeek-V4 hybrid ANE prefill (shared expert + attention-input stack +
+    # wq_b + stacked indexer).
+    if "deepseek_ane_prefill_enabled" in sent:
+        enabled = bool(request.deepseek_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith("deepseek_v4"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE prefill is available only for DeepSeek-V4 "
+                    "models."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_enabled = enabled
+    if "deepseek_ane_prefill_sequence_length" in sent:
+        value = request.deepseek_ane_prefill_sequence_length
+        if value is None or value < 1024 or value % 64:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+            )
+        current_settings.deepseek_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            current_settings.deepseek_ane_prefill_tail_padding_min_tokens = 0
+    if "deepseek_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.deepseek_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.deepseek_ane_prefill_sequence_length)
+        if value is None or not (value == 0 or 2 <= value < sequence_length):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "DeepSeek ANE tail padding threshold must be zero or "
+                    "between 2 and one less than the ANE prompt block."
+                ),
+            )
+        current_settings.deepseek_ane_prefill_tail_padding_min_tokens = int(value)
+    if "deepseek_ane_prefill_down_enabled" in sent:
+        current_settings.deepseek_ane_prefill_down_enabled = bool(
+            request.deepseek_ane_prefill_down_enabled
+        )
+    if "deepseek_ane_prefill_down_fraction" in sent:
+        value = request.deepseek_ane_prefill_down_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek shared-down ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_down_fraction = float(value)
+    if "deepseek_ane_prefill_wo_a_enabled" in sent:
+        current_settings.deepseek_ane_prefill_wo_a_enabled = bool(
+            request.deepseek_ane_prefill_wo_a_enabled
+        )
+    if "deepseek_ane_prefill_wo_a_fraction" in sent:
+        value = request.deepseek_ane_prefill_wo_a_fraction
+        if value is None or not 0.0 < value < 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek wo_a ANE fraction must be between 0 and 1.",
+            )
+        current_settings.deepseek_ane_prefill_wo_a_fraction = float(value)
+    if "deepseek_ane_prefill_cpu_enabled" in sent:
+        current_settings.deepseek_ane_prefill_cpu_enabled = bool(
+            request.deepseek_ane_prefill_cpu_enabled
+        )
+    if "deepseek_ane_prefill_cpu_fraction" in sent:
+        value = request.deepseek_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value < 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU fraction must be between 0.0 and 0.5.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_fraction = float(value)
+    if "deepseek_ane_prefill_cpu_threads" in sent:
+        value = request.deepseek_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="DeepSeek CPU worker count must be between 0 and 64.",
+            )
+        current_settings.deepseek_ane_prefill_cpu_threads = int(value)
+    if "deepseek_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.deepseek_ane_prefill_cpu_shared_resource = bool(
+            request.deepseek_ane_prefill_cpu_shared_resource
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -6821,7 +6921,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune a Qwen or DeepSeek ANE split without persisting settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -6879,6 +6979,16 @@ async def start_ane_tuning(
         raise HTTPException(
             status_code=400,
             detail=f"Model {tuning_request.model_id} is not a supported language model",
+        )
+    config_type = str(getattr(entry, "config_model_type", "") or "")
+    config_type = config_type.lower().replace("-", "_")
+    if (
+        tuning_request.model_family == "deepseek_v4"
+        and not config_type.startswith("deepseek_v4")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="DeepSeek ANE tuning is available only for DeepSeek-V4 models.",
         )
 
     cleanup_old_runs()

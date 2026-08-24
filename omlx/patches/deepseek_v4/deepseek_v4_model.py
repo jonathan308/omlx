@@ -997,6 +997,98 @@ def set_dspark_verify_armed(flag: bool) -> None:
     set_armed(flag)
 
 
+# Optional ANE prefill backends. They see every eligible call and return None
+# to fall through to the normal GPU path (decode, verify, non-fixed shapes).
+_ANE_LINEAR_BACKEND = None
+_ANE_GROUPED_LINEAR_BACKEND = None
+_ANE_MLP_BACKEND = None
+_ANE_ATTENTION_INPUT_BACKEND = None
+
+
+def register_ane_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for eligible plain linears."""
+    global _ANE_LINEAR_BACKEND
+    _ANE_LINEAR_BACKEND = backend
+
+
+def register_ane_grouped_linear_backend(backend) -> None:
+    """Install the optional ANE prefill backend for grouped linears."""
+    global _ANE_GROUPED_LINEAR_BACKEND
+    _ANE_GROUPED_LINEAR_BACKEND = backend
+
+
+def register_ane_mlp_backend(backend) -> None:
+    """Install the optional ANE prefill backend for the shared-expert MLP."""
+    global _ANE_MLP_BACKEND
+    _ANE_MLP_BACKEND = backend
+
+
+def register_ane_attention_input_backend(backend) -> None:
+    """Install the optional stacked backend for projections that consume x."""
+    global _ANE_ATTENTION_INPUT_BACKEND
+    _ANE_ATTENTION_INPUT_BACKEND = backend
+
+
+def _ane_attention_input(attn: nn.Module, x: mx.array) -> dict[str, mx.array]:
+    backend = _ANE_ATTENTION_INPUT_BACKEND
+    if backend is not None:
+        projected = backend(attn, x)
+        if projected is not None:
+            return projected
+    return {}
+
+
+def _projection_or(
+    projected: dict[str, mx.array], name: str, linear: nn.Module, x: mx.array
+) -> mx.array:
+    value = projected.get(name)
+    return linear(x) if value is None else value
+
+
+def _ane_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+def _ane_grouped_linear(linear: nn.Module, x: mx.array) -> mx.array:
+    backend = _ANE_GROUPED_LINEAR_BACKEND
+    if backend is not None:
+        out = backend(linear, x)
+        if out is not None:
+            return out
+    return linear(x)
+
+
+_ANE_STACKED_Q_BACKEND = None
+
+
+def register_ane_stacked_q_backend(backend) -> None:
+    """Install the optional ANE backend for the stacked attn+indexer wq_b."""
+    global _ANE_STACKED_Q_BACKEND
+    _ANE_STACKED_Q_BACKEND = backend
+
+
+def _ane_stacked_q(
+    attn_linear: nn.Module, indexer_linear: nn.Module | None, value: mx.array
+):
+    """Project the attention q, folding the indexer q into the same hybrid op.
+
+    Returns ``(attn_q_raw, indexer_q_raw)``; the second element is ``None``
+    whenever the stacked backend did not run, and the caller must then leave
+    the indexer to do its own projection.
+    """
+    backend = _ANE_STACKED_Q_BACKEND
+    if backend is not None and indexer_linear is not None:
+        split = backend(attn_linear, value)
+        if split is not None:
+            return split
+    return _ane_linear(attn_linear, value), None
+
+
 def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx.array:
     out = attn.rope(out, offset, inverse=True)
 
@@ -1039,6 +1131,9 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
     native_chain = _project_attention_output_chain(attn, prepared)
     if native_chain is not None:
         return native_chain
+    if _ANE_GROUPED_LINEAR_BACKEND is not None:
+        projected = finish(_ane_grouped_linear(attn.wo_a, prepared))
+        return _ane_linear(attn.wo_b, projected)
     return attn.wo_b(finish(_project_attention_oa(attn, prepared)))
 
 
@@ -1053,7 +1148,7 @@ def _project_verify_q_b(module: nn.Module, inputs: mx.array) -> mx.array:
 
         if qmv_eligible(module, inputs):
             return exact_verify_qmv(module, inputs)
-    return module(inputs)
+    return _ane_linear(module, inputs)
 
 
 def _batched_m1_attention(
@@ -2450,6 +2545,11 @@ class DeepseekV4MLP(nn.Module):
         self.fp32_swiglu = False
 
     def __call__(self, x: mx.array) -> mx.array:
+        backend = _ANE_MLP_BACKEND
+        if backend is not None and not is_dspark_verify_armed():
+            hybrid = backend(self, x)
+            if hybrid is not None:
+                return hybrid
         paired = False
         if is_dspark_verify_armed():
             from omlx.patches.deepseek_v4.verify_qmv import (
@@ -3519,22 +3619,27 @@ class LocalAttention(nn.Module):
         offset = _b1_cache_offset(cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        projection_bank = _decode_qkv_projection_bundle(self, x)
-        if projection_bank is None:
-            projection_bank = _owned_projection_bank(
-                x,
-                (self.wq_a, self.wkv),
-                self.sharding_group,
-            )
-        if projection_bank is None:
-            verify_bank = _verify_q_a_kv_bank(self, x)
-            if verify_bank is None:
-                q_a = self.wq_a(x)
-                kv_raw = self.wkv(x)
-            else:
-                q_a, kv_raw = verify_bank
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
         else:
-            q_a, kv_raw = projection_bank
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (self.wq_a, self.wkv),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+            else:
+                q_a, kv_raw = projection_bank
         q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
@@ -3643,29 +3748,41 @@ class CompressedAttention(nn.Module):
         offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        projection_bank = _decode_qkv_projection_bundle(self, x)
-        if projection_bank is None:
-            projection_bank = _owned_projection_bank(
-                x,
-                (
-                    self.wq_a,
-                    self.wkv,
-                    self.compressor.wkv,
-                    self.compressor.wgate,
-                ),
-                self.sharding_group,
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            compressor_projection = (
+                (compressed_kv, compressed_gate)
+                if compressed_kv is not None and compressed_gate is not None
+                else None
             )
-        if projection_bank is None:
-            verify_bank = _verify_q_a_kv_bank(self, x)
-            if verify_bank is None:
-                q_a = self.wq_a(x)
-                kv_raw = self.wkv(x)
-            else:
-                q_a, kv_raw = verify_bank
-            compressor_projection = None
         else:
-            q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
-            compressor_projection = (compressed_kv, compressed_gate)
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (
+                        self.wq_a,
+                        self.wkv,
+                        self.compressor.wkv,
+                        self.compressor.wgate,
+                    ),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+                compressor_projection = None
+            else:
+                q_a, kv_raw, compressed_kv, compressed_gate = projection_bank
+                compressor_projection = (compressed_kv, compressed_gate)
         q_raw = _project_verify_q_b(self.wq_b, self.q_norm(q_a))
         q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
@@ -3849,44 +3966,70 @@ class SparseCompressedAttention(nn.Module):
         offset = _b1_cache_offset(local_cache, B)
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        projection_bank = _decode_qkv_projection_bundle(self, x)
-        if projection_bank is None:
-            projection_bank = _owned_projection_bank(
-                x,
-                (
-                    self.wq_a,
-                    self.wkv,
-                    self.compressor.wkv,
-                    self.compressor.wgate,
-                    self.indexer.compressor.wkv,
-                    self.indexer.compressor.wgate,
-                ),
-                self.sharding_group,
+        projected = _ane_attention_input(self, x)
+        if projected:
+            q_a = _projection_or(projected, "wq_a", self.wq_a, x)
+            kv_raw = _projection_or(projected, "wkv", self.wkv, x)
+            compressed_kv = projected.get("compressor_wkv")
+            compressed_gate = projected.get("compressor_wgate")
+            compressor_projection = (
+                (compressed_kv, compressed_gate)
+                if compressed_kv is not None and compressed_gate is not None
+                else None
             )
-        if projection_bank is None:
-            verify_bank = _verify_q_a_kv_bank(self, x)
-            if verify_bank is None:
-                q_a = self.wq_a(x)
-                kv_raw = self.wkv(x)
-            else:
-                q_a, kv_raw = verify_bank
-            compressor_projection = None
-            index_compressor_projection = None
+            index_kv = projected.get("indexer_compressor_wkv")
+            index_gate = projected.get("indexer_compressor_wgate")
+            index_compressor_projection = (
+                (index_kv, index_gate)
+                if index_kv is not None and index_gate is not None
+                else None
+            )
         else:
-            (
-                q_a,
-                kv_raw,
-                compressed_kv,
-                compressed_gate,
-                index_kv,
-                index_gate,
-            ) = projection_bank
-            compressor_projection = (compressed_kv, compressed_gate)
-            index_compressor_projection = (index_kv, index_gate)
+            projection_bank = _decode_qkv_projection_bundle(self, x)
+            if projection_bank is None:
+                projection_bank = _owned_projection_bank(
+                    x,
+                    (
+                        self.wq_a,
+                        self.wkv,
+                        self.compressor.wkv,
+                        self.compressor.wgate,
+                        self.indexer.compressor.wkv,
+                        self.indexer.compressor.wgate,
+                    ),
+                    self.sharding_group,
+                )
+            if projection_bank is None:
+                verify_bank = _verify_q_a_kv_bank(self, x)
+                if verify_bank is None:
+                    q_a = self.wq_a(x)
+                    kv_raw = self.wkv(x)
+                else:
+                    q_a, kv_raw = verify_bank
+                compressor_projection = None
+                index_compressor_projection = None
+            else:
+                (
+                    q_a,
+                    kv_raw,
+                    compressed_kv,
+                    compressed_gate,
+                    index_kv,
+                    index_gate,
+                ) = projection_bank
+                compressor_projection = (compressed_kv, compressed_gate)
+                index_compressor_projection = (index_kv, index_gate)
         q_residual = self.q_norm(q_a)
-        q_raw = _project_verify_q_b(self.wq_b, q_residual).reshape(
-            B, L, self.n_heads, self.head_dim
-        )
+        if is_dspark_verify_armed():
+            q_raw = _project_verify_q_b(self.wq_b, q_residual)
+            indexer_q_raw = None
+        else:
+            q_raw, indexer_q_raw = _ane_stacked_q(
+                self.wq_b,
+                getattr(self.indexer, "wq_b", None),
+                q_residual,
+            )
+        q_raw = q_raw.reshape(B, L, self.n_heads, self.head_dim)
         q, kv = _finalize_attention_qkv(self, q_raw, kv_raw, offset)
         sinks = self.attn_sink.astype(q.dtype)
         if is_dspark_verify_armed() and B == 1 and L <= 6:
@@ -3939,7 +4082,12 @@ class SparseCompressedAttention(nn.Module):
                 )
                 index_q = index_q.transpose(0, 2, 1, 3)
                 index_q = self.rope(index_q, offset)
-                index_weights = self.indexer.weights_proj(x)
+                index_weights = _projection_or(
+                    projected,
+                    "indexer_weights",
+                    self.indexer.weights_proj,
+                    x,
+                )
                 topk_rows = _batch_indexer_rows(
                     self.indexer,
                     index_pooled_rows,
@@ -4043,6 +4191,14 @@ class SparseCompressedAttention(nn.Module):
                 (B, L, pooled.shape[1]),
             )
         else:
+            projected_q = None
+            if indexer_q_raw is not None:
+                projected_q = self.rope(
+                    indexer_q_raw.reshape(
+                        B, L, self.indexer.n_heads, self.indexer.head_dim
+                    ).transpose(0, 2, 1, 3),
+                    offset,
+                )
             topk = self.indexer(
                 x,
                 q_residual,
@@ -4050,6 +4206,8 @@ class SparseCompressedAttention(nn.Module):
                 idx_cache,
                 offset,
                 compressor_projection=index_compressor_projection,
+                projected_q=projected_q,
+                projected_weights=projected.get("indexer_weights"),
             )
         sparse_mask = None
         if pmask is not None and topk is not None:

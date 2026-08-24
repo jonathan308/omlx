@@ -497,6 +497,101 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
+        # Experimental DeepSeek-V4 ANE prefill (per-model setting).
+        if (
+            not ane_prefill_sequence_length
+            and getattr(
+                self._model_settings, "deepseek_ane_prefill_enabled", False
+            )
+            and (self.model_type or "").startswith("deepseek_v4")
+        ):
+            try:
+                from ..patches.deepseek_v4.ane_prefill import (
+                    enable_deepseek_v4_ane_prefill,
+                )
+
+                dsv4_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "deepseek_ane_prefill_sequence_length",
+                        4096,
+                    )
+                )
+
+                def _enable_dsv4_ane_prefill():
+                    return enable_deepseek_v4_ane_prefill(
+                        self._model,
+                        sequence_length=dsv4_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        down_enabled=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_down_enabled",
+                                True,
+                            )
+                        ),
+                        down_fraction=float(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_down_fraction",
+                                0.65,
+                            )
+                        ),
+                        wo_a_enabled=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_wo_a_enabled",
+                                True,
+                            )
+                        ),
+                        wo_a_fraction=float(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_wo_a_fraction",
+                                0.5,
+                            )
+                        ),
+                        cpu_fraction=(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_cpu_fraction",
+                                0.125,
+                            )
+                            if getattr(
+                                self._model_settings,
+                                "deepseek_ane_prefill_cpu_enabled",
+                                True,
+                            )
+                            else 0.0
+                        ),
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "deepseek_ane_prefill_cpu_threads",
+                            12,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "deepseek_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                    )
+
+                dsv4_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_dsv4_ane_prefill,
+                )
+                if dsv4_count:
+                    ane_prefill_sequence_length = dsv4_sequence_length
+            except Exception:
+                logger.warning("DeepSeek ANE prefill not enabled", exc_info=True)
+
         # Qwen3.5/3.6 sparse MoE prefill -> native weighted-sum after sorted
         # SwitchGLU. Strictly gated; decode and unsupported MoE variants fall
         # through to stock mlx-lm.
@@ -534,6 +629,13 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        if ane_prefill_sequence_length:
+            # Pooling-cache models must place block boundaries on the fixed
+            # ANE shape, or boundary clamping keeps every chunk smaller than
+            # the compiled shape and the ANE ops never engage.
+            scheduler_config.ane_prefill_block_size = ane_prefill_sequence_length
+            if scheduler_config.prefill_step_size < ane_prefill_sequence_length:
+                scheduler_config.prefill_step_size = ane_prefill_sequence_length
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

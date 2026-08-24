@@ -6,6 +6,7 @@
         'deepseek_v32', 'glm_moe_dsa',
     ]);
     const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
+    const DEEPSEEK_ANE_CONFIG_PREFIXES = ['deepseek_v4'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -42,6 +43,17 @@
         'qwen35_ane_prefill_cpu_gdn_fraction',
         'qwen35_ane_prefill_cpu_threads',
         'qwen35_ane_prefill_cpu_shared_resource',
+        'deepseek_ane_prefill_enabled',
+        'deepseek_ane_prefill_sequence_length',
+        'deepseek_ane_prefill_tail_padding_min_tokens',
+        'deepseek_ane_prefill_down_enabled',
+        'deepseek_ane_prefill_down_fraction',
+        'deepseek_ane_prefill_wo_a_enabled',
+        'deepseek_ane_prefill_wo_a_fraction',
+        'deepseek_ane_prefill_cpu_enabled',
+        'deepseek_ane_prefill_cpu_fraction',
+        'deepseek_ane_prefill_cpu_threads',
+        'deepseek_ane_prefill_cpu_shared_resource',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -236,6 +248,17 @@
                 qwen35_ane_prefill_cpu_gdn_fraction: 0,
                 qwen35_ane_prefill_cpu_threads: 8,
                 qwen35_ane_prefill_cpu_shared_resource: true,
+                deepseek_ane_prefill_enabled: false,
+                deepseek_ane_prefill_sequence_length: 4096,
+                deepseek_ane_prefill_tail_padding_min_tokens: 0,
+                deepseek_ane_prefill_down_enabled: true,
+                deepseek_ane_prefill_down_fraction: 0.65,
+                deepseek_ane_prefill_wo_a_enabled: true,
+                deepseek_ane_prefill_wo_a_fraction: 0.5,
+                deepseek_ane_prefill_cpu_enabled: true,
+                deepseek_ane_prefill_cpu_fraction: 0.125,
+                deepseek_ane_prefill_cpu_threads: 12,
+                deepseek_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
@@ -245,6 +268,7 @@
             aneTuning: {
                 tuningId: null,
                 modelId: null,
+                modelFamily: null,
                 running: false,
                 cancelling: false,
                 applying: false,
@@ -260,6 +284,7 @@
                 allowAneGdn: true,
                 allowCpuGdn: true,
                 allowCpuSharedResource: true,
+                verifyDeepseekFullModel: false,
             },
             _aneTuningPollTimer: null,
 
@@ -7226,6 +7251,13 @@
                 return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
             },
 
+            isDeepseekAnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return DEEPSEEK_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
+            },
+
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -7410,6 +7442,17 @@
                     qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
                     qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
                     qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
+                    deepseek_ane_prefill_enabled: s.deepseek_ane_prefill_enabled || false,
+                    deepseek_ane_prefill_sequence_length: s.deepseek_ane_prefill_sequence_length || 4096,
+                    deepseek_ane_prefill_tail_padding_min_tokens: s.deepseek_ane_prefill_tail_padding_min_tokens ?? 0,
+                    deepseek_ane_prefill_down_enabled: s.deepseek_ane_prefill_down_enabled !== false,
+                    deepseek_ane_prefill_down_fraction: s.deepseek_ane_prefill_down_fraction ?? 0.65,
+                    deepseek_ane_prefill_wo_a_enabled: s.deepseek_ane_prefill_wo_a_enabled !== false,
+                    deepseek_ane_prefill_wo_a_fraction: s.deepseek_ane_prefill_wo_a_fraction ?? 0.5,
+                    deepseek_ane_prefill_cpu_enabled: s.deepseek_ane_prefill_cpu_enabled !== false,
+                    deepseek_ane_prefill_cpu_fraction: s.deepseek_ane_prefill_cpu_fraction ?? 0.125,
+                    deepseek_ane_prefill_cpu_threads: s.deepseek_ane_prefill_cpu_threads ?? 12,
+                    deepseek_ane_prefill_cpu_shared_resource: s.deepseek_ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -7833,6 +7876,25 @@
             aneTuningRecommendationText() {
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation) return '';
+                if (recommendation.model_family === 'deepseek_v4') {
+                    const speedup = Number(recommendation.speedup_percent || 0);
+                    const parts = [recommendation.enabled ? 'DeepSeek ANE on' : 'GPU only'];
+                    if (recommendation.cpu_enabled) {
+                        parts.push(
+                            `CPU ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
+                            `${Number(recommendation.cpu_threads || 0)} workers`,
+                        );
+                    } else {
+                        parts.push('CPU off');
+                    }
+                    parts.push(
+                        recommendation.full_model_verified
+                            ? 'full model verified'
+                            : 'exact-shape estimate',
+                        `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}% projection throughput`,
+                    );
+                    return parts.join(' · ');
+                }
                 const speed = Number(recommendation.processing_tps || 0).toFixed(1);
                 const speedup = Number(recommendation.speedup_percent || 0);
                 const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
@@ -7860,6 +7922,13 @@
             },
 
             aneTuningResultText(result) {
+                if (this.aneTuning.status?.model_family === 'deepseek_v4'
+                    && result?.stage !== 'verification'
+                    && result?.latency_ms !== null
+                    && result?.latency_ms !== undefined) {
+                    const speedup = Number(result.speedup_percent || 0);
+                    return `${Number(result.latency_ms).toFixed(2)} ms (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+                }
                 if (result?.processing_tps === null
                     || result?.processing_tps === undefined) {
                     if (result?.latency_ms !== null
@@ -7890,7 +7959,7 @@
                 );
             },
 
-            async startANETuning() {
+            async startANETuning(modelFamily = 'qwen') {
                 if (!this.selectedModel || this.aneTuning.running) return;
                 const modelId = this.selectedModel.id;
                 if (this._aneTuningPollTimer) {
@@ -7900,6 +7969,7 @@
                 this.aneTuning = {
                     tuningId: null,
                     modelId,
+                    modelFamily,
                     running: true,
                     cancelling: false,
                     applying: false,
@@ -7909,16 +7979,24 @@
                     error: '',
                 };
                 try {
-                    const response = await fetch('/admin/api/bench/ane-tune/start', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_id: modelId,
-                            sequence_length: parseInt(
-                                this.modelSettings.qwen35_ane_prefill_sequence_length
-                            ) || 2048,
-                            repeats: 2,
-                            allow_cpu: this.aneTuningOverrides.allowCpu,
+                    const deepseek = modelFamily === 'deepseek_v4';
+                    const payload = {
+                        model_id: modelId,
+                        model_family: modelFamily,
+                        sequence_length: parseInt(
+                            deepseek
+                                ? this.modelSettings.deepseek_ane_prefill_sequence_length
+                                : this.modelSettings.qwen35_ane_prefill_sequence_length
+                        ) || (deepseek ? 4096 : 2048),
+                        repeats: 2,
+                        allow_cpu: this.aneTuningOverrides.allowCpu,
+                        allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
+                            && this.aneTuningOverrides.allowCpuSharedResource,
+                        verify_full_model: deepseek
+                            && this.aneTuningOverrides.verifyDeepseekFullModel,
+                    };
+                    if (!deepseek) {
+                        Object.assign(payload, {
                             allow_cpu_gate: this.aneTuningOverrides.allowCpu
                                 && this.aneTuningOverrides.allowCpuGate,
                             allow_cpu_down: this.aneTuningOverrides.allowCpu
@@ -7927,9 +8005,12 @@
                             allow_cpu_gdn: this.aneTuningOverrides.allowCpu
                                 && this.aneTuningOverrides.allowAneGdn
                                 && this.aneTuningOverrides.allowCpuGdn,
-                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
-                                && this.aneTuningOverrides.allowCpuSharedResource,
-                        }),
+                        });
+                    }
+                    const response = await fetch('/admin/api/bench/ane-tune/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.status === 401) {
@@ -8012,11 +8093,45 @@
                 if (!this.selectedModel || !this.aneTuningForSelectedModel()) return;
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation || this.aneTuning.applying) return;
-                const patch = {
-                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
-                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
-                };
-                if (recommendation.enabled) {
+                let patch;
+                if (recommendation.model_family === 'deepseek_v4') {
+                    patch = {
+                        deepseek_ane_prefill_enabled: !!recommendation.enabled,
+                        deepseek_ane_prefill_sequence_length: Number(
+                            recommendation.sequence_length
+                        ),
+                        deepseek_ane_prefill_tail_padding_min_tokens: Number(
+                            recommendation.tail_padding_min_tokens || 0
+                        ),
+                        deepseek_ane_prefill_down_enabled:
+                            recommendation.down_enabled !== false,
+                        deepseek_ane_prefill_down_fraction: Number(
+                            recommendation.down_fraction || 0.65
+                        ),
+                        deepseek_ane_prefill_wo_a_enabled:
+                            recommendation.wo_a_enabled !== false,
+                        deepseek_ane_prefill_wo_a_fraction: Number(
+                            recommendation.wo_a_fraction || 0.5
+                        ),
+                        deepseek_ane_prefill_cpu_enabled:
+                            !!recommendation.cpu_enabled,
+                        deepseek_ane_prefill_cpu_fraction: Number(
+                            recommendation.cpu_fraction || 0
+                        ),
+                        deepseek_ane_prefill_cpu_threads: Number(
+                            recommendation.cpu_threads || 0
+                        ),
+                        deepseek_ane_prefill_cpu_shared_resource:
+                            !!recommendation.cpu_shared_resource,
+                    };
+                } else {
+                    patch = {
+                        qwen35_ane_prefill_enabled: !!recommendation.enabled,
+                        qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                    };
+                }
+                if (recommendation.enabled
+                    && recommendation.model_family !== 'deepseek_v4') {
                     patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
                     patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
                     if (recommendation.gdn_enabled) {
@@ -8218,12 +8333,40 @@
                 return null;
             },
 
+            validateDeepseekAneSettings() {
+                if (!this.modelSettings.deepseek_ane_prefill_enabled) return null;
+                const sequenceLength = Number(
+                    this.modelSettings.deepseek_ane_prefill_sequence_length
+                );
+                if (!Number.isInteger(sequenceLength) || sequenceLength < 1024) {
+                    return 'DeepSeek ANE prompt block must be an integer of at least 1024.';
+                }
+                if (sequenceLength % 64 !== 0) {
+                    return 'DeepSeek ANE prompt block must be a multiple of 64.';
+                }
+                const threshold = Number(
+                    this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens
+                );
+                if (!Number.isInteger(threshold) || threshold < 0) {
+                    return 'DeepSeek ANE tail padding threshold must be a non-negative integer.';
+                }
+                if (threshold === 1 || threshold >= sequenceLength) {
+                    return 'DeepSeek ANE tail padding threshold must be zero or between 2 and one less than the prompt block.';
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
+                    return;
+                }
+                const deepseekAneValidationError = this.validateDeepseekAneSettings();
+                if (deepseekAneValidationError) {
+                    alert(deepseekAneValidationError);
                     return;
                 }
 
@@ -8324,6 +8467,27 @@
                                     ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
                                     : 8,
                                 qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
+                                deepseek_ane_prefill_enabled: !!this.modelSettings.deepseek_ane_prefill_enabled,
+                                deepseek_ane_prefill_sequence_length: parseInt(this.modelSettings.deepseek_ane_prefill_sequence_length) || 4096,
+                                deepseek_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
+                                deepseek_ane_prefill_down_enabled: !!this.modelSettings.deepseek_ane_prefill_down_enabled,
+                                deepseek_ane_prefill_down_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_down_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_down_fraction)
+                                    : 0.65,
+                                deepseek_ane_prefill_wo_a_enabled: !!this.modelSettings.deepseek_ane_prefill_wo_a_enabled,
+                                deepseek_ane_prefill_wo_a_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_wo_a_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_wo_a_fraction)
+                                    : 0.5,
+                                deepseek_ane_prefill_cpu_enabled: !!this.modelSettings.deepseek_ane_prefill_cpu_enabled,
+                                deepseek_ane_prefill_cpu_fraction: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_cpu_fraction)
+                                    : 0.125,
+                                deepseek_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.deepseek_ane_prefill_cpu_threads))
+                                    ? Number(this.modelSettings.deepseek_ane_prefill_cpu_threads)
+                                    : 12,
+                                deepseek_ane_prefill_cpu_shared_resource: !!this.modelSettings.deepseek_ane_prefill_cpu_shared_resource,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
