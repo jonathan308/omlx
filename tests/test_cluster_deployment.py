@@ -97,6 +97,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "JACCL_TWO_RANK_SMALL_ALLREDUCE",
         "OMLX_CLUSTER_TRACE_COLLECTIVES",
         "OMLX_DSV4_INDEXER_ROW_TP",
+        "OMLX_DSV4_INDEXER_GATHER_P2P",
         "OMLX_DSV4_NATIVE_INDEXER",
         "OMLX_DSV4F_MMA_SCORE",
         "OMLX_DSV4_HIERARCHICAL_INDEXER",
@@ -116,6 +117,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_DSV4_WSDPA_TP",
         "OMLX_DSV4_WSDPA_TOPK",
         "OMLX_DSV4_B1_SCALAR_OFFSET",
+        "OMLX_DSV4_QKV_BUNDLE_PREFILL",
         "OMLX_DSV4_FULL_MOE_DECODE",
         "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS",
         "OMLX_DSV4_ROUTER_TOPK_DECODE",
@@ -145,6 +147,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "JACCL_TWO_RANK_SMALL_ALLREDUCE=0" in envs
     assert "OMLX_CLUSTER_TRACE_COLLECTIVES=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" in envs
     assert "OMLX_DSV4_NATIVE_INDEXER=1" in envs
     assert "OMLX_DSV4F_MMA_SCORE=1" in envs
     assert "OMLX_DSV4_HIERARCHICAL_INDEXER=0" in envs
@@ -164,6 +167,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TP=1" in envs
     assert "OMLX_DSV4_WSDPA_TOPK=1" in envs
     assert "OMLX_DSV4_B1_SCALAR_OFFSET=1" in envs
+    assert "OMLX_DSV4_QKV_BUNDLE_PREFILL=0" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=1" in envs
     assert "OMLX_DSV4_ROUTER_TOPK_DECODE=1" in envs
@@ -185,6 +189,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("JACCL_TWO_RANK_SMALL_ALLREDUCE", "1")
     monkeypatch.setenv("OMLX_CLUSTER_TRACE_COLLECTIVES", "1")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP", "0")
+    monkeypatch.setenv("OMLX_DSV4_INDEXER_GATHER_P2P", "1")
     monkeypatch.setenv("OMLX_DSV4_NATIVE_INDEXER", "0")
     monkeypatch.setenv("OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL", "4096")
     monkeypatch.setenv("OMLX_CLUSTER_PREFILL_SHAPE_WARMUP", "0")
@@ -193,6 +198,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     monkeypatch.setenv("OMLX_DSV4_PREFILL_ASYNC_DEPTH", "2")
     monkeypatch.setenv("OMLX_DSV4_WSDPA_TP", "0")
     monkeypatch.setenv("OMLX_DSV4_B1_SCALAR_OFFSET", "0")
+    monkeypatch.setenv("OMLX_DSV4_QKV_BUNDLE_PREFILL", "1")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE", "1")
     monkeypatch.setenv("OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS", "2")
     monkeypatch.setenv("OMLX_DSV4_ROUTER_TOPK_DECODE", "0")
@@ -214,6 +220,8 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_CLUSTER_TRACE_COLLECTIVES=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" not in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=1" in envs
+    assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" not in envs
     assert "OMLX_DSV4_NATIVE_INDEXER=0" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=4096" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP_MIN_POOL=2048" not in envs
@@ -226,6 +234,7 @@ def test_hostfile_envs_respect_operator_overrides(monkeypatch):
     assert "OMLX_DSV4_WSDPA_TP=0" in envs
     assert "OMLX_DSV4_WSDPA_TP=1" not in envs
     assert "OMLX_DSV4_B1_SCALAR_OFFSET=0" in envs
+    assert "OMLX_DSV4_QKV_BUNDLE_PREFILL=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE=1" in envs
     assert "OMLX_DSV4_FULL_MOE_DECODE_MAX_TOKENS=2" in envs
     assert "OMLX_DSV4_ROUTER_TOPK_DECODE=0" in envs

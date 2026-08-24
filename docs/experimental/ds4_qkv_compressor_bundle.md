@@ -109,6 +109,31 @@ machine. Do not assume arbitrary concatenation is exact: on M3 Ultra the
 ratio-4 1024-row pairs and 256-row pairs are array-equal when grouped, but the
 ratio-128 512-to-1024 BF16 concat changes MLX's GEMM reduction geometry.
 
+### Lossless M=1024 candidate
+
+The ratio-4 M=1024 candidate now exposes the only grouping already proven
+array-equal: original packed MXFP8 Q-A plus raw-KV, original BF16 main
+compressor KV/gate, and original BF16 index-compressor KV/gate. M3 performs
+three stock-arithmetic dispatches. M5 performs four because its main 1024-row
+BF16 pair must remain two GEMMs: concatenating that pair changes its reduction
+geometry, while Q/KV and the index pair remain exact. Both restore the same
+six views. The candidate never
+dequantizes, converts to INT8, or requantizes an affine suffix.
+
+The M5 Q/KV bank uses the qualified NAX variant 5 tile
+(BM128/BK64/BN64/WM4/WN2); all original U32 codes and U8 scales pass directly
+to the same MLX MXFP8 implementation. If that symbol, NAX metallib, or device
+capability is absent, the route fails closed before packing any weights.
+
+On first qualified use, each source module is rebound to a row view of its
+canonical bank. Consequently there is no steady-state duplicate weight copy;
+the normal fallback still reads the exact source rows. The route is restricted
+to BF16 `[1,1024,4096]`, the exact released DS4-Flash ratio-4 fingerprint,
+Apple M3 Ultra or M5 Max, and either single-node execution or a rank-local TP2
+model. It adds no collective. `OMLX_DSV4_QKV_BUNDLE_PREFILL=0` is the rollback
+and remains the cluster default until full cold-prefill gates clear on both
+machines.
+
 Run the checkpoint audit and available stock-grouping ABBA probe with:
 
 ```bash

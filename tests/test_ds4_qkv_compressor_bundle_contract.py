@@ -5,6 +5,7 @@ from pathlib import Path
 
 from benchmarks.bench_ds4_qkv_compressor_bundle import (
     LAYER_RATIOS,
+    M1024_ROLLBACK_ENV,
     NATIVE_B1_SYMBOL,
     byte_ledger,
     dispatch_ledger,
@@ -57,6 +58,27 @@ def test_first_native_abi_stops_before_ape_and_cache_mutation():
     assert contract["parity"]["decode_positions"] == [0, 1, 2, 3]
 
 
+def test_m1024_candidate_is_lossless_rank_local_and_reversible():
+    candidate = promotion_contract()["m1024_production_candidate"]
+    assert candidate["shape"] == {
+        "batch": 1,
+        "rows": 1024,
+        "hidden": 4096,
+        "ratio": 4,
+    }
+    assert candidate["storage"]["requantization"] is False
+    assert candidate["storage"]["steady_state_duplicate_weight_bytes"] == 0
+    assert candidate["dispatches"] == {
+        "Apple M3 Ultra": 3,
+        "Apple M5 Max": 4,
+    }
+    assert candidate["single_node"] is True
+    assert candidate["tp2_rank_local"] is True
+    assert candidate["collectives_changed"] == 0
+    assert candidate["rollback_env"] == M1024_ROLLBACK_ENV
+    assert candidate["default_enabled"] is False
+
+
 def test_symbol_has_only_the_exact_promoted_production_seam():
     root = Path(__file__).parents[1]
     model = root / "omlx/patches/deepseek_v4/deepseek_v4_model.py"
@@ -93,3 +115,29 @@ def test_recorded_b1_gate_is_lossless_but_rejected_on_both_hosts():
         assert host["passed"] is False
     assert report["outcome"]["promoted"] is False
     assert report["outcome"]["production_dispatch"] is False
+
+
+def test_recorded_m1024_gate_preserves_storage_and_passes_both_hosts():
+    report = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "docs/experimental"
+            / "ds4_qkv_compressor_bundle_m1024_results_2026-08-23.json"
+        ).read_text()
+    )
+    assert report["storage"]["requantized"] is False
+    assert report["storage"]["steady_state_duplicate_weight_bytes"] == 0
+    assert report["rejected_m5_three_dispatch_schedule"]["projection_array_equal"] == [
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+    ]
+    for host in report["hosts"].values():
+        assert host["projection_array_equal"] == [True] * 6
+        assert host["fallback_views_array_equal"] == [True] * 6
+        assert host["speedup"] >= 1.05
+    assert report["gate"]["passed"] is True
+    assert report["outcome"]["cluster_default_enabled"] is False

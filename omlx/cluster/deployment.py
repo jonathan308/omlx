@@ -81,6 +81,11 @@ _RANK_ENV_DEFAULTS = (
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.
     ("OMLX_DSV4_INDEXER_ROW_TP", "1"),
+    # Candidate weighted-TP2 transport exchanges exact, unpadded index rows
+    # with ordered point-to-point operations. It requires both this flag and
+    # OMLX_DSV4_WEIGHTED_INDEXER_ROWS; equal/non-TP2 rows always retain the
+    # faster general collective. Keep both off pending a whole-model gate.
+    ("OMLX_DSV4_INDEXER_GATHER_P2P", "0"),
     ("OMLX_DSV4_NATIVE_INDEXER", "1"),
     # Bit-exact DS4F ratio-4 MMA score path, physically qualified on M2 Ultra,
     # M3 Ultra, and M5 Max. Carry one rollback value to every TP rank.
@@ -115,6 +120,11 @@ _RANK_ENV_DEFAULTS = (
     # Exact one-dispatch DS4 B1 ratio-4 Q/KV/compressor bundle. Physical TP2
     # gate: +9.6% short decode with unchanged 14K prefill and exact hashes.
     ("OMLX_DSV4_QKV_BUNDLE_DECODE", "1"),
+    # Lossless M=1024 continuation over original packed MXFP8/BF16 storage.
+    # M3 uses three dispatches; M5 keeps its reduction-sensitive main BF16
+    # banks separate and uses four. Carry one rollback value to every rank;
+    # remain default-off until the full cold-prefill TP2 gate is recorded.
+    ("OMLX_DSV4_QKV_BUNDLE_PREFILL", "0"),
     # Ratio-0/128 siblings are exact and locally faster on M5, but did not
     # improve whole-model TP2 decode after ratio-4 moved the critical path.
     ("OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"),

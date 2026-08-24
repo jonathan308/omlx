@@ -2504,6 +2504,208 @@ class TestIndexerFallbackTiling:
 
         assert gathered.tolist() == [[[1, 2], [3, 4], [5, 6], [7, 8]]]
 
+    @pytest.mark.parametrize(
+        "rank,local_values,peer_values,expected_ops",
+        (
+            (0, (1, 2, 3), (4, 5, 6, 7, 8), ("eval", "send", "recv")),
+            (1, (4, 5, 6, 7, 8), (1, 2, 3), ("eval", "send", "recv")),
+        ),
+    )
+    def test_tensor_prefill_tp2_p2p_gather_is_exact_and_ordered(
+        self,
+        applied_patch,
+        monkeypatch,
+        rank,
+        local_values,
+        peer_values,
+        expected_ops,
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+        local = mx.array([[list(local_values)]], dtype=mx.uint32).swapaxes(1, 2)
+        peer = mx.array([[list(peer_values)]], dtype=mx.uint32).swapaxes(1, 2)
+        peer_rows_first = peer.swapaxes(0, 1)
+        operations = []
+        original_eval = mx.eval
+
+        def traced_eval(*values):
+            operations.append(("eval", tuple(values[0].shape)))
+            return original_eval(*values)
+
+        def send(value, destination, *, group=None):
+            assert destination == 1 - rank
+            assert group is not None
+            operations.append(("send", tuple(value.shape)))
+            return value
+
+        def recv_like(template, source, *, group=None):
+            assert source == 1 - rank
+            assert group is not None
+            assert tuple(template.shape) == tuple(peer_rows_first.shape)
+            assert template.dtype == peer_rows_first.dtype
+            operations.append(("recv", tuple(template.shape)))
+            return peer_rows_first
+
+        monkeypatch.setattr(dm.mx, "eval", traced_eval)
+        monkeypatch.setattr(dm.mx.distributed, "send", send)
+        monkeypatch.setattr(dm.mx.distributed, "recv_like", recv_like)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "all_gather",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("qualified TP2 must not enter all_gather")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(local, 8, group)
+        original_eval(gathered)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
+        assert tuple(op for op, _shape in operations) == expected_ops
+
+    @pytest.mark.parametrize(
+        "weighted,weights,total_rows",
+        ((False, "3,5", 5), (True, "4,4", 4)),
+    )
+    def test_tensor_prefill_p2p_requires_weighted_uneven_rows(
+        self, applied_patch, monkeypatch, weighted, weights, total_rows
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", weights)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", weighted)
+        ranges = dm._indexer_row_ranges(total_rows, SimpleNamespace(size=lambda: 2))
+        local_rows = ranges[0][1] - ranges[0][0]
+        max_rows = max(stop - start for start, stop in ranges)
+        local = mx.arange(local_rows, dtype=mx.uint32).reshape(1, local_rows, 1)
+        wire = mx.arange(2 * max_rows, dtype=mx.uint32).reshape(
+            2 * max_rows, 1, 1
+        )
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append(group)
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("equal or unweighted rows must use all_gather")
+            ),
+        )
+
+        dm._gather_indexer_rows(local, total_rows, group)
+
+        assert calls == [group]
+
+    @pytest.mark.parametrize("rank", (0, 1))
+    def test_tensor_prefill_tp2_p2p_preserves_weighted_row_order(
+        self, applied_patch, monkeypatch, rank
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setenv("OMLX_TP_SHARD_WEIGHTS", "3,5")
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS", True)
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+        shards = (
+            mx.array([[[1], [2], [3]]], dtype=mx.uint32),
+            mx.array([[[4], [5], [6], [7], [8]]], dtype=mx.uint32),
+        )
+        local = shards[rank]
+        peer_rows_first = shards[1 - rank].swapaxes(0, 1)
+
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda value, destination, *, group=None: value,
+        )
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "recv_like",
+            lambda template, source, *, group=None: peer_rows_first,
+        )
+        gathered = dm._gather_indexer_rows(local, 8, group)
+        mx.eval(gathered)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6], [7], [8]]]
+
+    def test_tensor_prefill_tp2_p2p_has_collective_rollback(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", False)
+        first = mx.array([[[1], [2]]], dtype=mx.uint32)
+        second = mx.array([[[3], [4]]], dtype=mx.uint32)
+        wire = mx.concatenate([first.swapaxes(0, 1), second.swapaxes(0, 1)], axis=0)
+        group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append((tuple(value.shape), group))
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("rollback must not enter send")
+            ),
+        )
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "recv_like",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("rollback must not enter recv")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(first, 4, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4]]]
+        assert calls == [((2, 1, 1), group)]
+
+    def test_tensor_prefill_p2p_hard_gates_tp2(
+        self, applied_patch, monkeypatch
+    ):
+        mx, dm = self._reduce_and_ref()
+        monkeypatch.setattr(dm, "_DEEPSEEK_V4_INDEXER_GATHER_P2P", True)
+        local = mx.array([[[1], [2]]], dtype=mx.uint32)
+        wire = mx.concatenate(
+            [
+                local.swapaxes(0, 1),
+                mx.array([[[3], [4]]], dtype=mx.uint32).swapaxes(0, 1),
+                mx.array([[[5], [6]]], dtype=mx.uint32).swapaxes(0, 1),
+            ],
+            axis=0,
+        )
+        group = SimpleNamespace(size=lambda: 3, rank=lambda: 0)
+        calls = []
+
+        def all_gather(value, *, group=None):
+            calls.append(group)
+            return wire
+
+        monkeypatch.setattr(dm.mx.distributed, "all_gather", all_gather)
+        monkeypatch.setattr(
+            dm.mx.distributed,
+            "send",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("non-TP2 world must not enter send")
+            ),
+        )
+
+        gathered = dm._gather_indexer_rows(local, 6, group)
+
+        assert gathered.tolist() == [[[1], [2], [3], [4], [5], [6]]]
+        assert calls == [group]
+
     def test_missing_native_warning_fires_once(
         self, applied_patch, caplog, monkeypatch
     ):

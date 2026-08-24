@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable
 
 CONTRACT_VERSION = 1
 NATIVE_B1_SYMBOL = "deepseek_v4_qkv_compressor_bundle_b1"
+M1024_ROLLBACK_ENV = "OMLX_DSV4_QKV_BUNDLE_PREFILL"
 HIDDEN = 4096
 Q_RANK = 1024
 KV_DIM = 512
@@ -174,6 +175,35 @@ def promotion_contract() -> dict[str, Any]:
             "b1_min_speedup_each_machine": 1.05,
             "m1024_min_speedup_each_machine": 1.05,
             "comparison": "faster of stock separate projections and safe grouped baseline",
+        },
+        "m1024_production_candidate": {
+            "shape": {"batch": 1, "rows": 1024, "hidden": HIDDEN, "ratio": 4},
+            "storage": {
+                "q_a_raw_kv": "original packed MXFP8 U32 + original U8 scales",
+                "compressors": "original BF16 rows",
+                "requantization": False,
+                "steady_state_duplicate_weight_bytes": 0,
+            },
+            "dispatches": {"Apple M3 Ultra": 3, "Apple M5 Max": 4},
+            "packed_groups": [
+                ["wq_a", "wkv"],
+                ["compressor.wkv", "compressor.wgate"],
+                [
+                    "indexer.compressor.wkv",
+                    "indexer.compressor.wgate",
+                ],
+            ],
+            "m5_exception": (
+                "main BF16 compressor KV/gate remain separate because the "
+                "N=2048 grouping changes M5 reduction geometry"
+            ),
+            "m5_qkv_tile": "NAX BM128/BK64/BN64/WM4/WN2 (variant 5)",
+            "hardware": ["Apple M3 Ultra", "Apple M5 Max"],
+            "single_node": True,
+            "tp2_rank_local": True,
+            "collectives_changed": 0,
+            "rollback_env": M1024_ROLLBACK_ENV,
+            "default_enabled": False,
         },
     }
 

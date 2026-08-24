@@ -26,6 +26,9 @@ from omlx.patches.deepseek_v4.indexer_dispatch import (
     native_indexer_disabled,
     native_indexer_shape_eligible,
 )
+from omlx.patches.deepseek_v4.qkv_prefill_bundle import (
+    prefill_qkv_projection_bundle,
+)
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
@@ -474,7 +477,11 @@ def _decode_qkv_projection_bundle(
     attn: nn.Module,
     x: mx.array,
 ) -> Optional[Tuple[mx.array, ...]]:
-    """One exact B1 dispatch for each DS4 attention input schedule."""
+    """Exact DS4 attention-input bundle for qualified decode/prefill tiles."""
+
+    prefill = prefill_qkv_projection_bundle(attn, x)
+    if prefill is not None:
+        return prefill
 
     if (
         not _DEEPSEEK_V4_QKV_BUNDLE_DECODE
@@ -1603,6 +1610,17 @@ _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS = os.getenv(
     # all-gather to the larger 640-row shard outweighed the score imbalance.
     "OMLX_DSV4_WEIGHTED_INDEXER_ROWS", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+# JACCL's two-rank all-gather lost a completion during the 100K lifetime
+# gate.  DS4 row parallelism does not need a general collective here: each
+# rank already knows the peer's exact row shape and both need only exchange
+# their compact uint32 top-k rows. The physical gate rejected P2P for equal
+# rows but found it useful for unpadded 3:5 rows, so the path below requires
+# both explicit P2P and weighted-row opt-ins in addition to pure TP2.
+_DEEPSEEK_V4_INDEXER_GATHER_P2P = os.getenv(
+    # Default-off until a physical two-Mac lifetime gate proves that the
+    # stricter ordering does not cost more than 2% at 100K-equivalent rows.
+    "OMLX_DSV4_INDEXER_GATHER_P2P", "0"
+).strip().lower() in ("1", "true", "on", "yes")
 _DEEPSEEK_V4_INDEXER_DECISION_TRANSPORT = os.getenv(
     "OMLX_DSV4_INDEXER_DECISION_TRANSPORT", "jaccl"
 ).strip().lower()
@@ -1773,6 +1791,50 @@ def _gather_indexer_rows(
 
     size = int(group.size())
     ranges = _indexer_row_ranges(total_rows, group)
+    rank = int(group.rank()) if hasattr(group, "rank") else -1
+    row_counts = tuple(stop - start for start, stop in ranges)
+    # For unequal TP2 rows, rank zero's reconstruction depends on send before
+    # recv while rank one's depends on recv before send. This rank-asymmetric
+    # graph order gives JACCL one producer and one consumer per direction with
+    # one final transport evaluation instead of two Python/Metal barriers.
+    # The payload stays on-device throughout; recv_like's zero is shape
+    # metadata and no control-plane/CPU copy participates.
+    #
+    # Do not extend this ordering to a ring without a separate qualification:
+    # the two-phase proof relies on exactly one peer and non-empty row shards.
+    if (
+        _DEEPSEEK_V4_INDEXER_GATHER_P2P
+        and _DEEPSEEK_V4_WEIGHTED_INDEXER_ROWS
+        and size == 2
+        and rank in (0, 1)
+        and all(rows > 0 for rows in row_counts)
+        and row_counts[0] != row_counts[1]
+    ):
+        peer = 1 - rank
+        peer_rows = row_counts[peer]
+        rows_first = local_indices.swapaxes(0, 1)
+        peer_template = mx.zeros(
+            (peer_rows, *rows_first.shape[1:]),
+            dtype=rows_first.dtype,
+        )
+        # Both ranks finish their independent score/top-k work before either
+        # begins transport. Without this common boundary rank 1's first recv
+        # would defer its own score graph until after rank 0 sent, serializing
+        # the heterogeneous GPUs and surrendering row parallelism's benefit.
+        mx.eval(rows_first)
+        sent = mx.distributed.send(rows_first, peer, group=group)
+        peer_rows_first = mx.distributed.recv_like(
+            peer_template,
+            peer,
+            group=group,
+        )
+        parts = (
+            (sent, peer_rows_first)
+            if rank == 0
+            else (peer_rows_first, sent)
+        )
+        return mx.concatenate(parts, axis=0).swapaxes(0, 1)
+
     max_rows = max(stop - start for start, stop in ranges)
     rows_first = local_indices.swapaxes(0, 1)
     if rows_first.shape[0] < max_rows:
