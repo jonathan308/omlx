@@ -905,6 +905,9 @@
                         <p class="text-[10px] text-neutral-400 mt-1"
                            x-text="deploymentCacheLabel()"
                            data-cluster-v2-active-cache-mode></p>
+                        <p class="text-[10px] text-neutral-500 mt-1"
+                           x-text="deploymentFabricLabel() + ' · device links below are control/discovery routes'"
+                           data-cluster-v2-active-fabric></p>
                     </div>
                     <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border self-start"
                           :class="deploymentStatus().tone"

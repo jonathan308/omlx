@@ -300,11 +300,15 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
 
     assert "data-cluster-v2-active" in template
     assert "data-cluster-v2-active-device" in template
+    assert "data-cluster-v2-active-fabric" in template
     assert "data-cluster-v2-runtime-state" in template
     assert "data-cluster-v2-deactivate" in template
     assert "configuredDeployment()" in template
     assert "deploymentStatus().label" in template
     assert "deactivateDeployment" in javascript
+    assert "Tailscale control" in javascript
+    assert "Inference: JACCL over Thunderbolt RDMA" in javascript
+    assert "device links below are control/discovery routes" in template
     assert re.search(
         r"`/admin/api/cluster/deployments/\$\{encodeURIComponent\(id\)\}`",
         javascript,

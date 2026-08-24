@@ -87,7 +87,9 @@ function clusterV2Wizard() {
         tb: { label: 'Thunderbolt', icon: 'zap' },
         ethernet: { label: 'Ethernet', icon: 'cable' },
         wifi: { label: 'Wi-Fi', icon: 'wifi' },
-        tailscale: { label: 'Tailscale', icon: 'globe' },
+        // This is the address used to find/control the peer. It is not the
+        // collective fabric selected by the signed deployment.
+        tailscale: { label: 'Tailscale control', icon: 'globe' },
         unknown: { label: 'Network', icon: 'help-circle' },
     };
 
@@ -1542,7 +1544,7 @@ function clusterV2Wizard() {
                                   .map((peer) => this.deviceName(peer))
                                   .join(', ')}.`
                             : 'rdma_ctl reports devices on every Thunderbolt Mac.',
-                        fix: 'On the failing Mac, connect the Thunderbolt cable and verify with `rdma_ctl status` in Terminal, then Re-run checks. Without it the cluster falls back to the slower TCP ring.',
+                        fix: 'Connect the Thunderbolt cable and run `rdma_ctl status` on every Mac. If you are not on macOS 27 and it reports disabled: shut down, hold the power button to enter Recovery, open Utilities → Terminal, run `rdma_ctl enable`, then restart and Re-run checks. Without RDMA the cluster falls back to the slower TCP ring.',
                     });
                 }
             }
@@ -2335,6 +2337,15 @@ function clusterV2Wizard() {
             return this.resolvedBackend().startsWith('jaccl')
                 ? 'JACCL · Thunderbolt RDMA'
                 : 'TCP ring';
+        },
+
+        deploymentFabricLabel() {
+            const backend = String(
+                this.configuredDeployment()?.backend || this.resolvedBackend(),
+            );
+            return backend.startsWith('jaccl')
+                ? 'Inference: JACCL over Thunderbolt RDMA'
+                : 'Inference: TCP ring';
         },
 
         deploymentHosts() {

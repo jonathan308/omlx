@@ -87,6 +87,18 @@ On every Mac:
 5. For JACCL, configure Thunderbolt RDMA outside oMLX and confirm `rdma_ctl
    status` and `ibv_devices` report the link.
 
+The device card reports the **control/discovery route**. Seeing “Tailscale
+control” there does not mean tensor traffic is using Tailscale. For an active
+fast-path deployment, the dashboard must separately report **Inference: JACCL
+over Thunderbolt RDMA**; otherwise it reports the TCP ring fallback.
+
+If you are not on macOS 27 and `rdma_ctl status` reports RDMA disabled, enable
+it once on every Mac from macOS Recovery: shut down, hold the power button,
+choose Options, open **Utilities > Terminal**, run `rdma_ctl enable`, and
+restart. Reconnect the Thunderbolt cable and verify both `rdma_ctl status` and
+`ibv_devices` before starting the cluster. oMLX does not attempt this
+Recovery-only change remotely.
+
 Rank zero is the Mac whose dashboard activates the deployment. It owns the
 late pipeline layers and the private inference coordinator. For a 256 GiB Mac
 paired with a 128 GiB Mac, rank zero should normally be the larger machine.
