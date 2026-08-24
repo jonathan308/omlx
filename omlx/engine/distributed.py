@@ -552,9 +552,10 @@ class DistributedBatchedEngine(BatchedEngine):
         if (
             kwargs.get("seed") is not None
             and self.deployment.execution.sampling_rank_only
+            and temperature > 0.0
         ):
             raise ValueError(
-                "seeded single-request generation is incompatible with the "
+                "stochastic seeded generation is incompatible with the "
                 "experimental sampling-rank-only output path"
             )
         payload: dict[str, Any] = {
@@ -618,9 +619,10 @@ class DistributedBatchedEngine(BatchedEngine):
         if (
             kwargs.get("seed") is not None
             and self.deployment.execution.sampling_rank_only
+            and temperature > 0.0
         ):
             raise ValueError(
-                "seeded single-request generation is incompatible with the "
+                "stochastic seeded generation is incompatible with the "
                 "experimental sampling-rank-only output path"
             )
         payload: dict[str, Any] = {

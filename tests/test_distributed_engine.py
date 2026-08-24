@@ -264,6 +264,43 @@ def test_completion_payload_folds_thinking_budget_into_chat_template_kwargs():
     assert payload["chat_template_kwargs"] == {"thinking_budget": 512}
 
 
+def test_greedy_seed_is_forwarded_with_sampling_rank_only():
+    engine = DistributedBatchedEngine(_deployment())
+    payload = engine._chat_payload(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        max_tokens=64,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        stop=None,
+        stream=False,
+        kwargs={"seed": 42},
+    )
+    assert payload["seed"] == 42
+
+
+def test_stochastic_seed_remains_rejected_with_sampling_rank_only():
+    engine = DistributedBatchedEngine(_deployment())
+    with pytest.raises(ValueError, match="stochastic seeded generation"):
+        engine._completion_payload(
+            prompt="hi",
+            max_tokens=64,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            stop=None,
+            stream=False,
+            kwargs={"seed": 42},
+        )
+
+
 def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine = DistributedBatchedEngine(
         _deployment(),
