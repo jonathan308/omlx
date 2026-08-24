@@ -397,8 +397,8 @@ def test_checkpoint_snapshot_mutation_aborts_before_ready(tmp_path, monkeypatch)
 @pytest.mark.parametrize(
     "mutation,message",
     [
-        ("missing", "did not fill the complete native model structure"),
-        ("extra", "produced parameters outside the native model structure"),
+        ("missing", "model_unfilled"),
+        ("extra", "checkpoint_unconsumed"),
     ],
 )
 def test_strict_coverage_never_publishes_missing_or_extra_sanitizer_keys(
@@ -420,17 +420,26 @@ def test_strict_coverage_never_publishes_missing_or_extra_sanitizer_keys(
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {name: path.name for name in tensors}})
     )
+    monkeypatch.setattr(
+        LocalSafetensors,
+        "load_partition",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("coverage mismatch must fail before tensor reads")
+        ),
+    )
     progress = []
 
-    with pytest.raises(RuntimeError, match=message):
-        try_deepseek_v4_rank_local_load(
-            tmp_path,
-            tmp_path,
-            config,
-            _Group(0),
-            utils_module=mlx_utils,
-            mx_module=mx,
-            progress=progress.append,
-        )
+    result = try_deepseek_v4_rank_local_load(
+        tmp_path,
+        tmp_path,
+        config,
+        _Group(0),
+        utils_module=mlx_utils,
+        mx_module=mx,
+        progress=progress.append,
+    )
 
+    assert result is None
+    assert progress[-1]["phase"] == "tensor_native_fallback"
+    assert message in progress[-1]["reason"]
     assert all(event["phase"] != "tensor_native_ready" for event in progress)
