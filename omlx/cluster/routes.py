@@ -102,6 +102,7 @@ from .planner import (
     plan_hybrid,
     plan_proportional_pipeline,
     plan_unequal_pipeline,
+    recommend_tensor_shard_weights,
     remote_model_layout,
     synthetic_model_layout,
 )
@@ -1536,6 +1537,84 @@ def _resolve_fabric(
     }
 
 
+def _tp_layout_recommendation_payload(
+    model: Any,
+    nodes: list[NodeBudget],
+    plan: ShardPlan,
+    *,
+    workload_profile: str,
+    context_tokens: int,
+    qualification: TPQualificationProvenance | None,
+) -> dict[str, Any] | None:
+    """Describe a measured candidate without silently activating it."""
+
+    if plan.tensor_parallel_size <= 1 or plan.pipeline_stages != 1:
+        return None
+    assignments = sorted(plan.assignments, key=lambda item: item.rank)
+    current = tuple(
+        int(item.tensor_parallel_shard_weight or 1) for item in assignments
+    )
+    if qualification is not None:
+        persistent = qualification.source == "persistent"
+        return {
+            "state": "qualified" if persistent else "experimental",
+            "current_weights": list(current),
+            "recommended_weights": list(qualification.shard_weights),
+            "requires_qualification": not persistent,
+            "qualification_id": qualification.qualification_id,
+            "reason": qualification.reason,
+        }
+    try:
+        candidate = recommend_tensor_shard_weights(
+            model,
+            nodes,
+            workload_profile=workload_profile,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": f"shard recommendation unavailable: {exc}",
+        }
+    if candidate == current:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": "measured rank rates do not justify an asymmetric split",
+        }
+    try:
+        plan_hybrid(
+            model,
+            nodes,
+            tensor_parallel_size=plan.tensor_parallel_size,
+            workload_profile=workload_profile,
+            context_tokens=context_tokens,
+            qualified_tensor_shard_weights=(candidate,),
+        )
+    except PlanningError as exc:
+        return {
+            "state": "equal",
+            "current_weights": list(current),
+            "recommended_weights": list(current),
+            "requires_qualification": False,
+            "reason": f"measured asymmetric candidate does not fit: {exc}",
+        }
+    return {
+        "state": "calibration_required",
+        "current_weights": list(current),
+        "recommended_weights": list(candidate),
+        "requires_qualification": True,
+        "reason": (
+            "synthetic rank rates nominate this vector; matched full-model "
+            "A/B and parity are required before activation"
+        ),
+    }
+
+
 @router.get("/fabric")
 async def cluster_fabric(hosts: str = Query(...)):
     """The addresses these Macs answer on, and the backend they allow.
@@ -2062,6 +2141,14 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     preflight_summary = describe_preflight(issues)
     if fabric_blocker:
         preflight_summary = f"Cluster link is not ready: {fabric_blocker}"
+    tp_layout_recommendation = _tp_layout_recommendation_payload(
+        model,
+        _node_budgets(profiled_request_nodes),
+        choice.plan,
+        workload_profile=request.execution_profile,
+        context_tokens=request.target_context_tokens,
+        qualification=qualification_provenance,
+    )
     # Warning and blocker strings embed remote SSH stderr. Redact those and
     # only those: preflight issue commands are pasteable fixes that need their
     # user@host intact, and the activation block round-trips to /deployments.
@@ -2082,6 +2169,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             for size, outcome in sorted(measurements.items())
         },
         "tp_layout_qualification": qualification_decision,
+        "tp_layout_recommendation": tp_layout_recommendation,
         "performance_probe": performance_probe,
         "staging": staging,
         "strategies": STRATEGIES,

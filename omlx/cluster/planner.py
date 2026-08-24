@@ -2190,6 +2190,29 @@ def _tensor_shard_weights(
     return candidate
 
 
+def recommend_tensor_shard_weights(
+    model: ModelLayout,
+    group: Sequence[NodeBudget],
+    *,
+    workload_profile: ExecutionProfileName = "balanced",
+) -> tuple[int, ...]:
+    """Return the measured heterogeneous candidate without activating it.
+
+    Synthetic rank probes can nominate a vector, but only matched full-model
+    parity evidence may promote it. Keeping recommendation and activation as
+    separate APIs lets the wizard explain what it wants to calibrate while
+    ``plan_hybrid`` retains equal shards as the universal safe fallback.
+    """
+
+    if len(group) < 2:
+        raise ValueError("tensor shard recommendation requires at least two nodes")
+    return _tensor_shard_weights(
+        model,
+        group,
+        workload_profile=workload_profile,
+    )
+
+
 def _tp_stage_budget(
     group: Sequence[NodeBudget],
     stage: int,

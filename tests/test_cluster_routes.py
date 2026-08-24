@@ -1077,6 +1077,64 @@ def test_deepseek_ane_distributed_experiment_requires_operator_opt_in(monkeypatc
     assert execution.prefill_step_size == 4096
 
 
+def test_measured_asymmetric_tp_candidate_requires_full_model_calibration():
+    from omlx.cluster.performance import NodePerformanceProfile
+    from omlx.cluster.planner import ModelLayout, NodeBudget, plan_hybrid
+
+    def profile(node_id, rank, rate):
+        return NodePerformanceProfile(
+            node_id=node_id,
+            rank=rank,
+            decode_weight_bytes_per_second=rate,
+            prefill_weight_bytes_per_second=rate,
+            collective_latency_seconds=0.001,
+            collective_bandwidth_bytes_per_second=10_000,
+            backend="jaccl",
+            measured_at="2026-08-24T12:00:00+00:00",
+            samples=5,
+        )
+
+    model = ModelLayout(
+        source="recommendation",
+        fixed_weight_bytes=100,
+        layer_weight_bytes=(8_000, 8_000),
+        tensor_parallel_heads=8,
+        tensor_parallel_divisors=(8,),
+        tensor_parallel_shard_units=8,
+        supports_tensor_parallel=True,
+    )
+    nodes = [
+        NodeBudget(
+            "m3",
+            1_000_000,
+            rank=0,
+            performance=profile("m3", 0, 100.0),
+        ),
+        NodeBudget(
+            "m5",
+            1_000_000,
+            rank=1,
+            performance=profile("m5", 1, 200.0),
+        ),
+    ]
+    equal = plan_hybrid(model, nodes, tensor_parallel_size=2)
+
+    payload = routes._tp_layout_recommendation_payload(
+        model,
+        nodes,
+        equal,
+        workload_profile="balanced",
+        context_tokens=8192,
+        qualification=None,
+    )
+
+    assert payload is not None
+    assert payload["state"] == "calibration_required"
+    assert payload["current_weights"] == [4, 4]
+    assert payload["recommended_weights"] == [3, 5]
+    assert payload["requires_qualification"] is True
+
+
 def test_low_power_synthetic_profile_cannot_shape_node_budget():
     node = routes.ClusterPlanNodeRequest(
         node_id="m5-max",

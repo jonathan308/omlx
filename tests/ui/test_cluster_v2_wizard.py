@@ -1512,6 +1512,7 @@ def test_split_bar_has_a_tensor_variant_and_width_transitions():
     assert "Performance-qualified" in javascript
     assert "Experimental" in javascript
     assert "Equal" in javascript
+    assert "calibration required" in javascript
     assert template.count("transition-[width] duration-700 ease-out") >= 2
     # The contiguous-range bar is untouched for pipeline plans.
     assert "assignment.layer_count / Math.max(planTotalLayers(), 1)" in template

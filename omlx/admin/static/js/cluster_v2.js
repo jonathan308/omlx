@@ -2111,6 +2111,15 @@ function clusterV2Wizard() {
             return this.tensorQualification()?.source === 'persistent';
         },
 
+        tensorRecommendation() {
+            const value = this.planProposal?.tp_layout_recommendation;
+            return value && typeof value === 'object' ? value : null;
+        },
+
+        tensorRecommendationNeedsCalibration() {
+            return this.tensorRecommendation()?.state === 'calibration_required';
+        },
+
         tensorQualificationLabel() {
             const qualification = this.tensorQualification();
             const weights = this.planAssignments().map((assignment) =>
@@ -2122,6 +2131,13 @@ function clusterV2Wizard() {
             }
             if (qualification?.source === 'environment_override') {
                 return `Experimental ${vector} override`;
+            }
+            const recommendation = this.tensorRecommendation();
+            if (recommendation?.state === 'calibration_required') {
+                const candidate = (
+                    recommendation.recommended_weights || []
+                ).join(':');
+                return `Recommended ${candidate} · calibration required`;
             }
             return `Equal ${vector} safe fallback`;
         },
