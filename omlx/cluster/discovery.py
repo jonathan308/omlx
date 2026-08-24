@@ -945,6 +945,18 @@ def _http_probe_node_id(
         # bounded carrier. Reuse it for persisted-pair reboot recovery so a
         # verified 10.0.0.x address does not require another manual seed.
         try:
+            is_tailscale = ipaddress.ip_address(ip) in ipaddress.ip_network(
+                "100.64.0.0/10"
+            )
+        except ValueError:
+            is_tailscale = False
+        if is_tailscale:
+            _probe_diagnostics.value = {
+                "transport": "direct",
+                "error": str(direct_exc),
+            }
+            return None
+        try:
             payload = _system_proxy_probe_node_id(ip, port, timeout)
         except (OSError, RuntimeError, TimeoutError, ValueError) as proxy_exc:
             _probe_diagnostics.value = {
@@ -1717,6 +1729,13 @@ class DiscoveryService:
                 for (ip, port), candidate in self._candidates.items()
                 if now - candidate["last_probe"] >= self.config.probe_interval
             ]
+            due.sort(
+                key=lambda key: (
+                    not bool(self._candidates[key].get("verified")),
+                    self._candidates[key].get("node_id") is None,
+                    self._candidates[key].get("if_type") != "paired",
+                )
+            )
         for ip, port in due:
             self._probe_candidate(ip, port)
 
@@ -1881,6 +1900,8 @@ class DiscoveryService:
             return
         for entry in peers.values():
             if not isinstance(entry, dict):
+                continue
+            if entry.get("Online") is False:
                 continue
             ips = entry.get("TailscaleIPs")
             if not isinstance(ips, list):

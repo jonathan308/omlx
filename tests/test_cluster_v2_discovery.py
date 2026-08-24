@@ -380,6 +380,27 @@ def test_http_probe_falls_back_to_system_python_carrier(monkeypatch):
     assert calls == [("10.0.0.1", 8000, 3.0)]
 
 
+def test_tailscale_probe_failure_does_not_spawn_direct_subnet_proxy(monkeypatch):
+    from omlx.cluster import discovery
+
+    monkeypatch.setattr(
+        discovery.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("connection refused")
+        ),
+    )
+    monkeypatch.setattr(
+        discovery,
+        "_system_proxy_probe_node_id",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("Tailscale must stay on its direct userspace route")
+        ),
+    )
+
+    assert _http_probe_node_id("100.64.0.2", 8000, 3.0) is None
+
+
 def test_system_python_carrier_parses_bounded_node_probe(monkeypatch):
     from omlx.cluster import system_socket_proxy
 
@@ -606,6 +627,28 @@ def test_tailscale_peers_become_candidates():
     assert service._candidates[("100.64.0.2", 8000)]["if_type"] == "tailscale"
     # Non-tailscale addresses are not picked up from tailscale status.
     assert all(":" not in ip for ip, _ in service._candidates)
+
+
+def test_tailscale_sweep_ignores_offline_peers():
+    service, _ = _service(
+        tailscale_status=lambda: {
+            "Peer": {
+                "online": {
+                    "Online": True,
+                    "TailscaleIPs": ["100.64.0.2"],
+                },
+                "offline": {
+                    "Online": False,
+                    "TailscaleIPs": ["100.64.0.3"],
+                },
+            }
+        }
+    )
+
+    service._tailscale_sweep()
+
+    assert ("100.64.0.2", 8000) in service._candidates
+    assert ("100.64.0.3", 8000) not in service._candidates
 
 
 def test_tailscale_absent_is_a_noop():
