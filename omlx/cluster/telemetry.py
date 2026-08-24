@@ -1930,6 +1930,22 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
+        def _omlx_entry_trace(self, model: Any) -> dict[str, tuple[tuple[int, bool], ...]]:
+            """Bounded LRU shape trace for operator cache-reuse diagnosis."""
+
+            lru = getattr(self, "_lru", None)
+            rows = getattr(lru, "_lrus", {})
+            if not isinstance(rows, dict):
+                return {}
+            result: dict[str, tuple[tuple[int, bool], ...]] = {}
+            for cache_type, entries in rows.items():
+                result[str(cache_type)] = tuple(
+                    (len(tokens), stored_model == model)
+                    for stored_model, tokens in entries
+                    if isinstance(tokens, list)
+                )[:8]
+            return result
+
         def _omlx_cache_inventory(
             self,
         ) -> tuple[int, int, int, int, int, int]:
@@ -1953,6 +1969,15 @@ def install_server_telemetry(
 
         def _lookup(self, model: Any, tokens: list[int]) -> Any:
             cache, rest = self._fetch_observed(model, tokens)
+            if os.environ.get("OMLX_CLUSTER_CACHE_TRACE", "0") == "1":
+                logger.warning(
+                    "Prompt-cache lookup rank=%s tokens=%s found=%s rest=%s lru=%s",
+                    rank,
+                    len(tokens),
+                    cache is not None,
+                    len(rest),
+                    self._omlx_entry_trace(model),
+                )
             hit_tier = "memory" if cache is not None else None
             if cache is not None and not rest and tokens:
                 # MLX-LM's exact-hit branch returns an empty rest, unlike its
