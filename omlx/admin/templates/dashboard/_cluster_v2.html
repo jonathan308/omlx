@@ -802,7 +802,7 @@
                         </template>
                         <div x-show="planIsTensor()" x-cloak
                              class="mt-2 inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold"
-                             :class="tensorQualificationIsPersistent() ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : ((tensorQualification() || tensorRecommendationNeedsCalibration()) ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-neutral-200 bg-neutral-50 text-neutral-600')"
+                             :class="tensorQualificationIsPersistent() ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : (tensorRecommendationIsRejected() ? 'border-red-200 bg-red-50 text-red-700' : ((tensorQualification() || tensorRecommendationNeedsCalibration()) ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-neutral-200 bg-neutral-50 text-neutral-600'))"
                              x-text="tensorQualificationLabel()"
                              data-cluster-v2-tp-qualification></div>
                         <template x-if="!planIsTensor()">

@@ -2120,6 +2120,10 @@ function clusterV2Wizard() {
             return this.tensorRecommendation()?.state === 'calibration_required';
         },
 
+        tensorRecommendationIsRejected() {
+            return this.tensorRecommendation()?.state === 'rejected';
+        },
+
         tensorQualificationLabel() {
             const qualification = this.tensorQualification();
             const weights = this.planAssignments().map((assignment) =>
@@ -2138,6 +2142,12 @@ function clusterV2Wizard() {
                     recommendation.recommended_weights || []
                 ).join(':');
                 return `Recommended ${candidate} · calibration required`;
+            }
+            if (recommendation?.state === 'rejected') {
+                const candidate = (
+                    recommendation.recommended_weights || []
+                ).join(':');
+                return `Rejected ${candidate} · parity or performance failed`;
             }
             return `Equal ${vector} safe fallback`;
         },

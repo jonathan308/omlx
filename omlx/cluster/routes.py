@@ -2149,6 +2149,20 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         context_tokens=request.target_context_tokens,
         qualification=qualification_provenance,
     )
+    if qualification_decision.get("source") == "rejected_evidence":
+        tp_layout_recommendation = {
+            "state": "rejected",
+            "current_weights": [
+                int(item.tensor_parallel_shard_weight or 1)
+                for item in sorted(choice.plan.assignments, key=lambda row: row.rank)
+            ],
+            "recommended_weights": list(
+                qualification_decision.get("shard_weights") or []
+            ),
+            "requires_qualification": False,
+            "qualification_id": qualification_decision.get("qualification_id"),
+            "reason": qualification_decision.get("reason"),
+        }
     # Warning and blocker strings embed remote SSH stderr. Redact those and
     # only those: preflight issue commands are pasteable fixes that need their
     # user@host intact, and the activation block round-trips to /deployments.
@@ -3418,20 +3432,34 @@ async def qualify_tp_layout(
             status_code=400,
             detail="qualification shard vector does not match TP size",
         )
-    if request.equal_control.output_sha256 != request.candidate.output_sha256:
-        raise HTTPException(
-            status_code=400,
-            detail="candidate output hash differs from the matched equal control",
-        )
+    exact = request.equal_control.output_sha256 == request.candidate.output_sha256
     accepted, performance_reason = _tp_layout_candidate_clears_promotion(
         request.execution_profile,
         request.equal_control,
         request.candidate,
     )
-    if not accepted:
-        raise HTTPException(
-            status_code=400,
-            detail=f"candidate did not clear TP promotion policy: {performance_reason}",
+    promotable = bool(exact and accepted)
+    if exact:
+        parity_sha256 = request.candidate.output_sha256
+        evidence_reason = performance_reason
+    else:
+        parity_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "equal": request.equal_control.output_sha256,
+                    "candidate": request.candidate.output_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        evidence_reason = (
+            "rejected because the candidate output hash differs from the "
+            f"matched equal control; {performance_reason}"
+        )
+    if exact and not accepted:
+        evidence_reason = (
+            f"rejected by TP promotion policy; {performance_reason}"
         )
 
     try:
@@ -3487,10 +3515,10 @@ async def qualify_tp_layout(
                 request.candidate.decode_tokens_per_second,
                 request.candidate.samples,
             ),
-            exact=True,
-            parity_sha256=request.candidate.output_sha256,
-            promotable=True,
-            reason=f"{request.reason.strip()}; {performance_reason}",
+            exact=exact,
+            parity_sha256=parity_sha256,
+            promotable=promotable,
+            reason=f"{request.reason.strip()}; {evidence_reason}",
             qualified_at=datetime.now(UTC).isoformat(),
         )
         store = get_tp_layout_qualification_store()
@@ -3502,6 +3530,7 @@ async def qualify_tp_layout(
 
     return {
         "ok": True,
+        "state": "qualified" if record.promotable else "rejected",
         "qualification_id": record.qualification_id,
         "record_digest": record.record_digest,
         "shard_weights": list(record.shard_weights),

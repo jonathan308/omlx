@@ -667,6 +667,19 @@ class TPLayoutQualificationStore:
                 "shard_weights": list(record.shard_weights),
                 "reason": record.reason,
             }
+        with self._lock:
+            rejected = self._records.get(key.qualification_id)
+            if rejected is not None and rejected.key == key:
+                return {
+                    "matched": False,
+                    "source": "rejected_evidence",
+                    "qualification_id": rejected.qualification_id,
+                    "record_digest": rejected.record_digest,
+                    "shard_weights": list(rejected.shard_weights),
+                    "exact": rejected.exact,
+                    "promotable": rejected.promotable,
+                    "reason": rejected.reason,
+                }
         return {
             "matched": False,
             "source": "equal_fallback",

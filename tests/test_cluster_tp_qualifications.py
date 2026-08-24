@@ -440,8 +440,26 @@ def test_admin_route_records_live_keyed_tp_qualification(tmp_path, monkeypatch):
     assert len(listed["qualifications"]) == 1
 
 
-def test_admin_route_rejects_non_parity_or_weak_candidate(tmp_path):
-    configure_tp_layout_qualification_store(tmp_path)
+def test_admin_route_records_non_parity_or_weak_candidate_as_rejected(
+    tmp_path, monkeypatch
+):
+    store = configure_tp_layout_qualification_store(tmp_path)
+    model = ModelLayout(
+        source="synthetic-qualified",
+        fixed_weight_bytes=100,
+        layer_weight_bytes=(8_000, 8_000),
+        tensor_parallel_heads=8,
+        tensor_parallel_divisors=(8,),
+        tensor_parallel_shard_units=8,
+        supports_tensor_parallel=True,
+    )
+    budgets = [
+        NodeBudget("studio", 1_000_000, rank=0),
+        NodeBudget("m5", 1_000_000, rank=1),
+    ]
+    monkeypatch.setattr(routes, "_qualification_statuses", lambda _hosts: {})
+    monkeypatch.setattr(routes, "_tp_qualification_key", lambda **_kwargs: _key())
+    monkeypatch.setattr(routes, "_model_and_nodes", lambda _request: (model, budgets))
     mismatch = _qualification_request()
     mismatch["candidate"]["output_sha256"] = "b" * 64
 
@@ -450,8 +468,13 @@ def test_admin_route_rejects_non_parity_or_weak_candidate(tmp_path):
         json=mismatch,
     )
 
-    assert response.status_code == 400
-    assert "output hash differs" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["state"] == "rejected"
+    assert response.json()["exact"] is False
+    assert store.lookup(_key()) is None
+    decision = store.decision(_key())
+    assert decision["source"] == "rejected_evidence"
+    assert "output hash differs" in decision["reason"]
 
     weak = _qualification_request()
     weak["candidate"]["prefill_tokens_per_second"] = 740.0
@@ -459,5 +482,7 @@ def test_admin_route_rejects_non_parity_or_weak_candidate(tmp_path):
         "/admin/api/cluster/tp-layout-qualifications",
         json=weak,
     )
-    assert response.status_code == 400
-    assert "promotion policy" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["state"] == "rejected"
+    assert response.json()["exact"] is True
+    assert "promotion policy" in response.json()["reason"]
