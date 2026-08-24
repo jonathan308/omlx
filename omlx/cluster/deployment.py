@@ -197,10 +197,6 @@ _RANK_ENV_DEFAULTS = (
     # separate M5 rank 1 expert-blocked NAX projections. One rollback value
     # must reach every rank; exact local device/shape/rank gates decide use.
     ("OMLX_DSV4_COMBINED_MOE_PREFILL", "0"),
-    # Lossless heterogeneous routed-MoE schedule: 3:5 independent up/gate
-    # rows, then one exact activation-slice transfer restores canonical 4:4
-    # inputs and down-projection reduction boundaries.
-    ("OMLX_DSV4_MOE_CANONICAL_DOWN", "0"),
     # Exact M=1024 M5 TensorOps O-A projection for the 40-head 5/8 shard.
     # Default-off until the full TP A/B clears; exporting the value prevents
     # coordinator/worker capability decisions from diverging.

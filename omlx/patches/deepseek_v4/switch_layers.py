@@ -82,7 +82,6 @@ _DEEPSEEK_MXFP4_NAX_BLOCKS = os.environ.get(
 ).strip().lower() in ("1", "true", "on")
 _DEEPSEEK_MXFP4_NAX_BLOCKS_LOGGED = False
 _DEEPSEEK_MXFP4_NAX_BLOCKS_REJECTION_LOGGED = False
-_DEEPSEEK_CANONICAL_DOWN_LOGGED = False
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
@@ -467,67 +466,6 @@ class SwitchGLU(nn.Module):
         self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias=bias)
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
-
-    def _canonical_down_input(self, x: mx.array) -> mx.array:
-        """Rebuild canonical equal down-projection slices after unequal up/gate.
-
-        Rank 1 computes the extra middle activation segment and sends it to
-        rank 0. Both down projections then receive the exact same contiguous
-        4:4 inputs and weights as the canonical lossless topology; only the
-        independent up/gate rows are scheduled 3:5.
-        """
-
-        if not getattr(self, "_omlx_dsv4f_canonical_down", False):
-            return x
-        group = getattr(self, "sharding_group", None)
-        contract = getattr(self, "_omlx_dsv4f_moe_tp", None)
-        total_width = int(
-            getattr(self, "_omlx_dsv4f_global_intermediate", 0) or 0
-        )
-        if (
-            group is None
-            or int(group.size()) != 2
-            or contract is None
-            or tuple(contract[2]) != (3, 5)
-            or total_width != 2048
-            or x.ndim < 2
-            or int(x.shape[-1]) not in (768, 1280)
-        ):
-            raise RuntimeError(
-                "canonical-down routed MoE entered outside its signed TP2 contract"
-            )
-        rank = int(group.rank())
-        transfer_width = 256
-        if rank == 0:
-            if int(x.shape[-1]) != 768:
-                raise RuntimeError("canonical-down rank 0 activation width mismatch")
-            template = mx.zeros(
-                (*x.shape[:-1], transfer_width), dtype=x.dtype
-            )
-            middle = mx.distributed.recv_like(template, 1, group=group)
-            canonical = mx.contiguous(mx.concatenate([x, middle], axis=-1))
-        elif rank == 1:
-            if int(x.shape[-1]) != 1280:
-                raise RuntimeError("canonical-down rank 1 activation width mismatch")
-            sent = mx.distributed.send(
-                mx.contiguous(x[..., :transfer_width]), 0, group=group
-            )
-            canonical = mx.depends(
-                mx.contiguous(x[..., transfer_width:]), sent
-            )
-        else:
-            raise RuntimeError("canonical-down rank is outside TP2")
-        global _DEEPSEEK_CANONICAL_DOWN_LOGGED
-        if not _DEEPSEEK_CANONICAL_DOWN_LOGGED:
-            _DEEPSEEK_CANONICAL_DOWN_LOGGED = True
-            logging.getLogger(__name__).info(
-                "DeepSeek V4 routed MoE uses unequal 3:5 up/gate with "
-                "canonical 4:4 down inputs (rank=%d local=%d canonical=%d)",
-                rank,
-                int(x.shape[-1]),
-                int(canonical.shape[-1]),
-            )
-        return canonical
 
     def _can_use_mxfp4_full_decode(self, x, indices, scores) -> bool:
         if not _DEEPSEEK_MXFP4_FULL_DECODE or self.training or scores is None:
@@ -1027,7 +965,6 @@ class SwitchGLU(nn.Module):
             )
         else:
             x = self.activation(x_up, x_gate)
-            x = self._canonical_down_input(x)
             if (
                 block_plan is not None
                 and native_kinds is not None

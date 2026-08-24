@@ -221,21 +221,7 @@ def _validated_ds4_moe_tp_weights(
 ) -> Optional[Tuple[int, ...]]:
     """Optional routed-MoE-only split over a signed unequal outer TP plan."""
 
-    canonical_down = os.environ.get(
-        "OMLX_DSV4_MOE_CANONICAL_DOWN", "0"
-    ).strip().lower() in {"1", "true", "on", "yes"}
     raw = os.environ.get("OMLX_TP_MOE_SHARD_WEIGHTS", "").strip()
-    if not raw and canonical_down:
-        if outer_weights is not None or int(group.size()) != 2:
-            raise ValueError(
-                "canonical-down routed MoE requires an equal signed TP2 plan"
-            )
-        units = int(args.num_attention_heads) // int(args.o_groups)
-        if units < 4 or units % 2:
-            raise ValueError(
-                "canonical-down routed MoE requires an even four-plus unit split"
-            )
-        raw = f"{units // 2 - 1},{units // 2 + 1}"
     if not raw:
         return outer_weights
     try:
@@ -253,9 +239,7 @@ def _validated_ds4_moe_tp_weights(
         # declaring the non-routed split explicitly. In that form the plan's
         # 4:4 weight budget safely covers the routed 4:4 banks, while the small
         # attention/shared shift remains inside the existing tolerance.
-        if not canonical_down and not os.environ.get(
-            "OMLX_TP_NON_MOE_SHARD_WEIGHTS", ""
-        ).strip():
+        if not os.environ.get("OMLX_TP_NON_MOE_SHARD_WEIGHTS", "").strip():
             raise ValueError(
                 "OMLX_TP_MOE_SHARD_WEIGHTS requires either a signed unequal "
                 "outer plan or OMLX_TP_NON_MOE_SHARD_WEIGHTS"
@@ -4710,15 +4694,6 @@ class Model(nn.Module):
         moe_shard_weights = _validated_ds4_moe_tp_weights(
             self.args, group, outer_shard_weights
         )
-        canonical_moe_down = bool(
-            os.environ.get("OMLX_DSV4_MOE_CANONICAL_DOWN", "0")
-            .strip()
-            .lower()
-            in {"1", "true", "on", "yes"}
-            and outer_shard_weights is None
-            and moe_shard_weights is not None
-            and int(N) == 2
-        )
         for layer in self.model.layers:
             layer.attn.sharding_group = group
             indexer = getattr(layer.attn, "indexer", None)
@@ -4784,7 +4759,7 @@ class Model(nn.Module):
                 layer.ffn.switch_mlp.down_proj,
                 "sharded-to-all",
                 group=group,
-                weights=None if canonical_moe_down else moe_shard_weights,
+                weights=moe_shard_weights,
             )
             _shard_inplace_weighted(
                 layer.ffn.switch_mlp.up_proj,
@@ -4797,10 +4772,3 @@ class Model(nn.Module):
                 int(rank),
                 tuple(moe_shard_weights or ()),
             )
-            layer.ffn.switch_mlp._omlx_dsv4f_canonical_down = (
-                canonical_moe_down
-            )
-            layer.ffn.switch_mlp._omlx_dsv4f_global_intermediate = int(
-                self.args.moe_intermediate_size
-            )
-            layer.ffn.switch_mlp.sharding_group = group
