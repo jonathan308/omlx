@@ -127,12 +127,17 @@ def test_operator_qualified_tp_weights_are_default_absent(monkeypatch):
     )
 
 
-def test_operator_qualified_tp_weights_parse_one_pure_stage(monkeypatch):
+def test_operator_qualified_tp_weights_parse_one_pure_stage(monkeypatch, tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
     monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3, 5")
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "a" * 64)
 
     assert routes._operator_qualified_tp_shard_weights(
         tensor_parallel_size=2,
         node_count=2,
+        model_path=model,
     ) == ((3, 5),)
 
 
@@ -151,13 +156,19 @@ def test_operator_qualified_tp_weights_reject_unsafe_shapes(
     tensor_parallel_size,
     node_count,
     match,
+    tmp_path,
 ):
+    model = tmp_path / "model"
+    model.mkdir()
     monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", value)
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "a" * 64)
 
     with pytest.raises(routes.PlanningError, match=match):
         routes._operator_qualified_tp_shard_weights(
             tensor_parallel_size=tensor_parallel_size,
             node_count=node_count,
+            model_path=model,
         )
 
 
@@ -171,6 +182,20 @@ def test_operator_qualified_tp_weights_are_ignored_for_pipeline(monkeypatch):
         )
         is None
     )
+
+
+def test_operator_qualified_tp_weights_ignore_other_models(monkeypatch, tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "3,5")
+    monkeypatch.setenv("OMLX_TP_QUALIFIED_MODEL_IDENTITY", "a" * 64)
+    monkeypatch.setattr(routes, "model_identity_digest", lambda _root: "b" * 64)
+
+    assert routes._operator_qualified_tp_shard_weights(
+        tensor_parallel_size=2,
+        node_count=2,
+        model_path=model,
+    ) is None
 
 
 class _ReadyClusterEngine:

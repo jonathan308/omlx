@@ -902,6 +902,7 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 
 _QUALIFIED_TP_SHARD_WEIGHTS_ENV = "OMLX_TP_QUALIFIED_SHARD_WEIGHTS"
+_QUALIFIED_TP_MODEL_IDENTITY_ENV = "OMLX_TP_QUALIFIED_MODEL_IDENTITY"
 
 
 class _UnpromotablePerformanceCalibration(ValueError):
@@ -912,6 +913,7 @@ def _operator_qualified_tp_shard_weights(
     *,
     tensor_parallel_size: int,
     node_count: int,
+    model_path: str | Path | None = None,
 ) -> tuple[tuple[int, ...], ...] | None:
     """Parse the coordinator-only experimental pure-TP shard override.
 
@@ -925,6 +927,19 @@ def _operator_qualified_tp_shard_weights(
 
     raw = os.environ.get(_QUALIFIED_TP_SHARD_WEIGHTS_ENV)
     if raw is None or tensor_parallel_size <= 1:
+        return None
+    scope = os.environ.get(_QUALIFIED_TP_MODEL_IDENTITY_ENV, "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", scope) is None:
+        logger.warning(
+            "%s is ignored because %s is missing or invalid",
+            _QUALIFIED_TP_SHARD_WEIGHTS_ENV,
+            _QUALIFIED_TP_MODEL_IDENTITY_ENV,
+        )
+        return None
+    if model_path is None:
+        return None
+    root = Path(model_path).expanduser()
+    if not root.is_dir() or model_identity_digest(root) != scope:
         return None
     if tensor_parallel_size != node_count:
         raise PlanningError(
@@ -1057,6 +1072,7 @@ def _resolve_tp_layout_qualification(
     override = _operator_qualified_tp_shard_weights(
         tensor_parallel_size=tensor_parallel_size,
         node_count=len(nodes),
+        model_path=model_path,
     )
     if override is not None:
         provenance = TPQualificationProvenance.environment(override[0])
@@ -1207,6 +1223,7 @@ def _create_cluster_plan(
         override = _operator_qualified_tp_shard_weights(
             tensor_parallel_size=request.tensor_parallel_size,
             node_count=len(nodes),
+            model_path=request.model_path,
         )
         if override is not None:
             qualified_tensor_shard_weights = override
@@ -1572,6 +1589,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             _operator_qualified_tp_shard_weights(
                 tensor_parallel_size=len(nodes),
                 node_count=len(nodes),
+                model_path=request.model_path,
             )
             if request.strategy != "pipeline"
             else None
@@ -3484,6 +3502,7 @@ def _build_performance_plan(
     model: Any,
     nodes: list[NodeBudget],
     *,
+    model_path: str,
     tensor_parallel_size: int,
     workload_profile: str,
     microbatch_size: int,
@@ -3503,6 +3522,7 @@ def _build_performance_plan(
                 _operator_qualified_tp_shard_weights(
                     tensor_parallel_size=tensor_parallel_size,
                     node_count=len(nodes),
+                    model_path=model_path,
                 )
             ),
         )
@@ -3545,6 +3565,7 @@ def _performance_optimized_deployment(
     plan = _build_performance_plan(
         model,
         nodes,
+        model_path=deployment.model,
         tensor_parallel_size=deployment.tensor_parallel_size,
         workload_profile=deployment.execution.profile,
         microbatch_size=deployment.execution.pipeline_microbatch_size,
@@ -3562,6 +3583,7 @@ def _performance_optimized_deployment(
         plan = _build_performance_plan(
             model,
             nodes,
+            model_path=deployment.model,
             tensor_parallel_size=deployment.tensor_parallel_size,
             workload_profile=execution.profile,
             microbatch_size=execution.pipeline_microbatch_size,

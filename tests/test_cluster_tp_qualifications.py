@@ -276,6 +276,10 @@ def test_environment_override_precedes_persistent_record(
         "m5": _status("m5", "Apple M5 Max"),
     }
     monkeypatch.setenv("OMLX_TP_QUALIFIED_SHARD_WEIGHTS", "5,3")
+    monkeypatch.setenv(
+        "OMLX_TP_QUALIFIED_MODEL_IDENTITY",
+        routes.model_identity_digest(model),
+    )
     weights, provenance, decision = routes._resolve_tp_layout_qualification(
         model_path=str(model),
         nodes=nodes,
