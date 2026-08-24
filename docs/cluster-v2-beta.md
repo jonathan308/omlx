@@ -87,7 +87,7 @@ measured weights per rank, with a one-million-token context reservation.
 | DS4 30K-to-100K taper | about 6.5% |
 | DS4 non-MTP B1 decode | about 29-31 tok/s |
 | DS4 MTP fixed-depth-5, high acceptance | about 79.8-80.6 tok/s raw |
-| DS4 non-MTP B4 aggregate | 63.74 tok/s |
+| DS4 non-MTP B1/B2/B4 aggregate, current gate | 31.22 / 47.35 / 75.22 tok/s |
 | Qwen3-30B-A3B TP2 cold-prefix 30K | 1,533.73 tok/s |
 | Qwen3-30B-A3B TP2 B1 decode | 56.83 tok/s |
 | Qwen3-30B-A3B TP2 B4 aggregate | 216.3 tok/s |
@@ -107,6 +107,18 @@ At source `5575294f13fad2a2985ac2746ea5fcf6223c911b`:
 - live read-only autoconfigure against the paired M3/M5 returned
   `ready_to_activate=true`, JACCL with `fabric_ready=true`, a signed equal TP2
   plan, complete staging and no preflight issues;
+- ten consecutive physical unload/reload cycles each reached zero rank
+  processes and no launcher after unload, then exactly two ready ranks plus a
+  successful real completion after reload;
+- terminating the worker rank removed the launcher and both ranks in bounded
+  time, revoked the model's loaded state, returned HTTP 503 instead of hanging,
+  and reloaded to a successful canary without rebooting either Mac;
+- a 200K-token prefill disconnect cancelled at the shared 4,096-token boundary
+  with zero failures; a concurrent decode disconnect cancelled only its target
+  while the other 256-token stream completed;
+- a fresh distributed cache gate produced 0 cached tokens, then 8,000 reused
+  tokens; authenticated hot/SSD clear reported both ranks and the third
+  identical request returned to 0 cached tokens;
 - physical all-rank cache clear deleted hot and SSD state on both Macs and the
   repeat request reported zero cached tokens;
 - both active ranks report the same plan hash, measured shard bytes, request

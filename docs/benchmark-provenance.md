@@ -76,7 +76,8 @@ request.
 | DS4 TP2 `4:4` | 100K prefill (`world`) | cold-prefix (`prefix-miss`), single-stream | 684.66 | not recorded here | Identical completion hash; 6.5% taper from the matched 30K prompt |
 | DS4 TP2 `4:4` | Decode | `prefix-miss`, single-stream, non-MTP | approximately 29-31 | approximately 30 | B1; exact M=1 HC continuation remained off after a flat physical A/B |
 | DS4 TP2 `4:4` | Decode | `prefix-miss`, single-stream, MTP fixed depth 5 | 79.8-80.6 raw | approximately 77-80 | High-acceptance prompts; acceptance-dependent chat cases are lower |
-| DS4 TP2 `4:4` | Concurrent decode | `concurrent-4`, non-MTP | 63.74 aggregate | not recorded here | Four distinct request rows and equal hashes |
+| DS4 TP2 `4:4` | Concurrent decode | `concurrent-2`, short-prefix reuse, non-MTP | 47.35 aggregate | not recorded here | Two distinct live rows/equal hashes; 23.69 tok/s per request |
+| DS4 TP2 `4:4` | Concurrent decode | `concurrent-4`, short-prefix reuse, non-MTP | 75.22 aggregate | not recorded here | Four distinct live rows/equal hashes; about 18.82 tok/s per request |
 | DS4 single M3 Ultra | 30K prefill | cold-prefix (`prefix-miss`), single-stream | 481.02 | not applicable | Accepted single-node kernel stack; no distributed transport |
 
 The Qwen parity set used deterministic greedy requests with thinking disabled:
