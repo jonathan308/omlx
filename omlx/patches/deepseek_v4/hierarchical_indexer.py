@@ -34,11 +34,18 @@ _GROUP_ROWS = 16
 _CANDIDATE_FRACTION = float(
     os.getenv("OMLX_DSV4_HIERARCHICAL_CANDIDATE_FRACTION", "0.30")
 )
+_TRACE = os.getenv("OMLX_DSV4_HIERARCHICAL_TRACE", "0").strip().lower() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+)
 _NUMERIC_ABS_GUARD = 0.02
 _NUMERIC_REL_GUARD = 0.005
 _STATE_ATTR = "_omlx_dsv4_hierarchical_indexer_state"
 _SUCCESS_LOGGED = False
 _FALLBACK_LOGGED = False
+_TRACE_REASONS: set[str] = set()
 
 
 @dataclass
@@ -50,6 +57,14 @@ class _LowRankState:
     key_coordinate_norm: mx.array
     basis_pool_length: int
     projected_pool_length: int
+
+
+def _trace_once(reason: str) -> None:
+    """Emit one operator-requested live diagnostic without touching hot paths."""
+
+    if _TRACE and reason not in _TRACE_REASONS:
+        _TRACE_REASONS.add(reason)
+        print(f"OMLX_DSV4_HIERARCHICAL_TRACE {reason}", flush=True)
 
 
 def _project_keys(keys: mx.array, basis: mx.array) -> tuple[mx.array, ...]:
@@ -166,6 +181,13 @@ def hierarchical_topk(
         or pooled.shape[1] < max(_MIN_POOL, topk * 2)
         or not getattr(kernels, "_EXT_MMA_SCORE", False)
     ):
+        _trace_once(
+            "skip_gate "
+            f"q={tuple(q.shape)} pooled={tuple(pooled.shape)} "
+            f"weights={tuple(weights.shape)} ratio={ratio} topk={topk} "
+            f"query_offset={query_offset} mma="
+            f"{bool(getattr(kernels, '_EXT_MMA_SCORE', False))}"
+        )
         return None
 
     try:
@@ -179,6 +201,10 @@ def hierarchical_topk(
         )
         candidate_count = min(candidate_count, pool_length - 1)
         if candidate_count <= topk:
+            _trace_once(
+                f"skip_candidate_count pool={pool_length} topk={topk} "
+                f"candidates={candidate_count}"
+            )
             return None
 
         q_f = q[0].transpose(1, 0, 2).astype(mx.float32)
@@ -296,6 +322,9 @@ def hierarchical_topk(
                     pool_length,
                     candidate_count,
                 )
+            _trace_once(
+                f"certificate_miss pool={pool_length} candidates={candidate_count}"
+            )
             return None
 
         global _SUCCESS_LOGGED
@@ -309,8 +338,12 @@ def hierarchical_topk(
                 candidate_count,
                 _GROUP_ROWS,
             )
+        _trace_once(
+            f"certificate_pass pool={pool_length} candidates={candidate_count}"
+        )
         return mapped
-    except Exception:
+    except Exception as exc:
+        _trace_once(f"exception={type(exc).__name__}")
         logger.warning(
             "DS4 hierarchical index failed closed; using full scan",
             exc_info=True,
