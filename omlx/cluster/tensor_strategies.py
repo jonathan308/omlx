@@ -24,6 +24,15 @@ _VOCAB_PARALLEL_MIN_BYTES_ENV = "OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES"
 _VOCAB_PARALLEL_MIN_BYTES = 256 * 1024**2
 _LAZY_NATIVE_SHARD_ENV = "OMLX_TP_LAZY_NATIVE_SHARD"
 
+# Full-model TP parity, not the small projection fixture, is authoritative.
+# Dense Qwen3.5/3.8 currently diverges when its output vocabulary is split:
+# the layer shards remain correct, but coordinator reconstruction produces
+# repeated/invalid text after the first few tokens. Keep the exact replicated
+# head until that model-specific path has a physical parity certificate.
+_VOCAB_PARALLEL_UNQUALIFIED_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_moe"}
+)
+
 
 @dataclass(frozen=True)
 class TensorStrategy:
@@ -343,6 +352,17 @@ def _shard_output_head(
 
     mode = _vocab_parallel_mode()
     if mode == "off":
+        return False
+
+    model_type = _model_type(model)
+    if model_type in _VOCAB_PARALLEL_UNQUALIFIED_MODEL_TYPES:
+        reason = (
+            f"vocabulary parallelism is not parity-qualified for {model_type}; "
+            "the exact replicated output head is retained"
+        )
+        model._omlx_vocab_parallel_disabled_reason = reason
+        if mode == "on":
+            raise RuntimeError(reason)
         return False
 
     found = _find_untied_lm_head(model)

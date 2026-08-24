@@ -336,6 +336,8 @@ class TestQwen35Model:
         assert hasattr(qwen3_5, "MTPDecoderLayer")
 
     def test_text_model_class_has_mtp_forward(self):
+        import inspect
+
         from mlx_lm.models.qwen3_5 import TextModel
 
         # Methods are attached unconditionally; the per-instance ``mtp``
@@ -343,6 +345,7 @@ class TestQwen35Model:
         assert hasattr(TextModel, "mtp_forward")
         assert hasattr(TextModel, "make_mtp_cache")
         assert hasattr(TextModel, "_omlx_mtp_patched")
+        assert "skip_lm_head" in inspect.signature(TextModel.__call__).parameters
 
     def test_set_mtp_active_toggles_module_flag(self):
         """The active-flag controls whether subsequent loads attach self.mtp."""
@@ -358,11 +361,52 @@ class TestQwen35Model:
             set_mtp_active(prev)
 
     def test_outer_model_pass_through_methods(self):
+        import inspect
+
         from mlx_lm.models.qwen3_5 import Model
 
         assert hasattr(Model, "mtp_forward")
         assert hasattr(Model, "make_mtp_cache")
         assert hasattr(Model, "_omlx_mtp_patched")
+        assert "skip_lm_head" in inspect.signature(Model.__call__).parameters
+
+    def test_text_model_skip_lm_head_preserves_hidden_forward(self, monkeypatch):
+        import mlx.core as mx
+
+        from mlx_lm.models.qwen3_5 import TextModel
+        from omlx.patches.mlx_lm_mtp import prompt_priming
+
+        calls = {"model": 0, "head": 0}
+
+        class Backbone:
+            @staticmethod
+            def norm(value):
+                return value + 1
+
+            def __call__(self, inputs, cache, input_embeddings=None, n_confirmed=0):
+                calls["model"] += 1
+                return mx.zeros((1, 4, 8))
+
+        def head(_value):
+            calls["head"] += 1
+            return mx.zeros((1, 4, 16))
+
+        fake = SimpleNamespace(
+            model=Backbone(),
+            args=SimpleNamespace(tie_word_embeddings=False),
+            lm_head=head,
+        )
+        monkeypatch.setattr(prompt_priming, "maybe_capture", lambda *args: None)
+
+        result = TextModel.__call__(
+            fake,
+            mx.zeros((1, 4), dtype=mx.uint32),
+            cache=[],
+            skip_lm_head=True,
+        )
+
+        assert result is None
+        assert calls == {"model": 1, "head": 0}
 
     def test_decoder_layer_omits_n_confirmed_when_zero(self):
         """DFlash replaces linear_attn.__call__ with a hook that has no

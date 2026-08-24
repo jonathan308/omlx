@@ -666,7 +666,15 @@ def _supports_vocab_parallel_sampling(
         None,
     )
     if head is None:
-        return False, None, 0, "model has no validated vocabulary-parallel head"
+        reason = getattr(model, "_omlx_vocab_parallel_disabled_reason", None)
+        return (
+            False,
+            None,
+            0,
+            reason
+            if isinstance(reason, str) and reason
+            else "model has no validated vocabulary-parallel head",
+        )
     try:
         output_dims = int(head._omlx_output_dims)
         local_dims = int(head.weight.shape[0])

@@ -229,6 +229,21 @@ def test_vocab_parallel_auto_keeps_small_head_replicated(monkeypatch):
     assert not hasattr(model, "_omlx_vocab_parallel_head")
 
 
+def test_qwen35_vocab_parallel_stays_fail_closed_without_parity(monkeypatch):
+    monkeypatch.setenv("OMLX_CLUSTER_VOCAB_PARALLEL", "auto")
+    monkeypatch.setenv("OMLX_CLUSTER_VOCAB_PARALLEL_MIN_BYTES", "0")
+    head = _linear_with_weight(mx.zeros((6, 4)))
+    model = SimpleNamespace(model_type="qwen3_5", lm_head=head)
+
+    assert not _shard_output_head(model, _FakeGroup(0), mx)
+    assert model.lm_head is head
+    assert "not parity-qualified" in model._omlx_vocab_parallel_disabled_reason
+
+    monkeypatch.setenv("OMLX_CLUSTER_VOCAB_PARALLEL", "on")
+    with pytest.raises(RuntimeError, match="not parity-qualified"):
+        _shard_output_head(model, _FakeGroup(0), mx)
+
+
 @pytest.mark.parametrize("tie_by_config", [True, False])
 def test_vocab_parallel_never_slices_a_tied_embedding(monkeypatch, tie_by_config):
     monkeypatch.setenv("OMLX_CLUSTER_VOCAB_PARALLEL", "auto")
