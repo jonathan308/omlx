@@ -234,6 +234,7 @@ function clusterV2Wizard() {
         // SSD boundary snapshots are explicit because their bounded detached
         // payloads consume memory and disk even though writes run in back.
         promptCacheSsd: false,
+        promptCacheSsdMaxGiB: 20,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
         // recommendation badge to the fast-transport heuristic.
@@ -872,7 +873,8 @@ function clusterV2Wizard() {
                     deployment?.prompt_cache_ssd,
             );
             return enabled
-                ? 'Prompt reuse · memory + persistent SSD snapshots'
+                ? 'Prompt reuse · memory + persistent SSD snapshots · ' +
+                    `${Math.round(Number(deployment?.execution?.prompt_cache_ssd_max_bytes || 20 * (1024 ** 3)) / (1024 ** 3))} GiB per rank`
                 : 'Prompt reuse · memory only (SSD snapshots off)';
         },
 
@@ -2120,6 +2122,8 @@ function clusterV2Wizard() {
                     hosts: this.deploymentHosts(),
                     execution_profile: this.executionProfile,
                     prompt_cache_ssd: this.promptCacheSsd,
+                    prompt_cache_ssd_max_bytes:
+                        Math.max(1, Number(this.promptCacheSsdMaxGiB) || 20) * (1024 ** 3),
                     prefer: 'speed',
                     strategy: this.planStrategy,
                     detect_transports: true,
@@ -2543,6 +2547,8 @@ function clusterV2Wizard() {
                 async_overlap: execution.async_overlap !== false,
                 cache_affinity: execution.cache_affinity !== false,
                 prompt_cache_ssd: execution.prompt_cache_ssd === true,
+                prompt_cache_ssd_max_bytes:
+                    Number(execution.prompt_cache_ssd_max_bytes) || 20 * (1024 ** 3),
                 target_context_tokens:
                     Number(deployment.target_context_tokens) || 8192,
             };

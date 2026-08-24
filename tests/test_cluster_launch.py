@@ -1889,7 +1889,13 @@ def test_prompt_cache_ssd_reaches_the_rank_and_scopes_its_directory(tmp_path):
 
     # When explicitly enabled, the flag rides the one argv every host runs.
     assert "--prompt-cache-ssd" in _worker_argv(deployment, tmp_path)
+    assert "--prompt-cache-ssd-max-bytes" in _worker_argv(deployment, tmp_path)
     assert args.prompt_cache_ssd is True
+    assert (
+        args.prompt_cache_ssd_max_bytes
+        == deployment.execution.prompt_cache_ssd_max_bytes
+        == 20 * 1024**3
+    )
 
     # The directory is scoped by deployment and rank so no two runs or ranks
     # read each other's snapshots.

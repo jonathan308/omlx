@@ -246,7 +246,10 @@ def test_autoconfigure_signs_and_activates_explicit_ssd_prompt_snapshots():
     from fastapi.testclient import TestClient
 
     baseline = _autoconfigure_payload()
-    enabled = baseline | {"prompt_cache_ssd": True}
+    enabled = baseline | {
+        "prompt_cache_ssd": True,
+        "prompt_cache_ssd_max_bytes": 7 * 1024**3,
+    }
     with TestClient(_app()) as client:
         cold = client.post("/admin/api/cluster/autoconfigure", json=baseline)
         durable = client.post("/admin/api/cluster/autoconfigure", json=enabled)
@@ -258,7 +261,9 @@ def test_autoconfigure_signs_and_activates_explicit_ssd_prompt_snapshots():
     assert cold_body["activation"]["prompt_cache_ssd"] is False
     assert "prompt_cache_ssd" not in cold_body["plan"]
     assert durable_body["activation"]["prompt_cache_ssd"] is True
+    assert durable_body["activation"]["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
     assert durable_body["plan"]["prompt_cache_ssd"] is True
+    assert durable_body["plan"]["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
     assert durable_body["activation"]["approved_placement"] == (
         durable_body["plan"]["placement_signature"]
     )

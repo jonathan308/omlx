@@ -4827,6 +4827,15 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
             "ssd_entries": int(ssd.get("entries", 0) or 0),
             "ssd_bytes": int(ssd.get("bytes", 0) or 0),
             "ssd_hits": int(ssd.get("hits", 0) or 0),
+            "ssd_max_bytes": int(ssd.get("max_bytes", 0) or 0),
+            "ssd_capacity_bytes": int(ssd.get("capacity_bytes", 0) or 0),
+            "ssd_evictions": int(ssd.get("evictions", 0) or 0),
+            "ssd_capacity_drops": int(ssd.get("capacity_drops", 0) or 0),
+            "ssd_pending_bytes": int(ssd.get("pending_bytes", 0) or 0),
+            "ssd_pending_max_bytes": int(
+                ssd.get("pending_max_bytes", 0) or 0
+            ),
+            "ssd_write_failures": int(ssd.get("write_failures", 0) or 0),
         },
     }
 

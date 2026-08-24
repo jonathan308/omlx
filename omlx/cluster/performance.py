@@ -16,6 +16,12 @@ _MAX_LATENCY_SECONDS = 60.0
 _MAX_CONNECTIONS_PER_IP = 32
 _GIB = 1024**3
 
+# Persistent prompt snapshots are one file per aligned boundary and per rank.
+# A single long-context conversation can therefore consume many GiB even with
+# the 512-entry count guard. Keep a conservative, explicit per-rank ceiling in
+# the signed execution contract; operators can raise it for larger SSDs.
+DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES = 20 * _GIB
+
 
 def _finite_rate(value: Any, label: str) -> float:
     try:
@@ -176,6 +182,7 @@ class ExecutionSettings:
     # per-layer state cannot be sliced (rotating window, gated-delta-net) still
     # reuses a long prefix across requests instead of recomputing it.
     prompt_cache_ssd: bool = False
+    prompt_cache_ssd_max_bytes: int = DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
     sampling_rank_only: bool = True
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
@@ -191,6 +198,7 @@ class ExecutionSettings:
             "prompt_cache_size",
             "pipeline_microbatch_size",
             "ring_connections_per_ip",
+            "prompt_cache_ssd_max_bytes",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -205,7 +213,10 @@ class ExecutionSettings:
             raise ValueError(
                 f"ring connections per IP cannot exceed {_MAX_CONNECTIONS_PER_IP}"
             )
-        for name in ("prompt_cache_bytes", "max_kv_size"):
+        for name in (
+            "prompt_cache_bytes",
+            "max_kv_size",
+        ):
             value = getattr(self, name)
             if value is not None and (
                 not isinstance(value, int) or isinstance(value, bool) or value <= 0
@@ -227,6 +238,7 @@ class ExecutionSettings:
             "pipeline_microbatch_size": self.pipeline_microbatch_size,
             "cache_affinity": self.cache_affinity,
             "prompt_cache_ssd": self.prompt_cache_ssd,
+            "prompt_cache_ssd_max_bytes": self.prompt_cache_ssd_max_bytes,
             "sampling_rank_only": self.sampling_rank_only,
             "async_overlap": self.async_overlap,
             "ring_connections_per_ip": self.ring_connections_per_ip,

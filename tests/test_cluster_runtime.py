@@ -265,7 +265,18 @@ def _tiered_cache_metrics():
         "bytes": 69_632,
         "ssd_enabled": True,
         "memory": {"entries": 2, "bytes": 4_096, "hits": 1},
-        "ssd": {"entries": 7, "bytes": 65_536, "hits": 2},
+        "ssd": {
+            "entries": 7,
+            "bytes": 65_536,
+            "hits": 2,
+            "max_bytes": 20 * 1024**3,
+            "capacity_bytes": 70_000,
+            "evictions": 3,
+            "capacity_drops": 1,
+            "pending_bytes": 0,
+            "pending_max_bytes": 512 * 1024**2,
+            "write_failures": 0,
+        },
     }
 
 

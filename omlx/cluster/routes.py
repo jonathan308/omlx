@@ -85,6 +85,7 @@ from .model_inventory import (
     remote_model_inventory,
 )
 from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
     NodePerformanceProfile,
     execution_profile,
     tune_execution_settings,
@@ -452,6 +453,7 @@ class ClusterPlanRequest(BaseModel):
     # prefill requirement. None/False keeps the bounded SSD write-behind tier
     # out of the launch contract; True enables it explicitly on every rank.
     prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
@@ -507,6 +509,7 @@ class ClusterDeploymentRequest(BaseModel):
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -769,10 +772,17 @@ def _placement_signature(plan: dict[str, Any]) -> str:
     # signature. Enabling distributed SSD snapshot write-behind is a material
     # launch-mode change and must be explicitly approved.
     if bool(plan.get("prompt_cache_ssd", False)):
+        cache_contract = {
+            "prompt_cache_ssd": True,
+            "prompt_cache_ssd_max_bytes": int(
+                plan.get("prompt_cache_ssd_max_bytes")
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            ),
+        }
         if isinstance(rows, dict):
-            rows = rows | {"prompt_cache_ssd": True}
+            rows = rows | cache_contract
         else:
-            rows = {"rows": rows, "prompt_cache_ssd": True}
+            rows = {"rows": rows, **cache_contract}
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -843,6 +853,7 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
         ("mtp_enabled", False),
         ("mtp_num_draft_tokens", None),
         ("prompt_cache_ssd", False),
+        ("prompt_cache_ssd_max_bytes", DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES),
     ):
         before = approved.get(field, default)
         after = launched.get(field, default)
@@ -1019,6 +1030,10 @@ class ClusterAutoconfigureRequest(BaseModel):
     # so one-click setup keeps them opt-in and carries the choice through the
     # signed plan instead of silently changing memory/disk use at activation.
     prompt_cache_ssd: bool = False
+    prompt_cache_ssd_max_bytes: int = Field(
+        default=DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+        gt=0,
+    )
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
@@ -1237,6 +1252,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         nodes=request.nodes,
         execution_profile=request.execution_profile,
         prompt_cache_ssd=request.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
@@ -1637,7 +1653,10 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     # material launch-mode choice because every rank creates a persistent,
     # plan-scoped SSD snapshot store and must therefore be explicitly signed.
     if request.prompt_cache_ssd:
-        plan_contract["prompt_cache_ssd"] = True
+        plan_contract.update(
+            prompt_cache_ssd=True,
+            prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
+        )
     plan_payload = _plan_with_signature(plan_contract)
     preflight_summary = describe_preflight(issues)
     if fabric_blocker:
@@ -1688,6 +1707,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "async_overlap": request.async_overlap,
             "cache_affinity": request.cache_affinity,
             "prompt_cache_ssd": request.prompt_cache_ssd,
+            "prompt_cache_ssd_max_bytes": request.prompt_cache_ssd_max_bytes,
             "max_kv_size": request.max_kv_size,
             "target_context_tokens": request.target_context_tokens,
             "ring_connections_per_ip": (
@@ -2857,6 +2877,11 @@ async def cluster_plan(request: ClusterPlanRequest):
         )
     if request.prompt_cache_ssd is not None:
         payload["prompt_cache_ssd"] = request.prompt_cache_ssd
+        if request.prompt_cache_ssd:
+            payload["prompt_cache_ssd_max_bytes"] = int(
+                request.prompt_cache_ssd_max_bytes
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
     return _plan_with_signature(payload)
 
 
@@ -2926,6 +2951,10 @@ def _execution_for_request(
         async_overlap=request.async_overlap,
         cache_affinity=request.cache_affinity,
         prompt_cache_ssd=bool(getattr(request, "prompt_cache_ssd", False)),
+        prompt_cache_ssd_max_bytes=(
+            getattr(request, "prompt_cache_ssd_max_bytes", None)
+            or requested.prompt_cache_ssd_max_bytes
+        ),
         # The context chosen beside the model is both a reservation and a
         # runtime ceiling. Without this fallback the planner could reserve
         # 256k while the server used an unrelated advanced default (or no
@@ -2992,6 +3021,7 @@ def _create_deployment(
         mtp_enabled=request.mtp_enabled,
         mtp_num_draft_tokens=request.mtp_num_draft_tokens,
         prompt_cache_ssd=request.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=request.prompt_cache_ssd_max_bytes,
         path_map=request.path_map,
     )
     plan = _create_cluster_plan(plan_request)
@@ -3064,6 +3094,11 @@ def _create_deployment(
         )
     if request.prompt_cache_ssd is not None:
         plan_payload["prompt_cache_ssd"] = request.prompt_cache_ssd
+        if request.prompt_cache_ssd:
+            plan_payload["prompt_cache_ssd_max_bytes"] = int(
+                request.prompt_cache_ssd_max_bytes
+                or DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
     return deployment, plan_payload
 
 
@@ -3914,6 +3949,7 @@ class ClusterReplanRequest(BaseModel):
     mtp_enabled: bool | None = None
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     prompt_cache_ssd: bool | None = None
+    prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
@@ -4073,6 +4109,13 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
                 else current.execution.prompt_cache_ssd
                 if current is not None
                 else False
+            ),
+            prompt_cache_ssd_max_bytes=(
+                request.prompt_cache_ssd_max_bytes
+                if "prompt_cache_ssd_max_bytes" in request.model_fields_set
+                else current.execution.prompt_cache_ssd_max_bytes
+                if current is not None
+                else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
             ),
             path_map=path_map,
             # Not consulted by planning; activation re-checks the real one

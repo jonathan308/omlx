@@ -42,7 +42,10 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
-from .performance import ExecutionSettings
+from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    ExecutionSettings,
+)
 from .pipeline_compat import (
     install_pipeline_compatibility,
     pipeline_assignment_is_honored,
@@ -775,6 +778,7 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         pipeline_microbatch_size=args.pipeline_microbatch_size,
         cache_affinity=args.cache_affinity,
         prompt_cache_ssd=args.prompt_cache_ssd,
+        prompt_cache_ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
         sampling_rank_only=args.sampling_rank_only,
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
@@ -1852,6 +1856,7 @@ def run_worker(args: argparse.Namespace) -> int:
                         ssd_cache_dir=_prompt_cache_ssd_dir(args, rank),
                         ssd_cache_persistent=bool(args.prompt_cache_ssd),
                         ssd_write_behind=bool(args.prompt_cache_ssd),
+                        ssd_max_bytes=args.prompt_cache_ssd_max_bytes,
                         prefill_step_size=args.prefill_step_size,
                         prefill_guard=build_guard(
                             provider.model,
@@ -1982,6 +1987,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--cache-affinity", action="store_true")
     parser.add_argument("--prompt-cache-ssd", action="store_true")
+    parser.add_argument(
+        "--prompt-cache-ssd-max-bytes",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    )
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)

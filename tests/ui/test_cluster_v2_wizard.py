@@ -1076,11 +1076,14 @@ def test_persistent_prompt_cache_is_visible_opt_in_and_replans():
 
     assert "data-cluster-v2-prompt-cache-ssd" in template
     assert "data-cluster-v2-prompt-cache-ssd-toggle" in template
+    assert "data-cluster-v2-prompt-cache-ssd-cap" in template
     assert "data-cluster-v2-active-cache-mode" in template
     assert 'x-model="promptCacheSsd"' in template
     assert '@change="runPlan()"' in template
     assert "promptCacheSsd: false" in javascript
+    assert "promptCacheSsdMaxGiB: 20" in javascript
     assert "prompt_cache_ssd: this.promptCacheSsd" in javascript
+    assert "prompt_cache_ssd_max_bytes" in javascript
     assert "Writes run in the background" in template
     assert "512 MiB pending limit" in template
 

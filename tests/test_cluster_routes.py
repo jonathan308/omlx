@@ -2728,14 +2728,22 @@ def test_distributed_ssd_snapshots_are_explicit_and_signed(monkeypatch):
     baseline, baseline_plan = routes._create_deployment(_activation_request("ring"))
     snapshots, snapshot_plan = routes._create_deployment(
         _activation_request("ring").model_copy(
-            update={"prompt_cache_ssd": True}
+            update={
+                "prompt_cache_ssd": True,
+                "prompt_cache_ssd_max_bytes": 7 * 1024**3,
+            }
         )
     )
 
     assert baseline.execution.prompt_cache_ssd is False
     assert "prompt_cache_ssd" not in baseline_plan
     assert snapshots.execution.prompt_cache_ssd is True
+    assert snapshots.execution.prompt_cache_ssd_max_bytes == 7 * 1024**3
     assert snapshot_plan["prompt_cache_ssd"] is True
+    assert snapshot_plan["prompt_cache_ssd_max_bytes"] == 7 * 1024**3
     assert routes._placement_signature(snapshot_plan) != (
         routes._placement_signature(baseline_plan)
+    )
+    assert routes._placement_signature(snapshot_plan) != routes._placement_signature(
+        snapshot_plan | {"prompt_cache_ssd_max_bytes": 8 * 1024**3}
     )

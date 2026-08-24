@@ -499,6 +499,13 @@ def test_runtime_cache_distributed_row_uses_rank_prompt_cache(tmp_path):
         "ssd_entries": 0,
         "ssd_bytes": 0,
         "ssd_hits": 0,
+        "ssd_max_bytes": 0,
+        "ssd_capacity_bytes": 0,
+        "ssd_evictions": 0,
+        "ssd_capacity_drops": 0,
+        "ssd_pending_bytes": 0,
+        "ssd_pending_max_bytes": 0,
+        "ssd_write_failures": 0,
     }
     # Rank prompt-cache/snapshot stats are NOT the tiered hot/SSD cache and
     # must not leak into its columns or aggregates.
@@ -518,7 +525,18 @@ def test_runtime_cache_distributed_row_exposes_the_real_tier_split(tmp_path):
         {
             "ssd_enabled": True,
             "memory": {"entries": 2, "bytes": 4096, "hits": 1},
-            "ssd": {"entries": 7, "bytes": 65536, "hits": 2},
+            "ssd": {
+                "entries": 7,
+                "bytes": 65536,
+                "hits": 2,
+                "max_bytes": 20 * 1024**3,
+                "capacity_bytes": 70000,
+                "evictions": 4,
+                "capacity_drops": 1,
+                "pending_bytes": 1024,
+                "pending_max_bytes": 512 * 1024**2,
+                "write_failures": 2,
+            },
             "entries": 9,
             "bytes": 69632,
         }
@@ -540,6 +558,13 @@ def test_runtime_cache_distributed_row_exposes_the_real_tier_split(tmp_path):
     assert rank_cache["ssd_entries"] == 7
     assert rank_cache["ssd_bytes"] == 65536
     assert rank_cache["ssd_hits"] == 2
+    assert rank_cache["ssd_max_bytes"] == 20 * 1024**3
+    assert rank_cache["ssd_capacity_bytes"] == 70000
+    assert rank_cache["ssd_evictions"] == 4
+    assert rank_cache["ssd_capacity_drops"] == 1
+    assert rank_cache["ssd_pending_bytes"] == 1024
+    assert rank_cache["ssd_pending_max_bytes"] == 512 * 1024**2
+    assert rank_cache["ssd_write_failures"] == 2
 
 
 def test_runtime_cache_distributed_stale_marker_contributes_no_row(tmp_path):
@@ -574,6 +599,8 @@ def test_status_template_renders_cluster_badge_and_rank_cache_row():
     assert "m.rank_prompt_cache?.memory_entries" in status
     assert "m.rank_prompt_cache?.ssd_entries" in status
     assert "m.rank_prompt_cache?.ssd_hits" in status
+    assert "m.rank_prompt_cache?.ssd_max_bytes" in status
+    assert "m.rank_prompt_cache?.ssd_evictions" in status
     for key in (
         "cluster.badge.label",
         "cluster.badge.tensor",

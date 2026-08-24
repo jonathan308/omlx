@@ -18,7 +18,10 @@ from typing import Any, Protocol
 import json
 import os
 
-from .performance import ExecutionSettings
+from .performance import (
+    DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    ExecutionSettings,
+)
 from .planner import PipelineAssignment
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,44 @@ _MAX_TARGETED_CANCEL_REQUESTS = 256
 # it never competes with generation for the lock.
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+
+
+def _agreed_snapshot_capacity_charge(
+    local_charge: int | None,
+    *,
+    world_size: int,
+    rank: int,
+    control_plane: Any | None,
+) -> int | None:
+    """Largest rank charge, or None when safe agreement is unavailable.
+
+    The reliable control plane is intentional. Tiny int32 collectives are a
+    known-bad fit for JACCL control traffic (lost completion can poison the
+    following model collective), so an unmanaged multi-rank worker skips the
+    snapshot rather than reintroducing that fallback.
+    """
+
+    valid = local_charge is not None and int(local_charge) > 0
+    local = int(local_charge or 0)
+    if world_size <= 1:
+        return local if valid else None
+    if control_plane is None:
+        return None
+    sizes: list[int] = []
+    for source in range(world_size):
+        payload = (
+            struct.pack("!BQ", int(valid), local) if rank == source else None
+        )
+        packet = control_plane.broadcast_owned_bytes(
+            payload,
+            source_rank=source,
+            expected_size=9,
+        )
+        ok, size = struct.unpack("!BQ", packet)
+        if ok != 1 or size <= 0:
+            return None
+        sizes.append(int(size))
+    return max(sizes) if sizes else None
 
 
 def _transport_request_id(value: Any) -> str | None:
@@ -143,6 +184,7 @@ class RuntimeTelemetry:
         cancel_plan_hash: str = "",
         cancel_epoch_floor: int = 0,
         prompt_cache_ssd_enabled: bool = False,
+        prompt_cache_ssd_max_bytes: int = 0,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -199,6 +241,13 @@ class RuntimeTelemetry:
         self._cache_ssd_bytes = 0
         self._cache_ssd_hits = 0
         self._cache_ssd_enabled = bool(prompt_cache_ssd_enabled)
+        self._cache_ssd_max_bytes = max(0, int(prompt_cache_ssd_max_bytes))
+        self._cache_ssd_capacity_bytes = 0
+        self._cache_ssd_evictions = 0
+        self._cache_ssd_capacity_drops = 0
+        self._cache_ssd_pending_bytes = 0
+        self._cache_ssd_pending_max_bytes = 0
+        self._cache_ssd_write_failures = 0
         # Rank-side force-cancel surface. The coordinator drops a cancel file
         # next to the runtime markers; the heartbeat picks it up and removes
         # every active uid through BatchGenerator.remove — MLX-LM's own
@@ -740,6 +789,13 @@ class RuntimeTelemetry:
         memory_bytes: int | None = None,
         ssd_entries: int | None = None,
         ssd_bytes: int | None = None,
+        ssd_max_bytes: int | None = None,
+        ssd_capacity_bytes: int | None = None,
+        ssd_evictions: int | None = None,
+        ssd_capacity_drops: int | None = None,
+        ssd_pending_bytes: int | None = None,
+        ssd_pending_max_bytes: int | None = None,
+        ssd_write_failures: int | None = None,
         hit_tier: str | None = None,
     ) -> None:
         now = float(self._clock())
@@ -771,6 +827,15 @@ class RuntimeTelemetry:
                 self._cache_ssd_entries = max(0, int(ssd_entries))
             if ssd_bytes is not None:
                 self._cache_ssd_bytes = max(0, int(ssd_bytes))
+            self._observe_ssd_capacity_locked(
+                max_bytes=ssd_max_bytes,
+                capacity_bytes=ssd_capacity_bytes,
+                evictions=ssd_evictions,
+                capacity_drops=ssd_capacity_drops,
+                pending_bytes=ssd_pending_bytes,
+                pending_max_bytes=ssd_pending_max_bytes,
+                write_failures=ssd_write_failures,
+            )
             self._publish_locked(now, force=False)
 
     def observe_cache_state(
@@ -782,6 +847,13 @@ class RuntimeTelemetry:
         memory_bytes: int | None = None,
         ssd_entries: int | None = None,
         ssd_bytes: int | None = None,
+        ssd_max_bytes: int | None = None,
+        ssd_capacity_bytes: int | None = None,
+        ssd_evictions: int | None = None,
+        ssd_capacity_drops: int | None = None,
+        ssd_pending_bytes: int | None = None,
+        ssd_pending_max_bytes: int | None = None,
+        ssd_write_failures: int | None = None,
     ) -> None:
         now = float(self._clock())
         with self._lock:
@@ -798,7 +870,40 @@ class RuntimeTelemetry:
                 self._cache_ssd_entries = max(0, int(ssd_entries))
             if ssd_bytes is not None:
                 self._cache_ssd_bytes = max(0, int(ssd_bytes))
+            self._observe_ssd_capacity_locked(
+                max_bytes=ssd_max_bytes,
+                capacity_bytes=ssd_capacity_bytes,
+                evictions=ssd_evictions,
+                capacity_drops=ssd_capacity_drops,
+                pending_bytes=ssd_pending_bytes,
+                pending_max_bytes=ssd_pending_max_bytes,
+                write_failures=ssd_write_failures,
+            )
             self._publish_locked(now, force=False)
+
+    def _observe_ssd_capacity_locked(
+        self,
+        *,
+        max_bytes: int | None,
+        capacity_bytes: int | None,
+        evictions: int | None,
+        capacity_drops: int | None,
+        pending_bytes: int | None,
+        pending_max_bytes: int | None,
+        write_failures: int | None,
+    ) -> None:
+        values = {
+            "_cache_ssd_max_bytes": max_bytes,
+            "_cache_ssd_capacity_bytes": capacity_bytes,
+            "_cache_ssd_evictions": evictions,
+            "_cache_ssd_capacity_drops": capacity_drops,
+            "_cache_ssd_pending_bytes": pending_bytes,
+            "_cache_ssd_pending_max_bytes": pending_max_bytes,
+            "_cache_ssd_write_failures": write_failures,
+        }
+        for name, value in values.items():
+            if value is not None:
+                setattr(self, name, max(0, int(value)))
 
     def _finish_locked(
         self,
@@ -1019,6 +1124,13 @@ class RuntimeTelemetry:
                     "entries": self._cache_ssd_entries,
                     "bytes": self._cache_ssd_bytes,
                     "hits": self._cache_ssd_hits,
+                    "max_bytes": self._cache_ssd_max_bytes,
+                    "capacity_bytes": self._cache_ssd_capacity_bytes,
+                    "evictions": self._cache_ssd_evictions,
+                    "capacity_drops": self._cache_ssd_capacity_drops,
+                    "pending_bytes": self._cache_ssd_pending_bytes,
+                    "pending_max_bytes": self._cache_ssd_pending_max_bytes,
+                    "write_failures": self._cache_ssd_write_failures,
                 },
             },
             "pipeline": {
@@ -1141,6 +1253,7 @@ def install_server_telemetry(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
+    ssd_max_bytes: int | None = None,
     ssd_cache_persistent: bool = False,
     ssd_write_behind: bool = False,
     prefill_step_size: int = 2048,
@@ -1200,7 +1313,39 @@ def install_server_telemetry(
         cancel_plan_hash=marker_plan_hash,
         cancel_epoch_floor=worker_cancel_epoch_floor,
         prompt_cache_ssd_enabled=bool(ssd_cache_dir),
+        prompt_cache_ssd_max_bytes=(
+            int(ssd_max_bytes)
+            if ssd_max_bytes is not None
+            else execution.prompt_cache_ssd_max_bytes
+            if execution is not None
+            else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+        )
+        if ssd_cache_dir
+        else 0,
     )
+
+    try:
+        group = mx.distributed.init()
+        world_size = int(group.size())
+        rank = int(group.rank())
+    except Exception:
+        world_size = 1
+        rank = 0
+
+    def agree_snapshot_capacity_charge(local_charge: int | None) -> int | None:
+        """Largest rank file charge, or None if any rank cannot snapshot.
+
+        All ranks account the same largest charge even though their layer
+        slices have different physical sizes. The common charge plus the
+        operation-ordered LRU makes byte eviction rank-symmetric.
+        """
+
+        return _agreed_snapshot_capacity_charge(
+            local_charge,
+            world_size=world_size,
+            rank=rank,
+            control_plane=control_plane,
+        )
 
     snapshot_ctx = threading.local()
     snapshot_step = max(1, int(prefill_step_size))
@@ -1212,20 +1357,36 @@ def install_server_telemetry(
             candidate_boundaries,
         )
 
+        resolved_ssd_max_bytes = int(
+            ssd_max_bytes
+            or (
+                execution.prompt_cache_ssd_max_bytes
+                if execution is not None
+                else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            )
+        )
         ssd_store = SSDPromptSnapshotStore(
             ssd_cache_dir,
             step=snapshot_step,
             max_entries=ssd_max_entries,
+            max_bytes=resolved_ssd_max_bytes,
             persistent=ssd_cache_persistent,
             write_behind=ssd_write_behind,
+            capacity_agreement=agree_snapshot_capacity_charge,
         )
-    try:
-        group = mx.distributed.init()
-        world_size = int(group.size())
-        rank = int(group.rank())
-    except Exception:
-        world_size = 1
-        rank = 0
+
+    def ssd_store_observability() -> dict[str, int]:
+        if ssd_store is None:
+            return {}
+        return {
+            "ssd_max_bytes": ssd_store.max_bytes,
+            "ssd_capacity_bytes": ssd_store.capacity_bytes,
+            "ssd_evictions": ssd_store.evictions,
+            "ssd_capacity_drops": ssd_store.capacity_drops,
+            "ssd_pending_bytes": ssd_store.pending_bytes,
+            "ssd_pending_max_bytes": ssd_store.pending_max_bytes,
+            "ssd_write_failures": ssd_store.write_failures,
+        }
 
     def prompt_cache_positions(cache: Any) -> tuple[int, ...]:
         """Best-effort logical token positions for a rank-local cache copy."""
@@ -1462,8 +1623,13 @@ def install_server_telemetry(
                         extracted = self.extract_cache([uid]).get(uid)
                     except Exception:
                         extracted = None
-                    if extracted is not None:
-                        ssd_store.put(model, full[:absolute], extracted[0])
+                    # Every rank must enter capacity agreement for every
+                    # aligned boundary. A rank-local extraction failure is
+                    # represented as an invalid payload so all peers reject
+                    # the checkpoint together instead of one blocking in the
+                    # tiny size exchange.
+                    cache_payload = extracted[0] if extracted is not None else None
+                    ssd_store.put(model, full[:absolute], cache_payload)
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
@@ -1595,8 +1761,9 @@ def install_server_telemetry(
                 # The collective is taken on every request, hit or miss, so all
                 # ranks reach it the same number of times regardless of their
                 # in-memory state; the agreed boundary is only used when the
-                # in-memory tier missed. This is what lets SSD serve the batched
-                # path, whose byte-based eviction can diverge across ranks.
+                # in-memory tier missed. It also protects restore if a transient
+                # write failure leaves one rank without an otherwise symmetric
+                # byte-budget entry.
                 boundary = agree_ssd_boundary(model, tokens)
                 if cache is None and boundary > 0:
                     loaded = ssd_store.load(model, tokens, boundary)
@@ -1628,6 +1795,7 @@ def install_server_telemetry(
                 ssd_entries=ssd_entries,
                 ssd_bytes=ssd_bytes,
                 hit_tier=hit_tier,
+                **ssd_store_observability(),
             )
             return cache, rest
 
@@ -1671,6 +1839,7 @@ def install_server_telemetry(
                 memory_bytes=memory_bytes,
                 ssd_entries=ssd_entries,
                 ssd_bytes=ssd_bytes,
+                **ssd_store_observability(),
             )
             return result
 
@@ -1938,6 +2107,7 @@ def install_server_telemetry(
             memory_bytes=0,
             ssd_entries=len(ssd_store),
             ssd_bytes=ssd_store.nbytes,
+            **ssd_store_observability(),
         )
     # Started here rather than by the caller: this block is exactly the span
     # during which a rank is alive and expected to look alive, and a heartbeat

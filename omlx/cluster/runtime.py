@@ -368,6 +368,21 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
                     )
                     for key in ("entries", "bytes", "hits")
                 }
+                if tier == "ssd":
+                    for key in (
+                        "max_bytes",
+                        "capacity_bytes",
+                        "evictions",
+                        "capacity_drops",
+                        "pending_bytes",
+                        "pending_max_bytes",
+                        "write_failures",
+                    ):
+                        if key in raw_tier:
+                            validated_cache[tier][key] = _nonnegative_int(
+                                raw_tier.get(key),
+                                f"cache metrics {tier} {key}",
+                            )
             memory_tier = validated_cache["memory"]
             ssd_tier = validated_cache["ssd"]
             if (

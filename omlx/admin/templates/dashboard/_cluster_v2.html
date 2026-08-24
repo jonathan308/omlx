@@ -694,6 +694,26 @@
                                data-cluster-v2-prompt-cache-ssd-toggle>
                     </span>
                 </label>
+                <label x-show="promptCacheSsd" x-cloak
+                       class="mt-2 block rounded-xl border border-neutral-200 px-3 py-2.5"
+                       data-cluster-v2-prompt-cache-ssd-cap>
+                    <span class="block text-xs font-semibold text-neutral-900">SSD budget per rank</span>
+                    <span class="mt-2 inline-flex items-center gap-2">
+                        <input type="number"
+                               x-model.number="promptCacheSsdMaxGiB"
+                               @change="runPlan()"
+                               min="1"
+                               max="1024"
+                               step="1"
+                               :disabled="planLoading"
+                               class="w-24 text-xs border border-neutral-200 rounded-lg px-2 py-1.5 focus:ring-2 focus:ring-neutral-900 focus:border-transparent disabled:opacity-40"
+                               aria-label="Persistent prompt snapshot SSD budget per rank">
+                        <span class="text-xs text-neutral-600">GiB</span>
+                    </span>
+                    <span class="block text-[10px] text-neutral-500 mt-1">
+                        Oldest aligned snapshots are evicted deterministically at this limit. Default: 20 GiB on each rank.
+                    </span>
+                </label>
 
                 <!-- Per-node roles: how much of each Mac the cluster may take.
                      Default is unchanged (this Mac = Workstation, peers =

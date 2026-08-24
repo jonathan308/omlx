@@ -13,6 +13,7 @@ import pytest
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import run_cluster_performance_probe
 from omlx.cluster.performance import (
+    ExecutionSettings,
     NodePerformanceProfile,
     execution_profile,
     performance_profiles_from_records,
@@ -157,6 +158,7 @@ def test_partial_measurements_fall_back_to_original_memory_objective():
 def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     settings = execution_profile("throughput")
     assert settings.prompt_cache_ssd is False
+    assert settings.prompt_cache_ssd_max_bytes == 20 * 1024**3
     assignments = [
         SimpleNamespace(headroom_bytes=3 * 1024**3),
         SimpleNamespace(headroom_bytes=20 * 1024**3),
@@ -173,6 +175,14 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
     assert "synchronized single-prefix cache" in tuned.tuning_reason
+
+
+def test_execution_settings_require_a_positive_ssd_snapshot_budget():
+    with pytest.raises(ValueError, match="prompt_cache_ssd_max_bytes"):
+        ExecutionSettings(prompt_cache_ssd_max_bytes=None)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="prompt_cache_ssd_max_bytes"):
+        ExecutionSettings(prompt_cache_ssd_max_bytes=0)
 
 
 def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():

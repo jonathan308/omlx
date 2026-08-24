@@ -1385,7 +1385,13 @@ def build_mlx_launch_argv(
     if deployment.execution.cache_affinity:
         argv.append("--cache-affinity")
     if deployment.execution.prompt_cache_ssd:
-        argv.append("--prompt-cache-ssd")
+        argv.extend(
+            [
+                "--prompt-cache-ssd",
+                "--prompt-cache-ssd-max-bytes",
+                str(deployment.execution.prompt_cache_ssd_max_bytes),
+            ]
+        )
     if deployment.execution.auto_tune:
         argv.append("--auto-tune")
     if deployment.execution.sampling_rank_only:

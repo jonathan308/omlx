@@ -10,9 +10,50 @@ from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
     RuntimeTelemetry,
     _TelemetryQueue,
+    _agreed_snapshot_capacity_charge,
     _python_token_id,
     install_server_telemetry,
 )
+
+
+def test_snapshot_capacity_agreement_never_falls_back_to_tiny_collective():
+    assert _agreed_snapshot_capacity_charge(
+        123,
+        world_size=1,
+        rank=0,
+        control_plane=None,
+    ) == 123
+    assert _agreed_snapshot_capacity_charge(
+        123,
+        world_size=2,
+        rank=0,
+        control_plane=None,
+    ) is None
+
+
+def test_snapshot_capacity_agreement_uses_largest_reliable_rank_charge():
+    class ControlPlane:
+        def __init__(self):
+            self.calls = []
+
+        def broadcast_owned_bytes(self, payload, *, source_rank, expected_size):
+            self.calls.append((payload, source_rank, expected_size))
+            if source_rank == 0:
+                return payload
+            return b"\x01" + (456).to_bytes(8, "big")
+
+    control_plane = ControlPlane()
+
+    assert _agreed_snapshot_capacity_charge(
+        123,
+        world_size=2,
+        rank=0,
+        control_plane=control_plane,
+    ) == 456
+    assert control_plane.calls == [
+        (b"\x01" + (123).to_bytes(8, "big"), 0, 9),
+        (None, 1, 9),
+    ]
 
 
 class _Clock:
@@ -464,6 +505,13 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
         memory_bytes=1024,
         ssd_entries=1,
         ssd_bytes=3072,
+        ssd_max_bytes=20 * 1024**3,
+        ssd_capacity_bytes=4096,
+        ssd_evictions=2,
+        ssd_capacity_drops=1,
+        ssd_pending_bytes=512,
+        ssd_pending_max_bytes=512 * 1024**2,
+        ssd_write_failures=3,
         hit_tier="ssd",
     )
 
@@ -485,6 +533,13 @@ def test_telemetry_reports_coalescing_cache_affinity_and_stage_prediction():
         "entries": 1,
         "bytes": 3072,
         "hits": 1,
+        "max_bytes": 20 * 1024**3,
+        "capacity_bytes": 4096,
+        "evictions": 2,
+        "capacity_drops": 1,
+        "pending_bytes": 512,
+        "pending_max_bytes": 512 * 1024**2,
+        "write_failures": 3,
     }
     assert snapshot["stage"]["predicted_stage_seconds"] == 0.21
     assert snapshot["stage"]["observed_step_seconds"] == 0.25

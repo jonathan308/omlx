@@ -23,11 +23,12 @@ keys are a hash of ``(model, prefix tokens)`` and are therefore identical across
 ranks that processed the same broadcast request, while the bytes under a key are
 this rank's shard alone; prompts sharing a prefix share the early chain files.
 Eviction is a deterministic bounded LRU keyed on the sequence of operations
-rather than a wall clock, so ranks that see the same requests keep identical key
-sets without any coordination. Coordinating the *hit* across ranks (so a disk
-write that failed on one rank cannot desync the pipeline) is the caller's job
-and lives in the telemetry integration, which has the collective; this module
-stays pure and unit-testable.
+rather than a wall clock. Unequal shards can produce different file sizes, so
+the caller supplies a rank-agreed capacity charge for each boundary; ranks that
+see the same requests then make the same byte-budget decision. Coordinating the
+*hit* across ranks (so a disk write that failed on one rank cannot desync the
+pipeline) is also the caller's job and lives in the telemetry integration,
+which owns the reliable control plane; this module stays pure and unit-testable.
 
 When persistence is enabled, a compact atomic manifest records the digest,
 boundary and byte size of every chain segment. The digest already commits to
@@ -53,7 +54,9 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from .performance import DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +75,7 @@ class _FrozenPromptSnapshot:
     tensors: dict[str, Any]
     metadata: dict[str, str]
     nbytes: int
+    capacity_charge_bytes: int
 
 
 class PoolingCacheSnapshot:
@@ -364,8 +368,39 @@ def _prepare_snapshot_payload(
     return tensors, metadata, nbytes
 
 
-def _freeze_snapshot_payload(
+def _snapshot_capacity_charge(
     tensors: dict[str, Any], metadata: dict[str, str], nbytes: int
+) -> int:
+    """Conservative on-disk charge known before the async write starts.
+
+    Safetensors stores the raw tensor bytes plus one JSON header. The header
+    depends on rank-local tensor shapes and metadata, so charge a deliberately
+    loose upper bound and let the distributed caller agree on the largest
+    rank's value. That common charge makes byte-budget eviction choose the
+    same LRU victims even when pipeline stages hold different layer counts.
+    The writer still checks real file bytes as a fail-safe.
+    """
+
+    text_bytes = sum(
+        len(str(key).encode("utf-8")) + len(value.encode("utf-8"))
+        for key, value in metadata.items()
+    )
+    schema_bytes = 0
+    for name, value in tensors.items():
+        schema_bytes += len(str(name).encode("utf-8"))
+        schema_bytes += len(str(tuple(value.shape)).encode("ascii"))
+        schema_bytes += len(str(value.dtype).encode("ascii"))
+    # JSON escaping can expand a code point to six ASCII bytes. 64 KiB also
+    # covers safetensors' framing/alignment for ordinary small snapshots.
+    header_bound = max(64 * 1024, 8 * (text_bytes + schema_bytes + 1024))
+    return max(1, int(nbytes) + header_bound)
+
+
+def _freeze_snapshot_payload(
+    tensors: dict[str, Any],
+    metadata: dict[str, str],
+    nbytes: int,
+    capacity_charge_bytes: int,
 ) -> _FrozenPromptSnapshot:
     """Copy and fully materialize a payload on its owning inference thread.
 
@@ -384,7 +419,12 @@ def _freeze_snapshot_payload(
     with _mx_buffer_access_lock:
         frozen = {name: mx.array(value) for name, value in tensors.items()}
         mx.eval(*frozen.values())
-    return _FrozenPromptSnapshot(frozen, dict(metadata), nbytes)
+    return _FrozenPromptSnapshot(
+        frozen,
+        dict(metadata),
+        nbytes,
+        max(int(capacity_charge_bytes), int(nbytes)),
+    )
 
 
 @dataclass
@@ -393,6 +433,7 @@ class _Entry:
     filename: str
     nbytes: int
     boundary: int
+    capacity_charge_bytes: int
 
 
 def candidate_boundaries(prompt_len: int, step: int) -> tuple[int, ...]:
@@ -442,8 +483,10 @@ class SSDPromptSnapshotStore:
     the token prefix they end at, so two prompts sharing a prefix share the
     early files, exactly like the local paged SSD cache shares blocks.
 
-    Eviction is a deterministic bounded LRU (entry count, optionally bytes)
-    keyed on the sequence of operations rather than a wall clock. Evicting an
+    Eviction is a deterministic bounded LRU (entry count and bytes) keyed on
+    the sequence of operations rather than a wall clock. Distributed callers
+    provide one shared capacity charge per boundary, so unequal shard file
+    sizes still choose the same victims. Evicting an
     early file orphans the deeper files of its chain; they stop being offered,
     are never touched again, age to the LRU front and fall out on their own.
     """
@@ -454,26 +497,31 @@ class SSDPromptSnapshotStore:
         *,
         step: int = 2048,
         max_entries: int = _MAX_ENTRIES_DEFAULT,
-        max_bytes: int | None = None,
+        max_bytes: int = DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
         persistent: bool = False,
         write_behind: bool = False,
         max_pending_writes: int = _MAX_PENDING_WRITES_DEFAULT,
         pending_max_bytes: int = _PENDING_MAX_BYTES_DEFAULT,
+        capacity_agreement: Callable[[int | None], int | None] | None = None,
     ) -> None:
         self.directory = Path(directory)
         self.step = max(1, int(step))
         self.max_entries = max(1, int(max_entries))
-        self.max_bytes = max_bytes
+        self.max_bytes = max(1, int(max_bytes))
         self.persistent = bool(persistent)
         self.write_behind = bool(write_behind)
         self.max_pending_writes = max(1, int(max_pending_writes))
         self.pending_max_bytes = max(1, int(pending_max_bytes))
+        self._capacity_agreement = capacity_agreement
         self._lock = threading.RLock()
         # Access-ordered: most-recently-used at the end. The order is advanced
         # only by put/load, both driven by the identical request stream every
         # rank sees, so eviction is the same decision on every rank.
         self._index: OrderedDict[str, _Entry] = OrderedDict()
         self._nbytes = 0
+        self._capacity_bytes = 0
+        self._evictions = 0
+        self._capacity_drops = 0
         # A cache type save_prompt_cache rejects will be rejected on every
         # boundary, so the store disables itself after the first such failure
         # rather than paying a doomed write per request. Known-hostile types
@@ -518,6 +566,23 @@ class SSDPromptSnapshotStore:
             return self._nbytes
 
     @property
+    def capacity_bytes(self) -> int:
+        """Rank-symmetric bytes charged against ``max_bytes``."""
+
+        with self._lock:
+            return self._capacity_bytes
+
+    @property
+    def evictions(self) -> int:
+        with self._lock:
+            return self._evictions
+
+    @property
+    def capacity_drops(self) -> int:
+        with self._lock:
+            return self._capacity_drops
+
+    @property
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending)
@@ -547,6 +612,7 @@ class SSDPromptSnapshotStore:
     def _clear_directory(self) -> None:
         self._index.clear()
         self._nbytes = 0
+        self._capacity_bytes = 0
         for stale in self.directory.iterdir():
             if stale.is_file():
                 with suppress(OSError):
@@ -570,7 +636,8 @@ class SSDPromptSnapshotStore:
             return
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            if payload.get("version") != 1 or int(payload.get("step")) != self.step:
+            version = int(payload.get("version", 0))
+            if version not in (1, 2) or int(payload.get("step")) != self.step:
                 raise ValueError("snapshot manifest contract changed")
             rows = payload.get("entries")
             if not isinstance(rows, list):
@@ -583,12 +650,16 @@ class SSDPromptSnapshotStore:
                 filename = row.get("filename")
                 boundary = int(row.get("boundary"))
                 nbytes = int(row.get("nbytes"))
+                capacity_charge_bytes = int(
+                    row.get("capacity_charge_bytes", nbytes)
+                )
                 if (
                     not self._valid_key(key)
                     or filename != f"{key}.safetensors"
                     or boundary <= 0
                     or boundary % self.step != 0
                     or nbytes <= 0
+                    or capacity_charge_bytes < nbytes
                 ):
                     raise ValueError("snapshot manifest entry is unsafe")
                 path = self.directory / filename
@@ -596,8 +667,11 @@ class SSDPromptSnapshotStore:
                     raise ValueError("snapshot manifest contains a duplicate key")
                 if not path.is_file() or path.stat().st_size != nbytes:
                     raise ValueError("snapshot manifest file is missing or changed")
-                self._index[key] = _Entry((), filename, nbytes, boundary)
+                self._index[key] = _Entry(
+                    (), filename, nbytes, boundary, capacity_charge_bytes
+                )
                 self._nbytes += nbytes
+                self._capacity_bytes += capacity_charge_bytes
                 indexed_files.add(filename)
             for stale in self.directory.iterdir():
                 if stale.is_file() and stale.name not in indexed_files:
@@ -614,7 +688,7 @@ class SSDPromptSnapshotStore:
         if not self.persistent:
             return
         payload = {
-            "version": 1,
+            "version": 2,
             "step": self.step,
             "entries": [
                 {
@@ -622,6 +696,7 @@ class SSDPromptSnapshotStore:
                     "filename": entry.filename,
                     "nbytes": entry.nbytes,
                     "boundary": entry.boundary,
+                    "capacity_charge_bytes": entry.capacity_charge_bytes,
                 }
                 for key, entry in self._index.items()
             ],
@@ -655,7 +730,7 @@ class SSDPromptSnapshotStore:
             keys.append(hasher.copy().hexdigest())
         return keys
 
-    def put(self, model: Any, tokens: list[int], cache: list[Any]) -> bool:
+    def put(self, model: Any, tokens: list[int], cache: list[Any] | None) -> bool:
         """Persist the boundary file for ``tokens``. Best effort.
 
         ``tokens`` must end on the step grid. Plain KVCache members are stored
@@ -674,7 +749,10 @@ class SSDPromptSnapshotStore:
             return False
         key = self._chain_keys(model, token_tuple)[-1]
         with self._lock:
-            if self._closed or not self._serialisable:
+            if (
+                (self._closed or not self._serialisable)
+                and not (self.write_behind and self._capacity_agreement is not None)
+            ):
                 return False
             entry = self._index.get(key)
             if entry is not None and (
@@ -688,8 +766,14 @@ class SSDPromptSnapshotStore:
                 if not self.write_behind:
                     self._index.move_to_end(key)
                     self._persist_index_locked()
-                return True
-            if self.write_behind and key in self._pending:
+                    return True
+                if self._capacity_agreement is None:
+                    return True
+            if (
+                self.write_behind
+                and key in self._pending
+                and self._capacity_agreement is None
+            ):
                 return True
 
         if self.write_behind:
@@ -716,6 +800,12 @@ class SSDPromptSnapshotStore:
             os.close(descriptor)
             save_prompt_cache(temporary, wrapped)
             size = os.path.getsize(temporary)
+            if size > self.max_bytes:
+                with suppress(OSError):
+                    os.unlink(temporary)
+                with self._lock:
+                    self._capacity_drops += 1
+                return False
             os.replace(temporary, target)
         except OSError:
             # A transient disk problem: drop this snapshot, keep the store live.
@@ -740,8 +830,12 @@ class SSDPromptSnapshotStore:
             previous = self._index.pop(key, None)
             if previous is not None:
                 self._nbytes -= previous.nbytes
-            self._index[key] = _Entry(token_tuple, target.name, size, boundary)
+                self._capacity_bytes -= previous.capacity_charge_bytes
+            self._index[key] = _Entry(
+                token_tuple, target.name, size, boundary, size
+            )
             self._nbytes += size
+            self._capacity_bytes += size
             self._index.move_to_end(key)
             self._evict_locked()
             self._persist_index_locked()
@@ -764,20 +858,35 @@ class SSDPromptSnapshotStore:
         rank would defeat the memory safety the bound exists to provide.
         """
 
+        preparation_error: Exception | None = None
+        tensors: dict[str, Any] = {}
+        metadata: dict[str, str] = {}
+        nbytes = 0
+        local_charge: int | None = None
+        with self._lock:
+            unavailable = self._closed or not self._serialisable
         try:
+            if unavailable:
+                raise RuntimeError("prompt snapshot store is unavailable")
             tensors, metadata, nbytes = _prepare_snapshot_payload(
-                cache,
+                cache,  # type: ignore[arg-type]
                 boundary=boundary,
                 segment_start=boundary - self.step,
             )
+            local_charge = _snapshot_capacity_charge(tensors, metadata, nbytes)
         except Exception as error:
+            preparation_error = error
+
+        capacity_charge = self._agree_capacity_charge(local_charge)
+        if capacity_charge is None or preparation_error is not None:
+            if preparation_error is not None and not unavailable:
+                logger.warning(
+                    "prompt snapshot store disabled: %s: %s",
+                    type(preparation_error).__name__,
+                    preparation_error,
+                )
             with self._lock:
                 self._serialisable = False
-            logger.warning(
-                "prompt snapshot store disabled: %s: %s",
-                type(error).__name__,
-                error,
-            )
             return False
 
         with self._lock:
@@ -790,7 +899,18 @@ class SSDPromptSnapshotStore:
                 entry.tokens == token_tuple
                 or (not entry.tokens and entry.boundary == boundary)
             ):
+                # A legacy manifest may carry only physical bytes. Promote it
+                # to the newly agreed common charge before future eviction.
+                if entry.capacity_charge_bytes != capacity_charge:
+                    self._capacity_bytes -= entry.capacity_charge_bytes
+                    entry.capacity_charge_bytes = capacity_charge
+                    self._capacity_bytes += capacity_charge
+                    self._evict_locked()
+                    self._persist_index_locked()
                 return True
+            if capacity_charge > self.max_bytes:
+                self._capacity_drops += 1
+                return False
             if (
                 nbytes > self.pending_max_bytes
                 or len(self._pending) >= self.max_pending_writes
@@ -806,7 +926,12 @@ class SSDPromptSnapshotStore:
             self._capturing.add(key)
 
         try:
-            frozen = _freeze_snapshot_payload(tensors, metadata, nbytes)
+            frozen = _freeze_snapshot_payload(
+                tensors,
+                metadata,
+                nbytes,
+                capacity_charge,
+            )
         except Exception as error:
             self._release_pending(key, failed=True)
             with self._lock:
@@ -836,6 +961,24 @@ class SSDPromptSnapshotStore:
             self._pending_cond.notify_all()
         return True
 
+    def _agree_capacity_charge(self, local_charge: int | None) -> int | None:
+        """Return the rank-shared charge, failing closed on disagreement."""
+
+        if self._capacity_agreement is None:
+            return local_charge
+        try:
+            agreed = self._capacity_agreement(local_charge)
+        except Exception as error:
+            logger.warning("prompt snapshot capacity agreement failed: %s", error)
+            return None
+        if agreed is None or local_charge is None:
+            return None
+        try:
+            value = int(agreed)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= local_charge > 0 else None
+
     def _release_pending(self, key: str, *, failed: bool = False) -> None:
         with self._pending_cond:
             nbytes = self._pending.pop(key, None)
@@ -860,6 +1003,12 @@ class SSDPromptSnapshotStore:
         from omlx.utils.metal_sync import _mx_buffer_access_lock
 
         target = self._path(key)
+        # Reserve the common charge before creating the temporary file. Since
+        # the charge is an upper bound on the final safetensors bytes, existing
+        # snapshots plus the in-progress file stay within the disk ceiling.
+        with self._lock:
+            self._evict_for_incoming_locked(frozen.capacity_charge_bytes)
+            self._persist_index_locked()
         descriptor, temporary = tempfile.mkstemp(
             prefix=f".{key}.", suffix=".safetensors", dir=self.directory
         )
@@ -875,6 +1024,16 @@ class SSDPromptSnapshotStore:
                     frozen.metadata,
                 )
             size = os.path.getsize(temporary)
+            if size > frozen.capacity_charge_bytes:
+                raise ValueError(
+                    "prompt snapshot exceeded its pre-agreed capacity charge"
+                )
+            if size > self.max_bytes:
+                with self._lock:
+                    self._capacity_drops += 1
+                with suppress(OSError):
+                    os.unlink(temporary)
+                return
             os.replace(temporary, target)
         except Exception:
             with suppress(OSError):
@@ -885,13 +1044,16 @@ class SSDPromptSnapshotStore:
             previous = self._index.pop(key, None)
             if previous is not None:
                 self._nbytes -= previous.nbytes
+                self._capacity_bytes -= previous.capacity_charge_bytes
             self._index[key] = _Entry(
                 token_tuple,
                 target.name,
                 size,
                 boundary,
+                frozen.capacity_charge_bytes,
             )
             self._nbytes += size
+            self._capacity_bytes += frozen.capacity_charge_bytes
             self._index.move_to_end(key)
             self._evict_locked()
             self._persist_index_locked()
@@ -1031,6 +1193,7 @@ class SSDPromptSnapshotStore:
                 if not self._path(key).is_file():
                     self._index.pop(key, None)
                     self._nbytes -= entry.nbytes
+                    self._capacity_bytes -= entry.capacity_charge_bytes
                     self._persist_index_locked()
                     return None
         try:
@@ -1049,12 +1212,24 @@ class SSDPromptSnapshotStore:
 
     def _evict_locked(self) -> None:
         while len(self._index) > self.max_entries or (
-            self.max_bytes is not None and self._nbytes > self.max_bytes
+            self._capacity_bytes > self.max_bytes or self._nbytes > self.max_bytes
         ):
-            key, entry = self._index.popitem(last=False)
-            self._nbytes -= entry.nbytes
-            with suppress(OSError):
-                self._path(key).unlink()
+            self._evict_oldest_locked()
+
+    def _evict_for_incoming_locked(self, capacity_charge_bytes: int) -> None:
+        while (
+            self._index
+            and self._capacity_bytes + capacity_charge_bytes > self.max_bytes
+        ):
+            self._evict_oldest_locked()
+
+    def _evict_oldest_locked(self) -> None:
+        key, entry = self._index.popitem(last=False)
+        self._nbytes -= entry.nbytes
+        self._capacity_bytes -= entry.capacity_charge_bytes
+        self._evictions += 1
+        with suppress(OSError):
+            self._path(key).unlink()
 
 
 def _assemble_chain(files: list[list[Any]], boundary: int) -> list[Any] | None:

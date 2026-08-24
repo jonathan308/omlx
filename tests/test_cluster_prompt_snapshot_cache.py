@@ -3,12 +3,14 @@
 one linear chain of slabs, and stay consistent across ranks that see the same
 requests."""
 
+import json
 import threading
 import time
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
+from omlx.cluster.performance import DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
 from omlx.cluster.prompt_snapshot_cache import (
     SSDPromptSnapshotStore,
     agreed_boundary,
@@ -356,6 +358,24 @@ def test_invalid_persistent_manifest_fails_closed(tmp_path):
     assert (tmp_path / "index.json").is_file()
 
 
+def test_v1_persistent_manifest_migrates_without_losing_restore(tmp_path):
+    tokens = list(range(4))
+    first = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+    assert first.put(MODEL, tokens, _kv())
+    legacy = json.loads((tmp_path / "index.json").read_text())
+    legacy["version"] = 1
+    for row in legacy["entries"]:
+        row.pop("capacity_charge_bytes", None)
+    (tmp_path / "index.json").write_text(json.dumps(legacy))
+
+    second = SSDPromptSnapshotStore(tmp_path, step=4, persistent=True)
+
+    assert second.load(MODEL, tokens, 4) is not None
+    migrated = json.loads((tmp_path / "index.json").read_text())
+    assert migrated["version"] == 2
+    assert migrated["entries"][0]["capacity_charge_bytes"] > 0
+
+
 def test_an_unaligned_prompt_is_rejected(tmp_path):
     store = SSDPromptSnapshotStore(tmp_path, step=STEP)
     assert store.put(MODEL, list(range(STEP + 1)), _kv()) is False
@@ -407,6 +427,72 @@ def test_the_byte_budget_evicts_oldest_files(tmp_path):
     assert len(store) == 2
     assert store.nbytes <= file_size * 2.5
     assert store.load(MODEL, [0, 1], 2) is None
+
+
+def test_default_disk_budget_is_finite_and_conservative(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=2)
+
+    assert store.max_bytes == DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+    assert store.max_bytes == 20 * 1024**3
+
+
+def test_default_20_gib_budget_evicts_when_shared_charges_cross_it(tmp_path):
+    charge = 12 * 1024**3
+    store = SSDPromptSnapshotStore(
+        tmp_path,
+        step=2,
+        write_behind=True,
+        capacity_agreement=lambda _local: charge,
+    )
+
+    assert store.put(MODEL, [0, 1], _kv())
+    assert store.put(MODEL, [2, 3], _kv())
+    assert store.flush(timeout=5)
+
+    assert len(store) == 1
+    assert store.capacity_bytes == charge
+    assert store.nbytes <= store.max_bytes
+    assert store.evictions == 1
+    assert store.load(MODEL, [0, 1], 2) is None
+    assert store.load(MODEL, [2, 3], 2) is not None
+    assert store.close(timeout=5)
+
+
+def test_shared_capacity_charge_keeps_unequal_ranks_eviction_symmetric(tmp_path):
+    """Different shard file sizes must still evict the same oldest key."""
+
+    shared_charge = 1024 * 1024
+    budget = 2 * shared_charge
+    rank0 = SSDPromptSnapshotStore(
+        tmp_path / "r0",
+        step=2,
+        max_bytes=budget,
+        write_behind=True,
+        capacity_agreement=lambda _local: shared_charge,
+    )
+    rank1 = SSDPromptSnapshotStore(
+        tmp_path / "r1",
+        step=2,
+        max_bytes=budget,
+        write_behind=True,
+        capacity_agreement=lambda _local: shared_charge,
+    )
+    prompts = ([0, 1], [2, 3], [4, 5])
+    for prompt in prompts:
+        assert rank0.put(MODEL, prompt, _kv(layers=1))
+        assert rank1.put(MODEL, prompt, _kv(layers=2))
+    assert rank0.flush(timeout=5)
+    assert rank1.flush(timeout=5)
+
+    assert list(rank0._index) == list(rank1._index)
+    assert rank0.present_boundaries(MODEL, list(prompts[0])) == ()
+    assert rank1.present_boundaries(MODEL, list(prompts[0])) == ()
+    assert rank0.capacity_bytes == rank1.capacity_bytes == budget
+    assert rank0.nbytes <= rank0.max_bytes
+    assert rank1.nbytes <= rank1.max_bytes
+    assert rank0.evictions == rank1.evictions == 1
+    assert rank0.close(timeout=5)
+    assert rank1.close(timeout=5)
 
 
 def test_two_ranks_keep_identical_keys_from_identical_requests(tmp_path):
