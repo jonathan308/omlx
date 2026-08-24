@@ -412,6 +412,10 @@ def test_strict_coverage_never_publishes_missing_or_extra_sanitizer_keys(
     _write_checkpoint(tmp_path, config)
     path = tmp_path / "model.safetensors"
     tensors = dict(mx.load(str(path)))
+    # ``mx.load`` is lazy. Materialize every source tensor before replacing
+    # its backing file; otherwise save_safetensors may truncate the file and
+    # then try to evaluate an array that still maps the now-empty source.
+    mx.eval(*tensors.values())
     if mutation == "missing":
         del tensors["model.layers.0.attn.wq_a.weight"]
     else:
