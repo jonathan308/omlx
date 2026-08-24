@@ -107,6 +107,7 @@ unload_loaded_models() {
   "${venv_root}/bin/python" - "${port}" <<'PY'
 import json
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -133,6 +134,13 @@ for model in models:
         with urllib.request.urlopen(request, timeout=180) as response:
             response.read()
         print(f"omlx-dev: unloaded {model_id}")
+    except urllib.error.HTTPError as exc:
+        # Helper-backed entries such as MarkItDown can report loaded in the
+        # aggregate status without owning an EnginePool unload endpoint.
+        if exc.code in (400, 404):
+            continue
+        print(f"omlx-dev: could not unload {model_id}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     except Exception as exc:
         print(f"omlx-dev: could not unload {model_id}: {exc}", file=sys.stderr)
         raise SystemExit(1)
