@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -62,7 +63,13 @@ def _collective_measurements(
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     import mlx.core as mx
 
-    group = mx.distributed.init()
+    from .jaccl_side_channel import init_cluster_group
+
+    group = init_cluster_group(
+        mx,
+        backend="jaccl" if os.environ.get("MLX_JACCL_COORDINATOR") else None,
+        strict=bool(os.environ.get("MLX_JACCL_COORDINATOR")),
+    )
     rank = group.rank()
     barrier = mx.distributed.all_sum(mx.array(1), stream=mx.cpu)
     _evaluate(mx, barrier)
