@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 from benchmarks import bench_ds4_output_projection_chain as campaign
 
@@ -75,3 +76,27 @@ def test_output_chain_symbols_are_built_with_default_off_model_seam():
     assert "ds4_output_oa_interleaved" not in model
     assert "ds4_output_projection_chain" in model
     assert '"OMLX_DSV4_OUTPUT_CHAIN_PREFILL", "0"' in model
+
+
+def test_campaign_cli_accepts_canonical_equal_tp2(monkeypatch, capsys):
+    monkeypatch.setattr(campaign.fast, "has_symbol", lambda _name: True)
+    monkeypatch.setattr(campaign, "run_rank", lambda *_args, **_kwargs: {
+        "all_boundaries_exact": True,
+        "best_full_chain_speedup": 1.1,
+    })
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "campaign",
+            "--model",
+            "/tmp/model",
+            "--ranks",
+            "0",
+            "--shard-weights",
+            "4,4",
+        ],
+    )
+    assert campaign.main() == 0
+    assert campaign.rank_shape.__globals__["SHARD_WEIGHTS"] == (4, 4)
+    assert '"both_ranks_benefit": true' in capsys.readouterr().out

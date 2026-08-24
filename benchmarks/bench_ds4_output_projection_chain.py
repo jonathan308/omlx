@@ -312,9 +312,25 @@ def main() -> int:
     parser.add_argument("--cycles", type=int, default=12)
     parser.add_argument("--parity-seeds", type=int, default=3)
     parser.add_argument("--tokens", type=int, choices=(1024, 2048), default=1024)
+    parser.add_argument(
+        "--shard-weights",
+        default="3,5",
+        help="Two-rank DS4 head-unit split; use 4,4 for canonical TP2",
+    )
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
     TOKENS = args.tokens
+    shard_weights = tuple(
+        int(item.strip()) for item in args.shard_weights.split(",")
+    )
+    if len(shard_weights) != 2 or any(weight < 1 for weight in shard_weights):
+        raise ValueError("--shard-weights requires two positive integers")
+    if sum(shard_weights) != 8:
+        raise ValueError("DS4 shard weights must sum to eight head units")
+    # The imported loader and shape function intentionally share the source
+    # module globals. Override their benchmark-only partition before loading;
+    # no production model class or environment variable is touched.
+    rank_shape.__globals__["SHARD_WEIGHTS"] = shard_weights
 
     if not fast.has_symbol("ds4_output_projection_chain") or not fast.has_symbol(
         "ds4_output_oa_interleaved"
