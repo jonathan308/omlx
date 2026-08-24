@@ -42,6 +42,12 @@ measurements; the M5 rank must be rerun on its actual NAX device before any
 promotion. Results are shape-sensitive and have not been promoted to the
 model seam.
 
+The physical M5 follow-up rejected row 4 after a clean metallib rebuild:
+candidate median **0.478646 ms** versus stock **0.435417 ms** (**0.910x**),
+with bit-exact output. The M3 shape replay did not predict the M5
+scheduler/occupancy result. Row 4 therefore remains a benchmark-only rejected
+probe and must not enter model-serving dispatch.
+
 ## Amdahl and next gate
 
 At the current non-MTP TP2 rate (about 31.2 marker / 31.95 API tok/s), this
@@ -50,11 +56,10 @@ share. The isolated 16--22% kernel reduction is not evidence of a 16--22%
 end-to-end gain; a full layer attribution and cold two-rank B1 decode gate
 are required before claiming a 10% E2E improvement.
 
-Next gate: run five or more cold TP2 single-token repetitions with identical
-prompt/cache state and completion hash, compare default row selection against
-M5-only row-4, and record per-rank routed-MoE wall. Promote only if both
-slices are exact, the M5 critical rank improves without regressing M3, and the
-full decode exceeds the pre-change baseline by at least 10%.
+Next gate: retain the current qualified row schedules and run five or more cold
+TP2 single-token repetitions with identical prompt/cache state and completion
+hash while recording per-rank routed-MoE wall. A different physical-M5 kernel
+is required for the next production candidate; row 4 is closed.
 
 Reproduce the isolated probe:
 
