@@ -44,6 +44,7 @@ from .memory_guard import (
 )
 from .performance import (
     DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    DeepseekAnePrefillSettings,
     ExecutionSettings,
 )
 from .pipeline_compat import (
@@ -766,6 +767,19 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
 
 
 def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
+    deepseek_ane = DeepseekAnePrefillSettings(
+        enabled=args.deepseek_ane_prefill,
+        sequence_length=args.deepseek_ane_sequence_length,
+        tail_padding_min_tokens=args.deepseek_ane_tail_padding_min_tokens,
+        down_enabled=args.deepseek_ane_down,
+        down_fraction=args.deepseek_ane_down_fraction,
+        wo_a_enabled=args.deepseek_ane_wo_a,
+        wo_a_fraction=args.deepseek_ane_wo_a_fraction,
+        cpu_enabled=args.deepseek_ane_cpu,
+        cpu_fraction=args.deepseek_ane_cpu_fraction,
+        cpu_threads=args.deepseek_ane_cpu_threads,
+        cpu_shared_resource=args.deepseek_ane_cpu_shared_resource,
+    )
     return ExecutionSettings(
         profile=args.execution_profile,
         auto_tune=args.auto_tune,
@@ -783,7 +797,64 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
+        deepseek_ane_prefill=deepseek_ane,
     )
+
+
+def _enable_distributed_deepseek_ane_prefill(
+    model: Any,
+    settings: DeepseekAnePrefillSettings,
+) -> int:
+    """Install PR #3059 on one already-sharded rank, fail-soft per rank."""
+
+    if not settings.enabled:
+        return 0
+    model_type = next(
+        (
+            str(value)
+            for value in (
+                getattr(model, "model_type", None),
+                getattr(getattr(model, "args", None), "model_type", None),
+                getattr(getattr(model, "config", None), "model_type", None),
+            )
+            if isinstance(value, str) and value
+        ),
+        "",
+    )
+    if not model_type.startswith("deepseek_v4"):
+        logger.warning(
+            "Ignoring DeepSeek ANE execution settings for model type %r",
+            model_type,
+        )
+        return 0
+    try:
+        from omlx.patches.deepseek_v4.ane_prefill import (
+            enable_deepseek_v4_ane_prefill,
+        )
+
+        return int(
+            enable_deepseek_v4_ane_prefill(
+                model,
+                sequence_length=settings.sequence_length,
+                tail_padding_min_tokens=settings.tail_padding_min_tokens,
+                down_enabled=settings.down_enabled,
+                down_fraction=settings.down_fraction,
+                wo_a_enabled=settings.wo_a_enabled,
+                wo_a_fraction=settings.wo_a_fraction,
+                cpu_fraction=(
+                    settings.cpu_fraction if settings.cpu_enabled else 0.0
+                ),
+                cpu_threads=settings.cpu_threads,
+                cpu_shared_resource=settings.cpu_shared_resource,
+            )
+        )
+    except Exception:
+        logger.warning(
+            "DeepSeek ANE prefill could not be enabled on this rank; "
+            "continuing with the exact GPU path",
+            exc_info=True,
+        )
+        return 0
 
 
 def _prompt_cache_ssd_dir(args: argparse.Namespace, rank: int) -> str | None:
@@ -1719,6 +1790,10 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
             ):
                 provider.load_default()
+                _enable_distributed_deepseek_ane_prefill(
+                    provider.model,
+                    execution.deepseek_ane_prefill,
+                )
             protocol = _install_distributed_model_protocol(
                 provider.tokenizer,
                 args.model,
@@ -1996,6 +2071,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sampling-rank-only", action="store_true")
     parser.add_argument("--async-overlap", action="store_true")
+    parser.add_argument("--deepseek-ane-prefill", action="store_true")
+    parser.add_argument("--deepseek-ane-sequence-length", type=int, default=4096)
+    parser.add_argument(
+        "--deepseek-ane-tail-padding-min-tokens", type=int, default=0
+    )
+    parser.add_argument(
+        "--deepseek-ane-down",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--deepseek-ane-down-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--deepseek-ane-wo-a",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--deepseek-ane-wo-a-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--deepseek-ane-cpu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--deepseek-ane-cpu-fraction", type=float, default=0.125)
+    parser.add_argument("--deepseek-ane-cpu-threads", type=int, default=12)
+    parser.add_argument(
+        "--deepseek-ane-cpu-shared-resource",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--ring-connections-per-ip", type=int, default=1)
     parser.add_argument(
         "--tuning-reason",

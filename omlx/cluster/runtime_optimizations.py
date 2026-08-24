@@ -600,6 +600,27 @@ def _deepseek_v4_fused_decode_capability(
     return enabled, active, reason
 
 
+def _deepseek_ane_prefill_capability(model: Any) -> tuple[bool, bool, str]:
+    """Report PR #3059 procedure coverage on this physical rank."""
+
+    attempted = hasattr(model, "_omlx_ane_procedure_count")
+    count = int(getattr(model, "_omlx_ane_procedure_count", 0) or 0)
+    attention = int(
+        getattr(model, "_omlx_ane_attention_input_prefill_count", 0) or 0
+    )
+    queries = int(getattr(model, "_omlx_ane_query_prefill_count", 0) or 0)
+    if count:
+        return (
+            True,
+            True,
+            f"rank compiled {count} DeepSeek ANE procedures "
+            f"({attention} attention-input stacks, {queries} queries)",
+        )
+    if attempted:
+        return True, False, "DeepSeek ANE was requested but no procedure compiled"
+    return False, False, "DeepSeek ANE is disabled for this deployment"
+
+
 def _supports_vocab_parallel_sampling(
     model: Any,
     *,
@@ -901,6 +922,11 @@ def install_runtime_optimizations(
         fused_decode_reason,
     ) = _deepseek_v4_fused_decode_capability(model)
     (
+        deepseek_ane_enabled,
+        deepseek_ane_active,
+        deepseek_ane_reason,
+    ) = _deepseek_ane_prefill_capability(model)
+    (
         adaptive_prefill_enabled,
         adaptive_prefill_active,
         adaptive_prefill_after,
@@ -1168,6 +1194,11 @@ def install_runtime_optimizations(
             enabled=fused_decode_enabled,
             active=fused_decode_active,
             reason=fused_decode_reason,
+        ),
+        "deepseek_ane_prefill": _capability(
+            enabled=deepseek_ane_enabled,
+            active=deepseek_ane_active,
+            reason=deepseek_ane_reason,
         ),
         "deepseek_v4_adaptive_prefill": _capability(
             enabled=adaptive_prefill_enabled,

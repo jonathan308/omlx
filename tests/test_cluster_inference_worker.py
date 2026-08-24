@@ -612,6 +612,73 @@ def test_worker_execution_contract_reaches_mlx_lm_and_runtime_optimizations():
     assert _server_arguments(args, tensor_parallel_size=2).pipeline is False
 
 
+def test_worker_execution_contract_parses_deepseek_ane_settings():
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "org/model",
+            "--backend",
+            "ring",
+            "--port",
+            "32000",
+            "--deployment-id",
+            "test",
+            "--plan-hash",
+            "a" * 64,
+            "--plan",
+            "encoded",
+            "--prefill-step-size",
+            "4096",
+            "--deepseek-ane-prefill",
+            "--deepseek-ane-sequence-length",
+            "4096",
+            "--deepseek-ane-down-fraction",
+            "0.5",
+            "--no-deepseek-ane-wo-a",
+            "--no-deepseek-ane-cpu",
+        ]
+    )
+
+    execution = _execution_settings(args)
+    ane = execution.deepseek_ane_prefill
+    assert ane.enabled is True
+    assert ane.sequence_length == execution.prefill_step_size == 4096
+    assert ane.down_fraction == 0.5
+    assert ane.wo_a_enabled is False
+    assert ane.cpu_enabled is False
+
+
+def test_worker_enables_deepseek_ane_after_tensor_sharding(monkeypatch):
+    from omlx.cluster.performance import DeepseekAnePrefillSettings
+    from omlx.patches.deepseek_v4 import ane_prefill
+
+    calls = []
+    monkeypatch.setattr(
+        ane_prefill,
+        "enable_deepseek_v4_ane_prefill",
+        lambda model, **kwargs: calls.append((model, kwargs)) or 17,
+    )
+    model = SimpleNamespace(args=SimpleNamespace(model_type="deepseek_v4"))
+    settings = DeepseekAnePrefillSettings(
+        enabled=True,
+        sequence_length=4096,
+        down_fraction=0.5,
+        wo_a_enabled=False,
+        cpu_enabled=False,
+    )
+
+    count = inference_worker._enable_distributed_deepseek_ane_prefill(
+        model,
+        settings,
+    )
+
+    assert count == 17
+    assert calls[0][0] is model
+    assert calls[0][1]["sequence_length"] == 4096
+    assert calls[0][1]["wo_a_enabled"] is False
+    assert calls[0][1]["cpu_fraction"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Tensor-parallel sharding (B3)
 #

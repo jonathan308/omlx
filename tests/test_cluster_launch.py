@@ -1940,6 +1940,38 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
     assert _prompt_cache_ssd_dir(off, rank=0) is None
 
 
+def test_deepseek_ane_execution_settings_reach_worker_argv(tmp_path):
+    from omlx.cluster.performance import DeepseekAnePrefillSettings
+
+    baseline = _deployment()
+    ane = DeepseekAnePrefillSettings(
+        enabled=True,
+        sequence_length=4096,
+        down_fraction=0.5,
+        wo_a_enabled=False,
+        cpu_enabled=False,
+        cpu_threads=12,
+    )
+    deployment = replace(
+        baseline,
+        execution=replace(
+            baseline.execution,
+            prefill_step_size=4096,
+            deepseek_ane_prefill=ane,
+        ),
+    )
+
+    worker_argv = _worker_argv(deployment, tmp_path)
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+
+    assert "--deepseek-ane-prefill" in worker_argv
+    assert "--no-deepseek-ane-wo-a" in worker_argv
+    assert "--no-deepseek-ane-cpu" in worker_argv
+    assert args.deepseek_ane_sequence_length == 4096
+    assert args.deepseek_ane_down_fraction == 0.5
+    assert args.deepseek_ane_cpu_threads == 12
+
+
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
     deployment = _mixed_role_deployment()
 

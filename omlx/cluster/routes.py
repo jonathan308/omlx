@@ -87,6 +87,7 @@ from .model_inventory import (
 )
 from .performance import (
     DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
+    DeepseekAnePrefillSettings,
     NodePerformanceProfile,
     execution_profile,
     tune_execution_settings,
@@ -478,6 +479,24 @@ class ClusterHostRequest(BaseModel):
     python_executable: str | None = Field(default=None, max_length=4096)
 
 
+class DeepseekAnePrefillRequest(BaseModel):
+    """Explicit per-rank DeepSeek-V4 hybrid prefill settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    sequence_length: int = Field(default=4096, ge=1024, le=16384, multiple_of=64)
+    tail_padding_min_tokens: int = Field(default=0, ge=0, le=16383)
+    down_enabled: bool = True
+    down_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    wo_a_enabled: bool = False
+    wo_a_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    cpu_enabled: bool = False
+    cpu_fraction: float = Field(default=0.125, ge=0.0, lt=0.5)
+    cpu_threads: int = Field(default=12, ge=0, le=64)
+    cpu_shared_resource: bool = True
+
+
 def _validate_cluster_hosts(hosts: list[ClusterHostRequest]) -> None:
     """Validate a hostfile before any request can use its SSH destinations."""
 
@@ -528,6 +547,7 @@ class ClusterDeploymentRequest(BaseModel):
     )
     prompt_cache_ssd: bool | None = None
     prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
+    deepseek_ane_prefill: DeepseekAnePrefillRequest | None = None
     # ``placement_signature`` from the /plan response the user was shown. The
     # server refuses to activate anything else, which is the only
     # thing that makes "the plan you approved" a fact rather than a hope:
@@ -3295,6 +3315,12 @@ def _execution_for_request(
         auto_tune=request.auto_tune,
         sampling_rank_only=request.sampling_rank_only,
     )
+    deepseek_ane_request = getattr(request, "deepseek_ane_prefill", None)
+    deepseek_ane = DeepseekAnePrefillSettings.from_dict(
+        deepseek_ane_request.model_dump()
+        if deepseek_ane_request is not None
+        else None
+    )
     requested = replace(
         requested,
         async_overlap=request.async_overlap,
@@ -3315,12 +3341,31 @@ def _execution_for_request(
         ring_connections_per_ip=(
             request.ring_connections_per_ip or requested.ring_connections_per_ip
         ),
+        prefill_step_size=(
+            deepseek_ane.sequence_length
+            if deepseek_ane.enabled
+            else requested.prefill_step_size
+        ),
+        deepseek_ane_prefill=deepseek_ane,
     )
-    return tune_execution_settings(
+    tuned = tune_execution_settings(
         requested,
         assignments,
         backend=backend,
     )
+    if (
+        tuned.deepseek_ane_prefill.enabled
+        and tuned.prefill_step_size != tuned.deepseek_ane_prefill.sequence_length
+    ):
+        tuned = replace(
+            tuned,
+            deepseek_ane_prefill=DeepseekAnePrefillSettings(),
+            tuning_reason=(
+                f"{tuned.tuning_reason}; DeepSeek ANE disabled because the "
+                "memory tuner reduced the prefill step below its fixed tile"
+            ),
+        )
+    return tuned
 
 
 def _request_performance_profiles(
@@ -4351,6 +4396,7 @@ class ClusterReplanRequest(BaseModel):
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
     prompt_cache_ssd: bool | None = None
     prompt_cache_ssd_max_bytes: int | None = Field(default=None, gt=0)
+    deepseek_ane_prefill: DeepseekAnePrefillRequest | None = None
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
@@ -4517,6 +4563,16 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
                 else current.execution.prompt_cache_ssd_max_bytes
                 if current is not None
                 else DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES
+            ),
+            deepseek_ane_prefill=(
+                request.deepseek_ane_prefill
+                if "deepseek_ane_prefill" in request.model_fields_set
+                else DeepseekAnePrefillRequest(
+                    **current.execution.deepseek_ane_prefill.to_dict()
+                )
+                if current is not None
+                and current.execution.deepseek_ane_prefill.enabled
+                else None
             ),
             path_map=path_map,
             # Not consulted by planning; activation re-checks the real one

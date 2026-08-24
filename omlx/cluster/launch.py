@@ -1402,6 +1402,45 @@ def build_mlx_launch_argv(
         argv.append("--sampling-rank-only")
     if deployment.execution.async_overlap:
         argv.append("--async-overlap")
+    deepseek_ane = deployment.execution.deepseek_ane_prefill
+    if deepseek_ane.enabled:
+        argv.extend(
+            [
+                "--deepseek-ane-prefill",
+                "--deepseek-ane-sequence-length",
+                str(deepseek_ane.sequence_length),
+                "--deepseek-ane-tail-padding-min-tokens",
+                str(deepseek_ane.tail_padding_min_tokens),
+                "--deepseek-ane-down-fraction",
+                str(deepseek_ane.down_fraction),
+                "--deepseek-ane-wo-a-fraction",
+                str(deepseek_ane.wo_a_fraction),
+                "--deepseek-ane-cpu-fraction",
+                str(deepseek_ane.cpu_fraction),
+                "--deepseek-ane-cpu-threads",
+                str(deepseek_ane.cpu_threads),
+                (
+                    "--deepseek-ane-down"
+                    if deepseek_ane.down_enabled
+                    else "--no-deepseek-ane-down"
+                ),
+                (
+                    "--deepseek-ane-wo-a"
+                    if deepseek_ane.wo_a_enabled
+                    else "--no-deepseek-ane-wo-a"
+                ),
+                (
+                    "--deepseek-ane-cpu"
+                    if deepseek_ane.cpu_enabled
+                    else "--no-deepseek-ane-cpu"
+                ),
+                (
+                    "--deepseek-ane-cpu-shared-resource"
+                    if deepseek_ane.cpu_shared_resource
+                    else "--no-deepseek-ane-cpu-shared-resource"
+                ),
+            ]
+        )
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
     return argv

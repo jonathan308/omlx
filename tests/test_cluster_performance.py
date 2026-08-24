@@ -13,6 +13,7 @@ import pytest
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import DistributedLaunchError, run_cluster_performance_probe
 from omlx.cluster.performance import (
+    DeepseekAnePrefillSettings,
     ExecutionSettings,
     NodePerformanceProfile,
     execution_profile,
@@ -183,6 +184,33 @@ def test_execution_settings_require_a_positive_ssd_snapshot_budget():
 
     with pytest.raises(ValueError, match="prompt_cache_ssd_max_bytes"):
         ExecutionSettings(prompt_cache_ssd_max_bytes=0)
+
+
+def test_deepseek_ane_execution_contract_round_trips_only_when_enabled():
+    disabled = ExecutionSettings()
+    assert "deepseek_ane_prefill" not in disabled.to_dict()
+
+    ane = DeepseekAnePrefillSettings(
+        enabled=True,
+        sequence_length=4096,
+        down_fraction=0.5,
+        wo_a_enabled=False,
+        cpu_enabled=False,
+    )
+    settings = replace(
+        disabled,
+        prefill_step_size=4096,
+        deepseek_ane_prefill=ane,
+    )
+
+    restored = ExecutionSettings.from_dict(settings.to_dict())
+    assert restored == settings
+    assert restored.deepseek_ane_prefill.to_dict()["wo_a_enabled"] is False
+
+
+def test_deepseek_ane_execution_contract_rejects_invalid_tile():
+    with pytest.raises(ValueError, match="multiple of 64"):
+        DeepseekAnePrefillSettings(enabled=True, sequence_length=4095)
 
 
 def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():

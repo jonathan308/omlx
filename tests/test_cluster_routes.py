@@ -995,6 +995,52 @@ def test_selected_context_is_the_runtime_kv_ceiling():
     assert execution.max_kv_size == 262144
 
 
+def _deepseek_ane_execution_request(*, auto_tune: bool):
+    return SimpleNamespace(
+        execution_profile="balanced",
+        auto_tune=auto_tune,
+        sampling_rank_only=True,
+        async_overlap=True,
+        cache_affinity=True,
+        prompt_cache_ssd=True,
+        prompt_cache_ssd_max_bytes=20 * 1024**3,
+        max_kv_size=None,
+        target_context_tokens=262144,
+        ring_connections_per_ip=None,
+        deepseek_ane_prefill=routes.DeepseekAnePrefillRequest(
+            enabled=True,
+            sequence_length=4096,
+            down_fraction=0.5,
+            wo_a_enabled=False,
+            cpu_enabled=False,
+        ),
+    )
+
+
+def test_deepseek_ane_execution_contract_aligns_fixed_prefill_tile():
+    execution = routes._execution_for_request(
+        _deepseek_ane_execution_request(auto_tune=False),
+        [SimpleNamespace(headroom_bytes=32 * 1024**3)],
+        backend="jaccl",
+    )
+
+    assert execution.prefill_step_size == 4096
+    assert execution.deepseek_ane_prefill.enabled is True
+    assert execution.deepseek_ane_prefill.wo_a_enabled is False
+
+
+def test_deepseek_ane_disables_when_memory_tuner_reduces_tile():
+    execution = routes._execution_for_request(
+        _deepseek_ane_execution_request(auto_tune=True),
+        [SimpleNamespace(headroom_bytes=3 * 1024**3)],
+        backend="jaccl",
+    )
+
+    assert execution.prefill_step_size == 512
+    assert execution.deepseek_ane_prefill.enabled is False
+    assert "reduced the prefill step" in execution.tuning_reason
+
+
 def test_low_power_synthetic_profile_cannot_shape_node_budget():
     node = routes.ClusterPlanNodeRequest(
         node_id="m5-max",

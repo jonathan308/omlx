@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -21,6 +21,108 @@ _GIB = 1024**3
 # the 512-entry count guard. Keep a conservative, explicit per-rank ceiling in
 # the signed execution contract; operators can raise it for larger SSDs.
 DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES = 20 * _GIB
+
+
+@dataclass(frozen=True)
+class DeepseekAnePrefillSettings:
+    """Signed per-rank DeepSeek-V4 ANE/GPU/CPU prefill contract."""
+
+    enabled: bool = False
+    sequence_length: int = 4096
+    tail_padding_min_tokens: int = 0
+    down_enabled: bool = True
+    down_fraction: float = 0.5
+    wo_a_enabled: bool = False
+    wo_a_fraction: float = 0.5
+    cpu_enabled: bool = False
+    cpu_fraction: float = 0.125
+    cpu_threads: int = 12
+    cpu_shared_resource: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("DeepSeek ANE enabled flag must be boolean")
+        if (
+            not isinstance(self.sequence_length, int)
+            or isinstance(self.sequence_length, bool)
+            or self.sequence_length < 1024
+            or self.sequence_length % 64
+        ):
+            raise ValueError(
+                "DeepSeek ANE sequence length must be a multiple of 64 >= 1024"
+            )
+        if (
+            not isinstance(self.tail_padding_min_tokens, int)
+            or isinstance(self.tail_padding_min_tokens, bool)
+            or not (
+                self.tail_padding_min_tokens == 0
+                or 2 <= self.tail_padding_min_tokens < self.sequence_length
+            )
+        ):
+            raise ValueError(
+                "DeepSeek ANE tail padding must be zero or within the tile"
+            )
+        for name in ("down_fraction", "wo_a_fraction"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 < float(value) < 1.0
+            ):
+                raise ValueError(f"DeepSeek ANE {name} must be between zero and one")
+        if (
+            isinstance(self.cpu_fraction, bool)
+            or not isinstance(self.cpu_fraction, (int, float))
+            or not math.isfinite(float(self.cpu_fraction))
+            or not 0.0 <= float(self.cpu_fraction) < 0.5
+        ):
+            raise ValueError("DeepSeek ANE CPU fraction must be in [0, 0.5)")
+        if (
+            not isinstance(self.cpu_threads, int)
+            or isinstance(self.cpu_threads, bool)
+            or not 0 <= self.cpu_threads <= 64
+        ):
+            raise ValueError("DeepSeek ANE CPU threads must be in [0, 64]")
+        for name in (
+            "down_enabled",
+            "wo_a_enabled",
+            "cpu_enabled",
+            "cpu_shared_resource",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"DeepSeek ANE {name} must be boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "sequence_length": self.sequence_length,
+            "tail_padding_min_tokens": self.tail_padding_min_tokens,
+            "down_enabled": self.down_enabled,
+            "down_fraction": self.down_fraction,
+            "wo_a_enabled": self.wo_a_enabled,
+            "wo_a_fraction": self.wo_a_fraction,
+            "cpu_enabled": self.cpu_enabled,
+            "cpu_fraction": self.cpu_fraction,
+            "cpu_threads": self.cpu_threads,
+            "cpu_shared_resource": self.cpu_shared_resource,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> DeepseekAnePrefillSettings:
+        if payload is None:
+            return cls()
+        if not isinstance(payload, dict):
+            raise ValueError("DeepSeek ANE settings must be an object")
+        allowed = cls().to_dict()
+        unknown = set(payload) - set(allowed)
+        if unknown:
+            raise ValueError(
+                "DeepSeek ANE settings contain unknown fields: "
+                + ", ".join(sorted(unknown))
+            )
+        allowed.update(payload)
+        return cls(**allowed)
 
 
 def _finite_rate(value: Any, label: str) -> float:
@@ -187,10 +289,15 @@ class ExecutionSettings:
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
     tuning_reason: str = "balanced profile defaults"
+    deepseek_ane_prefill: DeepseekAnePrefillSettings = field(
+        default_factory=DeepseekAnePrefillSettings
+    )
 
     def __post_init__(self) -> None:
         if self.profile not in {"interactive", "balanced", "throughput"}:
             raise ValueError("execution profile is invalid")
+        if not isinstance(self.deepseek_ane_prefill, DeepseekAnePrefillSettings):
+            raise ValueError("deepseek_ane_prefill must be typed settings")
         for name in (
             "decode_concurrency",
             "prompt_concurrency",
@@ -226,7 +333,7 @@ class ExecutionSettings:
             raise ValueError("tuning_reason is required")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "profile": self.profile,
             "auto_tune": self.auto_tune,
             "decode_concurrency": self.decode_concurrency,
@@ -244,6 +351,9 @@ class ExecutionSettings:
             "ring_connections_per_ip": self.ring_connections_per_ip,
             "tuning_reason": self.tuning_reason,
         }
+        if self.deepseek_ane_prefill.enabled:
+            result["deepseek_ane_prefill"] = self.deepseek_ane_prefill.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> ExecutionSettings:
@@ -256,11 +366,14 @@ class ExecutionSettings:
             raise ValueError("execution profile is invalid")
         defaults = execution_profile(profile)
         values = defaults.to_dict()
+        deepseek_ane = DeepseekAnePrefillSettings.from_dict(
+            payload.get("deepseek_ane_prefill")
+        )
         for key in values:
             if key in payload:
                 values[key] = payload[key]
         try:
-            return cls(**values)
+            return cls(**values, deepseek_ane_prefill=deepseek_ane)
         except (TypeError, ValueError) as exc:
             if isinstance(exc, ValueError):
                 raise
