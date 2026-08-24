@@ -52,6 +52,31 @@ sheet, or a certified screen whose total full-pool work is demonstrably below
 the saved exact scan. Projection/MoE work remains the parallel campaign for
 raising the context-independent floor.
 
+## Score/select decomposition and bounded streaming rejection
+
+A later production-runtime replay isolated the real `L=512, P=62,500` graph:
+the qualified MMA score kernel took **28.005 ms**, deterministic top-512 took
+**0.749 ms**, and temporal sorting took **0.252 ms** (**28.660 ms combined**).
+Score generation is therefore 97.7% of this measured path. Eliminating only a
+top-k dispatch or the final score-sheet reread cannot materially change the
+250K taper.
+
+An exact chunk-streamed implementation was also physically rejected. It
+scores contiguous pooled-key chunks, selects each exact local top-512, merges
+the candidates in global temporal order, and preserves the external causal
+mask. At the same `L=512, P=62,500` shape, the complete full-sheet graph was
+**28.51 ms**; 16K chunks took **30.05 ms** and the best 32K chunks took
+**29.08 ms**, with identical final indices. The next hierarchy must reduce
+score arithmetic through a certified native screen; graph chunking by itself
+only adds launch/merge overhead.
+
+The existing rank-48 certificate remains the useful mathematical foundation,
+but its Python/MLX implementation is not a promotion candidate. A productive
+native version must emit grouped upper bounds or compact candidates without a
+full `[L,P]` approximate sheet, reuse the existing BF16 exact MMA rescore, and
+fail closed to the full scan whenever every omitted key is not proven below
+the exact cutoff.
+
 ## Exact M3 MMA partition follow-up
 
 A bounded follow-up kept the production MMA kernel's 64x64 output tile,
