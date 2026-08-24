@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import shutil
@@ -178,7 +179,12 @@ def _capture_prompt_boundary_cache(
     prompt_cache.insert_cache(
         model_key,
         cache_key[:],
-        cache,
+        # ``extract_cache`` returns rank-local views. Generation mutates those
+        # same cache objects after the prompt boundary, which otherwise turns
+        # a correctly keyed prefix into a post-assistant cache by the next
+        # request. MLX-LM already uses deepcopy on fetch; freeze the stored
+        # boundary with the matching operation.
+        copy.deepcopy(cache),
         cache_type="user",
     )
     return len(cache_key)
