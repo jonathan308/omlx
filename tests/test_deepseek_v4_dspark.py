@@ -889,12 +889,11 @@ def test_dspark_ragged_verify_topk_runs_each_row_at_its_exact_width(
 ):
     query_rows = mx.zeros((3, 2, 1, 4), dtype=mx.float32)
     local_rows = [
-        mx.zeros((1, 1, 8 + index, 4), dtype=mx.bfloat16)
-        for index in range(3)
+        mx.zeros((1, 1, 8, 4), dtype=mx.bfloat16) for _index in range(3)
     ]
     pooled_rows = [
         mx.zeros((1, width, 4), dtype=mx.bfloat16)
-        for width in (511, 512, 512)
+        for width in (511, 512, 513)
     ]
     topk_rows = [
         mx.arange(width, dtype=mx.uint32)[None, None]
@@ -920,8 +919,7 @@ def test_dspark_ragged_verify_topk_runs_each_row_at_its_exact_width(
 
     assert calls == [
         (1, 8, 511, 511),
-        (1, 9, 512, 512),
-        (1, 10, 512, 512),
+        (2, 8, 513, 512),
     ]
     assert result.shape == query_rows.shape
     assert result[:, 0, 0, 0].tolist() == [511.0, 512.0, 512.0]
