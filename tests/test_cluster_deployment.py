@@ -179,7 +179,7 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_CLUSTER_PREFILL_SHAPE_WARMUP=1" in envs
     assert "OMLX_DSV4_PREFILL_YIELD=1" in envs
     assert "OMLX_CONTENDED_PREFILL_CHUNK=512" in envs
-    assert "OMLX_DSV4_MIXED_PREFILL_CHUNK=1024" in envs
+    assert "OMLX_DSV4_MIXED_PREFILL_CHUNK=256" in envs
     assert "OMLX_MIXED_PREFILL_MIN_QUANTUM=128" in envs
     assert "OMLX_DSV4_PREFILL_STEP_TRACE=0" in envs
     assert "OMLX_DSV4_PREFILL_ASYNC_DEPTH=0" in envs

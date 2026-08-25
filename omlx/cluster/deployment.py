@@ -190,7 +190,7 @@ _RANK_ENV_DEFAULTS = (
     # Generic schedulers retain their 512/256/128 B1/B2/B4 policy. DS4's
     # physical TP path has its own live-qualified 1024/1024/512 schedule.
     ("OMLX_CONTENDED_PREFILL_CHUNK", "512"),
-    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "1024"),
+    ("OMLX_DSV4_MIXED_PREFILL_CHUNK", "256"),
     ("OMLX_MIXED_PREFILL_MIN_QUANTUM", "128"),
     ("OMLX_DSV4_PREFILL_STEP_TRACE", "0"),
     # Reversible depth-two graph overlap for pure TP2 prefill.  It remains off
