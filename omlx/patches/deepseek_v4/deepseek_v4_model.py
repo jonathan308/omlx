@@ -2677,6 +2677,16 @@ class DeepseekV4MoE(nn.Module):
             y = (y * scores[..., None].astype(y.dtype)).sum(-2)
         y = y + (shared if shared is not None else self.shared_experts(x))
 
+        if overlap_shared:
+            # JACCL uses RDMA buffers from the generation stream.  A lazy
+            # cross-stream dependency is not a sufficient ownership barrier:
+            # the following all_sum can post while the auxiliary command
+            # buffer is still live and lose a completion.  Materialize the
+            # canonical branch sum here, after both independent branches have
+            # already been queued, so their compute may overlap but only the
+            # drained generation stream enters JACCL.
+            mx.eval(y)
+
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
