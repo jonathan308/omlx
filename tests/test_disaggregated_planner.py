@@ -5,8 +5,10 @@ import pytest
 from omlx.cluster.disaggregated import (
     DisaggregatedNodeProfile,
     DisaggregatedWorkload,
+    build_full_replica_shard_plan,
     plan_disaggregated_prefill_decode,
 )
+from omlx.cluster.planner import NodeBudget, PlanningError, synthetic_model_layout
 
 
 def _node(name, *, budget=64_000, resident=16_000, prefill, decode):
@@ -75,4 +77,48 @@ def test_planner_validates_profile_rates_and_threshold():
     with pytest.raises(ValueError, match="minimum steady speedup"):
         plan_disaggregated_prefill_decode(
             nodes, _workload(), minimum_steady_speedup=0.99
+        )
+
+
+def _budget(name: str, rank: int, capacity: int = 64_000):
+    return NodeBudget(
+        node_id=name,
+        capacity_bytes=capacity,
+        reserve_bytes=8_000,
+        rank=rank,
+    )
+
+
+def test_full_replica_plan_assigns_every_layer_and_signs_phase_roles():
+    model = synthetic_model_layout(total_weight_bytes=30_000, layer_count=6)
+    plan = build_full_replica_shard_plan(
+        model,
+        [_budget("m3", 0), _budget("m5", 1)],
+        prefill_rank=1,
+        decode_rank=0,
+        context_tokens=4096,
+    )
+
+    assert plan.serving_mode == "disaggregated"
+    assert plan.prefill_rank == 1
+    assert plan.decode_rank == 0
+    assert plan.pipeline_stages == 1
+    assert [(row.start_layer, row.end_layer) for row in plan.assignments] == [
+        (0, 6),
+        (0, 6),
+    ]
+    assert plan.to_dict()["serving_mode"] == "disaggregated"
+    assert len(plan.plan_hash) == 64
+
+
+def test_full_replica_plan_refuses_a_node_that_cannot_hold_the_model():
+    model = synthetic_model_layout(total_weight_bytes=60_000, layer_count=6)
+
+    with pytest.raises(PlanningError, match="full replica does not fit node m5"):
+        build_full_replica_shard_plan(
+            model,
+            [_budget("m3", 0, 100_000), _budget("m5", 1, 50_000)],
+            prefill_rank=1,
+            decode_rank=0,
+            context_tokens=4096,
         )

@@ -94,6 +94,7 @@ from .performance import (
     tune_execution_settings,
 )
 from .parallel_groups import hybrid_group_split_supported
+from .disaggregated import build_full_replica_shard_plan
 from .planner import (
     LOCAL_NODE,
     NodeBudget,
@@ -461,6 +462,9 @@ class ClusterPlanRequest(BaseModel):
     allocation: Literal["balanced", "proportional"] = "balanced"
     pipeline_microbatch_size: int | None = Field(default=None, gt=0, le=256)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] = "sharded"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
@@ -538,6 +542,9 @@ class ClusterDeploymentRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     tensor_parallel_size: int = Field(default=1, ge=1, le=64)
+    serving_mode: Literal["sharded", "disaggregated"] = "sharded"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
     mtp_enabled: bool = False
     mtp_num_draft_tokens: int | None = Field(default=None, ge=1, le=8)
@@ -1242,6 +1249,32 @@ def _create_cluster_plan(
     tensor_parallel_qualification: TPQualificationProvenance | None = None,
 ):
     model, nodes = _model_and_nodes(request)
+    if request.serving_mode == "disaggregated":
+        if request.tensor_parallel_size != 1:
+            raise PlanningError(
+                "phase-split serving uses complete replicas, not tensor shards"
+            )
+        if request.mtp_enabled or request.mtp_num_draft_tokens is not None:
+            raise PlanningError(
+                "phase-split serving does not yet support speculative decode"
+            )
+        if request.prefill_rank is None or request.decode_rank is None:
+            raise PlanningError(
+                "phase-split serving requires selected prefill and decode Macs"
+            )
+        plan = build_full_replica_shard_plan(
+            model,
+            nodes,
+            prefill_rank=request.prefill_rank,
+            decode_rank=request.decode_rank,
+            context_tokens=request.target_context_tokens,
+            workload_profile=request.execution_profile,
+        )
+        path_map = validate_model_path_map(
+            request.path_map,
+            tuple(node.node_id.strip() for node in request.nodes),
+        )
+        return replace(plan, path_map=path_map) if path_map else plan
     if (
         request.tensor_parallel_size > 1
         and request.tensor_parallel_size < len(nodes)
@@ -1343,7 +1376,9 @@ class ClusterAutoconfigureRequest(BaseModel):
     hosts: list[ClusterHostRequest] = Field(default_factory=list, max_length=64)
     execution_profile: Literal["interactive", "balanced", "throughput"] = "balanced"
     prefer: Literal["speed", "capacity"] = "speed"
-    strategy: Literal["auto", "tensor", "pipeline"] = "auto"
+    strategy: Literal["auto", "tensor", "pipeline", "disaggregated"] = "auto"
+    prefill_rank: int | None = Field(default=None, ge=0, le=63)
+    decode_rank: int | None = Field(default=None, ge=0, le=63)
     detect_transports: bool = True
     preflight: bool = True
     auto_tune: bool = True
@@ -1727,36 +1762,63 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             measurements = {}
 
     try:
-        qualified_tensor_shard_weights = (
-            _operator_qualified_tp_shard_weights(
-                tensor_parallel_size=len(nodes),
-                node_count=len(nodes),
-                model_path=request.model_path,
+        if request.strategy == "disaggregated":
+            if request.prefill_rank is None or request.decode_rank is None:
+                raise PlanningError(
+                    "phase split requires selected prefill and decode Macs"
+                )
+            phase_plan = build_full_replica_shard_plan(
+                model,
+                nodes,
+                prefill_rank=request.prefill_rank,
+                decode_rank=request.decode_rank,
+                context_tokens=request.target_context_tokens,
+                workload_profile=request.execution_profile,
             )
-            if request.strategy != "pipeline"
-            else None
-        )
-        qualification_provenance = (
-            TPQualificationProvenance.environment(
-                qualified_tensor_shard_weights[0]
+            qualified_tensor_shard_weights = None
+            qualification_provenance = None
+            choice = SimpleNamespace(
+                plan=phase_plan,
+                tensor_parallel_size=1,
+                pipeline_stages=1,
+                reason=(
+                    "Each Mac holds a complete model replica. "
+                    f"Rank {request.prefill_rank} processes prompts and rank "
+                    f"{request.decode_rank} owns generation."
+                ),
+                warnings=(),
             )
-            if qualified_tensor_shard_weights is not None
-            else None
-        )
-        choice = choose_parallelism(
-            model,
-            nodes,
-            transports=strategy_transports,
-            prefer=request.prefer,
-            strategy=request.strategy,
-            measurements=measurements,
-            workload_profile=request.execution_profile,
-            context_tokens=request.target_context_tokens,
-            qualified_tensor_shard_weights=qualified_tensor_shard_weights,
-            hybrid_runtime_supported=hybrid_group_split_supported(
-                provisional_backend
-            ),
-        )
+        else:
+            qualified_tensor_shard_weights = (
+                _operator_qualified_tp_shard_weights(
+                    tensor_parallel_size=len(nodes),
+                    node_count=len(nodes),
+                    model_path=request.model_path,
+                )
+                if request.strategy != "pipeline"
+                else None
+            )
+            qualification_provenance = (
+                TPQualificationProvenance.environment(
+                    qualified_tensor_shard_weights[0]
+                )
+                if qualified_tensor_shard_weights is not None
+                else None
+            )
+            choice = choose_parallelism(
+                model,
+                nodes,
+                transports=strategy_transports,
+                prefer=request.prefer,
+                strategy=request.strategy,
+                measurements=measurements,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=qualified_tensor_shard_weights,
+                hybrid_runtime_supported=hybrid_group_split_supported(
+                    provisional_backend
+                ),
+            )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1819,18 +1881,30 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     # stage. Measured bandwidth is used where a node has been probed, so two
     # links of the same kind are not treated as interchangeable.
     link_profiles = _measured_link_profiles(request)
-    placement = order_hosts_for_topology(
-        [host.ssh for host in request.hosts],
-        transports,
-        choice.tensor_parallel_size,
-        link_profiles,
+    placement = (
+        SimpleNamespace(
+            hosts=tuple(requested_host_order),
+            warnings=(),
+            reason="phase roles retain the selected Mac order",
+        )
+        if request.strategy == "disaggregated"
+        else order_hosts_for_topology(
+            [host.ssh for host in request.hosts],
+            transports,
+            choice.tensor_parallel_size,
+            link_profiles,
+        )
     )
     warnings.extend(placement.warnings)
     placed_host_order = list(placement.hosts or requested_host_order)
-    grouped_host_order = _coalesce_verified_cuda_groups(
-        placed_host_order,
-        list(request.hosts),
-        list(request.nodes),
+    grouped_host_order = (
+        placed_host_order
+        if request.strategy == "disaggregated"
+        else _coalesce_verified_cuda_groups(
+            placed_host_order,
+            list(request.hosts),
+            list(request.nodes),
+        )
     )
     if grouped_host_order != placed_host_order:
         warnings.append(
@@ -1862,22 +1936,33 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         # Host order defines rank order. Rebuild the plan against that exact
         # order so assignments, memory budgets and transport endpoints cannot
         # describe three different rank maps.
-        ordered_plan = plan_hybrid(
-            model,
-            ordered_budgets,
-            tensor_parallel_size=choice.tensor_parallel_size,
-            workload_profile=request.execution_profile,
-            context_tokens=request.target_context_tokens,
-            qualified_tensor_shard_weights=(
-                qualified_tensor_shard_weights
-                if choice.tensor_parallel_size == len(ordered_budgets)
-                else None
-            ),
-            tensor_parallel_qualification=(
-                qualification_provenance
-                if choice.tensor_parallel_size == len(ordered_budgets)
-                else None
-            ),
+        ordered_plan = (
+            build_full_replica_shard_plan(
+                model,
+                ordered_budgets,
+                prefill_rank=int(request.prefill_rank),
+                decode_rank=int(request.decode_rank),
+                context_tokens=request.target_context_tokens,
+                workload_profile=request.execution_profile,
+            )
+            if request.strategy == "disaggregated"
+            else plan_hybrid(
+                model,
+                ordered_budgets,
+                tensor_parallel_size=choice.tensor_parallel_size,
+                workload_profile=request.execution_profile,
+                context_tokens=request.target_context_tokens,
+                qualified_tensor_shard_weights=(
+                    qualified_tensor_shard_weights
+                    if choice.tensor_parallel_size == len(ordered_budgets)
+                    else None
+                ),
+                tensor_parallel_qualification=(
+                    qualification_provenance
+                    if choice.tensor_parallel_size == len(ordered_budgets)
+                    else None
+                ),
+            )
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1988,11 +2073,24 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
 
     performance_probe: dict[str, Any] = {
         "ok": False,
-        "status": "disabled",
-        "reason": "automatic performance measurement disabled",
+        "status": (
+            "phase_probe_required"
+            if request.strategy == "disaggregated"
+            else "disabled"
+        ),
+        "reason": (
+            "phase split uses full-model prefill/decode calibration, not the "
+            "sharded synthetic placement probe"
+            if request.strategy == "disaggregated"
+            else "automatic performance measurement disabled"
+        ),
     }
     profiled_request_nodes = list(ordered_request_nodes)
-    existing_profiles = _request_performance_profiles(profiled_request_nodes)
+    existing_profiles = (
+        ()
+        if request.strategy == "disaggregated"
+        else _request_performance_profiles(profiled_request_nodes)
+    )
     if existing_profiles:
         # The first proposal carries these measurements into the post-staging
         # refresh. Reusing them avoids running the same distributed synthetic
@@ -2011,6 +2109,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         and request.model_path
         and len(activation_hosts) >= 2
         and qualification_provenance is None
+        and request.strategy != "disaggregated"
     ):
         try:
             probe_execution = _execution_for_request(
@@ -2179,6 +2278,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "fabric_blocker": _redact_diagnostic(fabric_blocker),
         "tensor_parallel_size": choice.tensor_parallel_size,
         "pipeline_stages": choice.pipeline_stages,
+        "serving_mode": choice.plan.serving_mode,
+        "prefill_rank": choice.plan.prefill_rank,
+        "decode_rank": choice.plan.decode_rank,
         "summary": choice.reason,
         "link": describe_transports(transports),
         "placement": placement.reason,
@@ -2231,6 +2333,9 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
             "tensor_parallel_size": choice.tensor_parallel_size,
+            "serving_mode": choice.plan.serving_mode,
+            "prefill_rank": choice.plan.prefill_rank,
+            "decode_rank": choice.plan.decode_rank,
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
             "preflight": True,
@@ -3755,6 +3860,9 @@ def _create_deployment(
         allocation=request.allocation,
         pipeline_microbatch_size=requested_microbatch,
         tensor_parallel_size=request.tensor_parallel_size,
+        serving_mode=request.serving_mode,
+        prefill_rank=request.prefill_rank,
+        decode_rank=request.decode_rank,
         target_context_tokens=request.target_context_tokens,
         mtp_enabled=request.mtp_enabled,
         mtp_num_draft_tokens=request.mtp_num_draft_tokens,
@@ -3867,6 +3975,9 @@ def _create_deployment(
         target_context_tokens=request.target_context_tokens,
         mtp_enabled=request.mtp_enabled,
         mtp_num_draft_tokens=request.mtp_num_draft_tokens,
+        serving_mode=request.serving_mode,
+        prefill_rank=request.prefill_rank,
+        decode_rank=request.decode_rank,
         path_map=validate_model_path_map(request.path_map, tuple(host_ids)),
         tensor_parallel_qualification=getattr(
             plan, "tensor_parallel_qualification", None

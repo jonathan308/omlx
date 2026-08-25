@@ -469,6 +469,11 @@ class ShardPlan:
     # provenance is part of ``plan_hash``; the same vector from an unqualified
     # source is therefore not silently interchangeable with a proven record.
     tensor_parallel_qualification: TPQualificationProvenance | None = None
+    # Non-sharded phase ownership. Defaults are omitted from serialization so
+    # existing plan hashes/signatures and API snapshots remain unchanged.
+    serving_mode: str = "sharded"
+    prefill_rank: int | None = None
+    decode_rank: int | None = None
 
     @property
     def max_context_tokens(self) -> int:
@@ -532,6 +537,12 @@ class ShardPlan:
         if self.tensor_parallel_qualification is not None:
             result["tensor_parallel_qualification"] = (
                 self.tensor_parallel_qualification.to_dict()
+            )
+        if self.serving_mode == "disaggregated":
+            result.update(
+                serving_mode="disaggregated",
+                prefill_rank=self.prefill_rank,
+                decode_rank=self.decode_rank,
             )
         return result
 

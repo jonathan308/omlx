@@ -941,6 +941,57 @@ def test_autoconfigure_reorders_nodes_and_hosts_as_one_rank_map(monkeypatch):
     )
 
 
+def test_autoconfigure_builds_signed_full_replica_phase_split():
+    from fastapi.testclient import TestClient
+
+    payload = _autoconfigure_payload()
+    payload.update(
+        strategy="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        auto_tune=False,
+        preflight=False,
+    )
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 200, response.text
+    proposal = response.json()
+    plan = proposal["plan"]
+    activation = proposal["activation"]
+    assert proposal["serving_mode"] == "disaggregated"
+    assert proposal["tensor_parallel_size"] == 1
+    assert proposal["pipeline_stages"] == 1
+    assert plan["serving_mode"] == "disaggregated"
+    assert plan["prefill_rank"] == 1
+    assert plan["decode_rank"] == 0
+    assert [row["layer_count"] for row in plan["assignments"]] == [32, 32]
+    assert activation["serving_mode"] == "disaggregated"
+    assert activation["prefill_rank"] == 1
+    assert activation["decode_rank"] == 0
+    assert proposal["performance_probe"]["status"] == "phase_probe_required"
+    assert activation["approved_placement"] == plan["placement_signature"]
+
+
+def test_autoconfigure_phase_split_refuses_a_partial_replica_fit():
+    from fastapi.testclient import TestClient
+
+    payload = _autoconfigure_payload(capacity_gib=32)
+    payload.update(
+        strategy="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        preflight=False,
+    )
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 400
+    assert "full replica does not fit" in response.json()["detail"]
+
+
 def test_placement_falls_back_loudly_when_the_fabric_will_not_split():
     """Better to say so than to silently put an all-reduce on Ethernet."""
 
