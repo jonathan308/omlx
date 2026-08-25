@@ -27,10 +27,10 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
-    _MTPVocabCoordinator,
     _deepseek_v4_fused_decode_capability,
     _deepseek_v4_outer_prefill_step,
     _indexer_row_parallel_capability,
+    _MTPVocabCoordinator,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
 )
