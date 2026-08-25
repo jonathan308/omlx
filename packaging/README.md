@@ -12,13 +12,22 @@ this directory only hands it a `_export/` tree of Python layers.
 
 ## Requirements
 
-- macOS 15.0+ (Sequoia) — required by MLX ≥ 0.29.2
-- Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+ on the host
+- macOS 26 (Tahoe) for this Fusion cluster beta (Path B). Do not label the
+  bundled runtime as macOS 15-26.
+- Apple Silicon
+- Python 3.11 on the host (the embedded runtime is cpython-3.11)
+- Guarded local `mlx` / `mlx-metal` **cp311** wheels at
+  `packaging/_wheels/guarded/` — see
+  [docs/packaging-guarded-mlx.md](../docs/packaging-guarded-mlx.md).
+  CPython 3.13 wheels from `guard-0321-rollback/` are not drop-in.
 - venvstacks (installed via `pip install -e ".[dev]"` from the repo
   root, or any of `uv`, `pipx run`)
 
 ## Build
+
+Do **not** run the commands below on the live Fusion Studio / cluster
+coordinator while it is serving DS4. Wait for a later window or a
+GitHub-hosted macos-26 runner that is not that machine.
 
 ```bash
 # Re-export the venvstacks layers (cold ~10-20 min, warm ~4 min)
@@ -34,7 +43,7 @@ Then the Swift bundle:
 ```bash
 apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle GLM-5.2 / MiniMax M3 native kernels
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # glm_moe_dsa/DS4, decode_fast, qwen35_prefill (NAX/ANE), minimax_m3, bonsai
 ```
 
 ## Output
@@ -43,7 +52,7 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle GLM-5.2 / 
 packaging/
 ├── _build/         # venvstacks intermediate layers
 ├── _export/        # venvstacks export — embedded into the .app
-└── _wheels/        # cached local wheels (e.g. mlx + mlx-metal pins)
+└── _wheels/guarded/ # operator-supplied mlx + mlx-metal cp311 pair (not git)
 ```
 
 ## Layer Configuration

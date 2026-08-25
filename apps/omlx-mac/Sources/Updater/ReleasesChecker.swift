@@ -4,7 +4,8 @@
 // single source of truth for distribution. No appcast XML, no EdDSA key
 // management on the maintainer side. Pulls a page of releases, picks the
 // latest stable PEP 440 tag, and selects the DMG asset whose filename
-// embeds the current macOS major version (e.g. `-macos15-` or `-macos26-`).
+// embeds the current macOS major version. This Fusion Path B beta ships
+// `-macos26-` only; a `macos15-26` range asset must not be chosen on 26.
 //
 // Channel handling: Stable accepts final tags only, Release Candidate also
 // accepts rc tags, and Dev accepts dev/pre-release tags. GitHub's
@@ -310,9 +311,9 @@ enum ReleasesChecker {
     }
 
     /// Pick the DMG asset whose filename embeds the current macOS major
-    /// version (e.g. `-macos15-` / `-macos26-` / `-macos15_`). Version
-    /// ranges such as `-macos26-27.` are accepted after exact matches.
-    /// Falls back to the single DMG when there's only one.
+    /// version (e.g. `-macos26-` / `-macos15-`). Exact majors win.
+    /// Forward ranges such as `-macos26-27.` are accepted after exact
+    /// matches. A `macos15-26` span is not a macOS 26 asset for this beta.
     static func findMatchingDMG(assets: [GitHubRelease.Asset]) -> GitHubRelease.Asset? {
         findMatchingDMG(assets: assets, macOSMajor: currentMacOSMajor())
     }
@@ -335,11 +336,27 @@ enum ReleasesChecker {
             return exact
         }
         if let ranged = candidates.first(where: { candidate in
-            candidate.ranges.contains { $0.contains(macOSMajor) }
+            candidate.ranges.contains { range in
+                guard range.contains(macOSMajor) else { return false }
+                // Path B: never treat macos15-26 as macOS 26.
+                if macOSMajor == 26 && range.lowerBound < 26 {
+                    return false
+                }
+                return true
+            }
         })?.asset {
             return ranged
         }
-        return dmgs.count == 1 ? dmgs[0] : nil
+        if dmgs.count == 1 {
+            let only = dmgs[0]
+            let ranges = macOSMajorRanges(in: only.name)
+            if macOSMajor == 26,
+               ranges.contains(where: { $0.lowerBound < 26 && $0.contains(26) }) {
+                return nil
+            }
+            return only
+        }
+        return nil
     }
 
     private static func macOSMajorRanges(in assetName: String) -> [ClosedRange<Int>] {

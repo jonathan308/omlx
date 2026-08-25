@@ -65,6 +65,14 @@ _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 NATIVE_AVAILABLE = _ext is not None
 
 
+def is_native_available() -> bool:
+    return NATIVE_AVAILABLE
+
+
+def import_error() -> Exception | None:
+    return _IMPORT_ERROR
+
+
 def _composed_rms_norm_residual(
     x: mx.array, weight: mx.array, residual: mx.array, eps: float
 ) -> Tuple[mx.array, mx.array]:
@@ -213,6 +221,8 @@ def sparse_attn_decode(
 
 __all__ = [
     "NATIVE_AVAILABLE",
+    "is_native_available",
+    "import_error",
     "rms_norm_residual",
     "sdpa_decode",
     "rope_kv_append",

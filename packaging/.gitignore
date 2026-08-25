@@ -3,6 +3,8 @@ _build/
 _export/
 dist/
 requirements/
+_wheels/*.whl
+_wheels/guarded/*.whl
 
 # Python
 __pycache__/

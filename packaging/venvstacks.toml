@@ -41,6 +41,10 @@ dynlib_exclude = [
 
 [tool.uv]
 exclude-newer = "2026-04-23T00:00:00Z"
+# Local cp311 mlx/mlx-metal pair. Without this, uv would look on PyPI and
+# could land stock 0.32.0 or 0.32.2. Wheels are not committed; see
+# packaging/_wheels/guarded/README.md.
+find-links = ["_wheels/guarded"]
 environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]

@@ -6,7 +6,7 @@ from setuptools import setup
 
 CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
 TRUTHY = {"1", "true", "yes", "on"}
-DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
+DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "26.0"
 
 
 def _with_custom_kernel() -> bool:
