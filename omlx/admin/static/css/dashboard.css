@@ -49,6 +49,17 @@
     [data-theme="dark"] .text-neutral-400 { color: var(--text-muted) !important; }
     [data-theme="dark"] .text-neutral-300 { color: var(--text-muted) !important; }
 
+    /* Cluster status is operational data, not decorative helper copy. Keep
+       its cache/fabric labels and request metrics readable in dark mode even
+       when the global muted palette is intentionally subtle. */
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-600,
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-500 {
+        color: #d4d4d8 !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-active] .text-neutral-400 {
+        color: #a1a1aa !important;
+    }
+
     /* === Borders === */
     [data-theme="dark"] .border-neutral-100 { border-color: var(--border-faint) !important; }
     [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
