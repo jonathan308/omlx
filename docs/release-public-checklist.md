@@ -67,9 +67,12 @@ before future Xcode pin changes instead of assuming `macos-latest` is stable.
    release commit, and only then create and push a matching tag such as
    `v0.6.4b1`. Prefer a protected, signed tag. **Do not create `v0.6.4b1`
    until the guarded cp311 wheels exist and have been reviewed.**
-2. On macOS 26, build the matched mlx/mlx-metal pair with
-   `scripts/build_guarded_mlx_cp311_wheels.sh` and place them in
-   `packaging/_wheels/guarded/`. See [packaging-guarded-mlx.md](packaging-guarded-mlx.md).
+2. **Do not compile on the live Fusion Studio / cluster coordinator
+   while it is serving DS4.** cp311 mlx-metal builds wait for a later
+   window or a GitHub-hosted `macos-26` runner that is not that machine.
+   Never run `scripts/build_guarded_mlx_cp311_wheels.sh`,
+   `setup.py build_ext`, or `apps/omlx-mac/Scripts/build.sh` there.
+   When an idle Mac exists, see [packaging-guarded-mlx.md](packaging-guarded-mlx.md).
 3. Run `Signed macOS DMG` manually and enter that existing tag. Approve the
    `macos-release` environment only after confirming the tag resolves to the
    intended reviewed commit.

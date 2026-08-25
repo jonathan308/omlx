@@ -25,9 +25,14 @@ were built for **CPython 3.13**. They cannot be copied into this cp311
 venvstacks layer. A matched **frontend + backend** pair must be rebuilt from
 `26421e953` with Python 3.11.
 
-## Build the pair (macOS 26 + Metal)
+## Build the pair later (not the live Studio)
 
-This Linux cloud VM cannot compile Metal. On a Mac:
+Do **not** compile Metal, run `setup.py build_ext`, or run
+`apps/omlx-mac/Scripts/build.sh` on the Fusion Studio that is serving
+live DS4, and do not send this to a self-hosted Mac that is the cluster
+coordinator. This Linux cloud VM also cannot compile Metal.
+
+When an idle GitHub-hosted macos-26 runner or later window exists:
 
 ```bash
 scripts/build_guarded_mlx_cp311_wheels.sh

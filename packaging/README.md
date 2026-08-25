@@ -25,6 +25,10 @@ this directory only hands it a `_export/` tree of Python layers.
 
 ## Build
 
+Do **not** run the commands below on the live Fusion Studio / cluster
+coordinator while it is serving DS4. Wait for a later window or a
+GitHub-hosted macos-26 runner that is not that machine.
+
 ```bash
 # Re-export the venvstacks layers (cold ~10-20 min, warm ~4 min)
 python packaging/build.py --venvstacks-only

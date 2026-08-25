@@ -125,8 +125,10 @@ def _guarded_wheel_error(detail: str) -> None:
         "    Do not use CPython 3.13 wheels from "
         "minimax-m3-cluster/runtime_patches/variants/guard-0321-rollback/; "
         "those are not drop-in for this runtime.\n"
-        "    Next step (macOS 26 + Metal, not this Linux VM):\n"
-        "      scripts/build_guarded_mlx_cp311_wheels.sh",
+        "    Next step: wait for a later window or a GitHub-hosted macos-26 "
+        "runner that is NOT the live Fusion Studio / DS4 cluster coordinator.\n"
+        "    Do not run scripts/build_guarded_mlx_cp311_wheels.sh, "
+        "setup.py build_ext, or apps/omlx-mac/Scripts/build.sh on that machine.",
         file=sys.stderr,
     )
     sys.exit(1)

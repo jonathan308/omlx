@@ -23,7 +23,7 @@ Expected artifact after the release gates pass:
 | Concurrent generation | Passed | Qwen completed four 512-token streams at 216.3 aggregate tok/s; DS4 completed its qualified B4 run at 69.3 aggregate tok/s. |
 | Functional greedy parity | Passed with limitation | With thinking disabled, four of six Qwen cases were token-exact and two of six were semantically equivalent. This is not a bit-exact or token-exact parity claim. |
 | Version and tag | Source bumped; tag blocked | `omlx/_version.py` is `0.6.4b1`. Do not create `v0.6.4b1` until the guarded cp311 wheels are reviewed. |
-| Guarded MLX pin | Blocked on macOS wheel build | Pin `0.32.1.dev20260825+26421e953` from `26421e953`. Never 0.32.2. cp313 rollback wheels are not drop-in. |
+| Guarded MLX pin | Blocked: not on the live Studio | Pin `0.32.1.dev20260825+26421e953` from `26421e953`. Never 0.32.2. cp313 rollback wheels are not drop-in. Do **not** compile on the DS4-serving Studio / cluster coordinator. |
 | Signed, notarized DMG | Blocked | macOS 26-only artifact name `oMLX-0.6.4b1-macos26-arm64.dmg`. Add Apple secrets and `APPLE_TEAM_ID` to `macos-release`. |
 
 Do not advertise this candidate as signed, notarized, or downloadable until the

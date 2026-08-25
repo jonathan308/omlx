@@ -40,12 +40,20 @@ Rebuild with `OMLX_WITH_CUSTOM_KERNEL=1` against the guarded cp311 pair:
 `apps/omlx-mac/Scripts/build.sh release --with-custom-kernel` is the DMG
 path. Default kernel deployment target is **26.0**.
 
-## Next local / macOS step
+## Next local / macOS step (not the live Studio)
 
-This pin does **not** include wheel binaries. On a macOS 26 Apple Silicon
-machine with Xcode 26.6 and CPython 3.11:
+This pin does **not** include wheel bytes. **Do not** run
+`scripts/build_guarded_mlx_cp311_wheels.sh`, `setup.py build_ext`, or
+`apps/omlx-mac/Scripts/build.sh` on the Studio that is serving live DS4,
+and do not send this work to a self-hosted Mac worker / private machine
+that is the in-use cluster coordinator.
+
+cp311 `mlx` / `mlx-metal` compile waits for a later window or a
+**GitHub-hosted** `macos-26` runner that is not that coordinator. When
+that idle Mac exists, with Xcode 26.6 and CPython 3.11:
 
 ```bash
+export OMLX_I_AM_NOT_THE_LIVE_CLUSTER_COORDINATOR=1
 scripts/build_guarded_mlx_cp311_wheels.sh
 ```
 

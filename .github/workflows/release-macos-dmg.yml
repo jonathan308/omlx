@@ -19,9 +19,20 @@ concurrency:
 jobs:
   build-unsigned-app:
     name: Build unsigned arm64 app
+    # GitHub-hosted macos-26 only. Do not retarget to a self-hosted Mac that
+    # is the live Fusion cluster coordinator (Studio serving DS4).
     runs-on: macos-26
     timeout-minutes: 120
     steps:
+      - name: Refuse self-hosted cluster coordinator
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "this job must run on GitHub-hosted macos-26, not a self-hosted Mac" >&2
+            echo "the live Fusion Studio / cluster coordinator serving DS4 is off-limits" >&2
+            exit 1
+          fi
+
       - name: Check out the release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -121,12 +132,22 @@ jobs:
   sign-notarize-release:
     name: Sign, notarize, and draft release
     needs: build-unsigned-app
+    # GitHub-hosted macos-26 only. Do not retarget to the live Fusion coordinator.
     runs-on: macos-26
     timeout-minutes: 180
     environment: macos-release
     permissions:
       contents: write
     steps:
+      - name: Refuse self-hosted cluster coordinator
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "this job must run on GitHub-hosted macos-26, not a self-hosted Mac" >&2
+            echo "the live Fusion Studio / cluster coordinator serving DS4 is off-limits" >&2
+            exit 1
+          fi
+
       # Release tooling and entitlements come from the protected default
       # branch, while the untrusted/tagged app payload comes from the prior
       # secretless job.

@@ -3,6 +3,11 @@
 # jonathan308/mlx@26421e953 for the Fusion DMG.
 #
 # Metal-only. Do not run on Linux. Does not invent wheel bytes.
+#
+# HARD STOP: do not run this on the live Fusion Studio / cluster
+# coordinator while it is serving DS4. Do not send it to a self-hosted
+# Mac worker that is that machine. Wait for a later window or a
+# GitHub-hosted macos-26 runner that is not the coordinator.
 
 set -euo pipefail
 
@@ -16,6 +21,9 @@ die() {
     echo "build_guarded_mlx_cp311_wheels.sh: error: $*" >&2
     exit 1
 }
+
+[ "${OMLX_I_AM_NOT_THE_LIVE_CLUSTER_COORDINATOR:-}" = "1" ] || die \
+    "refusing to compile Metal on a machine that might be the live DS4 Studio. Wait for a later window or a GitHub-hosted macos-26 runner that is not the cluster coordinator. To proceed on an idle Mac, export OMLX_I_AM_NOT_THE_LIVE_CLUSTER_COORDINATOR=1"
 
 [ "$(uname -s)" = "Darwin" ] || die "Metal wheels must be built on macOS, not $(uname -s)"
 [ "$(uname -m)" = "arm64" ] || die "expected Apple Silicon arm64, got $(uname -m)"

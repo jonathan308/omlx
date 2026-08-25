@@ -57,3 +57,21 @@ def test_docs_reject_cp313_rollback_wheels(rel):
     assert "not drop-in" in text or "not drop-in" in text.lower()
     assert "26421e953" in text
     assert "0.32.2" in text
+
+
+def test_live_studio_coordinator_is_off_limits_for_metal_compile():
+    docs = " ".join(
+        _read(rel)
+        for rel in (
+            "docs/packaging-guarded-mlx.md",
+            "docs/release-public-checklist.md",
+            "scripts/build_guarded_mlx_cp311_wheels.sh",
+            ".github/workflows/release-macos-dmg.yml",
+        )
+    )
+    assert "serving live DS4" in docs or "serving DS4" in docs
+    assert "cluster coordinator" in docs
+    assert "OMLX_I_AM_NOT_THE_LIVE_CLUSTER_COORDINATOR" in _read(
+        "scripts/build_guarded_mlx_cp311_wheels.sh"
+    )
+    assert "github-hosted" in _read(".github/workflows/release-macos-dmg.yml")
