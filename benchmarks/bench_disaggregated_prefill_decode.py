@@ -115,8 +115,15 @@ def main() -> int:
     result_event = next(
         (event for event in events if event.get("type") == "result"), None
     )
+    error_events = [event for event in events if event.get("type") == "error"]
+    effective_returncode = (
+        completed.returncode
+        if completed.returncode != 0
+        else (0 if result_event is not None and not error_events else 1)
+    )
     report = {
-        "returncode": completed.returncode,
+        "returncode": effective_returncode,
+        "launcher_returncode": completed.returncode,
         "events": events,
         "result": result_event,
         "stdout_tail": completed.stdout.splitlines()[-40:],
@@ -127,7 +134,7 @@ def main() -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
-    return completed.returncode
+    return effective_returncode
 
 
 if __name__ == "__main__":

@@ -286,7 +286,11 @@ def send_cache_transfer(
     mx.eval(mx.distributed.send(length, dst, group=group))
     mx.eval(mx.distributed.send(manifest_array, dst, group=group))
     for value in prepared.arrays:
-        wire_value = value if value.flags.row_contiguous else mx.contiguous(value)
+        # Python ``mlx.core.array`` intentionally does not expose the C++
+        # ``flags()`` API. Always materialize a dense wire view; this is a
+        # no-op for already-contiguous cache tensors and preserves the same
+        # storage contract safetensors would reconstruct on the decoder.
+        wire_value = mx.contiguous(value)
         mx.eval(mx.distributed.send(wire_value, dst, group=group))
     mx.synchronize()
     return CacheTransferStats(
