@@ -49,6 +49,10 @@ _MAX_TARGETED_CANCEL_REQUESTS = 256
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
 _DSML_TOOL_CALL_START = "<｜DSML｜tool_calls>"
 _DSML_TOOL_CALL_END = "</｜DSML｜tool_calls>"
+_DSML_INVOKE_START = "<｜DSML｜invoke "
+_DSML_INVOKE_END = "</｜DSML｜invoke>"
+_DSML_PARAMETER_START = "<｜DSML｜parameter "
+_DSML_PARAMETER_END = "</｜DSML｜parameter>"
 
 
 def _valid_transport_request_id(value: Any) -> bool:
@@ -896,6 +900,20 @@ raise SystemExit(2)
             tool_parser=parse_tool_call,
         )
         cleaned, parsed = parse_tool_calls(text, protocol, tools)
+        if not parsed and _DSML_TOOL_CALL_END not in text:
+            repaired = DistributedBatchedEngine._repair_truncated_dsml(text)
+            if repaired is not None:
+                repaired_cleaned, parsed = parse_tool_calls(
+                    repaired,
+                    protocol,
+                    tools,
+                )
+                if parsed:
+                    cleaned = repaired_cleaned
+                    logger.warning(
+                        "Recovered a structurally truncated DeepSeek DSML "
+                        "tool call at the distributed adapter boundary"
+                    )
         if not parsed:
             return cleaned, None
         normalized = [
@@ -907,6 +925,55 @@ raise SystemExit(2)
             for call in parsed
         ]
         return cleaned, normalized or None
+
+    @staticmethod
+    def _repair_truncated_dsml(text: str) -> str | None:
+        """Close one tail-truncated DSML call without guessing JSON values.
+
+        DeepSeek sometimes emits the complete function name/parameter value,
+        then stops before its deterministic XML close tags. Repair only one
+        trailing parameter/invoke/envelope stack. Multiple unmatched opens,
+        extra closes, or a second envelope remain non-executable recovery text.
+        """
+
+        start = text.find(_DSML_TOOL_CALL_START)
+        if start < 0 or text.find(_DSML_TOOL_CALL_START, start + 1) >= 0:
+            return None
+        prefix = text[:start]
+        block = text[start:]
+
+        def imbalance(open_marker: str, close_marker: str) -> int:
+            return block.count(open_marker) - block.count(close_marker)
+
+        parameter_gap = imbalance(_DSML_PARAMETER_START, _DSML_PARAMETER_END)
+        invoke_gap = imbalance(_DSML_INVOKE_START, _DSML_INVOKE_END)
+        envelope_gap = imbalance(_DSML_TOOL_CALL_START, _DSML_TOOL_CALL_END)
+        if any(gap not in (0, 1) for gap in (parameter_gap, invoke_gap, envelope_gap)):
+            return None
+        if envelope_gap != 1 or block.count(_DSML_INVOKE_START) != 1:
+            return None
+
+        if parameter_gap:
+            last_open = block.rfind(_DSML_PARAMETER_START)
+            insertion_candidates = [
+                position
+                for position in (
+                    block.find(_DSML_INVOKE_END, last_open),
+                    block.find(_DSML_TOOL_CALL_END, last_open),
+                )
+                if position >= 0
+            ]
+            insertion = min(insertion_candidates) if insertion_candidates else len(block)
+            block = block[:insertion] + _DSML_PARAMETER_END + block[insertion:]
+
+        if invoke_gap:
+            envelope_end = block.find(_DSML_TOOL_CALL_END)
+            insertion = envelope_end if envelope_end >= 0 else len(block)
+            block = block[:insertion] + _DSML_INVOKE_END + block[insertion:]
+
+        if _DSML_TOOL_CALL_END not in block:
+            block += _DSML_TOOL_CALL_END
+        return prefix + block
 
     @staticmethod
     def _dsml_stream_filter(tools: list[dict[str, Any]] | None) -> Any | None:
