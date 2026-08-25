@@ -1731,6 +1731,22 @@ class TestBatchGeneratorDispatch:
 
         assert attention._omlx_decode_consistent is True
 
+    def test_single_lane_allows_mtp_with_queued_but_unadmitted_request(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        batch_gen = SimpleNamespace(
+            completion_batch_size=1,
+            _generation_batch=SimpleNamespace(uids=[7]),
+            _prompt_batch=[],
+            _currently_processing=[],
+            _unprocessed_sequences=[object()],
+        )
+
+        assert batch_generator._batch_generator_allows_mtp_activation(batch_gen)
+
+        batch_gen._prompt_batch = [object()]
+        assert not batch_generator._batch_generator_allows_mtp_activation(batch_gen)
+
     def test_singleton_recovery_clears_marker_when_cache_compact(self):
         # A batch that shrinks back to one row with no residual left padding
         # satisfies the singleton-init invariant again, so the multirow

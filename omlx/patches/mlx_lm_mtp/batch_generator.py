@@ -404,11 +404,19 @@ def _model_mtp_decode_enabled(model: Any) -> bool:
 def _batch_generator_allows_mtp_activation(batch_gen: Any) -> bool:
     """True when lazy MTP activation cannot race with a pending batch merge."""
     try:
-        return (
-            len(getattr(batch_gen, "_unprocessed_sequences", [])) == 0
-            and len(getattr(batch_gen, "_prompt_batch", [])) == 0
-            and len(getattr(batch_gen, "_currently_processing", [])) == 0
+        prompt_empty = len(getattr(batch_gen, "_prompt_batch", [])) == 0
+        processing_empty = (
+            len(getattr(batch_gen, "_currently_processing", [])) == 0
         )
+        if not prompt_empty or not processing_empty:
+            return False
+        generation_batch = getattr(batch_gen, "_generation_batch", None)
+        completion_limit = int(getattr(batch_gen, "completion_batch_size", 0))
+        if completion_limit == 1 and generation_batch is not None:
+            # The pinned generator returns immediately after this one decode
+            # row; queued, not-yet-admitted prompts cannot merge this turn.
+            return len(getattr(generation_batch, "uids", ()) or ()) == 1
+        return len(getattr(batch_gen, "_unprocessed_sequences", [])) == 0
     except Exception:
         return False
 
