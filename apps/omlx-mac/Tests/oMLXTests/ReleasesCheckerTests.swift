@@ -145,6 +145,12 @@ final class ReleasesCheckerTests: XCTestCase {
                 macOSMajor: 15
             )
         )
+        XCTAssertNil(
+            ReleasesChecker.findMatchingDMG(
+                assets: [asset(mislabeledRange)],
+                macOSMajor: 26
+            )
+        )
     }
 
     func testFindMatchingDMGPrefersExactAssetOverRangeAsset() {

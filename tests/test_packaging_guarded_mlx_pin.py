@@ -112,3 +112,41 @@ def test_install_mlx_variant_script_closes_fusion_hole():
     )
     assert stock.returncode != 0
     assert "0.32.0" in stock.stderr or "stock" in stock.stderr.lower()
+
+
+def test_version_is_064b1():
+    assert _read("omlx/_version.py").strip() == '__version__ = "0.6.4b1"'
+
+
+def test_deployment_targets_are_macos26_nax_stays_262():
+    setup = _read("setup.py")
+    assert 'DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "26.0"' in setup
+    assert 'DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"' not in setup
+    build = _read("apps/omlx-mac/Scripts/build.sh")
+    assert "OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-26.0}" in build
+    assert "--minimum-deployment-target 26.0" in build
+    pbx = _read("apps/omlx-mac/oMLX.xcodeproj/project.pbxproj")
+    assert "MACOSX_DEPLOYMENT_TARGET = 26.0;" in pbx
+    assert "MACOSX_DEPLOYMENT_TARGET = 15.0;" not in pbx
+    nax = _read("omlx/custom_kernels/qwen35_prefill/csrc/CMakeLists.txt")
+    assert "-mmacosx-version-min=26.2" in nax
+
+
+def test_build_sh_includes_bonsai_and_decode_fast():
+    text = _read("apps/omlx-mac/Scripts/build.sh")
+    assert "omlx/custom_kernels/decode_fast" in text
+    assert "omlx/custom_kernels/bonsai" in text
+    assert "omlx_decode_fast_kernels.metallib" in text
+    assert "omlx_bonsai_kernels.metallib" in text
+
+
+def test_updater_requires_exact_macos26_not_15_26_range():
+    src = _read("apps/omlx-mac/Sources/Updater/ReleasesChecker.swift")
+    tests = _read("apps/omlx-mac/Tests/oMLXTests/ReleasesCheckerTests.swift")
+    assert "macos15-26" in tests
+    assert 'tahoeOnly = "oMLX-0.6.4b1-macos26-arm64.dmg"' in tests
+    assert "macOSMajor == 26 && range.lowerBound < 26" in src
+    assert "pypi.org/pypi/mlx" not in _read("packaging/build.py")
+    build = _read("packaging/build.py")
+    assert "pip\", \"download\"" not in build.split("def swap_platform_wheels", 1)[1].split("def _parse_git_requirements", 1)[0]
+    assert "https://pypi.org/pypi/mlx/json" not in build

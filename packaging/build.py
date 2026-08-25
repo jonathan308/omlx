@@ -242,9 +242,17 @@ def swap_platform_wheels(
     """Install the guarded local mlx/mlx-metal wheels into the export.
 
     Never downloads from PyPI. Path B of this beta is macOS 26-only; the
-    local wheels must already be a macosx_26_* cp311 pair.
+    local wheels must already be a macosx_26_* cp311 pair. Passing
+    --macos-target 15.0 (or any non-26.0 tag) is refused so this cannot
+    fall back to Fusion's old pip-download swap.
     """
     import zipfile
+
+    if macos_target != "26.0":
+        _guarded_wheel_error(
+            f"--macos-target {macos_target} is not Path B 26.0; "
+            "refusing PyPI platform-wheel swap"
+        )
 
     if python_version != "3.11":
         _guarded_wheel_error(
@@ -1230,9 +1238,10 @@ def main():
                              "staged omlx package directory and exit. "
                              "`build.sh` uses this after copying Resources/omlx.")
     parser.add_argument("--macos-target",
-                        help="Install the guarded local mlx/mlx-metal wheels "
-                             "for this macOS tag (Path B: 26.0). Never "
-                             "downloads mlx from PyPI.")
+                        help="Path B: only 26.0. Bypasses the old PyPI "
+                             "mlx/mlx-metal platform-wheel swap and installs "
+                             "guarded 0.32.1.dev20260825+26421e953 cp311 "
+                             "wheels from packaging/_wheels/guarded.")
     args = parser.parse_args()
 
     if args.print_fingerprint:
@@ -1255,6 +1264,12 @@ def main():
 
     build_venvstacks()
     if args.macos_target:
+        if args.macos_target != "26.0":
+            _guarded_wheel_error(
+                f"--macos-target {args.macos_target} is not Path B 26.0; "
+                "PyPI mlx/mlx-metal swap is disabled for this beta"
+            )
+        # Bypass Fusion's pip-download swap. Stage/install local guarded wheels.
         swap_platform_wheels(EXPORT_DIR, args.macos_target)
     _write_export_fingerprint()
     print("\n" + "=" * 50)
