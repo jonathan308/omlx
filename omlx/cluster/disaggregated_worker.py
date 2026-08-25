@@ -249,6 +249,7 @@ def run(args: argparse.Namespace) -> int:
             )
             remote_metrics = mx.distributed.recv((2,), mx.float32, 1, group=group)
             mx.eval(remote_tokens_array, remote_metrics)
+            mx.synchronize()
             remote_tokens = [int(value) for value in remote_tokens_array.tolist()]
             remote_decode_seconds, remote_recv_seconds = (
                 float(value) for value in remote_metrics.tolist()
@@ -321,6 +322,10 @@ def run(args: argparse.Namespace) -> int:
         )
         mx.eval(mx.distributed.send(token_array, 0, group=group))
         mx.eval(mx.distributed.send(metrics, 0, group=group))
+        # JACCL send is an MLX primitive. Evaluation queues it, while an
+        # explicit stream drain keeps the rank process and source buffers alive
+        # until the peer has consumed the final result frames.
+        mx.synchronize()
         _event(
             {
                 "type": "decode_complete",

@@ -119,7 +119,13 @@ def main() -> int:
     effective_returncode = (
         completed.returncode
         if completed.returncode != 0
-        else (0 if result_event is not None and not error_events else 1)
+        else (
+            0
+            if result_event is not None
+            and result_event.get("parity") is True
+            and not error_events
+            else 1
+        )
     )
     report = {
         "returncode": effective_returncode,
