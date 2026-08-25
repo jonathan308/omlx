@@ -303,9 +303,17 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     assert "data-cluster-v2-active-fabric" in template
     assert "data-cluster-v2-runtime-state" in template
     assert "data-cluster-v2-deactivate" in template
+    assert "data-cluster-v2-model-lifecycle" in template
+    assert "data-cluster-v2-change-model" in template
+    assert "data-cluster-v2-unload-weights" in template
+    assert "data-cluster-v2-load-weights" in template
+    assert "data-cluster-v2-change-model-confirm" in template
     assert "configuredDeployment()" in template
     assert "deploymentStatus().label" in template
     assert "deactivateDeployment" in javascript
+    assert "changeClusterModel" in javascript
+    assert "unloadDeploymentWeights" in javascript
+    assert "loadDeploymentWeights" in javascript
     assert "Tailscale control" in javascript
     assert "Inference: JACCL over Thunderbolt RDMA" in javascript
     assert "device links below are control/discovery routes" in template
@@ -321,6 +329,127 @@ def test_configured_deployment_panel_lists_devices_and_deactivates():
     # alias that made the live page render "this model".
     assert deployments["deployments"][0]["model"].endswith("minimax-m3")
     assert "model_path" not in deployments["deployments"][0]
+
+
+def test_change_model_reuses_onboarding_with_current_serving_settings():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+global.setTimeout = () => 0;
+const deployment = {
+  deployment_id: 'pool-a', model: '/models/old',
+  target_context_tokens: 131072,
+  execution: {
+    profile: 'throughput', prompt_cache_ssd: true,
+    prompt_cache_ssd_max_bytes: 20 * (1024 ** 3),
+  },
+  assignments: [
+    { node_id: 'node-a', role: 'workstation' },
+    { node_id: 'node-b', role: 'headless' },
+  ],
+};
+component.deploymentsPayload = [deployment];
+component.deploymentsLoaded = true;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, phase: 'ready', live: true,
+  ownership: 'loaded',
+}], launchers: [] };
+component.runtimeLoaded = true;
+component.selectedModelPath = '/models/old';
+component.planStrategy = 'tensor';
+component.modelOptions = [{ model_path: '/models/old', id: 'old' }];
+const calls = [];
+component.apiFetch = async (url, options = {}) => {
+  calls.push({ url, method: options.method || 'GET' });
+  if (url.endsWith('/deployments')) return { deployments: [] };
+  if (url.endsWith('/runtime')) return { jobs: [], launchers: [] };
+  if (url.endsWith('/models')) return { models: [] };
+  if (url.endsWith('/node-roles')) return { roles: [] };
+  return { ok: true };
+};
+(async () => {
+  component.beginModelChange(deployment);
+  await component.changeClusterModel(deployment);
+  process.stdout.write(JSON.stringify({
+    stage: component.stage,
+    deployments: component.deploymentsPayload,
+    selectedModelPath: component.selectedModelPath,
+    executionProfile: component.executionProfile,
+    promptCacheSsd: component.promptCacheSsd,
+    promptCacheSsdMaxGiB: component.promptCacheSsdMaxGiB,
+    targetContextTokens: component.targetContextTokens,
+    nodeRoles: component.nodeRoles,
+    planStrategy: component.planStrategy,
+    calls,
+  }));
+})();
+"""
+    )
+
+    assert result["stage"] == "plan"
+    assert result["deployments"] == []
+    assert result["selectedModelPath"] == ""
+    assert result["executionProfile"] == "throughput"
+    assert result["promptCacheSsd"] is True
+    assert result["promptCacheSsdMaxGiB"] == 20
+    assert result["targetContextTokens"] == 131072
+    assert result["nodeRoles"] == {
+        "node-a": "workstation",
+        "node-b": "headless",
+    }
+    assert result["planStrategy"] == "auto"
+    assert {
+        "url": "/admin/api/cluster/deployments/pool-a",
+        "method": "DELETE",
+    } in result["calls"]
+
+
+def test_active_card_load_and_unload_keep_the_signed_deployment():
+    result = _run_wizard(
+        """
+global.setTimeout = () => 0;
+const deployment = { deployment_id: 'pool-a', model: '/models/m' };
+component.deploymentsPayload = [deployment];
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, phase: 'ready', live: true,
+  ownership: 'loaded',
+}], launchers: [] };
+const calls = [];
+component.apiFetch = async (url, options = {}) => {
+  calls.push({ url, method: options.method || 'GET' });
+  if (url.endsWith('/deployments')) return { deployments: [deployment] };
+  if (url.endsWith('/runtime')) return { jobs: [], launchers: [] };
+  return { ok: true };
+};
+(async () => {
+  await component.unloadDeploymentWeights(deployment);
+  const armed = component.confirmUnloadFor;
+  await component.unloadDeploymentWeights(deployment);
+  const deploymentAfterUnload = component.configuredDeployment();
+  await component.loadDeploymentWeights(deployment);
+  process.stdout.write(JSON.stringify({
+    armed,
+    deploymentAfterUnload: deploymentAfterUnload && deploymentAfterUnload.deployment_id,
+    lifecycleBusy: component.clusterLifecycleBusy,
+    calls,
+  }));
+})();
+"""
+    )
+
+    assert result["armed"] == "pool-a"
+    assert result["deploymentAfterUnload"] == "pool-a"
+    assert result["lifecycleBusy"] is False
+    assert {
+        "url": "/admin/api/cluster/deployments/pool-a/unload",
+        "method": "POST",
+    } in result["calls"]
+    assert {
+        "url": "/admin/api/cluster/deployments/pool-a/load",
+        "method": "POST",
+    } in result["calls"]
 
 
 def test_runtime_residency_separates_configuration_from_observed_workers():
@@ -554,6 +683,7 @@ def test_serving_profile_drives_the_server_owned_signed_plan():
 component.setExecutionProfile('throughput');
 component.modelOptions = [{ model_path: '/models/m', id: 'm' }];
 component.selectedModelPath = '/models/m';
+component.targetContextTokens = 262144;
 let posted = null;
 component.apiFetch = async (url, options) => {
   if (url.endsWith('/autoconfigure')) {
@@ -573,6 +703,7 @@ component.apiFetch = async (url, options) => {
   process.stdout.write(JSON.stringify({
     selected: component.executionProfile,
     posted: posted.execution_profile,
+    context: posted.target_context_tokens,
     activation: component.activationRequestBody().execution_profile,
     presets: component.executionProfileOptions().map((option) => ({
       key: option.key,
@@ -585,6 +716,7 @@ component.apiFetch = async (url, options) => {
 
     assert result["selected"] == "throughput"
     assert result["posted"] == "throughput"
+    assert result["context"] == 262144
     assert result["activation"] == "throughput"
     assert result["presets"] == [
         {"key": "interactive", "limits": "4 decode · 2 prompt · batch 2"},
@@ -595,6 +727,8 @@ component.apiFetch = async (url, options) => {
     template = _read(TEMPLATE)
     assert "data-cluster-v2-serving-profile" in template
     assert "data-cluster-v2-serving-profile-option" in template
+    assert "data-cluster-v2-context-reservation" in template
+    assert 'aria-label="Distributed context reservation"' in template
     assert "There is no separate batching switch" in template
 
 
