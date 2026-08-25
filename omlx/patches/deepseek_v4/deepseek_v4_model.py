@@ -674,11 +674,17 @@ def _can_overlap_hc_residual(block: nn.Module, h: mx.array) -> bool:
 
 
 def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
-    """Return true only for the confirmed M5 rank-1 O-A prefill contract."""
+    """Return true only for physically confirmed M5 O-A prefill contracts."""
 
     if not _DEEPSEEK_V4_NAX_OA_PREFILL or getattr(attn, "training", False):
         return False
-    if tuple(prepared.shape) != (1, 8, 1024, 2560):
+    k = int(prepared.shape[-1]) if len(prepared.shape) == 4 else -1
+    contracts = {
+        2048: ((1, 8, 1024, 2048), (8, 1024, 512), (8, 1024, 64)),
+        2560: ((1, 8, 1024, 2560), (8, 1024, 640), (8, 1024, 80)),
+    }
+    contract = contracts.get(k)
+    if contract is None or tuple(prepared.shape) != contract[0]:
         return False
     if prepared.dtype != mx.bfloat16:
         return False
@@ -698,8 +704,8 @@ def _can_use_nax_oa_prefill(attn: nn.Module, prepared: mx.array) -> bool:
     if (
         weight is None
         or scales is None
-        or tuple(weight.shape) != (8, 1024, 640)
-        or tuple(scales.shape) != (8, 1024, 80)
+        or tuple(weight.shape) != contract[1]
+        or tuple(scales.shape) != contract[2]
         or weight.dtype != mx.uint32
         or scales.dtype != mx.uint8
     ):
@@ -729,12 +735,16 @@ def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
     from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
     global _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED
+    k = int(prepared.shape[-1])
+    nax_variant = 5 if k == 2048 else 0
     if not _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED:
         _DEEPSEEK_V4_NAX_OA_PREFILL_LOGGED = True
         logging.getLogger(__name__).info(
             "deepseek_v4: using exact M5 NAX O-A prefill tile "
-            "(M=1024, heads=40, BM64/BN64/BK64; "
-            "OMLX_DSV4_NAX_OA_PREFILL=0 disables)"
+            "(M=1024, K=%d, variant=%d; "
+            "OMLX_DSV4_NAX_OA_PREFILL=0 disables)",
+            k,
+            nax_variant,
         )
     projection = attn.wo_a
     return glm_fast.ds4_projection_mxfp8_qmm(
@@ -743,7 +753,7 @@ def _project_attention_oa(attn: nn.Module, prepared: mx.array) -> mx.array:
         projection["scales"],
         variant=0,
         use_nax=True,
-        nax_variant=0,
+        nax_variant=nax_variant,
     )
 
 

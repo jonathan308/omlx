@@ -27,13 +27,13 @@ class _Tensor:
 
 
 class _Projection:
-    def __init__(self):
+    def __init__(self, k=2560):
         self.group_size = 32
         self.bits = 8
         self.mode = "mxfp8"
         self.values = {
-            "weight": _Tensor((8, 1024, 640), mx.uint32),
-            "scales": _Tensor((8, 1024, 80), mx.uint8),
+            "weight": _Tensor((8, 1024, k // 4), mx.uint32),
+            "scales": _Tensor((8, 1024, k // 32), mx.uint8),
             "biases": None,
         }
         self.calls = []
@@ -153,6 +153,30 @@ def test_dispatch_uses_confirmed_nax_variant_and_logs_once(monkeypatch, dm, capl
         record for record in caplog.records if "NAX O-A prefill tile" in record.message
     ]
     assert len(records) == 1
+
+
+def test_equal_tp_shape_uses_confirmed_nax_variant_five(monkeypatch, dm):
+    monkeypatch.setattr(dm, "_DEEPSEEK_V4_NAX_OA_PREFILL", True)
+    monkeypatch.setattr(glm_fast, "is_native_available", lambda: True)
+    monkeypatch.setattr(glm_fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(glm_fast, "ds4_projection_nax_kernels_built", lambda: True)
+    monkeypatch.setattr(glm_fast, "ds4_projection_nax_device_available", lambda: True)
+    monkeypatch.setattr(dm.mx, "contiguous", lambda value: value)
+    projection = _Projection(k=2048)
+    attn = SimpleNamespace(training=False, wo_a=projection)
+    prepared = _Tensor((1, 8, 1024, 2048), mx.bfloat16)
+    native_result = object()
+    calls = []
+
+    def native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return native_result
+
+    monkeypatch.setattr(glm_fast, "ds4_projection_mxfp8_qmm", native)
+
+    assert dm._project_attention_oa(attn, prepared) is native_result
+    assert projection.calls == []
+    assert calls[0][1] == {"variant": 0, "use_nax": True, "nax_variant": 5}
 
 
 def test_candidate_preserves_the_stock_projection_array_exactly(monkeypatch, dm):
