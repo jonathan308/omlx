@@ -115,6 +115,10 @@ _RANK_ENV_DEFAULTS = (
     # per row. Keep it rank-identical and default-off; physical B2/B4 economics
     # decide whether a serving profile should enable it.
     ("OMLX_MTP_ROWWISE_BATCH", "0"),
+    # DS4's current DSpark MTP implementation is singleton-only. Until true
+    # N×M verification lands, one decode lane has higher aggregate throughput
+    # than forcing concurrent rows onto the slower standard batch path.
+    ("OMLX_DSV4_MTP_DECODE_CONCURRENCY", "1"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.

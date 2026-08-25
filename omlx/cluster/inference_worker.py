@@ -631,6 +631,35 @@ def _distributed_model_type(model_path: str | Path) -> str:
     return str(model_type or "").strip().lower()
 
 
+def _apply_distributed_mtp_decode_concurrency(
+    args: argparse.Namespace,
+    *,
+    mtp_enabled: bool,
+) -> int:
+    """Use the throughput-optimal DS4 lane until batched DSpark MTP exists."""
+
+    requested = max(1, int(args.decode_concurrency))
+    if not mtp_enabled or not _distributed_model_type(args.model).startswith(
+        "deepseek_v4"
+    ):
+        return requested
+    try:
+        limit = int(os.environ.get("OMLX_DSV4_MTP_DECODE_CONCURRENCY", "1"))
+    except ValueError:
+        limit = 1
+    limit = max(1, limit)
+    effective = min(requested, limit)
+    if effective != requested:
+        logger.info(
+            "DS4 distributed MTP decode concurrency capped %d -> %d: "
+            "singleton speculation currently outperforms standard B2/B4",
+            requested,
+            effective,
+        )
+        args.decode_concurrency = effective
+    return effective
+
+
 def _configure_distributed_mtp(
     model_path: str | Path,
     *,
@@ -1593,6 +1622,7 @@ def run_worker(args: argparse.Namespace) -> int:
         decode_worker_contract(args.plan)
     )
     mtp_enabled, mtp_num_draft_tokens = decode_worker_speculation(args.plan)
+    _apply_distributed_mtp_decode_concurrency(args, mtp_enabled=mtp_enabled)
     execution = _execution_settings(args)
     init_backend = "jaccl" if args.backend.startswith("jaccl") else "ring"
     jaccl_lease = (

@@ -16,19 +16,19 @@ import pytest
 import omlx.cluster.inference_worker as inference_worker
 from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
-    _cross_thread_generation_stream,
     _configure_distributed_mtp,
     _configure_indexer_decode_owner,
     _configure_tensor_shard_weights,
+    _cross_thread_generation_stream,
     _execution_settings,
     _install_distributed_model_protocol,
     _planned_prefill_shape_warmup_tokens,
     _run_prefill_shape_warmup,
     _server_arguments,
     _trace_collectives,
-    _wait_for_serve_release,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
+    _wait_for_serve_release,
     _watch_launcher_parent,
     _write_cancel_request,
     build_parser,
@@ -36,6 +36,36 @@ from omlx.cluster.inference_worker import (
 from omlx.cluster.planner import PipelineAssignment
 
 GiB = 1024**3
+
+
+def test_ds4_mtp_caps_decode_concurrency_until_batched_verification(
+    tmp_path,
+    monkeypatch,
+):
+    model = tmp_path / "ds4"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = SimpleNamespace(model=str(model), decode_concurrency=16)
+
+    monkeypatch.delenv("OMLX_DSV4_MTP_DECODE_CONCURRENCY", raising=False)
+    assert inference_worker._apply_distributed_mtp_decode_concurrency(
+        args,
+        mtp_enabled=True,
+    ) == 1
+    assert args.decode_concurrency == 1
+
+
+def test_non_mtp_decode_concurrency_is_unchanged(tmp_path):
+    model = tmp_path / "ds4"
+    model.mkdir()
+    (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    args = SimpleNamespace(model=str(model), decode_concurrency=16)
+
+    assert inference_worker._apply_distributed_mtp_decode_concurrency(
+        args,
+        mtp_enabled=False,
+    ) == 16
+    assert args.decode_concurrency == 16
 
 
 def test_collective_trace_records_order_and_restores_mlx_functions(
