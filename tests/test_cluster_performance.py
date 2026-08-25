@@ -1327,7 +1327,7 @@ def test_ds4_outer_prefill_yield_is_decode_and_request_aware():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 256
     )
 
     # Idle long requests retain the wider outer slice (and its lower scheduler
@@ -1389,7 +1389,7 @@ def test_ds4_outer_prefill_yields_when_decode_promotes_this_turn():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 256
     )
 
 
@@ -1410,7 +1410,7 @@ def test_ds4_outer_prefill_matches_admission_before_boundary_promotion():
             long_after=4096,
             kernel_step=1024,
         )
-        == 256
+        == 128
     )
 
 
@@ -1427,7 +1427,7 @@ def test_ds4_outer_prefill_scans_every_stock_admissible_pending_row():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 256
     )
 
     boundary_then_long = _outer_prefill_batch(
@@ -1440,13 +1440,13 @@ def test_ds4_outer_prefill_scans_every_stock_admissible_pending_row():
             long_after=4096,
             kernel_step=1024,
         )
-        == 1024
+        == 256
     )
 
 
 @pytest.mark.parametrize(
     ("decode_rows", "expected_quantum"),
-    ((1, 1024), (2, 1024), (4, 512)),
+    ((1, 256), (2, 256), (4, 128)),
 )
 def test_ds4_outer_prefill_uses_rank_deterministic_b1_b2_b4_budget(
     decode_rows,
@@ -1512,7 +1512,7 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
         assert batch.prefill_batch_size == 4
 
         def fail_turn():
-            assert batch.prefill_step_size == 1024
+            assert batch.prefill_step_size == 256
             assert batch.prefill_batch_size == 1
             raise RuntimeError("synthetic scheduler failure")
 
@@ -1522,7 +1522,7 @@ def test_ds4_runtime_caps_only_outer_turn_and_restores_class(monkeypatch):
         assert batch.prefill_step_size == 2048
         assert batch.prefill_batch_size == 4
 
-    assert observed == [(1024, 1)]
+    assert observed == [(256, 1)]
     assert mlx_generate.BatchGenerator.next is original_next
 
     monkeypatch.setenv("OMLX_DSV4_PREFILL_YIELD", "0")
@@ -1591,7 +1591,7 @@ def test_ds4_runtime_processes_one_existing_prompt_row_and_rotates(monkeypatch):
 
         def fail_turn():
             assert batch._prompt_batch.uids == [1]
-            assert batch.prefill_step_size == 1024
+            assert batch.prefill_step_size == 256
             assert batch.prefill_batch_size == 1
             raise RuntimeError("synthetic resident-row failure")
 
@@ -1602,8 +1602,8 @@ def test_ds4_runtime_processes_one_existing_prompt_row_and_rotates(monkeypatch):
         assert batch.prefill_batch_size == 4
 
     assert observed == [
-        ([1], 1, 1024, 1),
-        ([2], 1, 1024, 1),
+        ([1], 1, 256, 1),
+        ([2], 1, 256, 1),
     ]
     assert batch._prompt_batch.uids == [2, 1]
     assert len(batch._currently_processing) == 2
@@ -1665,7 +1665,7 @@ def test_ds4_runtime_promotes_ready_rows_before_bounded_prompt():
     ):
         mlx_generate.BatchGenerator.next(batch)
 
-    assert observed == [([1, 2], 1024, 2)]
+    assert observed == [([1, 2], 256, 2)]
     assert batch._prompt_batch.uids == [3, 1]
     assert len(batch._currently_processing) == 2
 
@@ -1738,12 +1738,12 @@ def test_ds4_pinned_next_admits_no_extra_prompt_behind_ready_rows():
     assert len(batch._currently_processing) == 1
     assert len(prompt_responses) == 3
     assert len(batch._prompt_batch.prompted) == 1
-    assert len(batch._prompt_batch.prompted[0]) == 1024
+    assert len(batch._prompt_batch.prompted[0]) == 256
 
 
 @pytest.mark.parametrize(
     ("queued_total", "expected_width"),
-    ((6000, 1024), (1000, 2000)),
+    ((6000, 256), (1000, 2000)),
 )
 def test_ds4_pinned_next_limits_pending_rows_during_decode(
     queued_total,
