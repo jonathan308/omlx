@@ -17,6 +17,7 @@ import concurrent.futures
 import gc
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -39,6 +40,12 @@ from .exceptions import (
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
+)
+from .keepwarm import (
+    KeepwarmAction,
+    KeepwarmConfig,
+    KeepwarmController,
+    metal_warmup_touch,
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -156,6 +163,7 @@ class EngineConfig:
     step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
+    keepwarm_config: KeepwarmConfig = field(default_factory=KeepwarmConfig.from_env)
     # Decode burst: run several scheduler.step() calls per run_in_executor
     # hand-off instead of one. Each decode token otherwise bounces back to the
     # event loop, ping-ponging the GIL with the asyncio loop + uvicorn on the
@@ -270,6 +278,10 @@ class EngineCore:
         self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
+        self._keepwarm = KeepwarmController(self.config.keepwarm_config)
+        self._pending_admissions = 0
+        self._pending_admissions_lock = threading.Lock()
+        self._next_keepwarm_check_at = 0.0
 
         # Drop transient aliases after ownership moves to the engine/scheduler
         # graph, so close()/deep_reset() can make that graph unreachable.
@@ -368,6 +380,63 @@ class EngineCore:
             outputs.append(self.scheduler.step())
         return outputs
 
+    def _pending_admission_count(self) -> int:
+        with self._pending_admissions_lock:
+            return self._pending_admissions
+
+    def _run_keepwarm_action(self, action: KeepwarmAction) -> bool:
+        """Run one local touch on this engine's sole MLX execution lane."""
+
+        try:
+            elapsed = metal_warmup_touch(mx, action, stream=self._mlx_stream)
+        except Exception as exc:  # keep a local model usable if warming fails
+            self._keepwarm.record(
+                action,
+                elapsed_seconds=0.0,
+                ok=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            logger.warning("Local keepwarm %s failed: %s", action.kind, exc)
+            return False
+        self._keepwarm.record(action, elapsed_seconds=elapsed, ok=True)
+        if elapsed >= self.config.keepwarm_config.slow_threshold_seconds:
+            logger.warning(
+                "Local keepwarm %s was slow (%.1f ms); backing off",
+                action.kind,
+                elapsed * 1000.0,
+            )
+        else:
+            logger.debug(
+                "Local keepwarm %s completed in %.1f ms",
+                action.kind,
+                elapsed * 1000.0,
+            )
+        return True
+
+    def _admit_request(self, request: Request) -> None:
+        """Warm after a long idle gap, then insert on the same MLX lane."""
+
+        pending = self._pending_admission_count()
+        if pending == 1 and not self.scheduler.has_requests():
+            action = self._keepwarm.request_start_action()
+            if action is not None:
+                self._run_keepwarm_action(action)
+        else:
+            self._keepwarm.observe_request_state(True)
+            if self.config.keepwarm_config.enabled:
+                self._keepwarm.skip("concurrent admission or scheduler busy")
+        self.scheduler.add_request(request)
+
+    def _idle_keepwarm_if_due(self) -> None:
+        """Re-check quiescence on the MLX lane and skip rather than queue."""
+
+        if self._pending_admission_count() or self.scheduler.has_requests():
+            self._keepwarm.observe_request_state(True)
+            return
+        action = self._keepwarm.idle_action()
+        if action is not None:
+            self._run_keepwarm_action(action)
+
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
@@ -391,6 +460,7 @@ class EngineCore:
                     self._reap_orphaned_collectors(now)
 
                 if self.scheduler.has_requests():
+                    self._keepwarm.observe_request_state(True)
                     step_outputs = await loop.run_in_executor(
                         self._mlx_executor, self._step_burst
                     )
@@ -489,6 +559,20 @@ class EngineCore:
                                     event.wait(), timeout=step_interval
                                 )
                 else:
+                    self._keepwarm.observe_request_state(False)
+                    if (
+                        self.config.keepwarm_config.enabled
+                        and now >= self._next_keepwarm_check_at
+                    ):
+                        # The executor helper performs the decisive busy check.
+                        # A request that arrived after this branch increments
+                        # _pending_admissions before it can queue its insertion,
+                        # so the touch skips instead of delaying admission.
+                        self._next_keepwarm_check_at = now + 0.25
+                        await loop.run_in_executor(
+                            self._mlx_executor,
+                            self._idle_keepwarm_if_due,
+                        )
                     event = self._wake_event
                     if event is None:
                         await asyncio.sleep(step_interval)
@@ -625,9 +709,11 @@ class EngineCore:
         # asyncio.Event per refused request. Re-raise after cleanup so
         # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
+        with self._pending_admissions_lock:
+            self._pending_admissions += 1
         try:
             await loop.run_in_executor(
-                self._mlx_executor, self.scheduler.add_request, request
+                self._mlx_executor, self._admit_request, request
             )
         except BaseException:
             # If the caller is cancelled here (e.g. the client disconnected
@@ -647,6 +733,9 @@ class EngineCore:
                 )
             self._cleanup_request(request_id)
             raise
+        finally:
+            with self._pending_admissions_lock:
+                self._pending_admissions = max(0, self._pending_admissions - 1)
         self._wake_engine_loop()
 
         return request_id
@@ -1091,6 +1180,7 @@ class EngineCore:
             "steps_executed": self._steps_executed,
             "active_requests": len(self._output_collectors),
             "stream_interval": self.config.stream_interval,
+            "keepwarm": self._keepwarm.snapshot(),
             **scheduler_stats,
         }
 

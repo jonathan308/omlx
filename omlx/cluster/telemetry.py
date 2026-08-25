@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
+import os
 import shutil
 import struct
 import threading
@@ -16,9 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-import json
-import os
-
+from ..keepwarm import (
+    KeepwarmAction,
+    KeepwarmConfig,
+    KeepwarmController,
+    distributed_dataplane_ping,
+    metal_warmup_touch,
+)
 from .performance import (
     DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
     ExecutionSettings,
@@ -65,6 +71,8 @@ _CANCEL_VOTE_SCHEMA_VERSION = 1
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
 _INTERNAL_REQUEST_PREFIX = "omlx-internal-"
+_KEEPWARM_MESSAGE_KIND = "omlx.keepwarm"
+_KEEPWARM_MESSAGE_SCHEMA = 1
 
 
 def _agreed_snapshot_capacity_charge(
@@ -302,6 +310,7 @@ class RuntimeTelemetry:
         self._cache_ssd_pending_bytes = 0
         self._cache_ssd_pending_max_bytes = 0
         self._cache_ssd_write_failures = 0
+        self._keepwarm: dict[str, Any] | None = None
         # Rank-side force-cancel surface. The coordinator drops a cancel file
         # next to the runtime markers; the heartbeat picks it up and removes
         # every active uid through BatchGenerator.remove — MLX-LM's own
@@ -500,6 +509,14 @@ class RuntimeTelemetry:
 
         with self._lock:
             return len(self._requests)
+
+    def observe_keepwarm(self, snapshot: dict[str, Any]) -> None:
+        """Publish bounded keepwarm state without creating a request sample."""
+
+        now = float(self._clock())
+        with self._lock:
+            self._keepwarm = copy.deepcopy(snapshot)
+            self._publish_locked(now, force=True)
 
     def make_cancel_vote(self, uids: Any) -> dict[str, Any]:
         """Create the next rank-zero-owned, monotonically ordered cancel vote."""
@@ -1330,6 +1347,8 @@ class RuntimeTelemetry:
             },
             "last_request": current,
         }
+        if self._keepwarm is not None:
+            result["keepwarm"] = copy.deepcopy(self._keepwarm)
         try:
             from omlx.patches.mlx_lm_mtp.batch_generator import (
                 mtp_runtime_stats_snapshot,
@@ -1510,6 +1529,107 @@ def install_server_telemetry(
     except Exception:
         world_size = 1
         rank = 0
+
+    keepwarm = KeepwarmController(KeepwarmConfig.from_env())
+    telemetry.observe_keepwarm(keepwarm.snapshot())
+
+    def run_keepwarm(action: KeepwarmAction) -> None:
+        """Run one rank-symmetric keepwarm transaction on generation threads."""
+
+        started = time.monotonic()
+        dataplane = bool(
+            keepwarm.config.dataplane_ping and world_size > 1
+        )
+        try:
+            metal_warmup_touch(mx, action)
+            if dataplane:
+                distributed_dataplane_ping(
+                    mx,
+                    group,
+                    rank=rank,
+                    world_size=world_size,
+                )
+        except Exception as exc:
+            keepwarm.record(
+                action,
+                elapsed_seconds=max(0.0, time.monotonic() - started),
+                ok=False,
+                dataplane_ping=dataplane,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            telemetry.observe_keepwarm(keepwarm.snapshot())
+            # A partially completed point-to-point exchange poisons the next
+            # model collective.  Let the rank's generation-thread guard exit
+            # the process so the supervisor relaunches one clean communicator.
+            raise
+        elapsed = max(0.0, time.monotonic() - started)
+        keepwarm.record(
+            action,
+            elapsed_seconds=elapsed,
+            ok=True,
+            dataplane_ping=dataplane,
+        )
+        telemetry.observe_keepwarm(keepwarm.snapshot())
+        if elapsed >= keepwarm.config.slow_threshold_seconds:
+            logger.warning(
+                "Cluster keepwarm %s was slow on rank %s (%.1f ms); backing off",
+                action.kind,
+                rank,
+                elapsed * 1000.0,
+            )
+        else:
+            logger.debug(
+                "Cluster keepwarm %s completed on rank %s in %.1f ms",
+                action.kind,
+                rank,
+                elapsed * 1000.0,
+            )
+
+    def keepwarm_envelope(
+        payload: Any,
+        action: KeepwarmAction,
+    ) -> dict[str, Any]:
+        return {
+            "kind": _KEEPWARM_MESSAGE_KIND,
+            "schema_version": _KEEPWARM_MESSAGE_SCHEMA,
+            "action": {
+                "kind": action.kind,
+                "matrix_size": action.matrix_size,
+                "repeats": action.repeats,
+                "idle_seconds": action.idle_seconds,
+                "cache_tokens": action.cache_tokens,
+            },
+            "payload": payload,
+        }
+
+    def unwrap_keepwarm(value: Any) -> tuple[Any, KeepwarmAction | None]:
+        if not (
+            isinstance(value, dict)
+            and value.get("kind") == _KEEPWARM_MESSAGE_KIND
+        ):
+            return value, None
+        if value.get("schema_version") != _KEEPWARM_MESSAGE_SCHEMA:
+            raise RuntimeError("distributed keepwarm envelope schema is invalid")
+        raw = value.get("action")
+        if not isinstance(raw, dict):
+            raise RuntimeError("distributed keepwarm action is missing")
+        try:
+            action = KeepwarmAction(
+                kind=str(raw["kind"]),
+                matrix_size=int(raw["matrix_size"]),
+                repeats=int(raw["repeats"]),
+                idle_seconds=max(0.0, float(raw["idle_seconds"])),
+                cache_tokens=max(0, int(raw.get("cache_tokens", 0))),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("distributed keepwarm action is malformed") from exc
+        if (
+            action.kind not in {"idle", "request_start", "post_response"}
+            or not 1 <= action.matrix_size <= 1024
+            or not 1 <= action.repeats <= 16
+        ):
+            raise RuntimeError("distributed keepwarm action is outside bounds")
+        return value.get("payload"), action
 
     def agree_snapshot_capacity_charge(local_charge: int | None) -> int | None:
         """Largest rank file charge, or None if any rank cannot snapshot.
@@ -2225,6 +2345,20 @@ def install_server_telemetry(
         def _share_object(self, obj: Any) -> Any:
             if not bool(getattr(self, "_is_distributed", False)):
                 return super()._share_object(obj)
+            local_rank = int(getattr(self, "_rank", rank))
+            active = telemetry.active_request_count() > 0
+            keepwarm.observe_request_state(active)
+            if local_rank == 0:
+                action = None
+                # A request share is a two-tuple (request, generation args).
+                # Cancellation votes/lists use other shapes and must never be
+                # mistaken for a request-start boundary.
+                if isinstance(obj, tuple) and len(obj) == 2:
+                    action = keepwarm.request_start_action()
+                elif obj is None and not active:
+                    action = keepwarm.idle_action()
+                if action is not None:
+                    obj = keepwarm_envelope(obj, action)
             # MLX-LM calls this with the rank-zero-owned ``uids_to_remove``
             # list once per batch-loop slice. Merge heartbeat/transport aborts
             # here, on the generation thread, so cancellation cannot depend on
@@ -2236,6 +2370,11 @@ def install_server_telemetry(
                     obj = telemetry.make_cancel_vote(obj)
             if control_plane is not None:
                 shared = control_plane.broadcast_object(obj)
+                shared, action = unwrap_keepwarm(shared)
+                if action is not None:
+                    if action.kind == "request_start":
+                        keepwarm.observe_request_state(True)
+                    run_keepwarm(action)
                 return self._finish_shared_cancel_vote(shared)
 
             # MLX-LM implements every rank-zero object broadcast as two
@@ -2253,8 +2392,8 @@ def install_server_telemetry(
 
             group = mx.distributed.init()
             world_size = int(group.size())
-            rank = int(getattr(self, "_rank", group.rank()))
-            if rank == 0:
+            local_rank = int(getattr(self, "_rank", group.rank()))
+            if local_rank == 0:
                 payload = pickle.dumps(obj) if obj is not None else b""
                 if len(payload) > _MAX_SHARED_REQUEST_BYTES:
                     raise RuntimeError(
@@ -2295,7 +2434,7 @@ def install_server_telemetry(
 
             local_data = (
                 mx.array(payload, dtype=mx.uint8)
-                if rank == 0
+                if local_rank == 0
                 else mx.zeros((size,), dtype=mx.uint8)
             )
             gathered_data = mx.distributed.all_gather(local_data, group=group)
@@ -2304,7 +2443,7 @@ def install_server_telemetry(
                 raise RuntimeError(
                     "distributed object broadcast failed its CRC32 integrity check"
                 )
-            if rank == 0:
+            if local_rank == 0:
                 shared = obj
             else:
                 try:
@@ -2313,6 +2452,11 @@ def install_server_telemetry(
                     raise RuntimeError(
                         "distributed object broadcast failed integrity decoding"
                     ) from exc
+            shared, action = unwrap_keepwarm(shared)
+            if action is not None:
+                if action.kind == "request_start":
+                    keepwarm.observe_request_state(True)
+                run_keepwarm(action)
             return self._finish_shared_cancel_vote(shared)
 
         def _share_request(self, request: Any) -> Any:

@@ -12,11 +12,11 @@ import pytest
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
-    _capture_prompt_boundary_cache,
     RuntimeTelemetry,
-    _TelemetryQueue,
     _agreed_snapshot_capacity_charge,
+    _capture_prompt_boundary_cache,
     _python_token_id,
+    _TelemetryQueue,
     install_server_telemetry,
 )
 
@@ -1049,6 +1049,126 @@ def test_server_patch_receives_distributed_request_with_checked_gather(monkeypat
     assert request == "request"
     assert args == {"max_tokens": 7}
     assert len(calls) == 2
+
+
+def test_cluster_request_start_keepwarm_is_payload_driven_and_rank_symmetric(
+    monkeypatch,
+):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    from omlx.cluster import telemetry as telemetry_module
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 0
+
+        def _share_object(self, _obj):
+            raise AssertionError("the reliable control plane must own sharing")
+
+        def _share_request(self, request):
+            shareable = self._share_object(request[1:] if request else None)
+            return None if shareable is None else (request[0], *shareable)
+
+    class ControlPlane:
+        def __init__(self):
+            self.messages = []
+
+        def broadcast_object(self, obj):
+            self.messages.append(obj)
+            return obj
+
+    events = []
+    monkeypatch.setenv("OMLX_KEEPWARM", "1")
+    monkeypatch.setenv("OMLX_KEEPWARM_REQUEST_START_IDLE_SECONDS", "0")
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(
+        telemetry_module,
+        "metal_warmup_touch",
+        lambda _mx, action: events.append(("metal", action.kind)) or 0.001,
+    )
+    monkeypatch.setattr(
+        telemetry_module,
+        "distributed_dataplane_ping",
+        lambda _mx, _group, **kwargs: events.append(
+            ("dataplane", kwargs["rank"], kwargs["world_size"])
+        ),
+    )
+    control = ControlPlane()
+    target = _Queue()
+
+    with install_server_telemetry(
+        _Marker(), heartbeat_interval=0, control_plane=control
+    ):
+        generator = mlx_server.ResponseGenerator()
+        queue, request, args = generator._share_request(
+            (target, "request", {"max_tokens": 7})
+        )
+
+    assert queue._queue is target
+    assert request == "request"
+    assert args == {"max_tokens": 7}
+    assert control.messages[0]["kind"] == "omlx.keepwarm"
+    assert control.messages[0]["action"]["kind"] == "request_start"
+    assert control.messages[0]["payload"] == ("request", {"max_tokens": 7})
+    assert events == [("metal", "request_start"), ("dataplane", 0, 2)]
+
+
+def test_cluster_idle_keepwarm_never_appears_as_a_user_request(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    from omlx.cluster import telemetry as telemetry_module
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 0
+
+        def _share_object(self, _obj):
+            raise AssertionError("the reliable control plane must own sharing")
+
+    class ControlPlane:
+        def __init__(self):
+            self.message = None
+
+        def broadcast_object(self, obj):
+            self.message = obj
+            return obj
+
+    monkeypatch.setenv("OMLX_KEEPWARM", "1")
+    monkeypatch.setenv("OMLX_KEEPWARM_IDLE_AFTER_SECONDS", "0")
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(telemetry_module, "metal_warmup_touch", lambda *_: 0.001)
+    monkeypatch.setattr(
+        telemetry_module, "distributed_dataplane_ping", lambda *_args, **_kwargs: None
+    )
+    marker = _Marker()
+    control = ControlPlane()
+
+    with install_server_telemetry(
+        marker, heartbeat_interval=0, control_plane=control
+    ):
+        generator = mlx_server.ResponseGenerator()
+        assert generator._share_object(None) is None
+
+    assert control.message["kind"] == "omlx.keepwarm"
+    assert control.message["payload"] is None
+    latest = marker.updates[-1][1]["metrics"]
+    assert latest["active_requests"] == 0
+    assert latest["requests_completed"] == 0
+    assert latest["keepwarm"]["count"] == 1
 
 
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(

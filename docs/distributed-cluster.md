@@ -305,6 +305,10 @@ end-to-end measurements so a poor cut, cache miss, or slow link is visible.
 
 ## Diagnostics
 
+For idle-gap Metal and JACCL warming, see
+[`keepwarm.md`](keepwarm.md). The feature is opt-in and its rank-symmetric
+configuration is propagated by the cluster launcher.
+
 ```bash
 omlx cluster status --json
 omlx cluster status --route-to 169.254.42.2

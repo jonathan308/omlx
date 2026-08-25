@@ -84,6 +84,25 @@ _RANK_ENV_DEFAULTS = (
     # root. The server replaces this default from GlobalSettings before a
     # launch, while each remote rank expands ``~`` for its own account.
     ("OMLX_CLUSTER_PROMPT_CACHE_ROOT", "~/.omlx/cache/cluster-prompt-snapshots"),
+    # ThunderMLX-derived latent keepwarm. The master switch is deliberately
+    # default-off until an operator enables it; every subordinate value is
+    # carried through one hostfile so ranks cannot enter mixed behavior.
+    ("OMLX_KEEPWARM", "0"),
+    ("OMLX_KEEPWARM_INTERVAL_SECONDS", "10"),
+    ("OMLX_KEEPWARM_IDLE_AFTER_SECONDS", "2"),
+    ("OMLX_KEEPWARM_MATRIX_SIZE", "1"),
+    ("OMLX_KEEPWARM_REPEATS", "1"),
+    ("OMLX_KEEPWARM_REQUEST_START", "1"),
+    ("OMLX_KEEPWARM_REQUEST_START_IDLE_SECONDS", "2"),
+    ("OMLX_KEEPWARM_REQUEST_START_MATRIX_SIZE", "128"),
+    ("OMLX_KEEPWARM_POST_RESPONSE", "1"),
+    ("OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS", "5"),
+    ("OMLX_KEEPWARM_POST_RESPONSE_MATRIX_SIZE", "128"),
+    ("OMLX_KEEPWARM_LARGE_CACHE_TOKENS", "8192"),
+    ("OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS", "60"),
+    ("OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS", "1"),
+    ("OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS", "60"),
+    ("OMLX_CLUSTER_KEEPWARM_DATAPLANE_PING", "1"),
     # Qualification gate for rank-zero-coordinated adaptive MTP depth. The
     # coordinator broadcasts the selected verify width and park decision, so
     # every TP rank enters the same collective graph. Production stays on its
