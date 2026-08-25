@@ -103,3 +103,27 @@ throughput.
    while eliminating dense score tensor writes.
 3. True sequence-batched DSpark MTP (`N x M`) after B1 verify-window economics
    are proven.
+
+## First cross-chip baseline
+
+Command:
+
+```sh
+~/omlx-v2-build/bin/python benchmarks/bench_ds4_verify_window.py \
+  --iterations 20 --warmup 3
+```
+
+BF16, H=32, local=128, pooled=512. All M=1..6 batch rows were bitwise
+identical to independent M=1 fused-kernel calls.
+
+| Chip | M=1 median | M=6 median | Logical KV/pass M=1→M=6 |
+| --- | ---: | ---: | ---: |
+| M3 Ultra | ~0.419 ms | ~0.280 ms | 0.655→3.932 MB |
+| M5 Max | ~0.519 ms | ~0.255 ms | 0.655→3.932 MB |
+
+The current kernel is already one dispatch and gains occupancy at M=4..6,
+despite logical KV traffic scaling with M. Therefore a shared-window kernel is
+not automatically the dominant latency win; it needs real Metal counters and
+whole-backbone attribution. The baseline supports continuing the prototype for
+bandwidth/energy and several-millisecond cycle savings, but not claiming it
+alone reaches 100–130 tok/s.
