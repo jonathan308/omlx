@@ -202,6 +202,7 @@ def _belongs_to_launch(
     return _command_deployment_id(process.command) == deployment_id and (
         "mlx._distributed_utils.launch" in process.command
         or "omlx.cluster.inference_worker" in process.command
+        or "omlx.cluster.disaggregated_server_worker" in process.command
     )
 
 
@@ -222,7 +223,11 @@ def _local_launch_survivors(
             (known_pids is not None and process.pid in known_pids)
             or (process_group is not None and process.process_group == process_group)
             or (
-                "omlx.cluster.inference_worker" in process.command
+                (
+                    "omlx.cluster.inference_worker" in process.command
+                    or "omlx.cluster.disaggregated_server_worker"
+                    in process.command
+                )
                 and _command_deployment_id(process.command) == deployment_id
             )
         )
@@ -648,7 +653,7 @@ _REMOTE_WORKER_SCAN_SCRIPT = (
     "\n if len(fields)!=2 or not fields[0].isdigit(): continue"
     "\n try: args=shlex.split(fields[1])"
     "\n except ValueError: continue"
-    "\n if 'omlx.cluster.inference_worker' not in args: continue"
+    "\n if not any(m in args for m in ('omlx.cluster.inference_worker','omlx.cluster.disaggregated_server_worker')): continue"
     "\n try: i=args.index('--deployment-id')"
     "\n except ValueError: continue"
     "\n if i+1<len(args) and args[i+1]==dep: p.append(int(fields[0]))"
@@ -1325,7 +1330,11 @@ def build_mlx_launch_argv(
             *_rank_python_module_argv(
                 [host.python_executable for host in deployment.hosts],
                 fallback=python_executable,
-                module="omlx.cluster.inference_worker",
+                module=(
+                    "omlx.cluster.disaggregated_server_worker"
+                    if deployment.serving_mode == "disaggregated"
+                    else "omlx.cluster.inference_worker"
+                ),
             ),
             # One shared argv launches every rank; send the ~-form so each rank
             # resolves the model in its own home (worker expands it). A coord
@@ -3696,7 +3705,7 @@ class DistributedJobSupervisor:
                 "    cmd=res.stdout.strip()\n"
                 "except Exception:\n"
                 "  cmd=''\n"
-                "if not ('omlx.cluster.inference_worker' in cmd and dep_id in cmd):\n"
+                "if not (('omlx.cluster.inference_worker' in cmd or 'omlx.cluster.disaggregated_server_worker' in cmd) and dep_id in cmd):\n"
                 "  out('pid-reused'); raise SystemExit(0)\n"
                 "try:\n"
                 "  os.kill(pid,signal.SIGTERM)\n"
