@@ -559,7 +559,7 @@ def run_worker(args: argparse.Namespace) -> int:
             control.barrier()
             if rank == 0:
                 cli_args = SimpleNamespace(
-                    allowed_origins=None,
+                    allowed_origins=["*"],
                     num_draft_tokens=0,
                     max_tokens=4096,
                     temp=0.0,
