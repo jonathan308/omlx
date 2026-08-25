@@ -73,12 +73,16 @@ def _prefill_call_count(prompt_tokens: int, step: int) -> int:
 
 def _heartbeat(mx: Any, group: Any, rank: int) -> None:
     value = mx.distributed.all_sum(
-        mx.array([rank + 1], dtype=mx.int32), group=group
+        mx.array([1.0], dtype=mx.float32), group=group
     )
     mx.eval(value)
-    expected = group.size() * (group.size() + 1) // 2
-    if int(value.item()) != expected:
-        raise RuntimeError("disaggregated control heartbeat lost a rank")
+    expected = int(group.size())
+    actual = float(value.item())
+    if actual != float(expected):
+        raise RuntimeError(
+            "disaggregated control heartbeat lost a rank: "
+            f"rank={rank} expected={expected} actual={actual}"
+        )
 
 
 def _cache_states(cache: list[Any]) -> list[Any]:
