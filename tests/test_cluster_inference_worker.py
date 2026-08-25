@@ -45,7 +45,9 @@ def test_ds4_mtp_caps_decode_concurrency_until_batched_verification(
     model = tmp_path / "ds4"
     model.mkdir()
     (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
-    args = SimpleNamespace(model=str(model), decode_concurrency=16)
+    args = SimpleNamespace(
+        model=str(model), decode_concurrency=16, prompt_concurrency=8
+    )
 
     monkeypatch.delenv("OMLX_DSV4_MTP_DECODE_CONCURRENCY", raising=False)
     assert inference_worker._apply_distributed_mtp_decode_concurrency(
@@ -53,19 +55,23 @@ def test_ds4_mtp_caps_decode_concurrency_until_batched_verification(
         mtp_enabled=True,
     ) == 1
     assert args.decode_concurrency == 1
+    assert args.prompt_concurrency == 1
 
 
 def test_non_mtp_decode_concurrency_is_unchanged(tmp_path):
     model = tmp_path / "ds4"
     model.mkdir()
     (model / "config.json").write_text('{"model_type":"deepseek_v4"}')
-    args = SimpleNamespace(model=str(model), decode_concurrency=16)
+    args = SimpleNamespace(
+        model=str(model), decode_concurrency=16, prompt_concurrency=8
+    )
 
     assert inference_worker._apply_distributed_mtp_decode_concurrency(
         args,
         mtp_enabled=False,
     ) == 16
     assert args.decode_concurrency == 16
+    assert args.prompt_concurrency == 8
 
 
 def test_collective_trace_records_order_and_restores_mlx_functions(
