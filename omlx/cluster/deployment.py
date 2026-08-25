@@ -92,6 +92,10 @@ _RANK_ENV_DEFAULTS = (
     # Deterministic accepted-prefix depth controller. Unlike the measured
     # controller it uses no rank-local clock and needs no depth broadcast.
     ("OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", "0"),
+    # Experimental multi-sequence MTP runs independent exact singleton cycles
+    # per row. Keep it rank-identical and default-off; physical B2/B4 economics
+    # decide whether a serving profile should enable it.
+    ("OMLX_MTP_ROWWISE_BATCH", "0"),
     # DS4's sparse prefill indexer is row-independent. TP ranks split prompt
     # rows and exchange only top-k indices instead of redundantly scoring the
     # full chunk on every GPU. Explicit env keeps live rollback one flag away.

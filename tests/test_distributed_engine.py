@@ -666,6 +666,69 @@ async def test_distributed_chat_recovers_raw_ds4_dsml_without_leaking_markup():
 
 
 @pytest.mark.asyncio
+async def test_distributed_chat_repairs_one_tail_truncated_dsml_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    truncated = (
+        'Ready.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="bash">\n'
+        '<｜DSML｜parameter name="command" string="true">curl -fsS example.test'
+    )
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": truncated},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "total_tokens": 30,
+                },
+            },
+        )
+
+    engine = _ready_engine(handler)
+    engine._model_type = "deepseek_v4"
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "Fetch it"}], tools=tools
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert output.text == "Ready."
+    assert output.finish_reason == "tool_calls"
+    assert output.tool_calls is not None
+    assert json.loads(output.tool_calls[0]["arguments"]) == {
+        "command": "curl -fsS example.test"
+    }
+
+
+def test_dsml_repair_refuses_multiple_unmatched_invokes():
+    malformed = (
+        '<｜DSML｜tool_calls><｜DSML｜invoke name="a">'
+        '<｜DSML｜invoke name="b">'
+    )
+    assert DistributedBatchedEngine._repair_truncated_dsml(malformed) is None
+
+
+@pytest.mark.asyncio
 async def test_distributed_stream_chat_preserves_structured_tool_calls():
     events = [
         {
@@ -821,6 +884,65 @@ async def test_distributed_stream_chat_buffers_split_dsml_and_emits_structured_c
     assert outputs[-1].finish_reason == "tool_calls"
     assert outputs[-1].tool_calls is not None
     assert outputs[-1].tool_calls[0]["name"] == "bash"
+    assert json.loads(outputs[-1].tool_calls[0]["arguments"]) == {
+        "command": "true"
+    }
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_repairs_truncated_dsml_without_raw_recovery():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    chunks = [
+        "Visible.\n\n<｜DSML｜tool_calls>",
+        '\n<｜DSML｜invoke name="bash">',
+        '\n<｜DSML｜parameter name="command" string="true">true',
+    ]
+    events = [
+        {"choices": [{"delta": {"content": chunk}, "finish_reason": None}]}
+        for chunk in chunks
+    ]
+    events.append(
+        {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+        }
+    )
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    body += "data: [DONE]\n\n"
+
+    engine = _ready_engine(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=body,
+        )
+    )
+    engine._model_type = "deepseek_v4"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Run true"}], tools=tools
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert all("DSML" not in output.new_text for output in outputs)
+    assert outputs[-1].text == "Visible."
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert outputs[-1].tool_calls is not None
     assert json.loads(outputs[-1].tool_calls[0]["arguments"]) == {
         "command": "true"
     }
