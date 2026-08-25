@@ -712,10 +712,39 @@ function clusterV2Wizard() {
 
         requestPrefillRate(request) {
             const progress = request?.prefill_progress;
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            const uncached = Math.max(0, prompt - cached);
+            if (
+                !progress?.active &&
+                cached > 0 &&
+                uncached <= Math.max(16, Math.floor(prompt * 0.01))
+            ) {
+                return 'Cache hit';
+            }
             const rate = progress?.active
                 ? Number(progress.average_speed || request?.prefill_tps || 0)
                 : Number(request?.prefill_tps || 0);
             return this.formatRequestRate(rate);
+        },
+
+        requestPrefillDetail(request) {
+            if (request?.prefill_progress?.active) return 'live average';
+            const prompt = Math.max(0, Number(request?.prompt_tokens || 0));
+            const cached = Math.min(
+                prompt,
+                Math.max(0, Number(request?.cached_tokens || 0)),
+            );
+            if (cached > 0) {
+                return `${cached.toLocaleString()} reused · ${Math.max(
+                    0,
+                    prompt - cached,
+                ).toLocaleString()} new`;
+            }
+            return 'prompt average';
         },
 
         requestDecodeRate(request) {

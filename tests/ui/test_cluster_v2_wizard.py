@@ -643,6 +643,12 @@ metrics.last_request = {
   decode_tps: 44.25,
 };
 const completed = component.deploymentRequestMetrics()[0];
+metrics.last_request = {
+  request_id: 43, status: 'completed', prompt_tokens: 512,
+  cached_tokens: 511, completion_tokens: 64, prefill_tps: 1.2,
+  decode_tps: 44.25,
+};
+const cached = component.deploymentRequestMetrics()[0];
 process.stdout.write(JSON.stringify({
   active,
   completed: {
@@ -650,6 +656,10 @@ process.stdout.write(JSON.stringify({
     history: completed._history,
     phase: component.requestPhaseLabel(completed),
     count: component.deploymentRequestCountLabel(),
+  },
+  cached: {
+    prefill: component.requestPrefillRate(cached),
+    detail: component.requestPrefillDetail(cached),
   },
 }));
 """
@@ -667,6 +677,10 @@ process.stdout.write(JSON.stringify({
         "history": True,
         "phase": "Complete",
         "count": "Last completed request",
+    }
+    assert result["cached"] == {
+        "prefill": "Cache hit",
+        "detail": "511 reused · 1 new",
     }
 
     template = _read(TEMPLATE)
