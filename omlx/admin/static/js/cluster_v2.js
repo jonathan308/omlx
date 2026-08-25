@@ -73,6 +73,10 @@ function clusterV2Wizard() {
         tpQualifications: '/admin/api/cluster/tp-layout-qualifications',
         deployment: (id) =>
             `/admin/api/cluster/deployments/${encodeURIComponent(id)}`,
+        deploymentLoad: (id) =>
+            `/admin/api/cluster/deployments/${encodeURIComponent(id)}/load`,
+        deploymentUnload: (id) =>
+            `/admin/api/cluster/deployments/${encodeURIComponent(id)}/unload`,
     };
 
     // exo-style data layer: one snapshot endpoint polled once per second
@@ -240,6 +244,7 @@ function clusterV2Wizard() {
         // payloads consume memory and disk even though writes run in back.
         promptCacheSsd: false,
         promptCacheSsdMaxGiB: 20,
+        targetContextTokens: 32768,
         // Per-model strategy advice from POST /admin/api/cluster/catalogue
         // (null = not attempted yet). catalogueFailed switches the
         // recommendation badge to the fast-transport heuristic.
@@ -273,6 +278,9 @@ function clusterV2Wizard() {
         stagingTimer: null,
         confirmUnpairFor: '',
         confirmDeactivateFor: '',
+        confirmUnloadFor: '',
+        confirmChangeModelFor: '',
+        clusterLifecycleBusy: false,
         executionReplan: null,
         executionReplanBusy: false,
         tpQualifications: null,
@@ -1865,6 +1873,14 @@ function clusterV2Wizard() {
         async selectModel(model) {
             if (!model || this.planLoading) return;
             this.selectedModelPath = model.model_path;
+            const modelLimit = Math.max(
+                1,
+                Number(model.model_context_length || 1_048_576),
+            );
+            this.targetContextTokens = Math.min(
+                Math.max(1, Number(this.targetContextTokens) || 32768),
+                modelLimit,
+            );
             this.plan = null;
             this.planProposal = null;
             this.checks.benchmark = null;
@@ -1896,6 +1912,30 @@ function clusterV2Wizard() {
                     detail: 'Wider automatic batches when requests overlap',
                 },
             ];
+        },
+
+        contextReservationOptions() {
+            const selectedLimit = Math.max(
+                1,
+                Number(this.selectedModel()?.model_context_length || 1_048_576),
+            );
+            const standard = [8192, 32768, 131072, 262144, 524288, 1_048_576];
+            const values = standard.filter((value) => value <= selectedLimit);
+            if (!values.includes(selectedLimit)) values.push(selectedLimit);
+            return [...new Set(values)].sort((left, right) => left - right);
+        },
+
+        contextReservationLabel(tokens) {
+            const value = Math.max(1, Number(tokens) || 0);
+            if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2).replace(/\.00$/, '')}M tokens`;
+            return `${Math.round(value / 1024)}K tokens`;
+        },
+
+        setTargetContextTokens(value) {
+            const parsed = Math.max(1, Number(value) || 32768);
+            if (parsed === this.targetContextTokens || this.planLoading) return;
+            this.targetContextTokens = parsed;
+            if (this.selectedModelPath) this.runPlan();
         },
 
         setExecutionProfile(key) {
@@ -2255,6 +2295,10 @@ function clusterV2Wizard() {
                     preflight: true,
                     auto_tune: true,
                     measure_performance: true,
+                    target_context_tokens: Math.max(
+                        1,
+                        Number(this.targetContextTokens) || 32768,
+                    ),
                 };
                 if (
                     model?.model_source &&
@@ -2767,14 +2811,168 @@ function clusterV2Wizard() {
             }
         },
 
+        hydratePlannerFromDeployment(deployment) {
+            const execution = this.deploymentExecution(deployment) || {};
+            this.executionProfile = String(
+                execution.profile || deployment?.execution?.profile || 'balanced',
+            );
+            this.promptCacheSsd = Boolean(
+                execution.prompt_cache_ssd ?? deployment?.prompt_cache_ssd,
+            );
+            this.promptCacheSsdMaxGiB = Math.max(
+                1,
+                Math.round(
+                    Number(
+                        execution.prompt_cache_ssd_max_bytes ||
+                            deployment?.prompt_cache_ssd_max_bytes ||
+                            20 * 1024 ** 3,
+                    ) /
+                        1024 ** 3,
+                ),
+            );
+            this.targetContextTokens = Math.max(
+                1,
+                Number(deployment?.target_context_tokens || 32768),
+            );
+            this.nodeRoles = Object.fromEntries(
+                (deployment?.assignments || [])
+                    .filter((assignment) => assignment?.node_id && assignment?.role)
+                    .map((assignment) => [assignment.node_id, assignment.role]),
+            );
+            // A different architecture may need a different split. Automatic
+            // retains all the current serving/cache/memory choices while
+            // letting the catalogue select TP or pipeline for the new model.
+            this.planStrategy = 'auto';
+        },
+
+        resetModelPicker() {
+            this.selectedModelPath = '';
+            this.modelSearch = '';
+            this.modelOptions = [];
+            this.modelsError = '';
+            this.catalogueModels = null;
+            this.catalogueFailed = false;
+            this.plan = null;
+            this.planProposal = null;
+            this.planError = '';
+            this.planFitFailure = null;
+            this.checks.benchmark = null;
+            this.stagingJob = null;
+            this.stagingActivation = null;
+            this.stagingError = '';
+        },
+
+        async unloadDeploymentWeights(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            if (this.confirmUnloadFor !== id) {
+                this.confirmUnloadFor = id;
+                this.confirmChangeModelFor = '';
+                return;
+            }
+            this.confirmUnloadFor = '';
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deploymentUnload(id), {
+                    method: 'POST',
+                });
+                this.notify(
+                    'success',
+                    'Cluster weights unloaded. The signed setup is still ready to load again.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not unload the cluster weights.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        async loadDeploymentWeights(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            this.clusterLifecycleBusy = true;
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deploymentLoad(id), {
+                    method: 'POST',
+                });
+                this.notify(
+                    'success',
+                    'Cluster weights loaded and every rank passed readiness.',
+                );
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not load the cluster weights.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
+        beginModelChange(deployment) {
+            const id = deployment?.deployment_id;
+            if (!id || this.clusterLifecycleBusy) return;
+            this.confirmChangeModelFor = id;
+            this.confirmUnloadFor = '';
+            this.confirmDeactivateFor = '';
+        },
+
+        cancelModelChange() {
+            this.confirmChangeModelFor = '';
+        },
+
+        async changeClusterModel(deployment) {
+            const id = deployment?.deployment_id;
+            if (
+                !id ||
+                this.confirmChangeModelFor !== id ||
+                this.clusterLifecycleBusy
+            ) {
+                return;
+            }
+            this.clusterLifecycleBusy = true;
+            this.hydratePlannerFromDeployment(deployment);
+            try {
+                await this.apiFetch(CLUSTER_V2_API.deployment(id), {
+                    method: 'DELETE',
+                });
+                this.confirmChangeModelFor = '';
+                this.resetModelPicker();
+                await this.refreshDeployments();
+                await this.refreshRuntime();
+                this.enterPlan();
+                this.notify(
+                    'info',
+                    'Previous shards unloaded. Choose the next model; current serving and memory settings are prefilled.',
+                );
+            } catch (error) {
+                this.notify(
+                    error?.status === 409 ? 'warning' : 'error',
+                    error?.message || 'Could not switch the clustered model.',
+                );
+            } finally {
+                this.clusterLifecycleBusy = false;
+            }
+        },
+
         async deactivateDeployment(deployment) {
             const id = deployment?.deployment_id;
-            if (!id) return;
+            if (!id || this.clusterLifecycleBusy) return;
             if (this.confirmDeactivateFor !== id) {
                 this.confirmDeactivateFor = id;
                 return;
             }
             this.confirmDeactivateFor = '';
+            this.confirmChangeModelFor = '';
+            this.confirmUnloadFor = '';
+            this.clusterLifecycleBusy = true;
             try {
                 await this.apiFetch(CLUSTER_V2_API.deployment(id), {
                     method: 'DELETE',
@@ -2787,6 +2985,8 @@ function clusterV2Wizard() {
                     'error',
                     error?.message || 'Could not deactivate',
                 );
+            } finally {
+                this.clusterLifecycleBusy = false;
             }
         },
 

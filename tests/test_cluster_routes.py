@@ -1389,6 +1389,24 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert listed.status_code == 200
     assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
 
+    unloaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/unload"
+    )
+    assert unloaded.status_code == 200, unloaded.json()
+    assert unloaded.json()["configured"] is True
+    assert unloaded.json()["stopped"] is True
+    assert pool.entry.engine is None
+    assert routes.get_cluster_registry().get("nemotron-pool") is not None
+
+    loaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/load"
+    )
+    assert loaded.status_code == 200, loaded.json()
+    assert loaded.json()["loaded"] is True
+    assert loaded.json()["canary_completion_tokens"] == 1
+    assert len(loaded.json()["ranks"]) == 2
+    assert pool.entry.engine is not None
+
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200
 

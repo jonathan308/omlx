@@ -5089,3 +5089,95 @@ async def deactivate_cluster_deployment(deployment_id: str):
         "deployment_id": deployment_id,
         "stopped": True,
     }
+
+
+@router.post("/deployments/{deployment_id}/unload")
+async def unload_cluster_deployment(deployment_id: str):
+    """Release resident ranks while keeping the signed deployment configured."""
+
+    registry = get_cluster_registry()
+    deployment = await asyncio.to_thread(registry.get, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="cluster deployment not found")
+    try:
+        pool = _engine_pool()
+        model_id = pool.resolve_cluster_model_id(deployment.model)
+        entry = pool.get_entry(model_id)
+        if entry is not None and entry.engine is not None:
+            await pool.prepare_cluster_reload(model_id)
+    except ModelNotFoundError:
+        # A configured deployment may legitimately be cold after restart.
+        # Keeping unload idempotent lets the dashboard recover without
+        # reconstructing EnginePool's private registration state.
+        model_id = None
+    except ModelBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The cluster is serving a request. It will not be interrupted; "
+                "unload it after the request finishes."
+            ),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "deployment_id": deployment_id,
+        "model_id": model_id,
+        "stopped": True,
+        "configured": True,
+    }
+
+
+@router.post("/deployments/{deployment_id}/load")
+async def load_cluster_deployment(deployment_id: str):
+    """Load a configured deployment and prove all ranks with a short canary."""
+
+    registry = get_cluster_registry()
+    deployment = await asyncio.to_thread(registry.get, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="cluster deployment not found")
+    try:
+        pool = _engine_pool()
+        try:
+            model_id = pool.resolve_cluster_model_id(deployment.model)
+        except ModelNotFoundError:
+            register = getattr(pool, "register_cluster_model", None)
+            if not callable(register):
+                raise
+            estimated_size = sum(
+                assignment.planned_weight_bytes
+                for assignment in deployment.assignments
+            )
+            model_id, _ = register(
+                deployment.model,
+                estimated_size=estimated_size,
+            )
+        engine = await pool.get_engine(model_id)
+        if getattr(engine, "deployment", None) != deployment:
+            raise DistributedLaunchError(
+                "engine pool did not load the configured distributed plan"
+            )
+        canary = await engine.generate(
+            "__omlx_cluster_readiness__",
+            max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+        )
+        status = engine.cluster_status()
+    except ModelBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The model is already changing state; wait and try again.",
+        ) from exc
+    except (DistributedLaunchError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "deployment_id": deployment_id,
+        "model_id": model_id,
+        "loaded": True,
+        "canary_completion_tokens": canary.completion_tokens,
+        "ranks": status.get("ranks", []),
+    }
