@@ -376,6 +376,32 @@ def test_aggregate_decode_tps_accumulates_b1_b2_b4_step_math():
     assert telemetry.snapshot()["aggregate_decode_tps"] == pytest.approx(50.0)
 
 
+def test_internal_readiness_request_is_not_published_as_user_traffic():
+    clock = _Clock()
+    telemetry = RuntimeTelemetry(_Marker(), clock=clock, publish_interval=0)
+    request_id = telemetry.begin_request("omlx-internal-readiness")
+    telemetry.observe_context(request_id, prompt_tokens=8, cached_tokens=0)
+    clock.value = 0.5
+    telemetry.observe_token(request_id)
+    telemetry.observe_batch_step(
+        prompt_responses=0,
+        generation_responses=1,
+        elapsed_seconds=0.05,
+    )
+
+    running = telemetry.snapshot()
+    assert running["active_requests"] == 0
+    assert running["active_request_metrics"] == []
+    assert running["aggregate_decode_tps"] == 0.0
+
+    telemetry.finish_request(request_id)
+    finished = telemetry.snapshot()
+    assert finished["requests_completed"] == 0
+    assert finished["prompt_tokens_total"] == 0
+    assert finished["completion_tokens_total"] == 0
+    assert finished["last_request"] is None
+
+
 def test_telemetry_publishes_live_mlx_lm_prefill_progress():
     clock = _Clock()
     marker = _Marker()

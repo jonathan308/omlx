@@ -4652,6 +4652,7 @@ async def _activate_and_report(
                 temperature=0.0,
                 top_p=1.0,
                 top_k=0,
+                _request_id="omlx-internal-readiness",
             )
             cluster_status = engine.cluster_status()
         except BaseException as exc:
@@ -5170,6 +5171,7 @@ async def load_cluster_deployment(deployment_id: str):
             temperature=0.0,
             top_p=1.0,
             top_k=0,
+            _request_id="omlx-internal-readiness",
         )
         status = engine.cluster_status()
     except ModelBusyError as exc:

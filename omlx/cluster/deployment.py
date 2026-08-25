@@ -80,6 +80,10 @@ _RANK_ENV_DEFAULTS = (
     # Prompt-cache structure tracing is operator-only. It must reach every
     # rank because cache reuse is a synchronized prefill decision.
     ("OMLX_CLUSTER_CACHE_TRACE", "0"),
+    # Keep distributed prompt snapshots under the ordinary oMLX SSD cache
+    # root. The server replaces this default from GlobalSettings before a
+    # launch, while each remote rank expands ``~`` for its own account.
+    ("OMLX_CLUSTER_PROMPT_CACHE_ROOT", "~/.omlx/cache/cluster-prompt-snapshots"),
     # Qualification gate for rank-zero-coordinated adaptive MTP depth. The
     # coordinator broadcasts the selected verify width and park decision, so
     # every TP rank enters the same collective graph. Production stays on its

@@ -918,16 +918,16 @@
             <div class="p-5 sm:p-6">
                 <div class="flex items-start justify-between gap-3">
                     <div>
-                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-400"
+                        <div class="text-xs font-bold uppercase tracking-wider text-neutral-600"
                              x-text="deploymentStatus().eyebrow"></div>
                         <h4 class="text-lg font-semibold text-neutral-900 mt-1"
                             x-text="configuredDeployment() ? displayModelName(configuredDeployment()) : ''"></h4>
-                        <p class="text-xs text-neutral-500 mt-1"
+                        <p class="text-xs text-neutral-600 mt-1"
                            x-text="deploymentStatus().detail"></p>
-                        <p class="text-[10px] text-neutral-400 mt-1"
+                        <p class="text-[10px] text-neutral-600 mt-1"
                            x-text="deploymentCacheLabel()"
                            data-cluster-v2-active-cache-mode></p>
-                        <p class="text-[10px] text-neutral-500 mt-1"
+                        <p class="text-[10px] text-neutral-600 mt-1"
                            x-text="deploymentFabricLabel() + ' · device links below are control/discovery routes'"
                            data-cluster-v2-active-fabric></p>
                     </div>
@@ -951,7 +951,7 @@
                     <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
                         <div>
                             <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Batching &amp; concurrency</div>
-                            <div class="text-[10px] text-neutral-400 mt-0.5">Resolved worker limits · changes require a signed re-plan</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5">Resolved worker limits · changes require a signed re-plan</div>
                         </div>
                         <span class="text-[10px] font-semibold text-neutral-500"
                               x-text="deploymentExecutionProfileLabel() + ' profile'"></span>
@@ -959,7 +959,7 @@
                     <div class="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-neutral-100">
                         <div class="px-4 py-3" data-cluster-v2-batching-state>
                             <div class="flex items-center justify-between gap-2">
-                                <span class="text-[9px] uppercase tracking-wider text-neutral-400">Continuous batching</span>
+                                <span class="text-[9px] uppercase tracking-wider text-neutral-600">Continuous batching</span>
                                 <span class="inline-flex rounded-full border px-2 py-0.5 text-[9px] font-semibold"
                                       :class="deploymentBatchStatus().tone"
                                       x-text="deploymentBatchStatus().label"></span>
@@ -968,20 +968,20 @@
                                  x-text="deploymentBatchStatus().detail"></div>
                         </div>
                         <div class="px-4 py-3" data-cluster-v2-decode-concurrency>
-                            <div class="text-[9px] uppercase tracking-wider text-neutral-400">Decode concurrency</div>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">Decode concurrency</div>
                             <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                  x-text="deploymentExecution()?.decode_concurrency ?? '—'"></div>
-                            <div class="text-[10px] text-neutral-500">maximum in-flight decode requests</div>
+                            <div class="text-[10px] text-neutral-600">maximum in-flight decode requests</div>
                         </div>
                         <div class="px-4 py-3" data-cluster-v2-prompt-concurrency>
-                            <div class="text-[9px] uppercase tracking-wider text-neutral-400">Prompt concurrency</div>
+                            <div class="text-[9px] uppercase tracking-wider text-neutral-600">Prompt concurrency</div>
                             <div class="text-lg font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                  x-text="deploymentExecution()?.prompt_concurrency ?? '—'"></div>
-                            <div class="text-[10px] text-neutral-500"
+                            <div class="text-[10px] text-neutral-600"
                                  x-text="'maximum prefills · batch target ' + (deploymentBatchStatus().target || '—')"></div>
                         </div>
                     </div>
-                    <div class="px-4 py-2 border-t border-neutral-100 text-[10px] text-neutral-400"
+                    <div class="px-4 py-2 border-t border-neutral-100 text-[10px] text-neutral-600"
                          x-show="deploymentExecution()?.tuning_reason"
                          x-text="deploymentExecution()?.tuning_reason"></div>
                     <div class="px-4 py-3 border-t border-neutral-100"
@@ -989,7 +989,7 @@
                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                             <div>
                                 <div class="text-[10px] font-semibold text-neutral-700">Change serving profile</div>
-                                <div class="text-[9px] text-neutral-400 mt-0.5">Select to preview a signed plan. Applying waits for request quiescence, reloads the ranks, and runs readiness again.</div>
+                                <div class="text-[9px] text-neutral-600 mt-0.5">Select to preview a signed plan. Applying waits for request quiescence, reloads the ranks, and runs readiness again.</div>
                             </div>
                             <div class="inline-flex rounded-lg border border-neutral-200 overflow-hidden self-start sm:self-auto">
                                 <template x-for="option in executionProfileOptions()" :key="'active-' + option.key">
@@ -1037,13 +1037,13 @@
                     <div class="flex items-center justify-between gap-3 px-4 py-2.5 bg-neutral-50 border-b border-neutral-200">
                         <div>
                             <div class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Request speeds</div>
-                            <div class="text-[10px] text-neutral-400 mt-0.5">Independent end-to-end rates from the coordinator</div>
+                            <div class="text-[10px] text-neutral-600 mt-0.5">Independent end-to-end rates from the coordinator</div>
                         </div>
                         <span class="text-[10px] font-semibold text-neutral-500"
                               x-text="deploymentRequestCountLabel()"></span>
                     </div>
                     <template x-if="!deploymentRequestMetrics().length">
-                        <div class="px-4 py-3 text-xs text-neutral-400">
+                        <div class="px-4 py-3 text-xs text-neutral-600">
                             No request measured yet. Prefill and decode rates appear here when inference starts.
                         </div>
                     </template>
@@ -1061,21 +1061,21 @@
                                               :class="requestPhaseTone(request)"
                                               x-text="requestPhaseLabel(request)"></span>
                                     </div>
-                                    <div class="text-[10px] text-neutral-400 mt-1"
+                                    <div class="text-[10px] text-neutral-600 mt-1"
                                          x-text="requestPromptDetail(request)"></div>
                                 </div>
                                 <div data-cluster-v2-request-prefill-rate>
                                     <div class="text-[9px] uppercase tracking-wider text-blue-700">Prefill</div>
                                     <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                          x-text="requestPrefillRate(request)"></div>
-                                    <div class="text-[10px] text-neutral-400 mt-0.5"
+                                    <div class="text-[10px] text-neutral-600 mt-0.5"
                                          x-text="request.prefill_progress?.active ? 'live average' : 'prompt average'"></div>
                                 </div>
                                 <div data-cluster-v2-request-decode-rate>
                                     <div class="text-[9px] uppercase tracking-wider text-green-700">Decode</div>
                                     <div class="text-sm font-semibold text-neutral-900 mt-0.5 tabular-nums"
                                          x-text="requestDecodeRate(request)"></div>
-                                    <div class="text-[10px] text-neutral-400 mt-0.5"
+                                    <div class="text-[10px] text-neutral-600 mt-0.5"
                                          x-text="requestDecodeDetail(request)"></div>
                                 </div>
                             </div>
@@ -1149,7 +1149,7 @@
                                     class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border disabled:opacity-40"
                                     :class="confirmDeactivateFor === deployment.deployment_id
                                         ? 'text-red-700 border-red-300 bg-red-50 hover:bg-red-100'
-                                        : 'text-neutral-500 border-neutral-200 hover:bg-neutral-50'"
+                                        : 'text-neutral-600 border-neutral-200 hover:bg-neutral-50'"
                                     data-cluster-v2-deactivate>
                                 <i data-lucide="octagon-x" class="w-3.5 h-3.5"></i>
                                 <span x-text="confirmDeactivateFor === deployment.deployment_id ? 'Confirm remove setup' : 'Remove cluster setup'"></span>
