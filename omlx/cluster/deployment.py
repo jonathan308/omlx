@@ -231,6 +231,10 @@ _RANK_ENV_DEFAULTS = (
     # separate M5 rank 1 expert-blocked NAX projections. One rollback value
     # must reach every rank; exact local device/shape/rank gates decide use.
     ("OMLX_DSV4_COMBINED_MOE_PREFILL", "0"),
+    # Exact M=1024 TP2 scheduling experiment: build the independent shared
+    # expert branch on a second thread-local Metal stream while routed experts
+    # stay on the generation stream. The canonical BF16 addition is unchanged.
+    ("OMLX_DSV4_SHARED_EXPERT_OVERLAP", "0"),
     # Exact M=1024 M5 TensorOps O-A projection for the 40-head 5/8 shard.
     # Default-off until the full TP A/B clears; exporting the value prevents
     # coordinator/worker capability decisions from diverging.

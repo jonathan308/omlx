@@ -473,6 +473,19 @@ _DEEPSEEK_V4_QKV_BUNDLE_DECODE_LOGGED = False
 _DEEPSEEK_V4_QKV_BUNDLE_ALL_SCHEDULES = os.getenv(
     "OMLX_DSV4_QKV_BUNDLE_ALL_SCHEDULES", "0"
 ).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_SHARED_EXPERT_OVERLAP = os.getenv(
+    "OMLX_DSV4_SHARED_EXPERT_OVERLAP", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_STATE = threading.local()
+_DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_LOGGED = False
+
+
+def _shared_expert_overlap_stream():
+    stream = getattr(_DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_STATE, "stream", None)
+    if stream is None:
+        stream = mx.new_stream(mx.default_device())
+        _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_STATE.stream = stream
+    return stream
 
 
 def _decode_qkv_projection_bundle(
@@ -2637,11 +2650,32 @@ class DeepseekV4MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
+        overlap_shared = bool(
+            _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP
+            and not self.training
+            and not is_dspark_verify_armed()
+            and self.sharding_group is not None
+            and int(self.sharding_group.size()) == 2
+            and tuple(x.shape) == (1, 1024, 4096)
+            and x.dtype == mx.bfloat16
+        )
+        shared = None
+        if overlap_shared:
+            with mx.stream(_shared_expert_overlap_stream()):
+                shared = self.shared_experts(x)
+            global _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_LOGGED
+            if not _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_LOGGED:
+                _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_LOGGED = True
+                logging.getLogger(__name__).info(
+                    "DeepSeek V4 shared/routed expert Metal-stream overlap active "
+                    "(M=1024, TP2; OMLX_DSV4_SHARED_EXPERT_OVERLAP=0 disables)"
+                )
+
         inds, scores = self.gate(x, input_ids)
         y = self.switch_mlp(x, inds, scores=scores)
         if y.ndim == scores.ndim + 1:
             y = (y * scores[..., None].astype(y.dtype)).sum(-2)
-        y = y + self.shared_experts(x)
+        y = y + (shared if shared is not None else self.shared_experts(x))
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
