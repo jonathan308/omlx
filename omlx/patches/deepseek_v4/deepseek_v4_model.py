@@ -3565,24 +3565,48 @@ def _ragged_verify_sparse_attention(
     *,
     decode_consistent: bool,
 ) -> mx.array:
-    """Evaluate a verify block rowwise when its sparse widths differ.
+    """Evaluate equal-geometry verify subgroups when sparse widths differ.
 
     At a ratio-4/128 pooling boundary, the first speculative row can select
     511 pooled entries while the following rows select 512. Padding that first
     row would either duplicate a KV entry or change the softmax reduction tree.
-    Run the at-most-six verification rows through the established B=1 exact
-    path instead, preserving each row's own local/pooled cache and top-k width.
+    Split the at-most-six verification rows into adjacent equal-geometry
+    groups. The boundary row runs through the established B=1 exact path while
+    the usual 512-wide tail remains batched. Each group's final pooled view is
+    safe for its earlier rows because their top-k indices can only name the
+    prefix they observed; no padded/duplicated entry enters the softmax.
     """
 
     outputs: List[mx.array] = []
-    for index, (local, pooled, topk) in enumerate(
-        zip(local_rows, pooled_rows, topk_rows)
-    ):
-        output = _sparse_pooled_attention(
-            query_rows[index : index + 1],
-            local,
+    start = 0
+    count = min(
+        int(query_rows.shape[0]),
+        len(local_rows),
+        len(pooled_rows),
+        len(topk_rows),
+    )
+    while start < count:
+        signature = (
+            int(local_rows[start].shape[2]),
+            int(topk_rows[start].shape[-1]),
+        )
+        stop = start + 1
+        while stop < count and (
+            int(local_rows[stop].shape[2]),
+            int(topk_rows[stop].shape[-1]),
+        ) == signature:
+            stop += 1
+        group_size = stop - start
+        pooled = pooled_rows[stop - 1]
+        pooled_batch = mx.broadcast_to(
             pooled,
-            topk,
+            (group_size, pooled.shape[1], pooled.shape[2]),
+        )
+        output = _sparse_pooled_attention(
+            query_rows[start:stop],
+            mx.concatenate(local_rows[start:stop], axis=0),
+            pooled_batch,
+            mx.concatenate(topk_rows[start:stop], axis=0),
             None,
             None,
             scale,
@@ -3592,7 +3616,8 @@ def _ragged_verify_sparse_attention(
         if output is None:
             raise RuntimeError("DS4 rowwise verify attention did not produce output")
         outputs.append(output)
-    if len(outputs) != int(query_rows.shape[0]):
+        start = stop
+    if sum(int(output.shape[0]) for output in outputs) != int(query_rows.shape[0]):
         raise RuntimeError("DS4 rowwise verify cache count is inconsistent")
     return mx.concatenate(outputs, axis=0)
 
