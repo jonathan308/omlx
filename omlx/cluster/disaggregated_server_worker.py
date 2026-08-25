@@ -26,6 +26,23 @@ _DTYPE_TO_CODE = {"float16": 1, "bfloat16": 2, "float32": 3}
 _CODE_TO_DTYPE = {value: key for key, value in _DTYPE_TO_CODE.items()}
 
 
+def _phase_event(rank: int, stage: str, **details: Any) -> None:
+    print(
+        "OMLX_CLUSTER_EVENT:"
+        + json.dumps(
+            {
+                "type": "phase_trace",
+                "rank": rank,
+                "stage": stage,
+                **details,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -148,6 +165,7 @@ class _PhaseResponseGenerator:
         prefill_step_size: int,
         cli_args: Any,
         stream: Any,
+        deployment_id: str,
     ) -> None:
         if decode_rank != 0 or prefill_rank != 1:
             raise RuntimeError(
@@ -165,6 +183,7 @@ class _PhaseResponseGenerator:
         self.prefill_step_size = prefill_step_size
         self.cli_args = cli_args
         self.stream = stream
+        self.deployment_id = deployment_id
         self.requests: Queue = Queue()
         self._stopping = threading.Event()
         self._decode_thread: threading.Thread | None = None
@@ -317,6 +336,7 @@ class _PhaseResponseGenerator:
             if request is None:
                 break
             try:
+                _phase_event(0, "broker_request", prompt_tokens=len(request.prompt))
                 self.control.broadcast_object(
                     {
                         "op": "prefill",
@@ -332,6 +352,7 @@ class _PhaseResponseGenerator:
                     expected_size=_LOGITS_HEADER.size,
                 )
                 dtype_code, rows, columns = _LOGITS_HEADER.unpack(header)
+                _phase_event(0, "broker_prefill_ready", logits_columns=columns)
                 dtype_name = _CODE_TO_DTYPE.get(dtype_code)
                 if dtype_name is None or rows != 1 or columns <= 0:
                     raise RuntimeError("prefill rank returned an invalid logits header")
@@ -342,6 +363,7 @@ class _PhaseResponseGenerator:
                 if previous is not None:
                     previous.join()
                 self.control.barrier()
+                _phase_event(0, "broker_cache_recv_start")
                 cache, _manifest, _stats = recv_cache_transfer(
                     self.mx,
                     src=self.prefill_rank,
@@ -356,6 +378,7 @@ class _PhaseResponseGenerator:
                 )
                 self.mx.eval(logits)
                 self.mx.synchronize()
+                _phase_event(0, "broker_cache_recv_done")
                 previous = threading.Thread(
                     target=self._decode,
                     args=(request, cache, logits),
@@ -390,6 +413,7 @@ def _prefill_rank_loop(
     group: Any,
     control: Any,
     model_identity: str,
+    rank: int,
 ) -> None:
     from mlx_lm.models.cache import make_prompt_cache
 
@@ -406,6 +430,7 @@ def _prefill_rank_loop(
         if len(prompt) < 2 or step < 1:
             raise RuntimeError("phase broker sent an invalid prompt")
         cache = make_prompt_cache(model)
+        _phase_event(rank, "prefill_request", prompt_tokens=len(prompt))
 
         def progress(processed: int, total: int) -> None:
             control.broadcast_owned_bytes(
@@ -422,6 +447,7 @@ def _prefill_rank_loop(
             step=step,
             progress=progress,
         )
+        _phase_event(rank, "prefill_compute_done")
         dtype_code = _DTYPE_TO_CODE.get(_dtype_name(logits.dtype))
         if dtype_code is None or logits.ndim != 2:
             raise RuntimeError("phase prefill produced unsupported logits")
@@ -431,6 +457,7 @@ def _prefill_rank_loop(
             expected_size=_LOGITS_HEADER.size,
         )
         control.barrier()
+        _phase_event(rank, "prefill_cache_send_start")
         prepared = prepare_cache_transfer(
             cache,
             model_identity=model_identity,
@@ -439,6 +466,7 @@ def _prefill_rank_loop(
         send_cache_transfer(mx, prepared, dst=0, group=group)
         mx.eval(mx.distributed.send(mx.contiguous(logits), 0, group=group))
         mx.synchronize()
+        _phase_event(rank, "prefill_cache_send_done")
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -581,6 +609,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     prefill_step_size=args.prefill_step_size,
                     cli_args=cli_args,
                     stream=stream,
+                    deployment_id=args.deployment_id,
                 )
                 _emit_event(
                     {
@@ -604,6 +633,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     group=group,
                     control=control,
                     model_identity=identity,
+                    rank=rank,
                 )
         return 0
     finally:
@@ -616,7 +646,16 @@ def run_worker(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    return run_worker(_arguments())
+    args = _arguments()
+    try:
+        return run_worker(args)
+    except BaseException as exc:
+        _phase_event(
+            int(os.environ.get("MLX_RANK", "-1")),
+            "rank_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 if __name__ == "__main__":
