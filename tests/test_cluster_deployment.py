@@ -11,6 +11,7 @@ from omlx.cluster.deployment import (
     ClusterHost,
     _assignment_from_dict,
     decode_worker_plan,
+    decode_worker_serving_mode,
     decode_worker_speculation,
 )
 from omlx.cluster.performance import NodePerformanceProfile, execution_profile
@@ -337,6 +338,86 @@ def test_deployment_carries_mtp_settings_to_every_rank():
     assert restored.mtp_enabled is True
     assert restored.mtp_num_draft_tokens == 5
     assert decode_worker_speculation(deployment.encode_worker_plan()) == (True, 5)
+
+
+def _disaggregated_deployment(**overrides):
+    base = _deployment()
+    assignments = tuple(
+        PipelineAssignment(
+            node_id=host.node_id,
+            rank=rank,
+            start_layer=0,
+            end_layer=48,
+            layer_weight_bytes=14 * GIB,
+            fixed_weight_bytes=GIB,
+            reserve_bytes=8 * GIB,
+            capacity_bytes=(256 if rank == 0 else 128) * GIB,
+            tensor_parallel_rank=0,
+            tensor_parallel_size=1,
+            kv_cache_bytes=2 * GIB,
+            kv_bytes_per_token=65536,
+            max_context_tokens=1_000_000,
+        )
+        for rank, host in enumerate(base.hosts)
+    )
+    fields = dict(
+        deployment_id="qwen-phase-split",
+        model="mlx-community/Qwen3.8-27B-4bit",
+        backend=base.backend,
+        hosts=base.hosts,
+        assignments=assignments,
+        plan_hash="f" * 64,
+        tensor_parallel_size=1,
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+    )
+    fields.update(overrides)
+    return ClusterDeployment(**fields)
+
+
+def test_disaggregated_deployment_round_trip_and_worker_contract():
+    deployment = _disaggregated_deployment()
+
+    restored = ClusterDeployment.from_dict(deployment.to_dict())
+    mode = decode_worker_serving_mode(deployment.encode_worker_plan())
+
+    assert restored == deployment
+    assert restored.to_dict()["serving_mode"] == "disaggregated"
+    assert mode == ("disaggregated", 1, 0)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"prefill_rank": 0, "decode_rank": 0},
+            "distinct prefill/decode ranks",
+        ),
+        ({"tensor_parallel_size": 2}, "tensor-parallel coordinates"),
+        ({"mtp_enabled": True}, "does not yet admit speculative"),
+    ],
+)
+def test_disaggregated_deployment_rejects_unsafe_contracts(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _disaggregated_deployment(**overrides)
+
+
+def test_legacy_deployment_decodes_to_sharded_mode():
+    payload = _deployment().to_dict()
+    payload["schema_version"] = 2
+    payload.pop("serving_mode")
+    payload.pop("prefill_rank")
+    payload.pop("decode_rank")
+
+    restored = ClusterDeployment.from_dict(payload)
+
+    assert restored.serving_mode == "sharded"
+    assert decode_worker_serving_mode(restored.encode_worker_plan()) == (
+        "sharded",
+        None,
+        None,
+    )
 
 
 @pytest.mark.parametrize(

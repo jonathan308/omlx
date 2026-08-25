@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
 from typing import Sequence
 
@@ -221,10 +223,126 @@ def plan_disaggregated_prefill_decode(
     )
 
 
+def build_full_replica_shard_plan(
+    model: object,
+    nodes: Sequence[object],
+    *,
+    prefill_rank: int,
+    decode_rank: int,
+    context_tokens: int,
+    workload_profile: str = "throughput",
+) -> object:
+    """Build the signed memory plan consumed by a persistent phase split.
+
+    Kept in this module so ordinary tensor/pipeline planning remains unchanged.
+    Both ranks receive the complete layer range and full KV reservation; the
+    deployment validator later refuses any partial or mismatched replica.
+    """
+
+    from .planner import (
+        PipelineAssignment,
+        PlanningError,
+        ShardPlan,
+        _kv_bytes_for_stage,
+        _kv_bytes_per_token_for_stage,
+        _max_context_for_stage,
+    )
+
+    if len(nodes) != 2 or {prefill_rank, decode_rank} != {0, 1}:
+        raise PlanningError(
+            "disaggregated serving requires two distinct phase ranks"
+        )
+    layer_weights = tuple(int(value) for value in model.layer_weight_bytes)
+    if not layer_weights:
+        raise PlanningError("disaggregated serving requires a layered model")
+    layer_bytes = sum(layer_weights)
+    fixed_bytes = int(model.fixed_weight_bytes)
+    layer_count = len(layer_weights)
+    kv_bytes = _kv_bytes_for_stage(model, layer_count, context_tokens)
+    kv_bytes_per_token = _kv_bytes_per_token_for_stage(model, layer_count)
+    assignments = []
+    for node in nodes:
+        planned_weights = fixed_bytes + layer_bytes
+        planned = planned_weights + kv_bytes
+        if planned > node.usable_bytes:
+            raise PlanningError(
+                f"full replica does not fit node {node.node_id}: {planned} > "
+                f"{node.usable_bytes} (weights {planned_weights}, KV {kv_bytes})"
+            )
+        if planned_weights > node.weight_ceiling_bytes:
+            raise PlanningError(
+                f"full replica exceeds the weight limit on node {node.node_id}: "
+                f"{planned_weights} > {node.weight_ceiling_bytes}"
+            )
+        assignments.append(
+            PipelineAssignment(
+                node_id=node.node_id,
+                rank=node.rank,
+                start_layer=0,
+                end_layer=layer_count,
+                layer_weight_bytes=layer_bytes,
+                fixed_weight_bytes=fixed_bytes,
+                reserve_bytes=node.reserve_bytes,
+                capacity_bytes=node.capacity_bytes,
+                manual_memory_limit=node.manual_memory_limit,
+                role=node.role,
+                memory_guard_tier=node.memory_guard_tier,
+                tensor_parallel_rank=0,
+                tensor_parallel_size=1,
+                tensor_parallel_shard_weight=1,
+                sharded_weight_bytes=0,
+                kv_cache_bytes=kv_bytes,
+                kv_bytes_per_token=kv_bytes_per_token,
+                max_context_tokens=_max_context_for_stage(
+                    model,
+                    node,
+                    layer_count=layer_count,
+                    weight_bytes=planned_weights,
+                ),
+            )
+        )
+    assignments.sort(key=lambda item: item.rank)
+    hash_payload = {
+        "serving_mode": "disaggregated",
+        "prefill_rank": prefill_rank,
+        "decode_rank": decode_rank,
+        "model": model.to_dict(),
+        "context_tokens": context_tokens,
+        "workload_profile": workload_profile,
+        "assignments": [item.to_dict() for item in assignments],
+    }
+    plan_hash = hashlib.sha256(
+        json.dumps(
+            hash_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return ShardPlan(
+        model=model,
+        assignments=tuple(assignments),
+        plan_hash=plan_hash,
+        optimization="disaggregated",
+        workload_profile=workload_profile,
+        performance_profiles=tuple(
+            node.performance
+            for node in nodes
+            if getattr(node, "performance", None) is not None
+        ),
+        tensor_parallel_size=1,
+        pipeline_stages=1,
+        target_context_tokens=context_tokens,
+        serving_mode="disaggregated",
+        prefill_rank=prefill_rank,
+        decode_rank=decode_rank,
+    )
+
+
 __all__ = [
     "DisaggregatedNodeProfile",
     "DisaggregatedOrientation",
     "DisaggregatedPlan",
     "DisaggregatedWorkload",
     "plan_disaggregated_prefill_decode",
+    "build_full_replica_shard_plan",
 ]
