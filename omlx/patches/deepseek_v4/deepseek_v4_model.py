@@ -2661,6 +2661,11 @@ class DeepseekV4MoE(nn.Module):
         )
         shared = None
         if overlap_shared:
+            # The sharded input is itself a lazy JACCL all_sum. Drain it on
+            # the generation stream before either independent branch captures
+            # the array; otherwise graph traversal can move that collective
+            # onto the auxiliary stream and poison the shared queue pair.
+            mx.eval(x)
             with mx.stream(_shared_expert_overlap_stream()):
                 shared = self.shared_experts(x)
             global _DEEPSEEK_V4_SHARED_EXPERT_OVERLAP_LOGGED
