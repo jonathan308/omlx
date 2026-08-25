@@ -1,7 +1,7 @@
 # Disaggregated prefill/decode over JACCL RDMA
 
-Status: physically proven prototype, default off, not connected to the public
-HTTP scheduler.
+Status: physically proven single-request and two-request pipeline prototype,
+default off, not connected to the public HTTP scheduler.
 
 ## Contract
 
@@ -60,20 +60,32 @@ Hardware:
 At 30K, the complete cache handoff costs 0.94% of prefill time. At 4K it costs
 about 1.0%. Both cache directions and both role assignments passed.
 
-The 4K+64 measurements imply a steady two-stage request interval of roughly
-`max(4.073 s prefill, 2.018 s decode) + 0.065 s handoff = 4.138 s`, versus
-about `4.073 + 2.012 = 6.085 s` when the M5 performs both phases serially. That
-is a projected 1.47x steady request-throughput improvement after pipeline fill;
-the first request pays the handoff and therefore has nearly unchanged/slightly
-higher latency. A multi-request physical overlap gate is still required before
-claiming the projection as measured aggregate throughput.
+The physical two-request 4K+64 pipeline measured:
+
+- two independent prompt/decode hashes, both exact;
+- 12.073 s when the M5 source performed the same two prefills and two control
+  decodes serially;
+- 10.040 s through the disaggregated fill/overlap/drain pipeline;
+- **1.2025x measured request-throughput speedup** including two handoffs and
+  pipeline fill/drain;
+- a 3.965 s overlap window in which the complete 2.019 s request-0 decode was
+  hidden beneath request-1 prefill.
+
+The same stage rates imply a steady filled-pipeline interval of roughly
+`max(4.0 s prefill, 2.0 s decode) + 0.065 s handoff = 4.07 s`, versus about
+6.0 s serially. More than two requests should approach a roughly 1.47x steady
+ceiling, but B4/B8 still require physical measurement. The first request pays
+the handoff and therefore has nearly unchanged/slightly higher latency.
 
 ## Implemented artifacts
 
 - `omlx/cluster/cache_transfer.py`: bounded universal cache manifest,
   reconstruction and direct point-to-point tensor transport.
 - `omlx/cluster/disaggregated_worker.py`: two-rank full-replica parity worker,
-  role reversal and control/data-plane separation.
+  role reversal, two-request overlap and control/data-plane separation.
+- `omlx/cluster/disaggregated.py`: fail-closed full-replica fit check and role
+  planner. It evaluates both orientations and recommends disaggregation only
+  when the estimated steady interval clears the configured gain threshold.
 - `benchmarks/bench_disaggregated_prefill_decode.py`: configured-fabric launcher
   and durable JSON report.
 - `tests/test_cluster_cache_transfer.py` and
@@ -82,10 +94,10 @@ claiming the projection as measured aggregate throughput.
 
 ## Before serving integration
 
-1. Add a planner capability that proves full-replica fit on both nodes and
-   measures both role directions. Choose the orientation that minimizes the
-   expected pipeline interval for the configured prompt/decode workload.
-2. Add a persistent two-stage request queue. While decode handles request N,
+1. Feed live per-node phase probes, model admission budgets and fabric metrics
+   into the implemented pure role planner; persist the resulting capability in
+   signed deployment state.
+2. Add a persistent serving queue. While decode handles request N,
    prefill should process N+1; cache transfer occurs at the stage boundary.
 3. Preserve request IDs, cancellation, steering, grammar state, sampler state,
    logit processors, tool-call parsing and per-request telemetry across the
@@ -94,7 +106,7 @@ claiming the projection as measured aggregate throughput.
    teardown, and cache ownership/garbage collection.
 5. Gate MTP/speculative state separately; the current prototype proves fixed
    greedy decode only.
-6. Run two-request physical overlap, B2/B4 queues, 30K/100K cache transfer,
+6. Extend the proven B2 overlap to B4/B8 queues; run 100K cache transfer,
    cancellation during prefill/handoff/decode, forced rank loss and reload.
 7. Expose the mode only when the planner proves it useful. Models that do not
    fit twice, single-request interactive workloads, and slow fabrics should
