@@ -481,7 +481,7 @@ def run(args: argparse.Namespace) -> int:
                 }
             )
 
-            if args.pipeline_requests == 2:
+            if args.pipeline_requests > 1:
                 return _run_request_pipeline(
                     mx=mx,
                     model=model,
