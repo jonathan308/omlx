@@ -236,6 +236,10 @@ def run(args: argparse.Namespace) -> int:
             transfer = send_cache_transfer(mx, prepared, dst=1, group=group)
             first_array = mx.array([first_token], dtype=mx.int32)
             mx.eval(mx.distributed.send(first_array, 1, group=group))
+            # Finish the prefill->decode direction before either rank posts a
+            # result in the reverse direction. Lazy sibling point-to-point
+            # operations may otherwise be topologically reordered.
+            mx.synchronize()
 
             baseline_tokens, baseline_decode_seconds = _fixed_greedy_decode(
                 mx,
@@ -247,8 +251,10 @@ def run(args: argparse.Namespace) -> int:
             remote_tokens_array = mx.distributed.recv(
                 (args.completion_tokens,), mx.int32, 1, group=group
             )
+            mx.eval(remote_tokens_array)
+            mx.synchronize()
             remote_metrics = mx.distributed.recv((2,), mx.float32, 1, group=group)
-            mx.eval(remote_tokens_array, remote_metrics)
+            mx.eval(remote_metrics)
             mx.synchronize()
             remote_tokens = [int(value) for value in remote_tokens_array.tolist()]
             remote_decode_seconds, remote_recv_seconds = (
@@ -308,6 +314,7 @@ def run(args: argparse.Namespace) -> int:
         )
         first_array = mx.distributed.recv((1,), mx.int32, 0, group=group)
         mx.eval(first_array)
+        mx.synchronize()
         first_token = int(first_array.item())
         remote_tokens, decode_seconds = _fixed_greedy_decode(
             mx,
@@ -321,6 +328,7 @@ def run(args: argparse.Namespace) -> int:
             [decode_seconds, recv_stats.elapsed_seconds], dtype=mx.float32
         )
         mx.eval(mx.distributed.send(token_array, 0, group=group))
+        mx.synchronize()
         mx.eval(mx.distributed.send(metrics, 0, group=group))
         # JACCL send is an MLX primitive. Evaluation queues it, while an
         # explicit stream drain keeps the rank process and source buffers alive
