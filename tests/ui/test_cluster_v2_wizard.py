@@ -1391,12 +1391,72 @@ process.stdout.write(JSON.stringify({
 """,
     )
 
-    assert result["keys"] == ["auto", "tensor", "pipeline"]
+    assert result["keys"] == ["auto", "tensor", "pipeline", "disaggregated"]
     assert result["tensor"]["disabled"] is True
     assert result["tensor"]["disabledReason"] == "Tensor parallelism needs 2+ Macs"
     assert result["afterPick"] == "auto", "a disabled option cannot be picked"
     # No catalogue call ever fired on a one-Mac setup → no badge, no errors.
     assert result["recommended"] == ""
+
+
+def test_phase_split_picker_posts_signed_role_ownership_and_renders_flow():
+    result = _run_wizard(
+        _WIZARD_TWO_MACS
+        + """
+const bodies = [];
+component.apiFetch = async (url, options) => {
+  const body = options?.body ? JSON.parse(options.body) : null;
+  bodies.push({ url, body });
+  if (url.endsWith('/autoconfigure')) {
+    return {
+      serving_mode: 'disaggregated',
+      performance_probe: { ok: false, status: 'phase_probe_required' },
+      plan: {
+        serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0,
+        assignments: [
+          { rank: 0, node_id: 'node-a', start_layer: 0, end_layer: 48, layer_count: 48 },
+          { rank: 1, node_id: 'node-b', start_layer: 0, end_layer: 48, layer_count: 48 },
+        ],
+        tensor_parallel_size: 1, pipeline_stages: 1,
+        placement_signature: 'f'.repeat(16),
+      },
+      activation: {
+        serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0,
+        approved_placement: 'f'.repeat(16),
+      },
+    };
+  }
+  return {};
+};
+component.modelOptions = [{ model_path: '/models/qwen', id: 'qwen' }];
+component.selectedModelPath = '/models/qwen';
+
+(async () => {
+  component.setPlanStrategy('disaggregated');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  process.stdout.write(JSON.stringify({
+    body: bodies.find((entry) => entry.url.endsWith('/autoconfigure'))?.body,
+    isPhase: component.planIsDisaggregated(),
+    totalLayers: component.planTotalLayers(),
+    roles: component.planAssignments().map((row) => component.phasePlanRole(row)),
+    benchmarkOkay: component.checks.benchmark?.ok,
+  }));
+})();
+""",
+    )
+
+    assert result["body"]["strategy"] == "disaggregated"
+    assert result["body"]["prefill_rank"] == 1
+    assert result["body"]["decode_rank"] == 0
+    assert result["body"]["measure_performance"] is False
+    assert result["isPhase"] is True
+    assert result["totalLayers"] == 48
+    assert result["roles"] == ["Decode", "Prefill"]
+    assert result["benchmarkOkay"] is True
+
+    template = _read(TEMPLATE)
+    assert "data-cluster-v2-phase-role-picker" in template
+    assert "data-cluster-v2-split-bar-disaggregated" in template
 
 
 def test_catalogue_drives_the_recommendation_badge_and_capability_locks():

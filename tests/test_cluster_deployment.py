@@ -394,6 +394,10 @@ def test_disaggregated_deployment_round_trip_and_worker_contract():
             {"prefill_rank": 0, "decode_rank": 0},
             "distinct prefill/decode ranks",
         ),
+        (
+            {"prefill_rank": 0, "decode_rank": 1},
+            "rank 0 decode and rank 1 prefill",
+        ),
         ({"tensor_parallel_size": 2}, "tensor-parallel coordinates"),
         ({"mtp_enabled": True}, "does not yet admit speculative"),
     ],
