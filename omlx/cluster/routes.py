@@ -5153,6 +5153,12 @@ async def load_cluster_deployment(deployment_id: str):
                 deployment.model,
                 estimated_size=estimated_size,
             )
+        entry = pool.get_entry(model_id)
+        resident = getattr(entry, "engine", None) if entry is not None else None
+        if resident is not None and getattr(
+            resident, "runtime_failed_reason", None
+        ):
+            await pool.prepare_cluster_reload(model_id)
         engine = await pool.get_engine(model_id)
         if getattr(engine, "deployment", None) != deployment:
             raise DistributedLaunchError(
@@ -5173,6 +5179,8 @@ async def load_cluster_deployment(deployment_id: str):
         ) from exc
     except (DistributedLaunchError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "ok": True,
         "deployment_id": deployment_id,
