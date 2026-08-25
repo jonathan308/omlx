@@ -37,6 +37,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--completion-tokens", type=int, default=32)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
+    parser.add_argument("--prefill-rank", type=int, choices=(0, 1), default=0)
     parser.add_argument(
         "--state-dir", default="~/.omlx/cluster/runtime-disaggregated"
     )
@@ -203,6 +204,8 @@ def run(args: argparse.Namespace) -> int:
         rank = int(group.rank())
         if group.size() != 2:
             raise RuntimeError("disaggregated prototype currently requires two ranks")
+        prefill_rank = int(args.prefill_rank)
+        decode_rank = 1 - prefill_rank
         _heartbeat(mx, group, rank)
         tokens = _prompt_tokens(tokenizer, args.prompt_tokens)
 
@@ -210,14 +213,14 @@ def run(args: argparse.Namespace) -> int:
             {
                 "type": "rank_loaded",
                 "rank": rank,
-                "role": "prefill" if rank == 0 else "decode",
+                "role": "prefill" if rank == prefill_rank else "decode",
                 "model_identity": identity,
                 "load_seconds": load_seconds,
                 "peak_memory_bytes": int(mx.get_peak_memory()),
             }
         )
 
-        if rank == 0:
+        if rank == prefill_rank:
             cache = make_prompt_cache(model)
             first_token, prefill_seconds, calls = _prefill(
                 mx,
@@ -233,9 +236,13 @@ def run(args: argparse.Namespace) -> int:
                 model_identity=identity,
                 prompt_tokens=len(tokens),
             )
-            transfer = send_cache_transfer(mx, prepared, dst=1, group=group)
+            transfer = send_cache_transfer(
+                mx, prepared, dst=decode_rank, group=group
+            )
             first_array = mx.array([first_token], dtype=mx.int32)
-            mx.eval(mx.distributed.send(first_array, 1, group=group))
+            mx.eval(
+                mx.distributed.send(first_array, decode_rank, group=group)
+            )
             # Finish the prefill->decode direction before either rank posts a
             # result in the reverse direction. Lazy sibling point-to-point
             # operations may otherwise be topologically reordered.
@@ -249,11 +256,16 @@ def run(args: argparse.Namespace) -> int:
                 args.completion_tokens,
             )
             remote_tokens_array = mx.distributed.recv(
-                (args.completion_tokens,), mx.int32, 1, group=group
+                (args.completion_tokens,),
+                mx.int32,
+                decode_rank,
+                group=group,
             )
             mx.eval(remote_tokens_array)
             mx.synchronize()
-            remote_metrics = mx.distributed.recv((2,), mx.float32, 1, group=group)
+            remote_metrics = mx.distributed.recv(
+                (2,), mx.float32, decode_rank, group=group
+            )
             mx.eval(remote_metrics)
             mx.synchronize()
             remote_tokens = [int(value) for value in remote_tokens_array.tolist()]
@@ -264,6 +276,8 @@ def run(args: argparse.Namespace) -> int:
             report = {
                 "type": "result",
                 "backend": args.backend,
+                "prefill_rank": prefill_rank,
+                "decode_rank": decode_rank,
                 "model": str(model_path),
                 "model_identity": identity,
                 "prompt_tokens": len(tokens),
@@ -308,11 +322,13 @@ def run(args: argparse.Namespace) -> int:
         )
         cache, manifest, recv_stats = recv_cache_transfer(
             mx,
-            src=0,
+            src=prefill_rank,
             group=group,
             expected_model_identity=identity,
         )
-        first_array = mx.distributed.recv((1,), mx.int32, 0, group=group)
+        first_array = mx.distributed.recv(
+            (1,), mx.int32, prefill_rank, group=group
+        )
         mx.eval(first_array)
         mx.synchronize()
         first_token = int(first_array.item())
@@ -327,9 +343,11 @@ def run(args: argparse.Namespace) -> int:
         metrics = mx.array(
             [decode_seconds, recv_stats.elapsed_seconds], dtype=mx.float32
         )
-        mx.eval(mx.distributed.send(token_array, 0, group=group))
+        mx.eval(
+            mx.distributed.send(token_array, prefill_rank, group=group)
+        )
         mx.synchronize()
-        mx.eval(mx.distributed.send(metrics, 0, group=group))
+        mx.eval(mx.distributed.send(metrics, prefill_rank, group=group))
         # JACCL send is an MLX primitive. Evaluation queues it, while an
         # explicit stream drain keeps the rank process and source buffers alive
         # until the peer has consumed the final result frames.
