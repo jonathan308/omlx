@@ -3,18 +3,18 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.32.2 is built with
-    # (MLX pins nanobind v2.15.0 via FetchContent in its CMakeLists.txt).
+    # Pin nanobind to match the ABI version MLX 0.32.0 was built with
+    # (MLX pins nanobind v2.13.0 via FetchContent in its CMakeLists.txt).
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
-    "nanobind==2.15.0",
-    # mlx floor admits the custom 0.32.2.dev build (JACCL guards/backports);
-    # an exact ==0.32.2 pin would make a fresh resolve replace it with the
+    "nanobind==2.13.0",
+    # mlx floor admits the custom 0.32.0.dev build (JACCL guards/backports);
+    # an exact ==0.32.0 pin would make a fresh resolve replace it with the
     # stock PyPI wheel and silently drop those fixes. When building with
     # isolation, pre-install the dev wheel with --no-build-isolation or
     # PIP_NO_BUILD_ISOLATION so this floor resolves to it.
-    "mlx>=0.32.2.dev0,<0.33",
+    "mlx>=0.32.0.dev0,<0.33",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -44,16 +44,16 @@ classifiers = [
 ]
 
 dependencies = [
-    # MLX 0.32.2 line; optional custom kernels live under
+    # MLX 0.32.0 line; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    # The floor admits the custom 0.32.2.dev wheel (JACCL guards/backports):
-    # an exact ==0.32.2 pin made a fresh resolve reinstall the stock PyPI
+    # The floor admits the custom 0.32.0.dev wheel (JACCL guards/backports):
+    # an exact ==0.32.0 pin made a fresh resolve reinstall the stock PyPI
     # wheel over the dev build, silently dropping those fixes. Install the
     # dev wheel first with --no-deps (ops/install_mlx_variant.sh) so the
     # resolver keeps it.
-    "mlx>=0.32.2.dev0,<0.33",
+    "mlx>=0.32.0.dev0,<0.33",
     # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
@@ -286,7 +286,7 @@ include = ["omlx*"]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
 override-dependencies = [
-    "mlx>=0.32.2.dev0,<0.33",
+    "mlx==0.32.0",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",
 ]
 
