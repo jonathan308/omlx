@@ -44,14 +44,17 @@ def test_overlap_preserves_canonical_sum_and_uses_secondary_stream(monkeypatch):
         yield
 
     secondary = object()
+    synchronized = []
     monkeypatch.setattr(dm, "_shared_expert_overlap_stream", lambda: secondary)
     monkeypatch.setattr(dm.mx, "stream", stream_context)
+    monkeypatch.setattr(dm.mx, "synchronize", lambda stream: synchronized.append(stream))
     value = mx.zeros((1, 1024, 4096), dtype=mx.bfloat16)
 
     result = dm.DeepseekV4MoE.__call__(_moe(1024), value, value[:, :, 0])
     mx.eval(result)
 
     assert entered == [secondary]
+    assert synchronized == [secondary]
     assert mx.array_equal(result, mx.ones_like(value)).item()
 
 
