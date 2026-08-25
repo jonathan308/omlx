@@ -15,8 +15,15 @@ bundled CPython 3.11 environment must not resolve stock PyPI MLX.
 
 `pyproject.toml` previously used `mlx>=0.32.0.dev0,<0.33`, which admits
 0.32.2, and `[tool.uv] override-dependencies` forced stock `mlx==0.32.0`.
-Both are now the exact local version above. A fresh resolve without the
-local wheels must fail rather than land PyPI.
+Both are now the exact local version above. Fusion 3a82bd27 also referenced
+`ops/install_mlx_variant.sh` (install the custom wheel first with `--no-deps`)
+but that file was missing; it is restored here and refuses 0.32.0 / 0.32.2.
+A fresh resolve without the local wheels must fail rather than land PyPI.
+
+```bash
+ops/install_mlx_variant.sh --check
+ops/install_mlx_variant.sh --python /path/to/cpython-3.11
+```
 
 ## CPython 3.13 rollback wheels are not drop-in
 
@@ -65,8 +72,12 @@ venvstacks export and the app on that Mac. Do not create or push tag
 
 ## Signing environment
 
-Create GitHub Environment `macos-release` (protected, required reviewers).
-Do not commit Apple credentials. In the GitHub UI add secrets:
+Create GitHub Environment `macos-release` on **jonathan308/omlx** (empty,
+protected, required reviewer **jonathan308**). Do **not** upload secrets
+when creating it, and do not copy secrets from `jonathan308/omlx-fusion`.
+Do not approve or revive omlx-fusion Signed macOS DMG run 32676126995.
+
+Later, in the GitHub UI only, add secrets:
 
 - `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`
 - `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The Fusion DMG must pin guarded MLX and must not admit 0.32.2."""
+"""The Fusion DMG must pin guarded MLX and must not admit 0.32.0 or 0.32.2."""
 
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,9 +21,12 @@ def test_pyproject_pins_exact_guarded_mlx_not_open_range():
     assert PIN in text
     assert f"mlx=={PIN}" in text
     assert f"mlx-metal=={PIN}" in text
-    overrides = text.split("[tool.uv]", 1)[1]
-    assert f"mlx=={PIN}" in overrides
-    assert "mlx==0.32.0" not in overrides
+    overrides = text.split("[tool.uv]", 1)[1].split("[tool.", 1)[0]
+    quoted = re.findall(r'"([^"]+)"', overrides)
+    assert f"mlx=={PIN}" in quoted
+    assert f"mlx-metal=={PIN}" in quoted
+    assert not any(q in {"mlx==0.32.0", "mlx==0.32.2"} for q in quoted)
+    assert "ops/install_mlx_variant.sh" in text
 
 
 def test_packaging_build_never_queries_pypi_for_mlx():
@@ -29,7 +34,7 @@ def test_packaging_build_never_queries_pypi_for_mlx():
     assert "pypi.org/pypi/mlx" not in text
     assert "GUARDED_MLX_VERSION" in text
     assert PIN in text
-    assert "0.32.2" in text  # forbidden-version guard
+    assert 'FORBIDDEN_MLX_VERSIONS = ("0.32.0", "0.32.2")' in text
 
 
 def test_dmg_name_is_macos26_only():
@@ -75,3 +80,35 @@ def test_live_studio_coordinator_is_off_limits_for_metal_compile():
         "scripts/build_guarded_mlx_cp311_wheels.sh"
     )
     assert "github-hosted" in _read(".github/workflows/release-macos-dmg.yml")
+
+
+def test_install_mlx_variant_script_closes_fusion_hole():
+    path = ROOT / "ops" / "install_mlx_variant.sh"
+    assert path.is_file()
+    text = path.read_text()
+    assert PIN in text
+    assert "--no-deps" in text
+    assert "--no-index" in text
+    assert "0.32.0" in text
+    assert "0.32.2" in text
+    assert "ssh " not in text
+    assert "does NOT compile Metal" in text
+    subprocess.run(["bash", "-n", str(path)], check=True)
+    # Wheels are not committed; --check must fail closed instead of PyPI.
+    result = subprocess.run(
+        ["bash", str(path), "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    err = result.stderr.lower()
+    assert "0.32.0" in err or "no .whl" in err or "missing" in err
+    stock = subprocess.run(
+        ["bash", str(path), "stock"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert stock.returncode != 0
+    assert "0.32.0" in stock.stderr or "stock" in stock.stderr.lower()

@@ -28,11 +28,14 @@ and [common issue checks](https://developer.apple.com/documentation/security/res
 
 ## One-time GitHub setup
 
-Create a GitHub Actions environment named `macos-release`. Restrict it with
-required reviewers and a deployment-branch policy. Environment protection rules
-delay access to environment secrets until approval; see [GitHub's environment documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
+Create a GitHub Actions environment named `macos-release` on jonathan308/omlx:
+empty, protected, required reviewer **jonathan308**. Do **not** upload secrets
+at create time and do not copy secrets from `jonathan308/omlx-fusion`. Do not
+approve or revive omlx-fusion Signed macOS DMG run 32676126995. A deployment-branch
+policy can be added later. Environment protection rules delay access to
+environment secrets until approval; see [GitHub's environment documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
 
-Jonathan must add these environment secrets in the GitHub UI (never commit them):
+Later, Jonathan must add these environment secrets in the GitHub UI (never commit them):
 
 | Name | Value |
 | --- | --- |

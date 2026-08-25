@@ -32,7 +32,7 @@ APP_NAME = "oMLX"
 GUARDED_MLX_VERSION = "0.32.1.dev20260825+26421e953"
 GUARDED_MLX_COMMIT = "26421e953"
 GUARDED_MLX_PYTHON_TAG = "cp311"
-FORBIDDEN_MLX_VERSIONS = ("0.32.2",)
+FORBIDDEN_MLX_VERSIONS = ("0.32.0", "0.32.2")
 
 
 def _read_version() -> str:
@@ -149,9 +149,13 @@ def _reject_forbidden_mlx(label: str) -> None:
     lowered = label.lower()
     for forbidden in FORBIDDEN_MLX_VERSIONS:
         if forbidden in lowered:
+            extra = (
+                "TP2 rejected 0.32.2 (JACCL all-reduce loss, rank exit 75)."
+                if forbidden == "0.32.2"
+                else "Fusion 3a82bd27's uv override used stock 0.32.0; do not restore it."
+            )
             _guarded_wheel_error(
-                f"refusing MLX {forbidden} in {label!r}; TP2 rejected "
-                "0.32.2 (JACCL all-reduce loss, rank exit 75)."
+                f"refusing MLX {forbidden} in {label!r}. {extra}"
             )
 
 

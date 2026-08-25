@@ -50,8 +50,10 @@ dependencies = [
     # to this exact mlx version — bumping the pin requires rebuilding them
     # (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext). NEVER resolve stock
     # PyPI mlx 0.32.0 or 0.32.2 into the bundled CPython 3.11 environment.
-    # Install the matched cp311 frontend+backend wheels from
-    # packaging/_wheels/guarded (see docs/packaging-guarded-mlx.md).
+    # Install the matched cp311 frontend+backend wheels first with --no-deps
+    # (ops/install_mlx_variant.sh) from packaging/_wheels/guarded so a fresh
+    # resolve cannot replace them with stock 0.32.0 or 0.32.2. See
+    # docs/packaging-guarded-mlx.md.
     "mlx==0.32.1.dev20260825+26421e953",
     "mlx-metal==0.32.1.dev20260825+26421e953",
     # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
@@ -284,9 +286,11 @@ include = ["omlx*"]
 "omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# Guarded mlx/mlx-metal are local cp311 wheels, not PyPI. find-links keeps
-# a fresh resolve from landing stock 0.32.0 or 0.32.2. mlx-lm stays git-pinned
-# so mlx-audio's transitive mlx-lm==0.31.1 pin is overridden.
+# Fusion 3a82bd27 overrode stock 0.32.0, which made a fresh resolve replace a
+# custom wheel with PyPI. Override the exact guarded pair instead, and
+# install it first via ops/install_mlx_variant.sh (--no-deps --no-index).
+# find-links keeps uv from landing stock 0.32.0 or 0.32.2. mlx-lm stays
+# git-pinned so mlx-audio's transitive mlx-lm==0.31.1 pin is overridden.
 find-links = ["packaging/_wheels/guarded"]
 override-dependencies = [
     "mlx==0.32.1.dev20260825+26421e953",

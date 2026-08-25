@@ -2,7 +2,9 @@
 
 This directory is the only allowed source of `mlx` / `mlx-metal` for the
 bundled Fusion DMG runtime. Wheels are **not** committed; drop the matched
-pair here before `packaging/build.py --venvstacks-only`.
+pair here before `packaging/build.py --venvstacks-only` or
+`ops/install_mlx_variant.sh`. That script installs with `--no-deps --no-index`
+and refuses stock 0.32.0 / 0.32.2.
 
 ## Pin
 
