@@ -14,6 +14,7 @@ import tempfile
 
 from omlx.cluster.disaggregated_worker import EVENT_PREFIX
 from omlx.cluster.launch import (
+    _available_control_port,
     _available_launch_ports,
     _install_cluster_ssh_wrapper,
     _rank_python_module_argv,
@@ -58,6 +59,9 @@ def main() -> int:
             encoding="utf-8",
         )
         _unused_api_port, collective_port = _available_launch_ports(deployment)
+        control_host = deployment.hosts[0].ips[0]
+        control_port = _available_control_port(control_host)
+        control_token = "disaggregated-prefill-decode-v1"
         launcher = (
             "from mlx._distributed_utils.launch import main; "
             "raise SystemExit(main() or 0)"
@@ -90,6 +94,12 @@ def main() -> int:
             str(args.prefill_step_size),
             "--prefill-rank",
             str(args.prefill_rank),
+            "--control-host",
+            control_host,
+            "--control-port",
+            str(control_port),
+            "--control-token",
+            control_token,
             "--deployment-id",
             "disaggregated-prefill-decode-prototype",
         ]
