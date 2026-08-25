@@ -32,7 +32,9 @@ def main() -> int:
     parser.add_argument("--completion-tokens", type=int, default=32)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--prefill-rank", type=int, choices=(0, 1), default=0)
-    parser.add_argument("--pipeline-requests", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--pipeline-requests", type=int, choices=(1, 2, 4, 8), default=1
+    )
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
