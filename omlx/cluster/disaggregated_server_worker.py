@@ -490,6 +490,7 @@ def run_worker(args: argparse.Namespace) -> int:
         _release_metal_memory,
         _runtime_assignment,
         _wait_for_serve_release,
+        RuntimeMarker,
     )
     from .jaccl_lease import acquire_jaccl_communicator_lease
     from .jaccl_side_channel import init_cluster_group
@@ -520,12 +521,31 @@ def run_worker(args: argparse.Namespace) -> int:
         if init_backend == "jaccl"
         else None
     )
+    marker = None
+    preserve_failure_marker = False
     try:
         group = init_cluster_group(mx, backend=init_backend, strict=True)
         rank = int(group.rank())
         if group.size() != 2:
             raise RuntimeError("phase server currently requires two ranks")
         assignment = sorted(assignments, key=lambda item: item.rank)[rank]
+        marker = RuntimeMarker(
+            state_dir=args.state_dir,
+            deployment_id=args.deployment_id,
+            rank=rank,
+            world_size=2,
+            model=args.model,
+            backend=args.backend,
+            plan_hash=plan_hash,
+        )
+        marker.update(
+            "loading",
+            load_stage="initializing_full_replica",
+            serving_mode="disaggregated",
+            prefill_rank=prefill_rank,
+            decode_rank=decode_rank,
+        )
+        marker.start_heartbeat()
         admission_ceiling = guard_rank_load(
             assignment,
             rank=rank,
@@ -558,6 +578,12 @@ def run_worker(args: argparse.Namespace) -> int:
         )
         model.eval()
         measured = max(0, int(mx.get_active_memory()) - before)
+        marker.update(
+            "loading",
+            load_stage="weights_resident",
+            measured_weight_bytes=measured,
+            assignments=[_runtime_assignment(item) for item in assignments],
+        )
         _emit_event(
             {
                 "type": "rank_ready",
@@ -585,6 +611,14 @@ def run_worker(args: argparse.Namespace) -> int:
             io_timeout=3600.0,
         ) as control:
             control.barrier()
+            marker.update(
+                "ready",
+                load_stage="ready",
+                measured_weight_bytes=measured,
+                serving_mode="disaggregated",
+                prefill_rank=prefill_rank,
+                decode_rank=decode_rank,
+            )
             if rank == 0:
                 cli_args = SimpleNamespace(
                     allowed_origins=["*"],
@@ -636,7 +670,24 @@ def run_worker(args: argparse.Namespace) -> int:
                     rank=rank,
                 )
         return 0
+    except KeyboardInterrupt:
+        return 0
+    except BaseException as exc:
+        preserve_failure_marker = True
+        if marker is not None:
+            try:
+                marker.update(
+                    "failed",
+                    error=f"{type(exc).__name__}: {exc}"[:1000],
+                )
+            except Exception:
+                pass
+        raise
     finally:
+        if marker is not None:
+            marker.stop_heartbeat()
+            if not preserve_failure_marker:
+                marker.remove()
         if lease is not None:
             lease.close()
         try:

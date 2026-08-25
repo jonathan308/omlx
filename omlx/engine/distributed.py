@@ -1115,6 +1115,8 @@ raise SystemExit(2)
             return None
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):
+            if self.deployment.serving_mode == "disaggregated":
+                return self._active_requests
             return None
         active = metrics.get("active_requests")
         if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
