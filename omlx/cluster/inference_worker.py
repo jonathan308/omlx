@@ -666,6 +666,17 @@ def _apply_distributed_mtp_decode_concurrency(
             effective,
         )
         args.prompt_concurrency = effective
+    microbatch_requested = max(
+        1, int(getattr(args, "pipeline_microbatch_size", 1))
+    )
+    if microbatch_requested > effective:
+        logger.info(
+            "DS4 distributed MTP pipeline microbatch capped %d -> %d to "
+            "match the decode lane",
+            microbatch_requested,
+            effective,
+        )
+        args.pipeline_microbatch_size = effective
     return effective
 
 
