@@ -536,6 +536,67 @@ async def test_distributed_chat_preserves_rank_zero_tool_calls_and_reasoning():
 
 
 @pytest.mark.asyncio
+async def test_distributed_chat_recovers_raw_ds4_dsml_without_leaking_markup():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    dsml = (
+        '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="bash">\n'
+        '<｜DSML｜parameter name="command" string="true">true'
+        "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": dsml,
+                            "reasoning_content": "Need the shell tool.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "total_tokens": 30,
+                },
+            },
+        )
+
+    engine = _ready_engine(handler)
+    engine._model_type = "deepseek_v4"
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "Run true"}], tools=tools
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert "DSML" not in output.text
+    assert output.text == "<think>Need the shell tool.</think>"
+    assert output.finish_reason == "tool_calls"
+    assert output.tool_calls is not None
+    assert output.tool_calls[0]["name"] == "bash"
+    assert json.loads(output.tool_calls[0]["arguments"]) == {"command": "true"}
+
+
+@pytest.mark.asyncio
 async def test_distributed_stream_chat_preserves_structured_tool_calls():
     events = [
         {
@@ -623,6 +684,77 @@ async def test_distributed_stream_chat_preserves_structured_tool_calls():
     assert outputs[-1].prompt_tokens == 12
     assert outputs[-1].completion_tokens == 5
     assert outputs[-1].cached_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_buffers_split_dsml_and_emits_structured_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    ]
+    chunks = [
+        "Before the call.\n\n<｜DSML｜tool",
+        '_calls>\n<｜DSML｜invoke name="bash">\n',
+        '<｜DSML｜parameter name="command" string="true">true',
+        "</｜DSML｜parameter>\n</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+    ]
+    events = [
+        {
+            "choices": [
+                {"delta": {"content": chunk}, "finish_reason": None}
+            ]
+        }
+        for chunk in chunks
+    ]
+    events.append(
+        {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 10,
+                "total_tokens": 30,
+            },
+        }
+    )
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    engine = _ready_engine(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+    )
+    engine._model_type = "deepseek_v4"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Run true"}], tools=tools
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert all("DSML" not in output.new_text for output in outputs)
+    assert outputs[-1].text == "Before the call."
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert outputs[-1].tool_calls is not None
+    assert outputs[-1].tool_calls[0]["name"] == "bash"
+    assert json.loads(outputs[-1].tool_calls[0]["arguments"]) == {
+        "command": "true"
+    }
 
 
 @pytest.mark.asyncio

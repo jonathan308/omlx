@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -32,8 +33,8 @@ from ..cluster.liveness import (
     marker_age_seconds,
     read_marker,
 )
-from ..reasoning_effort import _fallback_candidate, _normalized_input
 from ..exceptions import PrefillMemoryExceededError
+from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -46,6 +47,8 @@ logger = logging.getLogger(__name__)
 _PEER_HEALTH_TTL = 10.0
 _MAX_TARGETED_CANCEL_REQUESTS = 256
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+_DSML_TOOL_CALL_START = "<｜DSML｜tool_calls>"
+_DSML_TOOL_CALL_END = "</｜DSML｜tool_calls>"
 
 
 def _valid_transport_request_id(value: Any) -> bool:
@@ -868,6 +871,57 @@ raise SystemExit(2)
         return normalized or None
 
     @staticmethod
+    def _parse_dsml_tool_calls(
+        content: Any,
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[str, list[dict[str, Any]] | None]:
+        """Recover DS4 calls when private mlx-lm returns raw DSML content.
+
+        This fallback is intentionally narrower than the normal oMLX parser:
+        it runs only for a DSML envelope and only when the request registered
+        tools. Hermes/Qwen/MiniMax and already-structured backend calls retain
+        their existing paths.
+        """
+
+        text = content if isinstance(content, str) else ""
+        if not tools or _DSML_TOOL_CALL_START not in text:
+            return text, None
+        from ..api.tool_calling import parse_tool_calls
+        from ..patches.deepseek_v4.tool_parser_v4 import parse_tool_call
+
+        protocol = SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start=_DSML_TOOL_CALL_START,
+            tool_call_end=_DSML_TOOL_CALL_END,
+            tool_parser=parse_tool_call,
+        )
+        cleaned, parsed = parse_tool_calls(text, protocol, tools)
+        if not parsed:
+            return cleaned, None
+        normalized = [
+            {
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            }
+            for call in parsed
+        ]
+        return cleaned, normalized or None
+
+    @staticmethod
+    def _dsml_stream_filter(tools: list[dict[str, Any]] | None) -> Any | None:
+        if not tools:
+            return None
+        from ..api.tool_calling import ToolCallStreamFilter
+
+        return ToolCallStreamFilter(
+            SimpleNamespace(
+                tool_call_start=_DSML_TOOL_CALL_START,
+                tool_call_end=_DSML_TOOL_CALL_END,
+            )
+        )
+
+    @staticmethod
     def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
         """Carry private structured reasoning through GenerationOutput safely."""
 
@@ -1281,9 +1335,12 @@ raise SystemExit(2)
             usage = body["usage"]
             details = usage.get("prompt_tokens_details") or {}
             tool_calls = self._normalize_backend_tool_calls(message.get("tool_calls"))
+            content = message.get("content")
+            if not tool_calls and self._model_type == "deepseek_v4":
+                content, tool_calls = self._parse_dsml_tool_calls(content, tools)
             text = self._join_reasoning_and_content(
                 message.get("reasoning") or message.get("reasoning_content"),
-                message.get("content"),
+                content,
             )
             return GenerationOutput(
                 text=text,
@@ -1362,6 +1419,12 @@ raise SystemExit(2)
         request_started_at = time.monotonic()
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
+        dsml_filter = (
+            self._dsml_stream_filter(tools)
+            if self._model_type == "deepseek_v4"
+            else None
+        )
+        dsml_raw_content = ""
 
         request_id = await self._enter_request(requested_id)
         headers = self._backend_request_headers(request_id)
@@ -1491,6 +1554,9 @@ raise SystemExit(2)
                             new_text += reasoning
                         content = delta.get("content")
                         if isinstance(content, str) and content:
+                            if dsml_filter is not None:
+                                dsml_raw_content += content
+                                content = dsml_filter.feed(content)
                             if reasoning_open:
                                 new_text += "</think>"
                                 reasoning_open = False
@@ -1541,12 +1607,19 @@ raise SystemExit(2)
             await self._leave_request(request_id)
 
         pending_final_text = ""
+        if dsml_filter is not None:
+            pending_final_text += dsml_filter.finish()
         if reasoning_open:
-            pending_final_text = "</think>"
-            full_text += pending_final_text
+            pending_final_text = "</think>" + pending_final_text
+        full_text += pending_final_text
         tool_calls = self._normalize_backend_tool_calls(
             [backend_tool_calls[index] for index in sorted(backend_tool_calls)]
         )
+        if not tool_calls and dsml_raw_content:
+            _cleaned, tool_calls = self._parse_dsml_tool_calls(
+                dsml_raw_content,
+                tools,
+            )
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
             prompt_tokens=prompt_tokens,
