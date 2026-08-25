@@ -61,5 +61,39 @@
       "token_sha256": "2587d4d2049d46f42eb3f08673ac0754c7a8d689ff1a56185cce044286e94d44"
     }
   ],
-  "scope": "standalone full-replica parity prototype; no HTTP scheduler or multi-request overlap claim"
+  "pipeline_runs": [
+    {
+      "requests": 2,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "prefill_tokens_per_second": [
+        1024.1740455768747,
+        1033.2636062951308
+      ],
+      "remote_decode_tokens_per_second": [
+        31.198193856306165,
+        32.55066457317105
+      ],
+      "cache_tensor_bytes": [
+        422379520,
+        422379520
+      ],
+      "cache_send_seconds": [
+        0.06449808299930737,
+        0.07172066700059077
+      ],
+      "overlap_window_seconds": 3.964937667000413,
+      "serial_source_seconds": 12.072617709000951,
+      "pipeline_seconds": 10.039742707999721,
+      "measured_pipeline_speedup": 1.2024827787052177,
+      "parity_by_request": [true, true],
+      "token_sha256": [
+        "362f2bd93bbf9e8f8eefdf873284d4d6979d1689a8adea6df5984111d6b807f4",
+        "0ea614fa16658a5f9e8d056667f2949eeed0c4c554f329af2d260b6a68cc82c8"
+      ]
+    }
+  ],
+  "scope": "standalone full-replica parity and two-request overlap prototype; no HTTP scheduler claim"
 }
