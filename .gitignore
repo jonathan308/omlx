@@ -98,8 +98,12 @@ temp/
 # MLX cache
 .mlx_cache/
 
-# Build artifacts
-packaging/_wheels/
+# Build artifacts. Guarded mlx wheel *bytes* stay untracked; the README
+# that documents the cp311 pin is tracked.
+packaging/_wheels/*
+!packaging/_wheels/guarded/
+packaging/_wheels/guarded/*
+!packaging/_wheels/guarded/README.md
 packaging/_export/
 packaging/_build/
 *.dmg

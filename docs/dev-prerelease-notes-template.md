@@ -2,15 +2,15 @@
 
 # oMLX 0.6.4 Beta 1 release-candidate notes
 
-> This is a readiness record, not a published release announcement. The
-> recommended prerelease tag is `v0.6.4b1`, but the source version has not been
-> changed to `0.6.4b1`, no tag has been created, and no signed artifact exists
-> yet.
+> This is a readiness record, not a published release announcement. Source
+> version is `0.6.4b1`. Tag `v0.6.4b1` must **not** be created until the
+> guarded cp311 mlx/mlx-metal wheels exist and have been reviewed. No signed
+> artifact exists yet.
 
 Benchmark source commit: `6ebc22a822e3b50fe3c3d59acf1da62e8694f5dc`
 
 Expected artifact after the release gates pass:
-`oMLX-0.6.4b1-macos15-26-arm64.dmg`
+`oMLX-0.6.4b1-macos26-arm64.dmg`
 
 ## Readiness summary
 
@@ -22,8 +22,9 @@ Expected artifact after the release gates pass:
 | In-flight prefill cancellation | Passed | Both Qwen ranks stopped at 26,624 processed tokens and returned to ready. |
 | Concurrent generation | Passed | Qwen completed four 512-token streams at 216.3 aggregate tok/s; DS4 completed its qualified B4 run at 69.3 aggregate tok/s. |
 | Functional greedy parity | Passed with limitation | With thinking disabled, four of six Qwen cases were token-exact and two of six were semantically equivalent. This is not a bit-exact or token-exact parity claim. |
-| Version and tag | Pending | After review and green release CI, change `omlx/_version.py` from `0.6.4.dev1` to `0.6.4b1`, then create a matching protected tag `v0.6.4b1`. |
-| Signed, notarized DMG | Blocked | Install the five missing Apple secrets, configure `APPLE_TEAM_ID`, and approve the protected `macos-release` environment. |
+| Version and tag | Source bumped; tag blocked | `omlx/_version.py` is `0.6.4b1`. Do not create `v0.6.4b1` until the guarded cp311 wheels are reviewed. |
+| Guarded MLX pin | Blocked on macOS wheel build | Pin `0.32.1.dev20260825+26421e953` from `26421e953`. Never 0.32.2. cp313 rollback wheels are not drop-in. |
+| Signed, notarized DMG | Blocked | macOS 26-only artifact name `oMLX-0.6.4b1-macos26-arm64.dmg`. Add Apple secrets and `APPLE_TEAM_ID` to `macos-release`. |
 
 Do not advertise this candidate as signed, notarized, or downloadable until the
 gated workflow has produced and verified the DMG and checksum. Publishing the
@@ -122,10 +123,10 @@ log, or paste the credential values into release notes.
 After downloading the DMG and its generated `.sha256` file:
 
 ```sh
-shasum -a 256 -c oMLX-0.6.4b1-macos15-26-arm64.dmg.sha256
-xcrun stapler validate oMLX-0.6.4b1-macos15-26-arm64.dmg
+shasum -a 256 -c oMLX-0.6.4b1-macos26-arm64.dmg.sha256
+xcrun stapler validate oMLX-0.6.4b1-macos26-arm64.dmg
 spctl --assess --type open --verbose=2 \
-  --context context:primary-signature oMLX-0.6.4b1-macos15-26-arm64.dmg
+  --context context:primary-signature oMLX-0.6.4b1-macos26-arm64.dmg
 ```
 
 The checksum proves byte identity. Gatekeeper and stapler checks confirm the

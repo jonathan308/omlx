@@ -117,6 +117,36 @@ final class ReleasesCheckerTests: XCTestCase {
         )
     }
 
+    func testFindMatchingDMGSelectsMacOS26OnlyBetaAsset() {
+        let tahoeOnly = "oMLX-0.6.4b1-macos26-arm64.dmg"
+        let mislabeledRange = "oMLX-0.6.4b1-macos15-26-arm64.dmg"
+        let assets = [
+            asset(tahoeOnly),
+            asset(mislabeledRange),
+        ]
+
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 26
+            )?.name,
+            tahoeOnly
+        )
+        XCTAssertEqual(
+            ReleasesChecker.findMatchingDMG(
+                assets: assets,
+                macOSMajor: 15
+            )?.name,
+            mislabeledRange
+        )
+        XCTAssertNil(
+            ReleasesChecker.findMatchingDMG(
+                assets: [asset(tahoeOnly)],
+                macOSMajor: 15
+            )
+        )
+    }
+
     func testFindMatchingDMGPrefersExactAssetOverRangeAsset() {
         let range = "oMLX-0.4.4-macos26-27.dmg"
         let exact = "oMLX-0.4.4-macos27-beta.dmg"

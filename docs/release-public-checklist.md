@@ -28,12 +28,11 @@ and [common issue checks](https://developer.apple.com/documentation/security/res
 
 ## One-time GitHub setup
 
-Create a GitHub Actions environment named `macos-release`. Restrict it to the
-protected default branch and require at least one reviewer who can compare the
-requested tag/commit before secrets are released. Environment protection rules
+Create a GitHub Actions environment named `macos-release`. Restrict it with
+required reviewers and a deployment-branch policy. Environment protection rules
 delay access to environment secrets until approval; see [GitHub's environment documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
 
-Add these environment secrets:
+Jonathan must add these environment secrets in the GitHub UI (never commit them):
 
 | Name | Value |
 | --- | --- |
@@ -64,20 +63,26 @@ before future Xcode pin changes instead of assuming `macos-latest` is stable.
 
 ## Cutting a release
 
-1. Update `omlx/_version.py`, merge the reviewed release commit, and create and
-   push a matching tag such as `v0.6.3`. Prefer a protected, signed tag.
-2. Run `Signed macOS DMG` manually and enter that existing tag. Approve the
+1. Update `omlx/_version.py` (this beta is `0.6.4b1`), merge the reviewed
+   release commit, and only then create and push a matching tag such as
+   `v0.6.4b1`. Prefer a protected, signed tag. **Do not create `v0.6.4b1`
+   until the guarded cp311 wheels exist and have been reviewed.**
+2. On macOS 26, build the matched mlx/mlx-metal pair with
+   `scripts/build_guarded_mlx_cp311_wheels.sh` and place them in
+   `packaging/_wheels/guarded/`. See [packaging-guarded-mlx.md](packaging-guarded-mlx.md).
+3. Run `Signed macOS DMG` manually and enter that existing tag. Approve the
    `macos-release` environment only after confirming the tag resolves to the
    intended reviewed commit.
-3. Inspect the workflow's signed DMG artifact and its SHA-256 file. Confirm the
+4. Inspect the workflow's signed DMG artifact and its SHA-256 file. Confirm the
    draft release notes and assets. On a separate Mac, download through a
    quarantine-setting browser, verify the checksum, mount the image, and launch
    the app. Test a full in-app update from the preceding release as well.
-4. Publish the draft manually only after those checks pass. Publishing remains
+5. Publish the draft manually only after those checks pass. Publishing remains
    an explicit maintainer action.
 
-The DMG is named `oMLX-VERSION-macos15-26-arm64.dmg`, matching the updater's
-macOS-range selection. `OMLX_RELEASE_REPOSITORY` is embedded at build time and
+The DMG is named `oMLX-VERSION-macos26-arm64.dmg`. This Fusion cluster beta is
+**macOS 26-only** (Path B). Do not name or advertise it as macOS 15-26; the
+updater matches `-macos26-` as an exact major. `OMLX_RELEASE_REPOSITORY` is embedded at build time and
 defaults to `jonathan308/omlx`; the workflow sets it to the repository running
 the workflow. The updater validates the DMG with Gatekeeper, mounts it with
 image verification enabled, and requires the app to be notarized Developer ID

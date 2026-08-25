@@ -4,7 +4,8 @@
 // single source of truth for distribution. No appcast XML, no EdDSA key
 // management on the maintainer side. Pulls a page of releases, picks the
 // latest stable PEP 440 tag, and selects the DMG asset whose filename
-// embeds the current macOS major version (e.g. `-macos15-` or `-macos26-`).
+// embeds the current macOS major version (e.g. `-macos26-` for this
+// Fusion Path B beta). Historical `-macos15-` assets remain parseable.
 //
 // Channel handling: Stable accepts final tags only, Release Candidate also
 // accepts rc tags, and Dev accepts dev/pre-release tags. GitHub's

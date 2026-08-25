@@ -52,8 +52,9 @@
 #   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
 #                                       (default: PATH lookup of python3)
 #   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
-#   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
+#   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=26.0
 #                                       # macOS min version for custom kernels
+#                                       # (Path B Fusion beta is macOS 26-only)
 #   OMLX_RELEASE_REPOSITORY=owner/repo   # GitHub Releases source embedded in
 #                                       # Info.plist (default: jonathan308/omlx)
 #   OMLX_BUILD_ARCHS=arm64              # application architectures; the
@@ -117,6 +118,8 @@ CUSTOM_KERNEL_DIRS=(
     "$REPO_ROOT/omlx/custom_kernels/glm_moe_dsa"
     "$REPO_ROOT/omlx/custom_kernels/minimax_m3"
     "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill"
+    "$REPO_ROOT/omlx/custom_kernels/decode_fast"
+    "$REPO_ROOT/omlx/custom_kernels/bonsai"
 )
 # OMLX_EXPORT_DIR overrides the venvstacks export tree we copy Python
 # layers from. Release builds use this to point at a per-target export
@@ -222,7 +225,7 @@ _rebuild_venvstacks_export() {
 }
 
 _custom_kernel_deployment_target() {
-    printf "%s\n" "${OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-15.0}}"
+    printf "%s\n" "${OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-26.0}}"
 }
 
 _custom_kernel_pythonpath() {
@@ -251,7 +254,9 @@ _clean_custom_kernel_build_artifacts() {
         for ext_name in \
             "omlx.custom_kernels.glm_moe_dsa._ext" \
             "omlx.custom_kernels.minimax_m3._ext" \
-            "omlx.custom_kernels.qwen35_prefill._ext"; do
+            "omlx.custom_kernels.qwen35_prefill._ext" \
+            "omlx.custom_kernels.decode_fast._ext" \
+            "omlx.custom_kernels.bonsai._ext"; do
             find "$REPO_ROOT/build" \
                 -type d \
                 -name "$ext_name" \
@@ -328,7 +333,7 @@ import sys
 import mlx.core as mx
 
 failures = []
-for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
+for name in ("glm_moe_dsa", "minimax_m3", "qwen35_prefill", "decode_fast", "bonsai"):
     ext_dir = pathlib.Path("omlx/custom_kernels") / name
     so = next(ext_dir.glob("_ext.*.so"), None)
     if so is None:
@@ -387,6 +392,10 @@ _build_custom_kernels() {
         || die "custom kernel build finished but MiniMax M3 metallib is missing."
     [ -f "$REPO_ROOT/omlx/custom_kernels/qwen35_prefill/omlx_qwen35_prefill_kernels.metallib" ] \
         || die "custom kernel build finished but Qwen3.5 prefill metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/decode_fast/omlx_decode_fast_kernels.metallib" ] \
+        || die "custom kernel build finished but decode_fast metallib is missing."
+    [ -f "$REPO_ROOT/omlx/custom_kernels/bonsai/omlx_bonsai_kernels.metallib" ] \
+        || die "custom kernel build finished but bonsai metallib is missing."
     # The NAX (M5 tensor unit) metallib is SDK-gated in cmake, not
     # deployment-gated: any build on SDK 26.2+ must produce it. A silent
     # omission would ship DMGs whose M5 qmm quietly falls back to the
@@ -510,6 +519,7 @@ xcodebuild \
     MARKETING_VERSION="$APP_VERSION" \
     CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
     OMLX_RELEASE_REPOSITORY="$OMLX_RELEASE_REPOSITORY" \
+    MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}" \
     ARCHS="$OMLX_BUILD_ARCHS" \
     ONLY_ACTIVE_ARCH=YES \
     build >"$BUILD_DIR/xcodebuild.log" 2>&1 \
@@ -557,6 +567,21 @@ if [ -d "$DONOR_LAYERS/__venvstacks__" ]; then
     ditto "$DONOR_LAYERS/__venvstacks__" "$PYTHON_DIR/__venvstacks__"
     ok "  + __venvstacks__ metadata"
 fi
+
+log "Verifying bundled MLX is the guarded cp311 pair…"
+BUNDLE_PYTHON="$PYTHON_DIR/cpython-3.11/bin/python3"
+MLX_SITE="$PYTHON_DIR/framework-mlx-base/lib/python3.11/site-packages"
+[ -x "$BUNDLE_PYTHON" ] || die "bundled CPython 3.11 interpreter missing: $BUNDLE_PYTHON"
+[ -d "$MLX_SITE" ] || die "bundled MLX site-packages missing: $MLX_SITE"
+GUARDED_MLX_VERSION="0.32.1.dev20260825+26421e953"
+actual_mlx="$(PYTHONPATH="$MLX_SITE" "$BUNDLE_PYTHON" -c 'import mlx; print(mlx.__version__)')" \
+    || die "bundled environment cannot import mlx; stock PyPI resolve is forbidden."
+case "$actual_mlx" in
+    *0.32.2*) die "bundled mlx $actual_mlx is 0.32.2; TP2 rejected that ABI. Pin $GUARDED_MLX_VERSION." ;;
+esac
+[ "$actual_mlx" = "$GUARDED_MLX_VERSION" ] \
+    || die "bundled mlx $actual_mlx does not match guarded pin $GUARDED_MLX_VERSION."
+ok "  + mlx $actual_mlx"
 
 # --- Embed omlx package ---------------------------------------------------
 

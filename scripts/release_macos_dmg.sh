@@ -234,7 +234,7 @@ mkdir -p "$DMG_ROOT"
 ditto "$APP_PATH" "$DMG_ROOT/oMLX.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 
-DMG_NAME="oMLX-$APP_VERSION-macos15-26-arm64.dmg"
+DMG_NAME="oMLX-$APP_VERSION-macos26-arm64.dmg"
 DMG_PATH="$OUTPUT_DIR/$DMG_NAME"
 hdiutil create -volname "oMLX $APP_VERSION" -srcfolder "$DMG_ROOT" \
     -format UDZO -ov "$DMG_PATH"

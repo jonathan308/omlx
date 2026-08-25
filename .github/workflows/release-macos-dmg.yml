@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example, v0.6.3)
+        description: Existing version tag to build (for example, v0.6.4b1)
         required: true
         type: string
 
@@ -64,9 +64,25 @@ jobs:
             "venvstacks==0.7.0" "cmake==4.4.2" "nanobind==2.13.0" \
             "setuptools==80.10.2" "wheel==0.47.0"
 
+      - name: Require guarded cp311 MLX wheels
+        run: |
+          set -euo pipefail
+          python -c "
+          import importlib.util
+          spec = importlib.util.spec_from_file_location(
+              'omlx_packaging_build', 'packaging/build.py'
+          )
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.require_guarded_mlx_wheels()
+          print('guarded mlx wheels present')
+          "
+
       - name: Build staged app with native kernels
         env:
           OMLX_RELEASE_REPOSITORY: ${{ github.repository }}
+          MACOSX_DEPLOYMENT_TARGET: "26.0"
+          OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET: "26.0"
         run: apps/omlx-mac/Scripts/build.sh release --with-custom-kernel --rebuild-donor
 
       - name: Confirm arm64 application output
@@ -77,6 +93,16 @@ jobs:
           test "$(lipo -archs "$app/Contents/MacOS/oMLX")" = arm64
           actual_repo=$(/usr/libexec/PlistBuddy -c 'Print :OMLXReleaseRepository' "$app/Contents/Info.plist")
           test "$actual_repo" = "${{ github.repository }}"
+          min_os=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")
+          [[ "$min_os" == 26* ]] || {
+            echo "expected macOS 26-only LSMinimumSystemVersion, got $min_os" >&2
+            exit 1
+          }
+          py="$app/Contents/Resources/Python/cpython-3.11/bin/python3"
+          site="$app/Contents/Resources/Python/framework-mlx-base/lib/python3.11/site-packages"
+          mlx_ver=$(PYTHONPATH="$site" "$py" -c 'import mlx; print(mlx.__version__)')
+          test "$mlx_ver" = "0.32.1.dev20260825+26421e953"
+          case "$mlx_ver" in *0.32.2*) echo "refusing mlx 0.32.2" >&2; exit 1 ;; esac
 
       - name: Archive app without losing symlinks or extended attributes
         run: |

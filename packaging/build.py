@@ -25,7 +25,14 @@ BUILD_DIR = SCRIPT_DIR / "_build"
 EXPORT_DIR = SCRIPT_DIR / "_export"
 DIST_DIR = SCRIPT_DIR / "dist"
 WHEELS_DIR = SCRIPT_DIR / "_wheels"
+GUARDED_WHEELS_DIR = WHEELS_DIR / "guarded"
 APP_NAME = "oMLX"
+
+# Fusion Path B pin. NEVER package stock PyPI mlx 0.32.0 or 0.32.2.
+GUARDED_MLX_VERSION = "0.32.1.dev20260825+26421e953"
+GUARDED_MLX_COMMIT = "26421e953"
+GUARDED_MLX_PYTHON_TAG = "cp311"
+FORBIDDEN_MLX_VERSIONS = ("0.32.2",)
 
 
 def _read_version() -> str:
@@ -75,9 +82,17 @@ def clean_all(preserve_venv: bool = False):
     for d in dirs_to_clean:
         if preserve_venv and d in venv_dirs:
             continue
-        if d.exists():
-            shutil.rmtree(d, onerror=_rm_onerror)
-            print(f"  Removed {d.relative_to(SCRIPT_DIR)}/")
+        if d == WHEELS_DIR and d.exists():
+            # Keep operator-supplied guarded mlx wheels; wipe the rest.
+            for child in d.iterdir():
+                if child.name == "guarded":
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child, onerror=_rm_onerror)
+                else:
+                    child.unlink()
+            print("  Removed packaging/_wheels/ (kept guarded/)")
+            continue
 
     for f in files_to_clean:
         if preserve_venv and f.name == "_venvstacks_resolved.toml":
@@ -99,12 +114,102 @@ def run_cmd(cmd: list, cwd: Path = None, check: bool = True):
     return result
 
 
-def _resolve_mlx_version(toml_path: Path) -> str:
-    """Resolve the mlx version that venvstacks locked.
+def _guarded_wheel_error(detail: str) -> None:
+    print(
+        "  ✗ Guarded MLX wheels are required for the bundled CPython 3.11 "
+        "environment and must not be resolved from PyPI.\n"
+        f"    pin: mlx/mlx-metal == {GUARDED_MLX_VERSION}\n"
+        f"    commit: jonathan308/mlx@{GUARDED_MLX_COMMIT} "
+        "(feat/jaccl-subgroups), nanobind 2.13.0, ABI cp311\n"
+        f"    {detail}\n"
+        "    Do not use CPython 3.13 wheels from "
+        "minimax-m3-cluster/runtime_patches/variants/guard-0321-rollback/; "
+        "those are not drop-in for this runtime.\n"
+        "    Next step (macOS 26 + Metal, not this Linux VM):\n"
+        "      scripts/build_guarded_mlx_cp311_wheels.sh",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
-    Reads the locked requirements file to find the exact mlx version,
-    falling back to the latest version from PyPI if no lock file exists.
+
+def _wheel_filename_version(name: str) -> str | None:
+    # mlx-0.32.1.dev20260825+26421e953-cp311-cp311-macosx_26_0_arm64.whl
+    # mlx_metal-0.32.1.dev20260825+26421e953-py3-none-macosx_26_0_arm64.whl
+    match = re.match(
+        r"^(?:mlx|mlx_metal)-(.+?)-(?:cp\d+|py3)\b",
+        name,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _reject_forbidden_mlx(label: str) -> None:
+    lowered = label.lower()
+    for forbidden in FORBIDDEN_MLX_VERSIONS:
+        if forbidden in lowered:
+            _guarded_wheel_error(
+                f"refusing MLX {forbidden} in {label!r}; TP2 rejected "
+                "0.32.2 (JACCL all-reduce loss, rank exit 75)."
+            )
+
+
+def require_guarded_mlx_wheels() -> list[Path]:
+    """Require a matched local cp311 mlx + mlx-metal pair.
+
+    Does not download from PyPI and does not invent wheel bytes.
     """
+    if not GUARDED_WHEELS_DIR.is_dir():
+        _guarded_wheel_error(f"missing directory {GUARDED_WHEELS_DIR}")
+
+    wheels = sorted(GUARDED_WHEELS_DIR.glob("*.whl"))
+    if not wheels:
+        _guarded_wheel_error(f"no .whl files in {GUARDED_WHEELS_DIR}")
+
+    mlx_wheels = []
+    metal_wheels = []
+    for whl in wheels:
+        _reject_forbidden_mlx(whl.name)
+        lowered = whl.name.lower()
+        if "cp313" in lowered or "cp3.13" in lowered:
+            _guarded_wheel_error(
+                f"{whl.name} is a CPython 3.13 wheel; the bundled runtime "
+                "is CPython 3.11 and needs a matched cp311 pair built from "
+                f"{GUARDED_MLX_COMMIT}."
+            )
+        version = _wheel_filename_version(whl.name)
+        if version != GUARDED_MLX_VERSION:
+            _guarded_wheel_error(
+                f"{whl.name} version {version!r} does not match pin "
+                f"{GUARDED_MLX_VERSION}"
+            )
+        if lowered.startswith("mlx-") and "cp311" in lowered:
+            mlx_wheels.append(whl)
+        elif lowered.startswith("mlx_metal-") or lowered.startswith("mlx-metal-"):
+            metal_wheels.append(whl)
+
+    if not mlx_wheels:
+        _guarded_wheel_error(
+            f"no mlx-*{GUARDED_MLX_PYTHON_TAG}* frontend wheel in {GUARDED_WHEELS_DIR}"
+        )
+    if not metal_wheels:
+        _guarded_wheel_error(
+            f"no mlx_metal backend wheel in {GUARDED_WHEELS_DIR}"
+        )
+    return mlx_wheels + metal_wheels
+
+
+def _copy_guarded_wheels_into(dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for whl in require_guarded_mlx_wheels():
+        target = dest / whl.name
+        if target.resolve() != whl.resolve():
+            shutil.copy2(whl, target)
+        print(f"    guarded {whl.name}")
+
+
+def _resolve_mlx_version(toml_path: Path) -> str:
+    """Return the guarded mlx pin. Never query PyPI."""
+    del toml_path
     req_file = (
         SCRIPT_DIR
         / "requirements"
@@ -112,34 +217,33 @@ def _resolve_mlx_version(toml_path: Path) -> str:
         / "requirements-framework-mlx-base-macosx_arm64.txt"
     )
     if req_file.exists():
-        import re as _re
-
         content = req_file.read_text()
-        match = _re.search(r"^mlx==(\S+)", content, _re.MULTILINE)
+        match = re.search(r"^mlx==(\S+)", content, re.MULTILINE)
         if match:
-            return match.group(1)
-
-    # No lock file yet — query PyPI for the latest version
-    import json
-    import urllib.request
-
-    data = json.loads(
-        urllib.request.urlopen("https://pypi.org/pypi/mlx/json").read()
-    )
-    return data["info"]["version"]
+            locked = match.group(1)
+            _reject_forbidden_mlx(locked)
+            if locked != GUARDED_MLX_VERSION:
+                _guarded_wheel_error(
+                    f"lock file has mlx=={locked}, expected {GUARDED_MLX_VERSION}"
+                )
+            return locked
+    return GUARDED_MLX_VERSION
 
 
 def swap_platform_wheels(
     export_dir: Path, macos_target: str, python_version: str = "3.11"
 ):
-    """Replace mlx and mlx-metal in exported venvstacks with platform-specific wheels.
+    """Install the guarded local mlx/mlx-metal wheels into the export.
 
-    Downloads the wheels for the given macOS target (e.g. "26.0") and replaces
-    the existing packages in the framework layer's site-packages. This allows
-    building on macOS 15 while targeting macOS 26 wheels that contain
-    M5 Neural Accelerator matmul kernels.
+    Never downloads from PyPI. Path B of this beta is macOS 26-only; the
+    local wheels must already be a macosx_26_* cp311 pair.
     """
     import zipfile
+
+    if python_version != "3.11":
+        _guarded_wheel_error(
+            f"bundled runtime is CPython 3.11, not {python_version}"
+        )
 
     site_packages = (
         export_dir
@@ -153,28 +257,28 @@ def swap_platform_wheels(
         sys.exit(1)
 
     platform_tag = f"macosx_{macos_target.replace('.', '_')}_arm64"
-    toml_path = SCRIPT_DIR / "venvstacks.toml"
-    mlx_version = _resolve_mlx_version(toml_path)
-    packages = ["mlx", "mlx-metal"]
+    mlx_version = _resolve_mlx_version(SCRIPT_DIR / "venvstacks.toml")
+    _reject_forbidden_mlx(mlx_version)
+    if mlx_version != GUARDED_MLX_VERSION:
+        _guarded_wheel_error(
+            f"refusing to install mlx=={mlx_version}; pin is {GUARDED_MLX_VERSION}"
+        )
 
-    print(f"\n  Swapping mlx/mlx-metal to {platform_tag} (v{mlx_version})...")
-
-    # Download platform-specific wheels
+    print(f"\n  Installing guarded mlx/mlx-metal {mlx_version} for {platform_tag}...")
     wheels_tmp = SCRIPT_DIR / "_platform_wheels"
     if wheels_tmp.exists():
         shutil.rmtree(wheels_tmp)
     wheels_tmp.mkdir()
-
-    for pkg in packages:
-        run_cmd([
-            sys.executable, "-m", "pip", "download",
-            f"{pkg}=={mlx_version}",
-            "--platform", platform_tag,
-            f"--python-version={python_version}",
-            "--only-binary", ":all:",
-            "--no-deps",
-            "-d", str(wheels_tmp),
-        ])
+    selected = []
+    for whl in require_guarded_mlx_wheels():
+        if "macosx_26" not in whl.name:
+            _guarded_wheel_error(
+                f"{whl.name} is not a macOS 26 arm64 wheel (expected {platform_tag})"
+            )
+        shutil.copy2(whl, wheels_tmp / whl.name)
+        selected.append(whl.name)
+    if not selected:
+        _guarded_wheel_error("no guarded wheels to install")
 
     # Remove existing mlx/mlx-metal from site-packages
     for item in site_packages.iterdir():
@@ -186,7 +290,7 @@ def swap_platform_wheels(
                 shutil.rmtree(item)
                 print(f"    Removed {item.name}")
 
-    # Install downloaded wheels into site-packages
+    # Install guarded wheels into site-packages
     for whl in wheels_tmp.glob("*.whl"):
         print(f"    Installing {whl.name}")
         with zipfile.ZipFile(whl) as zf:
@@ -294,10 +398,19 @@ def build_local_wheels(source_toml: Path | None = None):
             source_toml = SCRIPT_DIR / "venvstacks.toml"
     git_reqs = _parse_git_requirements(source_toml)
 
-    # Clean and recreate wheels dir for fresh builds
+    # Recreate the working wheels dir for git-pinned packages, then copy
+    # the guarded mlx pair back in so venvstacks never consults PyPI for mlx.
+    require_guarded_mlx_wheels()
     if WHEELS_DIR.exists():
-        shutil.rmtree(WHEELS_DIR)
-    WHEELS_DIR.mkdir(parents=True)
+        for child in WHEELS_DIR.iterdir():
+            if child.resolve() == GUARDED_WHEELS_DIR.resolve():
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    WHEELS_DIR.mkdir(parents=True, exist_ok=True)
+    _copy_guarded_wheels_into(WHEELS_DIR)
 
     # Build wheels from git-pinned packages
     for full_req, git_url in git_reqs:
@@ -639,6 +752,11 @@ def _venvstacks_driver() -> list[str]:
 def build_venvstacks():
     """Build venvstacks layers."""
     print("\n[1/4] Building venvstacks layers...")
+    print(
+        f"  Guarded MLX pin: {GUARDED_MLX_VERSION} "
+        f"(commit {GUARDED_MLX_COMMIT}, cp311, never PyPI 0.32.0/0.32.2)"
+    )
+    require_guarded_mlx_wheels()
 
     venvstacks_cmd = _venvstacks_driver()
     print(f"  Using venvstacks driver: {' '.join(venvstacks_cmd)}")
@@ -1062,10 +1180,16 @@ def _compute_donor_fingerprint() -> str:
         SCRIPT_DIR.parent / "pyproject.toml",
         SCRIPT_DIR / "venvstacks.toml",
         SCRIPT_DIR.parent / "uv.lock",
+        SCRIPT_DIR / "_wheels" / "guarded" / "README.md",
     ]
     for path in inputs:
         if path.exists():
             h.update(path.read_bytes())
+    h.update(GUARDED_MLX_VERSION.encode())
+    if GUARDED_WHEELS_DIR.is_dir():
+        for whl in sorted(GUARDED_WHEELS_DIR.glob("*.whl")):
+            h.update(whl.name.encode())
+            h.update(str(whl.stat().st_size).encode())
     return h.hexdigest()
 
 
@@ -1100,9 +1224,9 @@ def main():
                              "staged omlx package directory and exit. "
                              "`build.sh` uses this after copying Resources/omlx.")
     parser.add_argument("--macos-target",
-                        help="Target macOS version for mlx/mlx-metal wheels "
-                             "(e.g. 26.0). Downloads platform-specific wheels "
-                             "with M5 Neural Accelerator support.")
+                        help="Install the guarded local mlx/mlx-metal wheels "
+                             "for this macOS tag (Path B: 26.0). Never "
+                             "downloads mlx from PyPI.")
     args = parser.parse_args()
 
     if args.print_fingerprint:
