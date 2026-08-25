@@ -952,6 +952,14 @@ def test_autoconfigure_builds_signed_full_replica_phase_split():
         auto_tune=False,
         preflight=False,
     )
+    payload["hosts"] = [
+        {
+            "node_id": f"node-{rank}",
+            "ssh": "127.0.0.1" if rank == 0 else "worker.local",
+            "ips": [f"10.0.0.{rank + 1}"],
+        }
+        for rank in range(2)
+    ]
 
     with TestClient(_app()) as client:
         response = client.post("/admin/api/cluster/autoconfigure", json=payload)

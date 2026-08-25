@@ -1964,7 +1964,10 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 ),
             )
         )
-        choice = replace(choice, plan=ordered_plan)
+        if request.strategy == "disaggregated":
+            choice.plan = ordered_plan
+        else:
+            choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
         [host.ssh for host in ordered_hosts],
         transports,
