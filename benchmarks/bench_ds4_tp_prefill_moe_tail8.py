@@ -245,12 +245,34 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         _build_mxfp4_blocks,
     )
 
-    pair_candidate = getattr(fast, PAIR_SYMBOL, None)
-    down_candidate = getattr(fast, DOWN_SYMBOL, None)
+    pair_symbol = args.pair_symbol or PAIR_SYMBOL
+    down_symbol = args.down_symbol or DOWN_SYMBOL
+    pair_candidate = getattr(fast, pair_symbol, None)
+    down_candidate = getattr(fast, down_symbol, None)
+    baseline_pair_native = (
+        getattr(fast, args.baseline_pair_symbol, None)
+        if args.baseline_pair_symbol
+        else None
+    )
+    baseline_down_native = (
+        getattr(fast, args.baseline_down_symbol, None)
+        if args.baseline_down_symbol
+        else None
+    )
     if pair_candidate is None or down_candidate is None:
         raise RuntimeError("tail8 native symbols are not wired")
-    if not fast.has_symbol(PAIR_SYMBOL) or not fast.has_symbol(DOWN_SYMBOL):
+    if not fast.has_symbol(pair_symbol) or not fast.has_symbol(down_symbol):
         raise RuntimeError("tail8 native symbols are unavailable")
+    if args.baseline_pair_symbol and (
+        baseline_pair_native is None
+        or not fast.has_symbol(args.baseline_pair_symbol)
+    ):
+        raise RuntimeError("requested native baseline pair symbol is unavailable")
+    if args.baseline_down_symbol and (
+        baseline_down_native is None
+        or not fast.has_symbol(args.baseline_down_symbol)
+    ):
+        raise RuntimeError("requested native baseline down symbol is unavailable")
 
     (
         up_weight,
@@ -288,6 +310,18 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         return (gate * mx.sigmoid(gate)) * mx.clip(up, -10.0, 10.0)
 
     def baseline_pair():
+        if baseline_pair_native is not None:
+            return baseline_pair_native(
+                sorted_x,
+                up_weight,
+                up_scales,
+                gate_weight,
+                gate_scales,
+                block_meta,
+                block_count,
+                10.0,
+                variant,
+            )
         pair = fast.deepseek_mxfp4_gather_qmm_pair_concat_blocks(
             sorted_x,
             up_weight,
@@ -330,9 +364,10 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         pair_baseline_stats["median_ms"] / pair_candidate_stats["median_ms"]
     )
 
-    def baseline_down():
-        return fast.deepseek_mxfp4_gather_qmm_blocks(
-            baseline_value,
+    def baseline_down_for(value):
+        function = baseline_down_native or fast.deepseek_mxfp4_gather_qmm_blocks
+        return function(
+            value,
             down_weight,
             down_scales,
             block_meta,
@@ -340,15 +375,21 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
             variant,
         )
 
-    def candidate_down():
+    def candidate_down_for(value):
         return down_candidate(
-            baseline_value,
+            value,
             down_weight,
             down_scales,
             block_meta,
             block_count,
             variant,
         )
+
+    def baseline_down():
+        return baseline_down_for(baseline_value)
+
+    def candidate_down():
+        return candidate_down_for(baseline_value)
 
     baseline_down_value = baseline_down()
     candidate_down_value = candidate_down()
@@ -367,24 +408,10 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
     )
 
     def baseline_full():
-        return fast.deepseek_mxfp4_gather_qmm_blocks(
-            baseline_pair(),
-            down_weight,
-            down_scales,
-            block_meta,
-            block_count,
-            variant,
-        )
+        return baseline_down_for(baseline_pair())
 
     def candidate_full():
-        return down_candidate(
-            candidate_pair(),
-            down_weight,
-            down_scales,
-            block_meta,
-            block_count,
-            variant,
-        )
+        return candidate_down_for(candidate_pair())
 
     baseline_full_value = baseline_full()
     candidate_full_value = candidate_full()
@@ -415,6 +442,14 @@ def run_gpu_gate(args: argparse.Namespace, shape: Shape) -> dict[str, object]:
         "layer": args.layer,
         "rank": args.rank,
         "shards": shards,
+        "symbols": {
+            "candidate_pair": pair_symbol,
+            "candidate_down": down_symbol,
+            "baseline_pair": (
+                args.baseline_pair_symbol or "pair_concat+activation"
+            ),
+            "baseline_down": args.baseline_down_symbol or "stock_blocks",
+        },
         "pair": {
             "array_equal": pair_exact,
             "candidate": pair_candidate_stats,
@@ -445,6 +480,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--cycles", type=int, default=4)
     parser.add_argument("--min-speedup", type=float, default=1.05)
+    parser.add_argument("--pair-symbol")
+    parser.add_argument("--down-symbol")
+    parser.add_argument("--baseline-pair-symbol")
+    parser.add_argument("--baseline-down-symbol")
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args()
 
