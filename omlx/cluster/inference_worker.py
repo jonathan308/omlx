@@ -657,6 +657,15 @@ def _apply_distributed_mtp_decode_concurrency(
             effective,
         )
         args.decode_concurrency = effective
+    prompt_requested = max(1, int(getattr(args, "prompt_concurrency", 1)))
+    if prompt_requested > effective:
+        logger.info(
+            "DS4 distributed MTP prompt concurrency capped %d -> %d to "
+            "match the decode lane",
+            prompt_requested,
+            effective,
+        )
+        args.prompt_concurrency = effective
     return effective
 
 
