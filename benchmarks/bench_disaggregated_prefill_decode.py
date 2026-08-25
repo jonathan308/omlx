@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--completion-tokens", type=int, default=32)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--prefill-rank", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--pipeline-requests", type=int, choices=(1, 2), default=1)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -94,6 +95,8 @@ def main() -> int:
             str(args.prefill_step_size),
             "--prefill-rank",
             str(args.prefill_rank),
+            "--pipeline-requests",
+            str(args.pipeline_requests),
             "--control-host",
             control_host,
             "--control-port",
@@ -126,7 +129,12 @@ def main() -> int:
         except json.JSONDecodeError:
             pass
     result_event = next(
-        (event for event in events if event.get("type") == "result"), None
+        (
+            event
+            for event in events
+            if event.get("type") in {"result", "pipeline_result"}
+        ),
+        None,
     )
     error_events = [event for event in events if event.get("type") == "error"]
     effective_returncode = (
