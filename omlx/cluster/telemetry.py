@@ -64,6 +64,7 @@ _CANCEL_VOTE_SCHEMA_VERSION = 1
 # it never competes with generation for the lock.
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+_INTERNAL_REQUEST_PREFIX = "omlx-internal-"
 
 
 def _agreed_snapshot_capacity_charge(
@@ -201,6 +202,7 @@ class _RequestSample:
     request_id: int
     started_at: float
     updated_at: float
+    internal: bool = False
     prompt_tokens: int = 0
     cached_tokens: int = 0
     completion_tokens: int = 0
@@ -380,6 +382,7 @@ class RuntimeTelemetry:
 
     def begin_request(self, transport_request_id: str | None = None) -> int:
         now = float(self._clock())
+        transport_request_id = _transport_request_id(transport_request_id)
         with self._lock:
             self._next_request_id += 1
             request_id = self._next_request_id
@@ -387,8 +390,11 @@ class RuntimeTelemetry:
                 request_id=request_id,
                 started_at=now,
                 updated_at=now,
+                internal=bool(
+                    transport_request_id
+                    and transport_request_id.startswith(_INTERNAL_REQUEST_PREFIX)
+                ),
             )
-            transport_request_id = _transport_request_id(transport_request_id)
             if transport_request_id is not None:
                 self._transport_to_request[transport_request_id] = request_id
                 self._request_to_transport[request_id] = transport_request_id
@@ -918,14 +924,20 @@ class RuntimeTelemetry:
             self._last_step_finished_at = now
             self._batch_steps += 1
             generation_rows = max(0, int(generation_responses))
-            if generation_rows > 0 and elapsed > 0.0:
-                self._decode_step_tokens_total += generation_rows
+            prompt_rows = max(0, int(prompt_responses))
+            internal_only = bool(self._requests) and all(
+                sample.internal for sample in self._requests.values()
+            )
+            visible_generation_rows = 0 if internal_only else generation_rows
+            visible_prompt_rows = 0 if internal_only else prompt_rows
+            if visible_generation_rows > 0 and elapsed > 0.0:
+                self._decode_step_tokens_total += visible_generation_rows
                 self._decode_step_seconds_total += elapsed
-            coalesced = max(prompt_responses, generation_responses)
+            coalesced = max(visible_prompt_rows, visible_generation_rows)
             self._last_batch = {
                 "step_seconds": elapsed,
-                "prompt_responses": max(0, int(prompt_responses)),
-                "generation_responses": generation_rows,
+                "prompt_responses": visible_prompt_rows,
+                "generation_responses": visible_generation_rows,
                 "coalesced_batch_size": max(0, int(coalesced)),
             }
             self._publish_locked(now, force=False)
@@ -1080,6 +1092,11 @@ class RuntimeTelemetry:
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
+        if sample.internal:
+            # Readiness canaries prove the ranks but are not user inference.
+            # Do not turn a four-token load probe into Request #1, poison the
+            # displayed prefill rate, or dilute lifetime aggregate throughput.
+            return True
         if status == "failed":
             self._requests_failed += 1
         elif status == "cancelled":
@@ -1193,7 +1210,11 @@ class RuntimeTelemetry:
 
     def _snapshot_locked(self, now: float) -> dict[str, Any]:
         active_samples = sorted(
-            self._requests.values(),
+            (
+                sample
+                for sample in self._requests.values()
+                if not sample.internal
+            ),
             key=lambda item: item.request_id,
         )
         active_sample = (
@@ -1228,7 +1249,7 @@ class RuntimeTelemetry:
         )
         result = {
             "scope": "end_to_end_pipeline",
-            "active_requests": len(self._requests),
+            "active_requests": len(active_samples),
             "requests_completed": self._requests_completed,
             "requests_failed": self._requests_failed,
             "requests_cancelled": self._requests_cancelled,
