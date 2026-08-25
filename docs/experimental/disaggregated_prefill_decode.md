@@ -73,9 +73,18 @@ The physical two-request 4K+64 pipeline measured:
 
 The same stage rates imply a steady filled-pipeline interval of roughly
 `max(4.0 s prefill, 2.0 s decode) + 0.065 s handoff = 4.07 s`, versus about
-6.0 s serially. More than two requests should approach a roughly 1.47x steady
-ceiling, but B4/B8 still require physical measurement. The first request pays
-the handoff and therefore has nearly unchanged/slightly higher latency.
+6.0 s serially. The deeper physical gates approached that ceiling:
+
+| queue | exact requests | serial source | pipeline | per request | speedup |
+|---:|---:|---:|---:|---:|---:|
+| B2 | 2/2 | 12.073 s | 10.040 s | 5.020 s | **1.2025x** |
+| B4 | 4/4 | 24.730 s | 18.822 s | 4.706 s | **1.3139x** |
+| B8 | 8/8 | 50.545 s | 36.699 s | 4.587 s | **1.3773x** |
+
+B8 moved eight 422.38 MB cache images at 5.8-6.5 GB/s each while decode held
+31.3-32.6 tok/s. Per-request wall fell from 6.318 s serial to 4.587 s through
+the measured pipeline. The first request still pays fill and handoff, so this
+mode improves sustained throughput rather than single-request latency.
 
 ## Implemented artifacts
 
@@ -97,8 +106,9 @@ the handoff and therefore has nearly unchanged/slightly higher latency.
 1. Feed live per-node phase probes, model admission budgets and fabric metrics
    into the implemented pure role planner; persist the resulting capability in
    signed deployment state.
-2. Add a persistent serving queue. While decode handles request N,
-   prefill should process N+1; cache transfer occurs at the stage boundary.
+2. Port the proven bounded B2/B4/B8 queue into the persistent HTTP serving
+   lifecycle. While decode handles request N, prefill processes N+1 and cache
+   transfer occurs at the stage boundary.
 3. Preserve request IDs, cancellation, steering, grammar state, sampler state,
    logit processors, tool-call parsing and per-request telemetry across the
    ownership transition.
@@ -106,8 +116,8 @@ the handoff and therefore has nearly unchanged/slightly higher latency.
    teardown, and cache ownership/garbage collection.
 5. Gate MTP/speculative state separately; the current prototype proves fixed
    greedy decode only.
-6. Extend the proven B2 overlap to B4/B8 queues; run 100K cache transfer,
-   cancellation during prefill/handoff/decode, forced rank loss and reload.
+6. Run mixed prompt/decode lengths, 100K cache transfer, cancellation during
+   prefill/handoff/decode, forced rank loss and reload.
 7. Expose the mode only when the planner proves it useful. Models that do not
    fit twice, single-request interactive workloads, and slow fabrics should
    remain on tensor/pipeline/single-node execution automatically.

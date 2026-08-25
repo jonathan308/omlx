@@ -93,6 +93,36 @@
         "362f2bd93bbf9e8f8eefdf873284d4d6979d1689a8adea6df5984111d6b807f4",
         "0ea614fa16658a5f9e8d056667f2949eeed0c4c554f329af2d260b6a68cc82c8"
       ]
+    },
+    {
+      "requests": 4,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "serial_source_seconds": 24.729965539996556,
+      "pipeline_seconds": 18.822177749998446,
+      "pipeline_seconds_per_request": 4.705544437499611,
+      "measured_pipeline_speedup": 1.313873764686905,
+      "parity_by_request": [true, true, true, true],
+      "cache_tensor_bytes_per_request": 422379520,
+      "prefill_tokens_per_second_range": [955.6426522112222, 1025.1743587567464],
+      "decode_tokens_per_second_range": [31.328686928973326, 32.70666688781281]
+    },
+    {
+      "requests": 8,
+      "prompt_tokens_per_request": 4096,
+      "completion_tokens_per_request": 64,
+      "prefill_rank": 1,
+      "decode_rank": 0,
+      "serial_source_seconds": 50.54528474900326,
+      "pipeline_seconds": 36.69946083399918,
+      "pipeline_seconds_per_request": 4.587432604249898,
+      "measured_pipeline_speedup": 1.3772759490291204,
+      "parity_by_request": [true, true, true, true, true, true, true, true],
+      "cache_tensor_bytes_per_request": 422379520,
+      "prefill_tokens_per_second_range": [927.9495382128434, 1020.1364774141709],
+      "decode_tokens_per_second_range": [31.281211466886383, 32.641643163073105]
     }
   ],
   "scope": "standalone full-replica parity and two-request overlap prototype; no HTTP scheduler claim"
