@@ -232,7 +232,7 @@ def _deepseek_v4_outer_prefill_step(
     *,
     long_after: int,
     kernel_step: int,
-    mixed_quantum: int = 1024,
+    mixed_quantum: int = 256,
 ) -> int:
     """Choose the DS4 outer scheduler slice for this exact batch turn.
 
@@ -243,7 +243,7 @@ def _deepseek_v4_outer_prefill_step(
     expensive 1024-token calls before returning control to an active decode.
 
     Cap only that *outer* slice when this turn contains both decode and
-    long-prompt work. The DS4 continuous-batching policy selects 1024/1024/512
+    long-prompt work. The DS4 continuous-batching policy selects 256/256/128
     prompt tokens for B1/B2/B4 decode pressure. Idle long prompts retain the
     wider outer slice and allocator reuse. The decision uses only mirrored
     batch structure and full request lengths -- never local clocks -- so TP
@@ -940,7 +940,7 @@ def install_runtime_optimizations(
     )
     mixed_prefill_quantum = _positive_batch_env_int(
         _DSV4_MIXED_PREFILL_CHUNK_ENV,
-        1024,
+        256,
     )
     raw_indexer_owner = os.environ.get(
         "OMLX_DSV4_INDEXER_DECODE_OWNER_RANK", ""
@@ -1210,7 +1210,7 @@ def install_runtime_optimizations(
             active=outer_prefill_yield_active,
             reason=(
                 "mixed DS4 turns process one prompt row; long rows use shared "
-                "1024/1024/512-token budgets at B1/B2/B4"
+                "256/256/128-token budgets at B1/B2/B4"
                 if outer_prefill_yield_active
                 else (
                     "DS4 contended-prefill yielding is disabled by the operator"

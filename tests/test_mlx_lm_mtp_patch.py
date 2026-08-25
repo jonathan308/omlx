@@ -1739,6 +1739,54 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_standard_multirow_step_temporarily_restores_fused_ds4_attention(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        attentions = [
+            SimpleNamespace(_omlx_decode_consistent=True) for _ in range(3)
+        ]
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            model=SimpleNamespace(
+                layers=[SimpleNamespace(attn=attention) for attention in attentions]
+            ),
+        )
+        batch = SimpleNamespace(model=model, uids=[1, 2])
+        seen = []
+
+        result = batch_generator._standard_multirow_next(
+            batch,
+            lambda: seen.append(
+                [attention._omlx_decode_consistent for attention in attentions]
+            )
+            or "ok",
+        )
+
+        assert result == "ok"
+        assert seen == [[False, False, False]]
+        assert [attention._omlx_decode_consistent for attention in attentions] == [
+            True,
+            True,
+            True,
+        ]
+
+    def test_standard_singleton_step_keeps_mtp_decode_consistency(self):
+        from omlx.patches.mlx_lm_mtp import batch_generator
+
+        attention = SimpleNamespace(_omlx_decode_consistent=True)
+        model = SimpleNamespace(
+            _omlx_mtp_decode_enabled=True,
+            model=SimpleNamespace(layers=[SimpleNamespace(attn=attention)]),
+        )
+        batch = SimpleNamespace(model=model, uids=[1])
+
+        batch_generator._standard_multirow_next(
+            batch,
+            lambda: attention._omlx_decode_consistent,
+        )
+
+        assert attention._omlx_decode_consistent is True
+
     def test_singleton_recovery_clears_marker_when_cache_compact(self):
         # A batch that shrinks back to one row with no residual left padding
         # satisfies the singleton-init invariant again, so the multirow

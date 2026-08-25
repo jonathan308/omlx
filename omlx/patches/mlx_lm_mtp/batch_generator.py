@@ -283,7 +283,10 @@ def apply() -> bool:
             park_state = _mtp_park_state_for_batch(self)
             if tax_probe is not None or park_state is not None:
                 step_t0 = time.perf_counter()
-                result = original_next(self, *args, **kwargs)
+                result = _standard_multirow_next(
+                    self,
+                    lambda: original_next(self, *args, **kwargs),
+                )
                 if tax_probe is not None:
                     _record_std_tax_sample(
                         self, (time.perf_counter() - step_t0) * 1000.0
@@ -291,7 +294,10 @@ def apply() -> bool:
                 if park_state is not None:
                     _record_parked_standard_step(self)
                 return result
-            return original_next(self, *args, **kwargs)
+            return _standard_multirow_next(
+                self,
+                lambda: original_next(self, *args, **kwargs),
+            )
 
         def patched_extend(self, batch, *args, **kwargs):
             # The host (self) may have active MTP about to gain a co-runner.
@@ -550,6 +556,37 @@ def _rowwise_batch_mtp_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _standard_multirow_next(gen_batch: Any, call: Any) -> Any:
+    """Use normal fused DS4 attention when a multi-row batch is not using MTP.
+
+    DS4 marks attention decode-consistent globally when its MTP head is loaded,
+    because singleton verification must match one-token decode exactly. A
+    standard B2/B4 step performs no speculative verification, so retaining the
+    slower rowwise-exact mode is unnecessary. Toggle it off for this one step
+    and restore it before singleton MTP can resume.
+    """
+
+    uids = getattr(gen_batch, "uids", None)
+    model = getattr(gen_batch, "model", None)
+    if uids is None or len(uids) <= 1 or not _model_mtp_decode_enabled(model):
+        return call()
+    inner = getattr(model, "model", None) or getattr(model, "_language_model", None)
+    changed: List[Tuple[Any, bool]] = []
+    for layer in getattr(inner, "layers", ()) or ():
+        attention = getattr(layer, "attn", None)
+        if attention is None or not hasattr(attention, "_omlx_decode_consistent"):
+            continue
+        previous = bool(attention._omlx_decode_consistent)
+        if previous:
+            attention._omlx_decode_consistent = False
+            changed.append((attention, previous))
+    try:
+        return call()
+    finally:
+        for attention, previous in changed:
+            attention._omlx_decode_consistent = previous
 
 
 def _allows_new_mtp_activation(gen_batch: Any, state_attr: str) -> bool:
