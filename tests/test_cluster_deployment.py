@@ -98,6 +98,8 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
         "OMLX_CLUSTER_TRACE_COLLECTIVES",
         "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH",
         "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH",
+        "OMLX_MTP_ROWWISE_BATCH",
+        "OMLX_DSV4_MTP_DECODE_CONCURRENCY",
         "OMLX_DSV4_INDEXER_ROW_TP",
         "OMLX_DSV4_INDEXER_GATHER_P2P",
         "OMLX_DSV4_NATIVE_INDEXER",
@@ -160,6 +162,8 @@ def test_hostfile_envs_carry_stability_defaults(monkeypatch):
     assert "OMLX_CLUSTER_TRACE_COLLECTIVES=0" in envs
     assert "OMLX_MTP_DISTRIBUTED_ADAPTIVE_DEPTH=0" in envs
     assert "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH=0" in envs
+    assert "OMLX_MTP_ROWWISE_BATCH=0" in envs
+    assert "OMLX_DSV4_MTP_DECODE_CONCURRENCY=1" in envs
     assert "OMLX_DSV4_INDEXER_ROW_TP=1" in envs
     assert "OMLX_DSV4_INDEXER_GATHER_P2P=0" in envs
     assert "OMLX_DSV4_NATIVE_INDEXER=1" in envs
