@@ -291,6 +291,35 @@ def test_runtime_markers_preserve_validated_cache_tier_metrics(tmp_path):
     assert result["jobs"][0]["metrics"]["cache"] == metrics["cache"]
 
 
+def test_runtime_markers_preserve_bounded_keepwarm_metrics(tmp_path):
+    keepwarm = {
+        "enabled": True,
+        "request_active": False,
+        "count": 7,
+        "failures": 0,
+        "skips": 2,
+        "slow_count": 0,
+        "last_event": {
+            "ok": True,
+            "action": "idle",
+            "at_monotonic": 123.0,
+            "elapsed_ms": 0.31,
+            "idle_seconds": 10.0,
+            "matrix_size": 1,
+            "repeats": 1,
+            "cache_tokens": 0,
+            "dataplane_ping": True,
+        },
+    }
+    metrics = _metrics() | {"keepwarm": keepwarm}
+    (tmp_path / "job.json").write_text(json.dumps(_marker(metrics=metrics)))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    assert result["jobs"][0]["metrics"]["keepwarm"] == keepwarm
+
+
 def test_runtime_markers_reject_inconsistent_cache_tier_totals(tmp_path):
     cache = _tiered_cache_metrics()
     cache["ssd"]["bytes"] += 1

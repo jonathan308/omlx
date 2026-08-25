@@ -290,6 +290,67 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
         "metrics aggregate_wall_tps",
     )
 
+    keepwarm = value.get("keepwarm")
+    if keepwarm is not None:
+        if not isinstance(keepwarm, dict):
+            raise ValueError("runtime keepwarm metrics are invalid")
+        enabled = keepwarm.get("enabled")
+        request_active = keepwarm.get("request_active")
+        if not isinstance(enabled, bool) or not isinstance(request_active, bool):
+            raise ValueError("runtime keepwarm state flags are invalid")
+        validated_keepwarm: dict[str, Any] = {
+            "enabled": enabled,
+            "request_active": request_active,
+        }
+        for key in ("count", "failures", "skips", "slow_count"):
+            validated_keepwarm[key] = _nonnegative_int(
+                keepwarm.get(key, 0),
+                f"metrics keepwarm {key}",
+            )
+        event = keepwarm.get("last_event")
+        if event is not None:
+            if not isinstance(event, dict):
+                raise ValueError("runtime keepwarm event is invalid")
+            action = event.get("action")
+            if action not in {"idle", "request_start", "post_response", "skip"}:
+                raise ValueError("runtime keepwarm event action is invalid")
+            ok = event.get("ok")
+            if not isinstance(ok, bool):
+                raise ValueError("runtime keepwarm event status is invalid")
+            validated_event: dict[str, Any] = {
+                "action": action,
+                "ok": ok,
+                "at_monotonic": _nonnegative_float(
+                    event.get("at_monotonic", 0.0),
+                    "metrics keepwarm event timestamp",
+                ),
+            }
+            for key in ("elapsed_ms", "idle_seconds"):
+                if key in event:
+                    validated_event[key] = _nonnegative_float(
+                        event[key], f"metrics keepwarm event {key}"
+                    )
+            for key in ("matrix_size", "repeats", "cache_tokens"):
+                if key in event:
+                    validated_event[key] = _nonnegative_int(
+                        event[key], f"metrics keepwarm event {key}"
+                    )
+            dataplane_ping = event.get("dataplane_ping")
+            if dataplane_ping is not None:
+                if not isinstance(dataplane_ping, bool):
+                    raise ValueError("runtime keepwarm data-plane flag is invalid")
+                validated_event["dataplane_ping"] = dataplane_ping
+            for key in ("reason", "error"):
+                text = event.get(key)
+                if text is not None:
+                    if not isinstance(text, str) or len(text) > 500:
+                        raise ValueError(f"runtime keepwarm event {key} is invalid")
+                    validated_event[key] = text
+            validated_keepwarm["last_event"] = validated_event
+        else:
+            validated_keepwarm["last_event"] = None
+        result["keepwarm"] = validated_keepwarm
+
     active_details = value.get("active_request_metrics")
     if active_details is not None:
         if (
