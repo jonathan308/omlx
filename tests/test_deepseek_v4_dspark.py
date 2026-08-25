@@ -593,6 +593,7 @@ def test_dspark_head_gemv_gathers_a_vocab_parallel_local_projection():
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
 def test_verify_exact_multi_qmv_matches_decode_rows(rows):
     from mlx_lm.models.mla import MultiLinear
+
     from omlx.patches.deepseek_v4.verify_qmv import exact_verify_multi_qmv
 
     mx.random.seed(59 + rows)
@@ -882,6 +883,50 @@ def test_dspark_indexer_batches_adjacent_pool_lengths(dsv4):
     )
 
 
+def test_dspark_ragged_verify_topk_runs_each_row_at_its_exact_width(
+    dsv4,
+    monkeypatch,
+):
+    query_rows = mx.zeros((3, 2, 1, 4), dtype=mx.float32)
+    local_rows = [
+        mx.zeros((1, 1, 8 + index, 4), dtype=mx.bfloat16)
+        for index in range(3)
+    ]
+    pooled_rows = [
+        mx.zeros((1, width, 4), dtype=mx.bfloat16)
+        for width in (511, 512, 512)
+    ]
+    topk_rows = [
+        mx.arange(width, dtype=mx.uint32)[None, None]
+        for width in (511, 512, 512)
+    ]
+    calls = []
+
+    def row_attention(query, local, pooled, topk, *_args, **_kwargs):
+        calls.append((query.shape[0], local.shape[2], pooled.shape[1], topk.shape[-1]))
+        return query + mx.array(float(topk.shape[-1]), dtype=query.dtype)
+
+    monkeypatch.setattr(dsv4, "_sparse_pooled_attention", row_attention)
+    result = dsv4._ragged_verify_sparse_attention(
+        query_rows,
+        local_rows,
+        pooled_rows,
+        topk_rows,
+        4**-0.5,
+        mx.zeros((2,), dtype=mx.bfloat16),
+        decode_consistent=True,
+    )
+    mx.eval(result)
+
+    assert calls == [
+        (1, 8, 511, 511),
+        (1, 9, 512, 512),
+        (1, 10, 512, 512),
+    ]
+    assert result.shape == query_rows.shape
+    assert result[:, 0, 0, 0].tolist() == [511.0, 512.0, 512.0]
+
+
 @pytest.mark.parametrize("key_length", [156, 512, 640, 1024])
 @pytest.mark.parametrize("rows", [2, 3, 6])
 def test_dspark_attention_matches_stock_m1_fallback(dsv4, key_length, rows):
@@ -994,6 +1039,7 @@ def test_vectorized_verify_ring_snapshots_match_m1_updates(dsv4, batch_cache):
 @pytest.mark.parametrize("batch_cache", [False, True])
 def test_vectorized_verify_ring_rollback_matches_accepted_prefix(dsv4, batch_cache):
     from mlx_lm.models.cache import BatchRotatingKVCache
+
     from omlx.patches.mlx_lm_mtp.cache_rollback import set_undo_armed
 
     def make_cache():

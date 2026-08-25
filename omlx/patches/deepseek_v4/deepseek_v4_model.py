@@ -20,6 +20,7 @@ from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+from omlx.patches.deepseek_v4.hierarchical_indexer import hierarchical_topk
 from omlx.patches.deepseek_v4.indexer_dispatch import (
     disable_native_indexer,
     native_indexer_available,
@@ -37,7 +38,6 @@ from omlx.patches.deepseek_v4.verify_attention import (
     rowwise_gemm,
 )
 from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
-from omlx.patches.deepseek_v4.hierarchical_indexer import hierarchical_topk
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, PoolingCache, RotatingKVCache
@@ -1135,8 +1135,10 @@ def _project_attention_output(attn: nn.Module, out: mx.array, offset: Any) -> mx
             )
         from omlx.patches.deepseek_v4.verify_qmv import (
             eligible as qmv_eligible,
-            exact_verify_qmv,
+        )
+        from omlx.patches.deepseek_v4.verify_qmv import (
             exact_verify_multi_qmv,
+            exact_verify_qmv,
             multi_eligible,
         )
 
@@ -1171,6 +1173,8 @@ def _project_verify_q_b(module: nn.Module, inputs: mx.array) -> mx.array:
     if is_dspark_verify_armed():
         from omlx.patches.deepseek_v4.verify_qmv import (
             eligible as qmv_eligible,
+        )
+        from omlx.patches.deepseek_v4.verify_qmv import (
             exact_verify_qmv,
         )
 
@@ -3551,6 +3555,48 @@ def _batch_indexer_rows(
     return results
 
 
+def _ragged_verify_sparse_attention(
+    query_rows: mx.array,
+    local_rows: List[mx.array],
+    pooled_rows: List[mx.array],
+    topk_rows: List[mx.array],
+    scale: float,
+    sinks: mx.array,
+    *,
+    decode_consistent: bool,
+) -> mx.array:
+    """Evaluate a verify block rowwise when its sparse widths differ.
+
+    At a ratio-4/128 pooling boundary, the first speculative row can select
+    511 pooled entries while the following rows select 512. Padding that first
+    row would either duplicate a KV entry or change the softmax reduction tree.
+    Run the at-most-six verification rows through the established B=1 exact
+    path instead, preserving each row's own local/pooled cache and top-k width.
+    """
+
+    outputs: List[mx.array] = []
+    for index, (local, pooled, topk) in enumerate(
+        zip(local_rows, pooled_rows, topk_rows)
+    ):
+        output = _sparse_pooled_attention(
+            query_rows[index : index + 1],
+            local,
+            pooled,
+            topk,
+            None,
+            None,
+            scale,
+            sinks,
+            decode_consistent=decode_consistent,
+        )
+        if output is None:
+            raise RuntimeError("DS4 rowwise verify attention did not produce output")
+        outputs.append(output)
+    if len(outputs) != int(query_rows.shape[0]):
+        raise RuntimeError("DS4 rowwise verify cache count is inconsistent")
+    return mx.concatenate(outputs, axis=0)
+
+
 def _b1_cache_offset(cache: Any, batch_size: int) -> Any:
     """Use BatchRotatingKVCache's host absolute offset for a B=1 request.
 
@@ -4189,9 +4235,14 @@ class SparseCompressedAttention(nn.Module):
                     pooled,
                     (L, pooled.shape[1], pooled.shape[2]),
                 )
-                topk_batch = mx.concatenate(topk_rows, axis=0)
+                topk_widths = tuple(int(row.shape[-1]) for row in topk_rows)
+                ragged_topk = len(set(topk_widths)) > 1
+                topk_batch = (
+                    None if ragged_topk else mx.concatenate(topk_rows, axis=0)
+                )
                 use_ring_kernel = bool(
                     not _DEEPSEEK_V4_RING_VERIFY_DISABLED
+                    and not ragged_topk
                     and ring_view is not None
                     # The physical-ring kernel has an aligned 64-row MMA
                     # store. TP ranks own fewer query heads, so they must use
@@ -4216,7 +4267,19 @@ class SparseCompressedAttention(nn.Module):
                         use_ring_kernel = False
                 set_dspark_verify_armed(False)
                 try:
-                    if use_ring_kernel:
+                    if ragged_topk:
+                        if local_rows is None:
+                            local_rows = _materialize_rotating_verify_rows(ring_view)
+                        batch_out = _ragged_verify_sparse_attention(
+                            query_batch,
+                            local_rows,
+                            pooled_rows,
+                            topk_rows,
+                            self.scale,
+                            sinks,
+                            decode_consistent=self._omlx_decode_consistent,
+                        )
+                    elif use_ring_kernel:
                         batch_out = _sparse_pooled_ring_attention(
                             query_batch,
                             ring_view.source,
