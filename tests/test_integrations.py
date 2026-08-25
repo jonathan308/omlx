@@ -11,7 +11,11 @@ import yaml
 from omlx.integrations import get_integration, list_integrations
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
-from omlx.integrations.codex import CodexIntegration
+from omlx.integrations.codex import (
+    CodexIntegration,
+    codex_config_args,
+    write_codex_config,
+)
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
 from omlx.integrations.copilot import CopilotIntegration
 from omlx.integrations.hermes import HermesIntegration
@@ -84,134 +88,48 @@ class TestCodexIntegration:
         cmd = codex.get_command(ctx(port=8000, api_key="", model=""))
         assert "select-a-model" in cmd
 
-    def test_configure(self, tmp_path):
-        codex = CodexIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
-
-        assert config_path.exists()
-        content = config_path.read_text()
-        assert 'model = "qwen3.5"' in content
-        assert 'model_provider = "omlx"' in content
-        assert 'base_url = "http://127.0.0.1:8000/v1"' in content
-        assert 'env_key = "OMLX_API_KEY"' in content
-
-    def test_configure_custom_host(self, tmp_path):
-        codex = CodexIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(
-                ctx(port=9000, api_key="key", model="test", host="192.168.1.100")
+    def test_config_args_use_process_scoped_provider(self):
+        args = codex_config_args(
+            ctx(
+                host="192.168.1.100",
+                port=9000,
+                model="deepseek-v3.1",
+                context_window=240_000,
             )
+        )
 
-        content = config_path.read_text()
-        assert 'base_url = "http://192.168.1.100:9000/v1"' in content
+        assert 'model_provider="omlx"' in args
+        assert (
+            'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
+        )
+        assert 'model_providers.omlx.env_key="OMLX_API_KEY"' in args
+        assert "model_context_window=240000" in args
+        assert not any("model_auto_compact_token_limit" in arg for arg in args)
 
-    def test_configure_creates_backup(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text('model = "old"')
+    def test_config_args_reasoning_uses_resolved_metadata(self):
+        reasoning_args = codex_config_args(
+            ctx(port=8000, model="custom-model", reasoning=True)
+        )
+        non_reasoning_args = codex_config_args(
+            ctx(port=8000, model="deepseek-r1", reasoning=False)
+        )
 
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="new"))
+        assert 'model_reasoning_effort="high"' in reasoning_args
+        assert not any("model_reasoning_effort" in arg for arg in non_reasoning_args)
 
-        backups = list(tmp_path.glob("config.*.bak"))
-        assert len(backups) == 1
-        assert backups[0].read_text() == 'model = "old"'
+    def test_configure_does_not_write_codex_config(self):
+        with patch("omlx.integrations.codex.write_codex_config") as writer:
+            CodexIntegration().configure(ctx(port=8000, model="new-model"))
+
+        writer.assert_not_called()
 
     def test_type(self):
         codex = CodexIntegration()
-        assert codex.type == "config_file"
+        assert codex.type == "env_var"
         assert codex.display_name == "Codex"
 
-    def test_configure_preserves_existing(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        existing = """\
-model = "old-model"
-other_key = "value"
-
-[model_providers.custom]
-name = "Custom"
-model = "should-not-override"
-
-[model_providers.omlx]
-name = "old-omlx"
-"""
-        config_path.write_text(existing)
-
+    def test_launch_forwards_extra_args(self):
         codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="new-model"))
-
-        content = config_path.read_text()
-        assert 'model = "new-model"' in content
-        assert 'model_provider = "omlx"' in content
-        assert 'other_key = "value"' in content
-        assert "[model_providers.custom]" in content
-        assert 'model = "should-not-override"' in content
-        assert "[model_providers.omlx]" in content
-        assert 'name = "oMLX"' in content
-        assert "old-omlx" not in content
-
-    def test_configure_reasoning_model(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="deepseek-r1-distill"))
-
-        content = config_path.read_text()
-        assert 'model_reasoning_effort = "high"' in content
-        assert 'model = "deepseek-r1-distill"' in content
-
-    def test_configure_non_reasoning_model(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="llama-3.1-8b"))
-
-        content = config_path.read_text()
-        assert "model_reasoning_effort" not in content
-
-    def test_configure_reasoning_true_overrides_slug(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, model="qwen3.6", reasoning=True))
-
-        content = config_path.read_text()
-        assert 'model_reasoning_effort = "high"' in content
-
-    def test_configure_reasoning_false_overrides_slug(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(
-                ctx(port=8000, model="deepseek-r1-distill", reasoning=False)
-            )
-
-        content = config_path.read_text()
-        assert "model_reasoning_effort" not in content
-
-    def test_configure_clears_stale_reasoning_flag(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            'model = "old-thinking-model"\n'
-            'model_provider = "omlx"\n'
-            'model_reasoning_effort = "high"\n'
-        )
-
-        codex = CodexIntegration()
-        with patch.object(CodexIntegration, "CONFIG_PATH", config_path):
-            codex.configure(ctx(port=8000, api_key="", model="llama-3.1-8b"))
-
-        content = config_path.read_text()
-        assert 'model = "llama-3.1-8b"' in content
-        assert "model_reasoning_effort" not in content
-
-    def test_launch_forwards_extra_args(self, tmp_path):
-        codex = CodexIntegration()
-        config_path = tmp_path / "codex" / "config.toml"
         captured = {}
 
         def fake_execvpe(binary, argv, env):
@@ -225,7 +143,7 @@ name = "old-omlx"
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         with (
-            patch.object(CodexIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.codex.write_codex_config") as writer,
             patch("omlx.integrations.codex.os.environ", base_env),
             patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
         ):
@@ -238,11 +156,87 @@ name = "old-omlx"
                 )
             )
 
-        assert captured["argv"] == ["codex", "-m", "qwen3.5", "--yolo"]
+        assert captured["argv"][-3:] == ["-m", "qwen3.5", "--yolo"]
+        assert 'model_provider="omlx"' in captured["argv"]
+        assert "model_context_window=240000" not in captured["argv"]
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONDONTWRITEBYTECODE" not in captured["env"]
+        writer.assert_not_called()
+
+
+class TestCodexConfigWriter:
+    """Keep coverage for the config writer used by Codex App."""
+
+    def test_writes_provider_config(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+
+        write_codex_config(
+            config_path,
+            ctx(
+                host="192.168.1.100",
+                port=9000,
+                api_key="test-key",
+                model="qwen3.5",
+            ),
+        )
+
+        content = config_path.read_text()
+        assert 'model = "qwen3.5"' in content
+        assert 'model_provider = "omlx"' in content
+        assert 'base_url = "http://192.168.1.100:9000/v1"' in content
+        assert 'env_key = "OMLX_API_KEY"' in content
+
+    def test_creates_backup(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('model = "old"')
+
+        write_codex_config(config_path, ctx(port=8000, model="new"))
+
+        backups = list(tmp_path.glob("config.*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == 'model = "old"'
+
+    def test_preserves_existing_sections(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-model"\n'
+            'other_key = "value"\n'
+            "\n"
+            "[agents]\n"
+            "max_concurrent_threads_per_session = 4\n"
+            "\n"
+            "[model_providers.omlx]\n"
+            'name = "old-omlx"\n'
+        )
+
+        write_codex_config(config_path, ctx(port=8000, model="new-model"))
+
+        content = config_path.read_text()
+        assert 'model = "new-model"' in content
+        assert 'other_key = "value"' in content
+        assert "[agents]" in content
+        assert "max_concurrent_threads_per_session = 4" in content
+        assert 'name = "oMLX"' in content
+        assert "old-omlx" not in content
+
+    def test_clears_stale_reasoning_effort(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            'model = "old-thinking-model"\n'
+            'model_provider = "omlx"\n'
+            'model_reasoning_effort = "high"\n'
+        )
+
+        write_codex_config(
+            config_path,
+            ctx(port=8000, model="llama-3.1-8b", reasoning=False),
+        )
+
+        content = config_path.read_text()
+        assert 'model = "llama-3.1-8b"' in content
+        assert "model_reasoning_effort" not in content
 
 
 def make_app_bundle(
@@ -915,7 +909,7 @@ class TestHermesIntegration:
         assert "context_length" not in model_config
         assert "max_tokens" not in model_config
 
-    def test_configure_uses_hermes_min_context_length(self, tmp_path):
+    def test_configure_preserves_actual_context_length(self, tmp_path):
         config_path = tmp_path / "config.yaml"
 
         hermes = HermesIntegration()
@@ -930,7 +924,78 @@ class TestHermesIntegration:
             )
 
         model_config = yaml.safe_load(config_path.read_text())["model"]
-        assert model_config["context_length"] == 64000
+        assert model_config["context_length"] == 32768
+
+    def test_model_disabled_reason_below_64k(self):
+        hermes = HermesIntegration()
+
+        reason = hermes.model_disabled_reason(
+            {"id": "small-model", "max_context_window": 32768}
+        )
+
+        assert reason is not None
+        assert "at least 64K" in reason
+        assert "32,768" in reason
+
+    def test_model_disabled_reason_allows_64k(self):
+        hermes = HermesIntegration()
+
+        assert (
+            hermes.model_disabled_reason(
+                {"id": "supported-model", "max_context_window": 64000}
+            )
+            is None
+        )
+
+    def test_select_model_rejects_disabled_choice(self, capsys):
+        hermes = HermesIntegration()
+
+        with (
+            patch("omlx.integrations.base.sys.stdout.isatty", return_value=False),
+            patch("builtins.input", side_effect=["1", "2"]),
+        ):
+            selected = hermes.select_model(
+                [
+                    {"id": "small-model", "max_context_window": 32768},
+                    {"id": "supported-model", "max_context_window": 64000},
+                ]
+            )
+
+        assert selected == "supported-model"
+        output = capsys.readouterr().out
+        assert "small-model" in output
+        assert "unavailable" in output
+        assert "Cannot select small-model" in output
+
+    def test_launch_rejects_context_below_64k_and_records_actual_value(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        hermes = HermesIntegration()
+
+        with (
+            patch.object(HermesIntegration, "CONFIG_PATH", config_path),
+            patch("omlx.integrations.hermes.os.execvpe") as execvpe,
+            pytest.raises(SystemExit) as exc,
+        ):
+            hermes.launch(
+                ctx(
+                    port=8000,
+                    api_key="secret",
+                    model="small-model",
+                    context_window=32768,
+                    max_tokens=8192,
+                )
+            )
+
+        assert exc.value.code == 1
+        execvpe.assert_not_called()
+        output = capsys.readouterr().out
+        assert "Cannot launch Hermes Agent" in output
+        assert "at least 64K" in output
+
+        config = yaml.safe_load(config_path.read_text())
+        assert config["model"]["context_length"] == 32768
 
     def test_launch_sets_config_and_execs(self, tmp_path):
         config_path = tmp_path / "config.yaml"
@@ -1520,6 +1585,140 @@ class TestClaudeCodeIntegration:
         env = captured["env"]
         assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
         assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env
+
+    def test_launch_disables_nonessential_traffic_by_default(self):
+        # Cross-session messaging is opt-in (--cross-session) because
+        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is the privacy-oriented
+        # default for a launch aimed at a local model.
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(ctx(port=8000, api_key="key", model="qwen3.5"))
+
+        env = captured["env"]
+        assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        for var in (
+            "DISABLE_AUTOUPDATER",
+            "DISABLE_ERROR_REPORTING",
+            "DISABLE_FEEDBACK_COMMAND",
+            "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
+        ):
+            assert var not in env
+
+    def test_launch_cross_session_enables_messaging_traffic(self):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch("omlx.integrations.claude.os.environ", {"PATH": "/usr/bin"}),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        env = captured["env"]
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in env
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["DISABLE_ERROR_REPORTING"] == "1"
+        assert env["DISABLE_FEEDBACK_COMMAND"] == "1"
+        assert env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] == "1"
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "0"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "false"),
+            ("DISABLE_TELEMETRY", "1"),
+            ("DISABLE_TELEMETRY", "0"),
+            ("DISABLE_TELEMETRY", "false"),
+            ("DO_NOT_TRACK", "1"),
+            ("DISABLE_GROWTHBOOK", "true"),
+        ),
+    )
+    def test_launch_cross_session_warns_when_user_env_blocks_messaging(
+        self, capsys, name, value
+    ):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch(
+                "omlx.integrations.claude.os.environ",
+                {"PATH": "/usr/bin", name: value},
+            ),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        # The user's own opt-out is preserved, not silently overridden.
+        assert captured["env"][name] == value
+        output = capsys.readouterr().out
+        assert name in output
+        assert "cross-session messaging will remain unavailable" in output
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("DO_NOT_TRACK", "0"),
+            ("DO_NOT_TRACK", "false"),
+            ("DISABLE_GROWTHBOOK", "0"),
+            ("DISABLE_GROWTHBOOK", "false"),
+        ),
+    )
+    def test_launch_cross_session_accepts_false_boolean_opt_outs(
+        self, capsys, name, value
+    ):
+        cc = ClaudeCodeIntegration()
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+
+        with (
+            patch(
+                "omlx.integrations.claude.os.environ",
+                {"PATH": "/usr/bin", name: value},
+            ),
+            patch("omlx.integrations.claude.os.execvpe", side_effect=fake_execvpe),
+            patch.object(
+                ClaudeCodeIntegration, "_find_claude_binary", return_value="claude"
+            ),
+        ):
+            cc.launch(
+                ctx(port=8000, api_key="key", model="qwen3.5", cross_session=True)
+            )
+
+        assert captured["env"][name] == value
+        assert (
+            "cross-session messaging will remain unavailable"
+            not in capsys.readouterr().out
+        )
 
     def test_launch_sets_distinct_claude_tier_models(self):
         cc = ClaudeCodeIntegration()

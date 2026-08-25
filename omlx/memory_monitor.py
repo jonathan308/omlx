@@ -18,12 +18,13 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
 from omlx.exceptions import PrefillMemoryExceededError, describe_ceiling_binding
+from omlx.patches.deepseek_v4.indexer_dispatch import native_indexer_eligible
 from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,23 @@ class MemoryInfo:
     utilization: float
 
 
+class PrefillMemoryProfile(Protocol):
+    """Model-specific prefill memory strategy used by ``MemoryMonitor``.
+
+    Most models use the monitor's uniform KV/SDPA formulas. Architectures
+    whose cache and attention shapes cannot be represented by those formulas
+    can provide this small internal strategy instead.
+    """
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int: ...
+
+    def estimate_prefill_transient_bytes(
+        self, query_tokens: int, kv_len: int
+    ) -> int: ...
+
+
 class MemoryMonitor:
     """
     Memory monitor for paged SSD-based KV cache.
@@ -205,6 +223,10 @@ class MemoryMonitor:
         # per layer, so they need a capped term instead of the linear
         # full-attention formula. Empty for non-hybrid models.
         self._rotating_layer_specs: tuple[tuple[int, int], ...] = ()
+        self._prefill_memory_profile: PrefillMemoryProfile | None = None
+        # Fixed-shape ANE prefill I/O surfaces (issue #2841); set via
+        # set_model_info, 0 unless the Qwen ANE prefill backend is attached.
+        self._ane_prefill_transient_bytes: int = 0
         # Fixed per-sequence recurrent state (GDN/Mamba ArraysCache),
         # measured once from a live cache after the first prefill chunk.
         self._fixed_state_bytes: int = 0
@@ -376,6 +398,16 @@ class MemoryMonitor:
         # In paged SSD-only mode, no memory to free from KV cache
         return 0
 
+    def clear_ane_prefill_transient(self) -> None:
+        """Stop reserving ANE prefill I/O surfaces after the banks are shed.
+
+        The reservation is snapshotted at load; once the runtime headroom
+        rung releases the banks the surfaces are gone, so keeping the term
+        would make every later admission pass pause for memory that can no
+        longer be reclaimed. The next load re-prices it via set_model_info.
+        """
+        self._ane_prefill_transient_bytes = 0
+
     def set_model_info(
         self,
         num_layers: int,
@@ -387,6 +419,8 @@ class MemoryMonitor:
         compute_dtype_size: Optional[float] = None,
         kv_bytes_per_token: Optional[float] = None,
         rotating_layer_specs: Sequence[tuple[int, int]] | None = None,
+        prefill_memory_profile: PrefillMemoryProfile | None = None,
+        ane_prefill_transient_bytes: int = 0,
     ) -> None:
         """
         Set model information for memory estimation.
@@ -415,6 +449,9 @@ class MemoryMonitor:
                 ``(layer_count, window_tokens)`` pairs, used by
                 ``estimate_resident_kv_bytes`` for the window-capped KV term.
                 These layers are excluded from ``num_kv_cache_layers``.
+            prefill_memory_profile: Optional model-specific strategy for cache
+                and prefill transient shapes that the uniform estimator cannot
+                represent.
         """
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -442,6 +479,11 @@ class MemoryMonitor:
             for count, window in (rotating_layer_specs or ())
             if count > 0 and window > 0
         )
+        self._prefill_memory_profile = prefill_memory_profile
+        # ANE prefill I/O surfaces are dirtied by the first long prompt, on
+        # top of the KV+SDPA peak, so admission must price them or the hard
+        # watermark aborts the request mid-prefill (issue #2841).
+        self._ane_prefill_transient_bytes = max(int(ane_prefill_transient_bytes), 0)
         # A new model's fixed state must be re-measured; a stale value from
         # the previous model would silently mis-charge admission.
         self._fixed_state_bytes = 0
@@ -518,9 +560,13 @@ class MemoryMonitor:
         """
         Estimate memory usage for a KV cache block.
 
+        The default layer count is the number of layers that retain KV state.
+        When cache layout information is unavailable, it falls back to the
+        configured transformer layer count.
+
         Args:
             block_size: Number of tokens in the block
-            num_layers: Override stored num_layers
+            num_layers: Override the stored KV-cache layer count
             num_kv_heads: Override stored num_kv_heads
             head_dim: Override stored head_dim
             dtype_size: Override stored dtype_size
@@ -528,7 +574,17 @@ class MemoryMonitor:
         Returns:
             Estimated memory in bytes for one block.
         """
-        layers = num_layers or self._num_layers or 32  # Default for ~7B model
+        # A block grows with the layers that retain per-token KV state, not
+        # with recurrent or other layers whose state is fixed per sequence.
+        # Keep an explicit ``num_layers`` override for callers that need a
+        # custom estimate, while preserving a genuine zero for rotating-only
+        # models.
+        if num_layers is not None:
+            layers = num_layers
+        elif self._num_kv_cache_layers is not None:
+            layers = self._num_kv_cache_layers
+        else:
+            layers = self._num_layers or 32  # Default for ~7B model
         kv_heads = num_kv_heads or self._num_kv_heads or 8
         dim = head_dim or self._head_dim or 128
         dtype = dtype_size or self._dtype_size
@@ -562,7 +618,18 @@ class MemoryMonitor:
         Returns:
             Estimated KV cache memory in bytes.
         """
-        layers = self._num_kv_cache_layers or self._num_layers or 0
+        if self._prefill_memory_profile is not None:
+            return self._prefill_memory_profile.estimate_resident_kv_bytes(
+                num_tokens,
+                chunk_tokens=max(int(num_tokens), 1),
+            )
+
+        # A genuine 0 means the model has no full-attention KVCache layers.
+        # Falling back by truthiness charges every rotating-only layer as a
+        # full linear cache (issue #2521).
+        layers = self._num_kv_cache_layers
+        if layers is None:
+            layers = self._num_layers or 0
         kv_heads = self._num_kv_heads or 0
         dim = self._head_dim or 0
         dtype = self._dtype_size
@@ -601,6 +668,10 @@ class MemoryMonitor:
         """
         if num_tokens <= 0:
             return 0
+        if self._prefill_memory_profile is not None:
+            return self._prefill_memory_profile.estimate_resident_kv_bytes(
+                num_tokens, chunk_tokens=chunk_tokens
+            )
         total = self.estimate_prompt_kv_bytes(num_tokens)
 
         if self._rotating_layer_specs:
@@ -741,7 +812,7 @@ class MemoryMonitor:
         # baseline. Resident math includes window-capped sliding-window
         # layers and measured fixed state, not just full-attention KVCache.
         kv = self.estimate_resident_kv_bytes(new_tokens, chunk_tokens=eff_chunk)
-        return attn + kv
+        return attn + kv + self._ane_prefill_transient_bytes
 
     def estimate_chunk_transient_bytes(self, n_tokens: int, kv_len: int) -> int:
         """Transient SDPA activation bytes for ONE prefill chunk.
@@ -759,6 +830,10 @@ class MemoryMonitor:
 
         Returns 0 when model info is unavailable.
         """
+        if self._prefill_memory_profile is not None:
+            return self._prefill_memory_profile.estimate_prefill_transient_bytes(
+                n_tokens, kv_len
+            )
         return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
@@ -842,6 +917,346 @@ def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
 
 def _pos_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+@dataclass(frozen=True)
+class _DeepSeekV4PrefillMemoryProfile:
+    """Exact-shape prefill estimator for DeepSeek V4's hybrid attention.
+
+    Every layer keeps a 128-token local K-only rotating cache. Ratio-4 layers
+    additionally keep main and indexer pools and use top-k sparse attention;
+    ratio-128 layers attend over a much smaller dense pool. Treating these as
+    ordinary full-context K/V + dense SDPA is the 81.25 GiB false positive in
+    issue #2521.
+    """
+
+    local_layers: int
+    ratio4_layers: int
+    ratio128_layers: int
+    num_attention_heads: int
+    head_dim: int
+    sliding_window: int
+    index_n_heads: int
+    index_head_dim: int
+    index_topk: int
+    dtype_size: float
+    wsdpa_dtype_supported: bool = False
+
+    def _wsdpa_route_active(self, *, topk: bool = False) -> bool:
+        """Match the live WSDPA route without a process-wide head-dim flag."""
+        if (
+            not self.wsdpa_dtype_supported
+            or self.num_attention_heads != 64
+            or self.head_dim != 512
+        ):
+            return False
+        try:
+            from omlx.patches.deepseek_v4.wsdpa_attention import (
+                wsdpa_prefill_route_active,
+            )
+
+            return wsdpa_prefill_route_active(topk=topk)
+        except Exception:
+            return False
+
+    def _wsdpa_attention_bytes(
+        self,
+        query_tokens: int,
+        local_tokens: int,
+        pooled_tokens: int = 0,
+        *,
+        selected_tokens: int = 0,
+    ) -> int:
+        """Bound the custom kernel's contiguous inputs and output.
+
+        The kernel performs online softmax in registers and never materializes
+        a score matrix. Count potentially copied query/KV/top-k inputs and keep
+        the generic estimator's fp32-width output bound for conservatism.
+        """
+        query = (
+            self.num_attention_heads * query_tokens * self.head_dim * self.dtype_size
+        )
+        keys = (local_tokens + pooled_tokens) * self.head_dim * self.dtype_size
+        output = self.num_attention_heads * query_tokens * self.head_dim * 4
+        topk = query_tokens * selected_tokens * 4
+        return int(query + keys + output + topk)
+
+    def _pool_cache_elements(
+        self,
+        num_tokens: int,
+        *,
+        ratio: int,
+        pooled_dim: int,
+        overlap: bool,
+    ) -> int:
+        pooled = (num_tokens // ratio) * pooled_dim
+        projection_dim = pooled_dim * (2 if overlap else 1)
+        # PoolingCache allocates full KV/gate remainder buffers on first use.
+        buffers = 2 * ratio * projection_dim
+        # Ratio-4 compression retains the previous raw window for overlap.
+        carry = 2 * ratio * projection_dim if overlap and num_tokens >= ratio else 0
+        return pooled + buffers + carry
+
+    def estimate_resident_kv_bytes(
+        self, num_tokens: int, *, chunk_tokens: int = 1
+    ) -> int:
+        if num_tokens <= 0:
+            return 0
+
+        num_tokens = int(num_tokens)
+        chunk_tokens = max(1, min(int(chunk_tokens), num_tokens))
+        local_tokens = min(
+            num_tokens,
+            self.sliding_window + chunk_tokens - 1,
+        )
+        total_elements = self.local_layers * local_tokens * self.head_dim
+
+        if self.ratio4_layers:
+            main_pool = self._pool_cache_elements(
+                num_tokens,
+                ratio=4,
+                pooled_dim=self.head_dim,
+                overlap=True,
+            )
+            index_pool = self._pool_cache_elements(
+                num_tokens,
+                ratio=4,
+                pooled_dim=self.index_head_dim,
+                overlap=True,
+            )
+            total_elements += self.ratio4_layers * (main_pool + index_pool)
+
+        if self.ratio128_layers:
+            pool = self._pool_cache_elements(
+                num_tokens,
+                ratio=128,
+                pooled_dim=self.head_dim,
+                overlap=False,
+            )
+            total_elements += self.ratio128_layers * pool
+
+        return int(total_elements * self.dtype_size)
+
+    def _indexer_fallback_bytes(self, query_tokens: int, pooled_tokens: int) -> int:
+        if query_tokens <= 0 or pooled_tokens <= 0:
+            return 0
+
+        score_elements = self.index_n_heads * query_tokens * pooled_tokens
+        query = self.index_n_heads * query_tokens * self.index_head_dim * 4
+        keys = pooled_tokens * self.index_head_dim * 4
+        weights = self.index_n_heads * query_tokens * 4
+        # The model splits score matmuls to keep each tensor below MLX's int32
+        # indexing limit, then concatenates the reduced shards lazily. MLX can
+        # keep every per-head shard live while evaluating that graph, so the
+        # aggregate peak still approaches the full [H, L, P] fp32 volume.
+        materialized_scores = score_elements * 4
+        reduced_scores = query_tokens * pooled_tokens * 4
+
+        # _stable_topk_indices keeps the reduced fp32 scores while building
+        # region/key/partition uint32 workspaces. Six score-width buffers is a
+        # conservative bound for the unfused MLX path.
+        topk_workspace = 6 * reduced_scores
+        selected = query_tokens * min(self.index_topk, pooled_tokens) * 4
+        return (
+            query
+            + keys
+            + weights
+            + materialized_scores
+            + topk_workspace
+            + selected
+        )
+
+    def _indexer_native_bytes(self, query_tokens: int, pooled_tokens: int) -> int:
+        """Bound the fused native indexer score and deterministic top-k path."""
+        query = (
+            self.index_n_heads * query_tokens * self.index_head_dim * self.dtype_size
+        )
+        weights = self.index_n_heads * query_tokens * self.dtype_size
+        scores = query_tokens * pooled_tokens * self.dtype_size
+        selected = query_tokens * self.index_topk * 4
+        return int(query + weights + scores + selected)
+
+    def _sparse_attention_bytes(
+        self, query_tokens: int, local_tokens: int, pooled_tokens: int
+    ) -> int:
+        selected = min(self.index_topk, pooled_tokens)
+        gathered = query_tokens * selected * self.head_dim * self.dtype_size
+        score_width = (
+            self.num_attention_heads * query_tokens * (local_tokens + selected)
+        )
+        scores_and_weights = 2 * score_width * self.dtype_size
+        query = (
+            self.num_attention_heads * query_tokens * self.head_dim * self.dtype_size
+        )
+        output = self.num_attention_heads * query_tokens * self.head_dim * 4
+        return int(gathered + scores_and_weights + query + output)
+
+    def estimate_prefill_transient_bytes(self, query_tokens: int, kv_len: int) -> int:
+        if query_tokens <= 0 or kv_len <= 0:
+            return 0
+
+        query_tokens = int(query_tokens)
+        kv_len = int(kv_len)
+        local_tokens = min(
+            kv_len,
+            self.sliding_window + query_tokens - 1,
+        )
+        candidates: list[int] = []
+
+        if self.local_layers:
+            if query_tokens > 1 and self._wsdpa_route_active():
+                local_attention = self._wsdpa_attention_bytes(
+                    query_tokens, local_tokens
+                )
+            else:
+                local_attention = estimate_unfused_sdpa_call_bytes(
+                    self.num_attention_heads,
+                    query_tokens,
+                    local_tokens,
+                    self.head_dim,
+                    self.dtype_size,
+                )
+            candidates.append(local_attention)
+
+        if self.ratio128_layers:
+            pooled_tokens = kv_len // 128
+            attended = local_tokens + pooled_tokens
+            projection = 2 * query_tokens * self.head_dim * self.dtype_size
+            if query_tokens > 1 and self._wsdpa_route_active():
+                attention = self._wsdpa_attention_bytes(
+                    query_tokens,
+                    local_tokens,
+                    pooled_tokens,
+                )
+                candidates.append(int(projection) + attention)
+            else:
+                concat = attended * self.head_dim * self.dtype_size
+                candidates.append(
+                    int(projection + concat)
+                    + estimate_unfused_sdpa_call_bytes(
+                        self.num_attention_heads,
+                        query_tokens,
+                        attended,
+                        self.head_dim,
+                        self.dtype_size,
+                    )
+                )
+
+        if self.ratio4_layers:
+            pooled_tokens = kv_len // 4
+            # Main and index compressors each project KV + gate at twice the
+            # pooled width on overlap layers.
+            projections = int(
+                4
+                * query_tokens
+                * (self.head_dim + self.index_head_dim)
+                * self.dtype_size
+            )
+            if native_indexer_eligible(
+                query_tokens=query_tokens,
+                pooled_tokens=pooled_tokens,
+                n_heads=self.index_n_heads,
+                head_dim=self.index_head_dim,
+                index_topk=self.index_topk,
+                dtype_supported=self.dtype_size == 2,
+            ):
+                indexer = self._indexer_native_bytes(query_tokens, pooled_tokens)
+            else:
+                indexer = self._indexer_fallback_bytes(query_tokens, pooled_tokens)
+            if pooled_tokens <= self.index_topk:
+                attended = local_tokens + pooled_tokens
+                if query_tokens > 1 and self._wsdpa_route_active():
+                    attention = self._wsdpa_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                    )
+                else:
+                    attention = estimate_unfused_sdpa_call_bytes(
+                        self.num_attention_heads,
+                        query_tokens,
+                        attended,
+                        self.head_dim,
+                        self.dtype_size,
+                    )
+            else:
+                if query_tokens > 4 and self._wsdpa_route_active(topk=True):
+                    attention = self._wsdpa_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                        selected_tokens=self.index_topk,
+                    )
+                else:
+                    attention = self._sparse_attention_bytes(
+                        query_tokens,
+                        local_tokens,
+                        pooled_tokens,
+                    )
+            # Both are evaluated within the same layer graph. Summing them is
+            # deliberately conservative for lazy MLX execution and remains far
+            # below the impossible dense full-context SDPA charge.
+            candidates.append(projections + indexer + attention)
+
+        return max(candidates, default=0)
+
+
+def make_prefill_memory_profile(
+    config: Any,
+    *,
+    compute_dtype_size: float,
+    wsdpa_dtype_supported: bool = False,
+) -> PrefillMemoryProfile | None:
+    """Build the one model-specific prefill strategy currently required."""
+    model_type = str(_cfg_get(config, "model_type", "") or "")
+    if not model_type.startswith("deepseek_v4"):
+        return None
+
+    num_layers = _cfg_get(config, "num_hidden_layers")
+    ratios = _cfg_get(config, "compress_ratios")
+    if (
+        not _pos_int(num_layers)
+        or not isinstance(ratios, Sequence)
+        or isinstance(ratios, (str, bytes))
+    ):
+        return None
+    ratios = tuple(ratios[:num_layers])
+    if len(ratios) != num_layers or any(ratio not in (0, 4, 128) for ratio in ratios):
+        return None
+
+    num_attention_heads = _cfg_get(config, "num_attention_heads")
+    head_dim = _cfg_get(config, "head_dim")
+    sliding_window = _cfg_get(config, "sliding_window")
+    index_n_heads = _cfg_get(config, "index_n_heads")
+    index_head_dim = _cfg_get(config, "index_head_dim")
+    index_topk = _cfg_get(config, "index_topk")
+    required = (
+        num_attention_heads,
+        head_dim,
+        sliding_window,
+        index_n_heads,
+        index_head_dim,
+        index_topk,
+    )
+    if not all(_pos_int(value) for value in required):
+        return None
+    if not isinstance(compute_dtype_size, (int, float)) or compute_dtype_size <= 0:
+        return None
+
+    counts = Counter(ratios)
+    return _DeepSeekV4PrefillMemoryProfile(
+        local_layers=num_layers,
+        ratio4_layers=counts[4],
+        ratio128_layers=counts[128],
+        num_attention_heads=num_attention_heads,
+        head_dim=head_dim,
+        sliding_window=sliding_window,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        index_topk=index_topk,
+        dtype_size=float(compute_dtype_size),
+        wsdpa_dtype_supported=bool(wsdpa_dtype_supported),
+    )
 
 
 # Known rotating-cache class names, matching the scheduler-side sets
@@ -969,6 +1384,20 @@ def estimate_mla_kv_bytes_per_token(
     return float(elems_per_token) * float(dtype_size)
 
 
+def _ane_prefill_transient_bytes(model: Any) -> int:
+    """ANE prefill I/O surface bytes for ``model``, 0 when not attached.
+
+    Defensive: the ANE patch is optional at runtime, so any import or lookup
+    failure leaves the KV+SDPA estimate unchanged (issue #2841).
+    """
+    try:
+        from omlx.patches.qwen35_ane_prefill import ane_prefill_transient_bytes
+
+        return int(ane_prefill_transient_bytes(model))
+    except Exception:  # noqa: BLE001 - patch optional; never break estimation
+        return 0
+
+
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
@@ -1089,6 +1518,7 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
                 compute_dtype_size=dtype_size,
                 kv_bytes_per_token=kv_bytes_per_token,
                 rotating_layer_specs=rotating_layer_specs,
+                ane_prefill_transient_bytes=_ane_prefill_transient_bytes(model),
             )
             logger.debug(
                 f"Model info for memory estimation: "

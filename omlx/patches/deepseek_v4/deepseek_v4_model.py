@@ -1,6 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
+import logging
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -10,25 +12,32 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, PoolingCache, RotatingKVCache
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
-from .mla import MultiLinear
-from .pipeline import PipelineMixin
-from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+from omlx.patches.deepseek_v4.indexer_dispatch import (
+    disable_native_indexer,
+    native_indexer_available,
+    native_indexer_disabled,
+    native_indexer_shape_eligible,
+)
+from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
     exact_local_scores,
     exact_local_values,
     rowwise_gemm,
 )
+from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
+
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import CacheList, PoolingCache, RotatingKVCache
+from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .mla import MultiLinear
+from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
-_DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = False
 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = False
 
 
@@ -164,6 +173,7 @@ class ModelArgs(BaseModelArgs):
     n_mtp_layers: int = 0
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
+    use_native_ratio128_attention: bool = True
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -459,6 +469,81 @@ def _overlap_compress_kv(kv, gate, ape, head_dim):
     return (kv * weights).sum(axis=-2)
 
 
+# Pooled-axis tile for the MLX indexer fallback (used when the native
+# glm_moe_dsa extension is not built). The native dsa_indexer_scores kernel
+# keeps the (heads, L, P) score tensor in registers; the fallback has to
+# materialize it, and at ratio 4 with a 512-token chunk P = ctx/4, so the
+# intermediate is (1, 64, 512, ctx/4) fp32 — 8.3 GiB at 273k context, read
+# five more times. Worse, 64*512*P crosses 2**31 elements at ctx = 256k, the
+# boundary where mlx's int32 kernel indexing silently zeros the tail and
+# corrupts top-k selection. Tiling keeps each matmul under 2**31 elements;
+# the memory estimator separately accounts for lazy evaluation retaining
+# multiple score shards at once.
+_INDEXER_POOL_TILE = 16384
+# mlx kernels index with int32, so a tensor at or past 2**31 elements has its
+# tail silently zeroed. Stay a factor of 2 below that. For a 512-token chunk
+# with 64 index heads this is reached at P = ctx/4 ~= 32768, i.e. ctx ~= 128k.
+_INDEXER_MAX_ELEMS = 2**30
+_DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = False
+_DEEPSEEK_V4_M2_MMA_SCORE = os.getenv(
+    "OMLX_DSV4F_M2_MMA_SCORE", "1"
+).strip().lower() in ("1", "true", "on", "yes")
+_DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = False
+
+
+def _dsv4f_m2_exact_pairing(config, compress_ratio: int) -> bool:
+    """True only for the exact DeepSeek-V4-Flash / Apple M2 Ultra pairing.
+
+    The v25 MMA indexer score kernel is benchmark-proven (and bit-exact
+    validated) on precisely this checkpoint/hardware combination; every
+    other pairing keeps the Steel kernel.
+    """
+    if compress_ratio != 4:
+        return False
+    try:
+        if mx.device_info().get("device_name") != "Apple M2 Ultra":
+            return False
+    except Exception:
+        return False
+    return (
+        config.model_type == "deepseek_v4"
+        and config.vocab_size == 129280
+        and config.hidden_size == 4096
+        and config.moe_intermediate_size == 2048
+        and config.num_hidden_layers == 43
+        and config.num_attention_heads == 64
+        and config.n_routed_experts == 256
+        and config.num_experts_per_tok == 6
+        and config.max_position_embeddings == 1048576
+        and config.index_n_heads == 64
+        and config.index_head_dim == 128
+        and config.index_topk == 512
+    )
+
+
+def _dsv4f_m2_mma_score_enabled(config, compress_ratio: int) -> bool:
+    """Gate for the v25 from-scratch MMA score kernel (1.37x over Steel).
+
+    Exact-fingerprint pairing, env rollback (OMLX_DSV4F_M2_MMA_SCORE=0),
+    and an extension build exposing the symbol. The kernel serves bf16 /
+    H=64 / D=128 / weights [B, L, H] / non-causal only — all guaranteed by
+    the fingerprint and this call site; N >= 64 is re-checked per call.
+    """
+    if not _DEEPSEEK_V4_M2_MMA_SCORE:
+        return False
+    return _dsv4f_m2_exact_pairing(config, compress_ratio)
+
+
+@partial(mx.compile, shapeless=True)
+def _indexer_head_reduce(scores, weights, scale):
+    """relu -> scale -> head-weight -> head-sum, fused over `scores`.
+
+    `scores` is (B, H, L, P_tile); the reduction is over the head axis (1),
+    entirely within each pooled tile, so tiling P never crosses the reduce.
+    """
+    return (mx.maximum(scores, 0) * scale * weights).sum(axis=1)
+
+
 @partial(mx.compile, shapeless=True)
 def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
     if sinks is not None:
@@ -579,6 +664,26 @@ def _sparse_pooled_ring_attention(
     ).astype(q.dtype)
 
 
+def _native_sparse_attention_available() -> bool:
+    """Return whether ratio-128 dispatch may attempt the native kernel."""
+    global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+
+    if _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+        return False
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return glm_fast.has_symbol("deepseek_v4_sparse_attention")
+    except Exception as exc:
+        _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+        logging.getLogger(__name__).warning(
+            "DSV4 native sparse attention unavailable; MLX fallback for "
+            "the rest of this process: %s",
+            exc,
+        )
+        return False
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -592,13 +697,14 @@ def _sparse_pooled_attention(
     compress_ratio: Optional[int] = None,
     local_window: Optional[int] = None,
     decode_consistent: bool = False,
-) -> mx.array:
+    native_only: bool = False,
+    _standard_mask: bool = False,
+) -> Optional[mx.array]:
     global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
 
     B, H, L, D = q.shape
     if (
-        not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
-        and q_offset is not None
+        q_offset is not None
         and compress_ratio is not None
         and local_window is not None
         and sinks is not None
@@ -616,23 +722,47 @@ def _sparse_pooled_attention(
         and pooled.shape[-1] == D
         and topk.ndim == 3
     ):
-        try:
-            from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        if _standard_mask and B == 1 and q.dtype == mx.bfloat16 and topk.shape[1] == L:
+            out = wsdpa_topk_prefill(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                sinks,
+                scale,
+                int(q_offset),
+                int(local_window),
+                int(compress_ratio),
+            )
+            if out is not None:
+                return out
+        if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-            if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
-                return glm_fast.deepseek_v4_sparse_attention(
-                    q,
-                    local_kv,
-                    pooled,
-                    topk[:, None],
-                    sinks,
-                    scale,
-                    int(q_offset),
-                    int(compress_ratio),
-                    int(local_window),
+                if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
+                    return glm_fast.deepseek_v4_sparse_attention(
+                        q,
+                        local_kv,
+                        pooled,
+                        topk[:, None],
+                        sinks,
+                        scale,
+                        int(q_offset),
+                        int(compress_ratio),
+                        int(local_window),
+                    )
+            except Exception as exc:
+                _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native sparse attention kernel failed; MLX fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
                 )
-        except Exception:
-            _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+
+    if native_only:
+        return None
 
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
@@ -1123,6 +1253,9 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        self._m2_mma_score = _dsv4f_m2_mma_score_enabled(
+            config, compress_ratio
+        )
 
     def __call__(
         self,
@@ -1135,8 +1268,6 @@ class Indexer(nn.Module):
         projected_q: Optional[mx.array] = None,
         projected_weights: Optional[mx.array] = None,
     ):
-        global _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
-
         B, L, _ = x.shape
         if compressor_projection is None:
             pooled = self.compressor(x, pool_cache, offset)
@@ -1159,35 +1290,95 @@ class Indexer(nn.Module):
         pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
         k = min(self.index_topk, pooled.shape[1])
 
-        if (
-            not _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED
-            and pooled.shape[1] > self.index_topk
-            and k == self.index_topk
-            and L > 1
-            and L % 64 == 0
-            and pooled.shape[1] % 64 == 0
-            and self.n_heads in (32, 64)
-            and self.head_dim == 128
-            and q.dtype in (mx.float16, mx.bfloat16)
+        if native_indexer_shape_eligible(
+            query_tokens=L,
+            pooled_tokens=pooled.shape[1],
+            n_heads=self.n_heads,
+            head_dim=self.head_dim,
+            index_topk=self.index_topk,
+            dtype_supported=q.dtype in (mx.float16, mx.bfloat16),
         ):
             try:
                 from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
-                if glm_fast.has_symbol("dsa_indexer_scores") and glm_fast.has_symbol(
-                    "dsa_topk_indices"
-                ):
+                _have_native = native_indexer_available()
+                if not _have_native and not native_indexer_disabled():
+                    # Warn only when the kernels are genuinely missing -- the
+                    # shape predicates above legitimately skip small/early
+                    # chunks, so warning outside this branch cries wolf. The
+                    # miss is otherwise completely silent, and the MLX
+                    # fallback's prefill slope is ~4x worse at long context.
+                    global _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED
+                    if not _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED:
+                        _DEEPSEEK_V4_INDEXER_FALLBACK_WARNED = True
+                        logging.getLogger(__name__).warning(
+                            "deepseek_v4: native dsa_indexer_scores/"
+                            "dsa_topk_indices unavailable (glm_moe_dsa "
+                            "extension not built); falling back to MLX. "
+                            "Long-context prefill is several times slower "
+                            "(rebuild with OMLX_WITH_CUSTOM_KERNEL=1)."
+                        )
+                if _have_native:
                     weights = (
                         self.weights_proj(x)
                         if projected_weights is None
                         else projected_weights
                     ).astype(q.dtype) * ((self.n_heads**-0.5) * self.scale)
-                    scores4 = glm_fast.dsa_indexer_scores(
-                        q,
-                        pooled[:, None],
-                        weights,
-                        causal=False,
+                    # Fused pooled-ratio causal mask (lossless): the kernel
+                    # epilogue writes the finfo(bf16).min sentinel itself
+                    # when the mask is the plain 2-D PoolingCache ratio mask,
+                    # bit-identical to the mx.where pass it replaces.
+                    # Batched 3-D masks keep the where pass; pmask is None
+                    # stays unmasked as before.
+                    _mask_ratio = 0
+                    _mask_q_offset = 0
+                    if (
+                        pmask is not None
+                        and pmask.ndim == 2
+                        and isinstance(offset, int)
+                        and type(pool_cache).__name__ == "PoolingCache"
+                    ):
+                        _mask_ratio = int(pool_cache.ratio)
+                        _mask_q_offset = int(offset)
+                    # v25 from-scratch MMA score kernel: 1.37x over Steel
+                    # on the exact M2/DSV4F pairing, bit-exact incl. the
+                    # fused pooled-ratio mask (validated across aligned and
+                    # unaligned M/N and chunked-prefill offsets). Gated by
+                    # fingerprint + OMLX_DSV4F_M2_MMA_SCORE + extension
+                    # symbol; every other configuration keeps the Steel
+                    # path below unchanged.
+                    _use_mma = (
+                        self._m2_mma_score
+                        and getattr(glm_fast, "_EXT_MMA_SCORE", False)
+                        and q.dtype == mx.bfloat16
+                        and pooled.shape[1] >= 64
                     )
-                    if pmask is not None:
+                    global _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED
+                    if _use_mma and not _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED:
+                        _DEEPSEEK_V4_M2_MMA_SCORE_LOGGED = True
+                        logging.getLogger(__name__).info(
+                            "deepseek_v4: DSV4F/M2 v25 MMA indexer score "
+                            "kernel active (zero-per-head-barrier, "
+                            "1.37x over Steel)"
+                        )
+                    if _use_mma:
+                        scores4 = glm_fast.dsa_indexer_scores_mma(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
+                    else:
+                        scores4 = glm_fast.dsa_indexer_scores(
+                            q,
+                            pooled[:, None],
+                            weights,
+                            causal=False,
+                            mask_ratio=_mask_ratio,
+                            mask_q_offset=_mask_q_offset,
+                        )
+                    if _mask_ratio == 0 and pmask is not None:
                         scores4 = mx.where(
                             (pmask[:, None] if pmask.ndim == 3 else pmask[None, None]),
                             scores4,
@@ -1204,17 +1395,45 @@ class Indexer(nn.Module):
                         bucketed=False,
                     )[:, 0]
                     return mx.sort(indices, axis=-1)
-            except Exception:
-                _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = True
+            except Exception as exc:
+                disable_native_indexer()
+                logging.getLogger(__name__).warning(
+                    "DSV4 native indexer top-k failed; MLX fallback "
+                    "(slower prefill) for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
 
-        scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
-            mx.float32
-        )
-        scores = mx.maximum(scores, 0) * self.scale
         weights = (
             self.weights_proj(x) if projected_weights is None else projected_weights
         ).astype(mx.float32) * (self.n_heads**-0.5)
-        scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        weights = weights.swapaxes(-1, -2)[..., None]  # (B, H, L, 1)
+        qf = q.astype(mx.float32)
+        kf = pooled[:, None].swapaxes(-1, -2).astype(mx.float32)  # (B, 1, Dh, P)
+        n_pool = pooled.shape[1]
+        n_elems = qf.shape[0] * qf.shape[1] * qf.shape[2] * n_pool
+        if n_elems < _INDEXER_MAX_ELEMS:
+            # Single matmul: fastest, and the intermediate is safely indexable.
+            scores = _indexer_head_reduce(qf @ kf, weights, self.scale)
+        else:
+            # Only past the int32 indexing limit is tiling worth its cost:
+            # splitting the pooled axis adds matmul launches and a full-width
+            # concatenate (measured: ~1.2x slower slope at 273k), but an
+            # intermediate over 2**31 elements is silently zeroed by mlx's
+            # int32 kernel indexing, which corrupts top-k selection. Choose
+            # the largest tile that stays under the limit so the split is as
+            # coarse as correctness allows.
+            per_pool = max(1, qf.shape[0] * qf.shape[1] * qf.shape[2])
+            tile = max(1024, min(_INDEXER_POOL_TILE, _INDEXER_MAX_ELEMS // per_pool))
+            scores = mx.concatenate(
+                [
+                    _indexer_head_reduce(
+                        qf @ kf[..., s : s + tile], weights, self.scale
+                    )
+                    for s in range(0, n_pool, tile)
+                ],
+                axis=-1,
+            )
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
@@ -1277,8 +1496,14 @@ def _batch_indexer_rows(
                         scores,
                         indexer.index_topk,
                     )
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, indexer.index_topk)
         indices = indices[:, None]
@@ -1328,8 +1553,14 @@ def _batch_indexer_rows(
 
                 if fast.has_symbol("dspark_fp32_topk_indices"):
                     indices = fast.dspark_fp32_topk_indices(scores, k)
-            except Exception:
+            except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
+                logging.getLogger(__name__).warning(
+                    "DSV4 native DSpark top-k failed; stable-sort fallback "
+                    "for the rest of this process: %s",
+                    exc,
+                    exc_info=True,
+                )
         if indices is None:
             indices = _stable_topk_indices(scores, k)
         indices = indices[:, None]
@@ -1388,6 +1619,8 @@ class LocalAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
         offset = cache.offset if cache is not None else 0
@@ -1415,15 +1648,28 @@ class LocalAttention(nn.Module):
         if self.dspark and B == 1 and L == 1:
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
-            out = scaled_dot_product_attention(
-                q,
-                kv,
-                kv,
-                cache=cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
-            )
+            out = None
+            if _standard_mask and B == 1 and L > 1:
+                out = wsdpa_prefill(
+                    q,
+                    kv,
+                    None,
+                    sinks,
+                    self.scale,
+                    offset,
+                    self.config.sliding_window,
+                    1,
+                )
+            if out is None:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
         out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
@@ -1483,6 +1729,8 @@ class CompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
@@ -1531,21 +1779,66 @@ class CompressedAttention(nn.Module):
             pooled_mask = (
                 pool_cache.make_mask(L, offset) if pool_cache is not None else None
             )
-        if pooled.shape[1] > 0:
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-        if self.dspark and B == 1 and L == 1:
-            out = exact_attention(q, [kv], self.scale, sinks)
-        else:
-            out = scaled_dot_product_attention(
+        # The wsdpa and native kernels reconstruct the model's causal/sliding
+        # masks from offsets; direct callers with custom masks stay on the
+        # reference path.
+        out = None
+        if _standard_mask and B == 1 and L > 1:
+            out = wsdpa_prefill(
                 q,
                 kv,
-                kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
+                pooled if pooled.shape[1] > 0 else None,
+                sinks,
+                self.scale,
+                offset,
+                self.config.sliding_window,
+                self.compress_ratio,
             )
+        if out is None and (
+            self.config.use_native_ratio128_attention
+            and self.compress_ratio == 128
+            and _standard_mask
+            and pooled.shape[1] > 0
+            and L > 4
+            and not (self.dspark and B == 1 and L == 1)
+            and _native_sparse_attention_available()
+        ):
+            pooled_indices = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+            out = _sparse_pooled_attention(
+                q,
+                kv,
+                pooled,
+                pooled_indices,
+                mask,
+                pooled_mask,
+                self.scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
+                decode_consistent=self.dspark,
+                native_only=True,
+                _standard_mask=_standard_mask,
+            )
+        if out is None:
+            if pooled.shape[1] > 0:
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            if self.dspark and B == 1 and L == 1:
+                out = exact_attention(q, [kv], self.scale, sinks)
+            else:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
         out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
@@ -1605,6 +1898,8 @@ class SparseCompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
@@ -1739,7 +2034,18 @@ class SparseCompressedAttention(nn.Module):
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
-        topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
+        if 0 < pooled.shape[1] <= self.indexer.index_topk:
+            index_pooled = self.indexer.compressor(x, idx_cache, offset)
+            if index_pooled.shape[1] != pooled.shape[1]:
+                raise RuntimeError(
+                    "DeepSeek V4 attention/indexer pooling caches diverged"
+                )
+            topk = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+        else:
+            topk = self.indexer(x, q_residual, self.rope, idx_cache, offset)
         sparse_mask = None
         if pmask is not None and topk is not None:
             sparse_mask = mx.take_along_axis(
@@ -1752,30 +2058,57 @@ class SparseCompressedAttention(nn.Module):
             if self.dspark and B == 1 and L == 1:
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
-                out = scaled_dot_product_attention(
-                    q,
-                    kv,
-                    kv,
-                    cache=local_cache,
-                    scale=self.scale,
-                    mask=mask,
-                    sinks=sinks,
-                )
+                out = None
+                if _standard_mask and B == 1 and L > 1:
+                    out = wsdpa_prefill(
+                        q,
+                        kv,
+                        None,
+                        sinks,
+                        self.scale,
+                        offset,
+                        self.config.sliding_window,
+                        self.compress_ratio,
+                    )
+                if out is None:
+                    out = scaled_dot_product_attention(
+                        q,
+                        kv,
+                        kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-            mask = _extend_mask(mask, pmask, full_kv.shape[2])
             if self.dspark and B == 1 and L == 1:
+                full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
-                out = scaled_dot_product_attention(
-                    q,
-                    full_kv,
-                    full_kv,
-                    cache=local_cache,
-                    scale=self.scale,
-                    mask=mask,
-                    sinks=sinks,
-                )
+                out = None
+                if _standard_mask and B == 1 and L > 1:
+                    out = wsdpa_prefill(
+                        q,
+                        kv,
+                        pooled,
+                        sinks,
+                        self.scale,
+                        offset,
+                        self.config.sliding_window,
+                        self.compress_ratio,
+                    )
+                if out is None:
+                    full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+                    mask = _extend_mask(mask, pmask, full_kv.shape[2])
+                    out = scaled_dot_product_attention(
+                        q,
+                        full_kv,
+                        full_kv,
+                        cache=local_cache,
+                        scale=self.scale,
+                        mask=mask,
+                        sinks=sinks,
+                    )
         else:
             out = _sparse_pooled_attention(
                 q,
@@ -1790,6 +2123,7 @@ class SparseCompressedAttention(nn.Module):
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
                 decode_consistent=self.dspark,
+                _standard_mask=_standard_mask,
             )
 
         out = _project_attention_output(self, out, offset)
@@ -1826,10 +2160,18 @@ class DeepseekV4Block(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         input_ids: mx.array,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         residual = h
         x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
+        attn_input = self.attn_norm(x)
+        x = self.attn(
+            attn_input,
+            mask=mask,
+            cache=cache,
+            _standard_mask=_standard_mask,
+        )
         h = hc_expand(x, residual, post, comb)
 
         residual = h
@@ -1880,7 +2222,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
-            h = layer(h, mask, layer_cache, inputs)
+            # This mask was created above from the model's own cache/window.
+            h = layer(h, mask, layer_cache, inputs, _standard_mask=True)
 
         _materialize_cache_arrays(cache)
 
@@ -2043,7 +2386,7 @@ class Model(nn.Module):
                 ("w2", "down_proj"),
                 ("w3", "up_proj"),
             ):
-                for suffix in ("weight", "scales"):
+                for suffix in ("weight", "scales", "biases"):
                     key0 = f"{prefix}.0.{src}.{suffix}"
                     if key0 in weights:
                         stacked = [

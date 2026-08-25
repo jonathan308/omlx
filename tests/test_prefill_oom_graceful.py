@@ -185,7 +185,15 @@ def test_adaptive_throttle_requests_eviction_before_shrinking():
     assert exc.value.request.requested_tokens == 2048
     assert exc.value.request.reason == "adaptive_prefill_throttle"
 
-    # The same request does not loop on eviction; it falls back to throttling.
+    # A second pause is allowed: the first pass can be satisfied by a
+    # marginal transient reclaim without ever reaching the durable rungs
+    # (ANE bank release), so recurring pressure earns one more shot at the
+    # ladder before the guard falls back to throttling for good.
+    with pytest.raises(_PrefillEvictionNeeded):
+        _call(ns, 2048)
+    assert request.prefill_eviction_retries == 2
+
+    # The third time the request does not loop on eviction; it throttles.
     result = _call(ns, 2048)
     assert result < 2048
 
@@ -367,6 +375,32 @@ def test_guard_raises_clean_error_when_even_floor_cannot_fit():
     assert exc.value.limit_bytes == int(hard * Scheduler._PREFILL_ABORT_MARGIN)
 
 
+def test_guard_rejection_logs_admission_terms_breakdown(caplog):
+    """The Phase 0.1 diagnostic line (docs/qwen35-hardening-and-optimization.md)
+    must break the admission bound down into its separate contributors on
+    every rejection, so a rejection is diagnosable from one log line without
+    re-deriving which term actually bound."""
+    hard = 42 * _GB
+    current = 41 * _GB
+    bpt = 27 * 1024 * 1024
+    ns = _throttle_ctx(current=current, hard=hard, samples_bpt=bpt, reclaim_to=current)
+    ns._fake_current = current
+
+    with caplog.at_level(logging.WARNING, logger="omlx.scheduler"):
+        with pytest.raises(PrefillMemoryExceededError):
+            _guard_call(ns, 256, kv_len=122_000)
+
+    terms_records = [
+        r for r in caplog.records if "admission terms" in r.getMessage()
+    ]
+    assert len(terms_records) == 1
+    msg = terms_records[0].getMessage()
+    assert "current=" in msg
+    assert "predicted_transient=" in msg
+    assert "observed_max_bytes=" in msg
+    assert "ane_prefill_transient_bytes=0.00GB" in msg  # ns.memory_monitor is None
+
+
 def test_guard_requests_eviction_before_capacity_rejection():
     hard = 42 * _GB
     current = 41 * _GB
@@ -469,6 +503,164 @@ def test_predicted_transient_static_uses_candidate_chunk_size():
 def test_predicted_transient_zero_without_signals():
     ns = _throttle_ctx(current=0, hard=40 * _GB, samples_bpt=None, monitor=None)
     assert ns._predicted_chunk_transient(4, 1000) == 0.0
+
+
+def test_adaptive_throttle_charges_recently_reclaimed_footprint():
+    """A pool drop must remain priced until the next chunk reallocates it."""
+    static_prediction = 11.18 * _GB
+    released = 6.34 * _GB
+    monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: (
+            static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
+        ),
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+    ns = _throttle_ctx(
+        current=97.23 * _GB,
+        hard=119.17 * _GB,
+        soft_ratio=110.23 / 119.17,
+        monitor=monitor,
+        abort=200 * _GB,
+    )
+    ns._prefill_headroom_safety = 110.23 / 119.17
+    ns._fake_current = 97.23 * _GB
+    ns.requests = {}
+    ns.config = SimpleNamespace(model_name="model-b")
+    ns._raise_prefill_eviction_if_available = (
+        Scheduler._raise_prefill_eviction_if_available.__get__(ns, Scheduler)
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    assert _call(ns, 2048, kv_len=147_680) == 2048
+
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+
+    assert _call(ns, 2048, kv_len=147_680) < 2048
+
+
+def test_predicted_transient_does_not_double_count_reclaim_covered_by_raw():
+    """A conservative raw-last sample may already cover pool reallocation."""
+    raw_prediction = 11.83 * _GB
+    static_prediction = 4.11 * _GB
+    released = 6.86 * _GB
+    raw_per_token = raw_prediction / (
+        512 * Scheduler._PREFILL_TRANSIENT_SAFETY
+    )
+    monitor = SimpleNamespace(
+        estimate_chunk_transient_bytes=lambda _n, _kv: (
+            static_prediction / Scheduler._PREFILL_TRANSIENT_SAFETY
+        ),
+        estimate_prompt_kv_bytes=lambda _n: 0,
+    )
+    ns = _throttle_ctx(
+        current=99.12 * _GB,
+        hard=118.71 * _GB,
+        samples_bpt=raw_per_token,
+        monitor=monitor,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+
+    predicted = ns._predicted_chunk_transient(512, 186_368)
+
+    assert predicted == pytest.approx(raw_prediction)
+
+
+def test_sub_floor_tail_release_is_charged():
+    """A release on a tail below min_chunk still feeds the reclaim ledger."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    ns._record_chunk_transient(
+        17,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+
+def test_skipped_positive_sample_clears_reclaim_charge():
+    """Any positive delta drops the charge, even on EWMA-skipped samples."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    # Positive growth on a sub-floor tail is excluded from the EWMA but the
+    # footprint recovered, so the one-shot charge must not stay armed.
+    ns._record_chunk_transient(
+        17,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=2048,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
+
+
+def test_speed_partial_positive_clears_reclaim_charge():
+    """Speed-priority partial chunks also confirm reallocation."""
+    released = 6 * _GB
+    ns = _throttle_ctx(current=97 * _GB, hard=119 * _GB)
+    ns._prefill_speed_priority = True
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+    ns._record_chunk_transient(
+        512,
+        100 * _GB,
+        100 * _GB - released,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == released
+
+    ns._record_chunk_transient(
+        256,
+        94 * _GB,
+        99 * _GB,
+        request_id="r",
+        loop_label="test",
+        requested_step=512,
+    )
+    assert ns._prefill_transient_tracker.recent_reclaim_bytes == 0
 
 
 def test_record_chunk_transient_skips_tail_samples():
@@ -654,14 +846,27 @@ def test_step_prefill_reclaims_before_first_guard():
         _memory_limit_bytes=0,
         _glm_dsa_adaptive_prefill=None,
         model=lambda *args, **kwargs: events.append("model"),
+        _supports_skip_lm_head=lambda: False,
         _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
     )
-    ns._prefill_step_size_for_progress = (
-        Scheduler._prefill_step_size_for_progress.__get__(ns, Scheduler)
-    )
+    ns.running = {}
+    ns._decode_fairness = True
+    ns._decode_time_owed_s = 0.0
+    ns._decode_activity_key = "test-engine"
+    ns._prefill_tps_best = None
+    for _name in (
+        "_prefill_step_size_for_progress",
+        "_base_prefill_step_size",
+        "_contended_prefill_cap",
+        "_decode_contention",
+        "_others_decoding",
+        "_should_clear_after_chunk",
+        "_accrue_decode_debt",
+    ):
+        setattr(ns, _name, getattr(Scheduler, _name).__get__(ns, Scheduler))
     ns._step_prefill_chunk = Scheduler._step_prefill_chunk.__get__(ns, Scheduler)
 
     with (

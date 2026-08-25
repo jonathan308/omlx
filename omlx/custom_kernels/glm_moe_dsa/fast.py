@@ -69,6 +69,35 @@ def _verify_abi(ext, import_error):
 _ext, _IMPORT_ERROR = _verify_abi(_ext, _IMPORT_ERROR)
 
 
+def _probe_mask_fold(ext) -> bool:
+    """True iff the built extension accepts the mask-fold kwargs.
+
+    ``dsa_indexer_scores`` grew ``mask_ratio``/``mask_q_offset`` after the
+    first native builds shipped. An older ``_ext`` parses no such kwargs, so
+    passing them unconditionally raises ``TypeError`` for every caller —
+    including GLM-5.2's historical unmasked path. Nanobind renders named
+    args into ``__doc__``, so probe the signature once at import; callers
+    on older builds keep the historical call signature and the mask is
+    applied in a second pass with identical sentinel semantics.
+    """
+    fn = getattr(ext, "dsa_indexer_scores", None)
+    if fn is None:
+        return False
+    doc = getattr(fn, "__doc__", None) or ""
+    return "mask_ratio" in doc and "mask_q_offset" in doc
+
+
+_EXT_MASK_FOLD = _probe_mask_fold(_ext)
+
+
+def _probe_mma_score(ext) -> bool:
+    """True iff the built extension exposes the v25 M2 MMA score kernel."""
+    return getattr(ext, "dsa_indexer_scores_mma", None) is not None
+
+
+_EXT_MMA_SCORE = _probe_mma_score(_ext)
+
+
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
@@ -120,6 +149,39 @@ def _native_stream_kwargs(stream) -> dict[str, object]:
     return {"stream": stream}
 
 
+def dsa_indexer_scores_mma(
+    queries: mx.array,
+    keys: mx.array,
+    weights: mx.array,
+    mask_ratio: int = 0,
+    mask_q_offset: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """v25 M2 from-scratch MMA indexer scores (~1.37x over the Steel kernel).
+
+    Serves ONLY bf16, H=64, D=128, weights rank 3 ([B, L, H]), non-causal;
+    the extension raises on anything else — callers gate and fall back to
+    ``dsa_indexer_scores``. Same fused pooled-ratio mask semantics
+    (``mask_ratio``/``mask_q_offset``) and bit-exact output vs the Steel
+    kernel. No slow-path fallback: requires a local extension build that
+    exposes the symbol (probe with ``_EXT_MMA_SCORE``).
+    """
+    if not (_ext is not None and _EXT_MMA_SCORE):
+        raise RuntimeError(
+            "dsa_indexer_scores_mma requires a local extension build that "
+            "exposes the v25 MMA score kernel"
+        )
+    return _ext.dsa_indexer_scores_mma(
+        queries,
+        keys,
+        weights,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
+
+
 def dsa_indexer_scores(
     queries: mx.array,
     keys: mx.array,
@@ -128,11 +190,39 @@ def dsa_indexer_scores(
     unused_causal_prefix_topk: int = 0,
     skip_causal_future_store: bool = False,
     causal_q_offset: int = -1,
+    mask_ratio: int = 0,
+    mask_q_offset: int = 0,
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None:
+    """Head-summed DSA indexer scores.
+
+    ``mask_ratio > 0`` folds the pooled-ratio causal mask into the kernel
+    epilogue: pooled column ``c`` is masked for query row ``r`` iff
+    ``c >= (mask_q_offset + r + 1) // mask_ratio`` and receives the
+    ``finfo(dtype).min`` sentinel — bit-identical to applying
+    ``mx.where(mask, scores, finfo.min)`` in a second pass. ``mask_ratio=0``
+    (default) is the historical unmasked behavior. On extension builds
+    predating the fold kwargs, the historical call signature is kept and
+    the same mask is applied in a second pass with identical semantics.
+    """
+    if _ext is not None and _EXT_MASK_FOLD:
         return _ext.dsa_indexer_scores(
+            queries,
+            keys,
+            weights,
+            causal=causal,
+            unused_causal_prefix_topk=unused_causal_prefix_topk,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            mask_ratio=mask_ratio,
+            mask_q_offset=mask_q_offset,
+            **_native_stream_kwargs(stream),
+        )
+    if _ext is not None:
+        # Older build without the mask-fold kwargs: keep the historical
+        # call signature; the mask is applied in a second pass below.
+        scores = _ext.dsa_indexer_scores(
             queries,
             keys,
             weights,
@@ -142,16 +232,29 @@ def dsa_indexer_scores(
             causal_q_offset=causal_q_offset,
             **_native_stream_kwargs(stream),
         )
-    return mx.fast.dsa_indexer_scores(
-        queries,
-        keys,
-        weights,
-        causal=causal,
-        unused_causal_prefix_topk=unused_causal_prefix_topk,
-        skip_causal_future_store=skip_causal_future_store,
-        causal_q_offset=causal_q_offset,
-        stream=stream or mx.gpu,
-    )
+    else:
+        scores = mx.fast.dsa_indexer_scores(
+            queries,
+            keys,
+            weights,
+            causal=causal,
+            unused_causal_prefix_topk=unused_causal_prefix_topk,
+            skip_causal_future_store=skip_causal_future_store,
+            causal_q_offset=causal_q_offset,
+            stream=stream or mx.gpu,
+        )
+    if mask_ratio > 0:
+        # Preserve the fused kernel's exact sentinel semantics on the
+        # non-fused paths (same validity rule, same finfo.min sentinel).
+        L = queries.shape[2]
+        P = keys.shape[2]
+        pool_idx = mx.arange(P)
+        query_idx = mx.arange(mask_q_offset + 1, mask_q_offset + L + 1)
+        mask = pool_idx < query_idx[:, None] // mask_ratio
+        scores = mx.where(
+            mask[None, None], scores, mx.finfo(scores.dtype).min
+        )
+    return scores
 
 
 def dsa_decode_scores(

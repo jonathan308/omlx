@@ -54,6 +54,10 @@
 #   OMLX_WITH_CUSTOM_KERNEL=1           # same as --with-custom-kernel
 #   OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET=15.0
 #                                       # macOS min version for custom kernels
+#   OMLX_RELEASE_REPOSITORY=owner/repo   # GitHub Releases source embedded in
+#                                       # Info.plist (default: jonathan308/omlx)
+#   OMLX_BUILD_ARCHS=arm64              # application architectures; the
+#                                       # bundled Python runtime is arm64-only
 
 set -euo pipefail
 
@@ -125,6 +129,8 @@ OMLX_DONOR_APP_SET="${OMLX_DONOR_APP+1}"
 OMLX_DONOR_APP="${OMLX_DONOR_APP:-/Applications/oMLX.app}"
 OUTPUT_DIR="${OMLX_NEXT_OUT:-$PROJECT_DIR/build/Stage}"
 BUILD_DIR="$PROJECT_DIR/build"
+OMLX_RELEASE_REPOSITORY="${OMLX_RELEASE_REPOSITORY:-jonathan308/omlx}"
+OMLX_BUILD_ARCHS="${OMLX_BUILD_ARCHS:-arm64}"
 
 LIGHT_BLUE="\033[1;34m"
 GREEN="\033[1;32m"
@@ -136,6 +142,9 @@ log()  { printf "${LIGHT_BLUE}[build.sh]${RESET} %s\n" "$*"; }
 ok()   { printf "${GREEN}[build.sh]${RESET} %s\n" "$*"; }
 warn() { printf "${YELLOW}[build.sh]${RESET} %s\n" "$*"; }
 die()  { printf "${RED}[build.sh ERROR]${RESET} %s\n" "$*" >&2; exit 1; }
+
+[ "$OMLX_BUILD_ARCHS" = "arm64" ] \
+    || die "OMLX_BUILD_ARCHS must be arm64; bundled Python layers are Apple Silicon-only."
 
 _is_mach_o_file() {
     local path="$1"
@@ -500,6 +509,9 @@ xcodebuild \
     CODE_SIGNING_ALLOWED=NO \
     MARKETING_VERSION="$APP_VERSION" \
     CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+    OMLX_RELEASE_REPOSITORY="$OMLX_RELEASE_REPOSITORY" \
+    ARCHS="$OMLX_BUILD_ARCHS" \
+    ONLY_ACTIVE_ARCH=YES \
     build >"$BUILD_DIR/xcodebuild.log" 2>&1 \
         || { tail -40 "$BUILD_DIR/xcodebuild.log" >&2; die "xcodebuild failed; full log: $BUILD_DIR/xcodebuild.log"; }
 
@@ -609,6 +621,42 @@ EOF
 chmod 755 "$CLI_WRAPPER"
 ok "  + omlx-cli"
 
+# --- Embed cluster interpreter wrapper ------------------------------------
+#
+# omlx-cli above hardcodes `-m omlx.cli`, so it can never answer the
+# `-c 'import omlx'` probe a peer coordinator runs, nor host the `-c` scripts
+# the memory-ceiling and preflight probes execute. Ship a second wrapper that
+# assembles the same environment and then forwards argv to the interpreter
+# untouched — this is what ~/.omlx/bin/omlx-cluster-python points at, and what
+# discover_remote_python_executable has always looked for (#2680).
+
+log "Writing app-bundle cluster interpreter wrapper..."
+CLUSTER_PYTHON_WRAPPER="$STAGED_APP/Contents/MacOS/omlx-cluster-python"
+cat > "$CLUSTER_PYTHON_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+
+REAL_PATH="$(realpath "$0")"
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$REAL_PATH")/.." && pwd)"
+RESOURCES="$APP_ROOT/Resources"
+PYROOT="$RESOURCES/Python"
+CPYTHON="$PYROOT/cpython-3.11"
+PYTHON="$CPYTHON/bin/python3"
+MLX_SITE="$PYROOT/framework-mlx-base/lib/python3.11/site-packages"
+
+export PYTHONHOME="$CPYTHON"
+export PYTHONDONTWRITEBYTECODE=1
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$RESOURCES:$MLX_SITE:$PYTHONPATH"
+else
+    export PYTHONPATH="$RESOURCES:$MLX_SITE"
+fi
+
+exec "$PYTHON" "$@"
+EOF
+chmod 755 "$CLUSTER_PYTHON_WRAPPER"
+ok "  + omlx-cluster-python"
+
 # --- Compile AppIcon.icon (Tahoe Liquid Glass) ----------------------------
 #
 # Xcode 26.5's project build system does NOT route a standalone
@@ -677,6 +725,8 @@ else
     _sign_embedded_mach_o_files "$PYTHON_DIR"
     codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
     ok "  + signed omlx-cli wrapper"
+    codesign --force --sign - "$CLUSTER_PYTHON_WRAPPER" >/dev/null 2>&1
+    ok "  + signed omlx-cluster-python wrapper"
 fi
 
 log "Ad-hoc resigning app bundle…"

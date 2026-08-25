@@ -20,6 +20,16 @@ METAL_FUNC uint dsa_ordered_key_16_bits(ushort bits) {
   return (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
 }
 
+// finfo(T).min as an exact bit pattern: bf16 0xFF7F (-3.3895313892515355e38),
+// fp16 0xFBFF (-65504). This is the sentinel the call site's mx.where pass
+// writes (mx.finfo(dtype).min) — finite, and distinct from the -inf the
+// kernel's own causal path uses. Bit-exact by construction.
+template <typename T>
+METAL_FUNC T dsa_finfo_min() {
+  return as_type<T>(
+      ushort(metal::is_same<T, bfloat16_t>::value ? 0xFF7F : 0xFBFF));
+}
+
 template <typename T, typename O, int TOPK, int THREADS>
 [[kernel, max_total_threads_per_threadgroup(THREADS)]] void dsa_topk_indices_16bit(
     const device T* scores [[buffer(0)]],
@@ -358,6 +368,8 @@ dsa_indexer_score(
     const constant int& unused_causal_prefix_topk [[buffer(6)]],
     const constant bool& skip_causal_future_store [[buffer(7)]],
     const constant int& causal_q_offset [[buffer(8)]],
+    const constant int& mask_ratio [[buffer(9)]],
+    const constant int& mask_q_offset [[buffer(10)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -396,6 +408,8 @@ dsa_indexer_score(
   const int M = params->M;
   const int N = params->N;
   const int D = params->K;
+  const short tgp_bm = short(metal::min(BM, M - c_row));
+  const short tgp_bn = short(metal::min(BN, N - c_col));
   const int q_offset = causal_q_offset >= 0 ? causal_q_offset : N - M;
   constexpr int THREADS = WM * WN * 32;
   const int thread_idx = int(simd_group_id) * 32 + int(simd_lane_id);
@@ -453,8 +467,16 @@ dsa_indexer_score(
 
     for (int d = 0; d < params->gemm_k_iterations_aligned; ++d) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.load_unsafe();
-      loader_b.load_unsafe();
+      if (tgp_bm == BM) {
+        loader_a.load_unsafe();
+      } else {
+        loader_a.load_safe(short2(BK, tgp_bm));
+      }
+      if (tgp_bn == BN) {
+        loader_b.load_unsafe();
+      } else {
+        loader_b.load_safe(short2(BK, tgp_bn));
+      }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.mma(As, Bs);
@@ -469,9 +491,10 @@ dsa_indexer_score(
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < decltype(mma_op.Ctile)::kTileRows; ++i) {
       const int row = c_row + mma_op.sm + i * mma_t::TM_stride;
-      const float weight = weights_lh
-          ? static_cast<float>(W[size_t(row) * H + h])
-          : static_cast<float>(W[size_t(h) * M + row]);
+      const float weight = row < M
+          ? (weights_lh ? static_cast<float>(W[size_t(row) * H + h])
+                        : static_cast<float>(W[size_t(h) * M + row]))
+          : 0.0f;
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < decltype(mma_op.Ctile)::kTileCols; ++j) {
         thread const auto& frag = mma_op.Ctile.frag_at(i, j);
@@ -483,6 +506,7 @@ dsa_indexer_score(
     }
   }
 
+  const T pooled_sentinel = dsa_finfo_min<T>();
   device T* Dst = O + size_t(mma_op.sm) * params->ldd + mma_op.sn;
   short ai = 0;
   STEEL_PRAGMA_UNROLL
@@ -498,9 +522,24 @@ dsa_indexer_score(
       for (short e = 0; e < decltype(mma_op.Ctile)::kElemsPerFrag; ++e) {
         const int col = col_base + e;
         const bool future = do_causal && col > q_offset + row;
+        // ── Pooled-ratio causal mask (lossless opt 3) ─────────────────────
+        // Folds the call site's separate mx.where pass into the epilogue.
+        // Validity rule (cache_extras.py PoolingCache.make_mask): pooled
+        // column `col` is visible to query row `row` iff
+        //   col < (mask_q_offset + row + 1) // mask_ratio
+        // so masked iff col >= that bound (int operands are non-negative,
+        // C++ truncation == Python floor). Masked positions receive the SAME
+        // sentinel the where pass wrote — finfo(T).min, not -inf — so the
+        // post-mask output is bit-identical to the old two-step path.
+        // mask_ratio == 0 disables the mode (pmask == None callers).
+        const bool pooled_masked = mask_ratio > 0 &&
+            col >= (mask_q_offset + row + 1) / mask_ratio;
         const T value = future ? static_cast<T>(-INFINITY)
-                               : static_cast<T>(accum[ai]);
-        Dst[out_base + e] = value;
+            : pooled_masked  ? pooled_sentinel
+                             : static_cast<T>(accum[ai]);
+        if (row < M && col < N) {
+          Dst[out_base + e] = value;
+        }
         ai++;
       }
     }

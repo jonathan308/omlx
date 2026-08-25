@@ -154,7 +154,10 @@ def _uses_quantized_source_sensitivity(config: dict) -> bool:
     quant_method = str(quantization_config.get("quant_method", "")).lower()
     if quant_method == "mxfp8":
         return True
-    return quant_method == "fp8" and _is_deepseek_v4_config(config)
+    return quant_method == "fp8" and (
+        _is_deepseek_v4_config(config)
+        or config.get("model_type") == "bailing_hybrid"
+    )
 
 
 def _is_minimax_m3_config(config: dict) -> bool:
@@ -1231,6 +1234,28 @@ def resolve_output_name(
 
 GEMMA4_ASSISTANT_MTP_PREFIX = "language_model.mtp."
 GEMMA4_ASSISTANT_MTP_SHARD = "model-mtp.safetensors"
+MTPLX_SIDECAR_SHARD = "mtp.safetensors"
+MTPLX_RUNTIME_FILE = "mtplx_runtime.json"
+
+# MTPLX forge calibrates the contract per model; oMLX's Lightning MTP
+# runtime implements exactly one execution convention, so anything else is
+# rejected fail-closed at import time. Missing fields mean the MTPLX
+# documented defaults (mtplx.mtp_patch.MTPContract), which is how
+# pre-calibration exports (mtplx 0.1.0-preview) ship.
+_MTPLX_CONTRACT_DEFAULTS = {
+    "base_hidden_variant": "post_norm",
+    "hidden_variant": "post_norm",
+    "concat_order": "embedding_hidden",
+    "mtp_position_mode": "cache",
+}
+
+_MTPLX_CONTRACT_ALLOWLIST = {
+    "arch_id": ("qwen3-next-mtp",),
+    "base_hidden_variant": ("post_norm",),
+    "hidden_variant": ("post_norm",),
+    "concat_order": ("embedding_hidden",),
+    "mtp_position_mode": ("local", "cache"),
+}
 
 
 def validate_gemma4_assistant_pair(
@@ -1315,8 +1340,7 @@ def combine_gemma4_assistant_mtp(
         (assistant_config.get("text_config") or {}).get("num_hidden_layers", 0) or 0
     )
     text_config["mtp_assistant_config"] = assistant_config
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Merged gemma4 assistant MTP head into %s "
@@ -1331,18 +1355,36 @@ def combine_gemma4_assistant_mtp(
 # ── Native MTP head donor combine (Qwen3.5/3.6) ─────────────────────────
 
 
-def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Atomically replace a JSON file (tmp write + rename)."""
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+    ) as tmp:
+        json.dump(payload, tmp, indent=2)
+        tmp.flush()
+        temp_name = tmp.name
+    Path(temp_name).replace(path)
+
+
+def _write_mtp_shard_and_merge_index(
+    output: Path,
+    mtp_weights: dict,
+    *,
+    write_shard: bool = True,
+) -> int:
     """Write mtp weights as one extra shard and merge the safetensors index.
 
-    Shared by the gemma4 assistant combine and the native donor graft (the
-    shard name is historical). The index merge is a no-op when the output
-    has no ``model.safetensors.index.json``. Returns the shard byte size.
+    Shared by the gemma4 assistant combine and native MTP imports (the shard
+    was renamed into place already when ``write_shard`` is False). The index
+    merge is a no-op when the output has no ``model.safetensors.index.json``.
+    Returns the tensor byte size.
     """
-    mx.save_safetensors(
-        str(output / GEMMA4_ASSISTANT_MTP_SHARD),
-        mtp_weights,
-        metadata={"format": "mlx"},
-    )
+    if write_shard:
+        mx.save_safetensors(
+            str(output / GEMMA4_ASSISTANT_MTP_SHARD),
+            mtp_weights,
+            metadata={"format": "mlx"},
+        )
     mtp_size = sum(v.nbytes for v in mtp_weights.values())
 
     out_index_path = output / "model.safetensors.index.json"
@@ -1355,9 +1397,201 @@ def _write_mtp_shard_and_merge_index(output: Path, mtp_weights: dict) -> int:
         metadata = index.get("metadata") or {}
         metadata["total_size"] = int(metadata.get("total_size", 0) or 0) + mtp_size
         index["metadata"] = metadata
-        with open(out_index_path, "w") as f:
-            json.dump(index, f, indent=2)
+        _atomic_write_json(out_index_path, index)
     return mtp_size
+
+
+def _synthesize_mtp_quant_entries(
+    donor_quant: dict,
+    mtp_key_shards: dict,
+    *,
+    recipient_prefix: str,
+) -> dict:
+    """Build per-layer quant entries for modules with explicit ``.scales``."""
+    if not isinstance(donor_quant, dict):
+        return {}
+    donor_global = {
+        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
+    }
+    quant_entries: dict = {}
+    for key in mtp_key_shards:
+        if not key.endswith(".scales"):
+            continue
+        base = key[: -len(".scales")]
+        bare_module = _strip_mtp_key_prefix(base)
+        if bare_module is None:
+            continue
+        candidates = (
+            base,
+            bare_module,
+            "language_model." + bare_module,
+            "model." + bare_module,
+            "model.language_model." + bare_module,
+        )
+        spec = None
+        for candidate in candidates:
+            value = donor_quant.get(candidate)
+            if isinstance(value, dict):
+                spec = value
+                break
+        if spec is None:
+            if not donor_global:
+                raise ValueError(
+                    "Donor MTP head is quantized but its config declares no "
+                    "global quantization parameters"
+                )
+            spec = donor_global
+        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    return quant_entries
+
+
+def _resolve_mtplx_sidecar(model_path: Path, config: dict) -> Optional[Path]:
+    """Resolve the MTPLX side-car weights file, or None.
+
+    Follows MTPLX's own resolution order: the config-declared
+    ``mlx_lm_extra_tensors.mtp_file`` first, then the conventional
+    locations (``mtplx.artifacts.expected_mtp_file``).
+    """
+    candidates: list[str] = []
+    extra = config.get("mlx_lm_extra_tensors")
+    if isinstance(extra, dict) and extra.get("mtp_file"):
+        candidates.append(str(extra["mtp_file"]))
+    candidates += [
+        MTPLX_SIDECAR_SHARD,
+        "mtp/weights.safetensors",
+        GEMMA4_ASSISTANT_MTP_SHARD,
+    ]
+    for rel in candidates:
+        path = model_path / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def _validate_mtplx_runtime_contract(model_path: Path, config: dict) -> None:
+    """Fail-closed check that the export's contract matches oMLX's runtime.
+
+    The contract comes from ``mtplx_runtime.json`` (Forge always writes it),
+    with ``config.json -> mtplx_mtp_contract`` as the base layer and the
+    MTPLX documented defaults filling anything omitted.
+    """
+    runtime_path = model_path / MTPLX_RUNTIME_FILE
+    if not runtime_path.exists():
+        raise ValueError(f"Missing required runtime contract: {runtime_path}")
+    with open(runtime_path) as f:
+        runtime = json.load(f)
+
+    checks: dict = dict(_MTPLX_CONTRACT_DEFAULTS)
+    for layer in (config.get("mtplx_mtp_contract"), runtime.get("mtp_contract")):
+        if isinstance(layer, dict):
+            checks.update({k: layer[k] for k in _MTPLX_CONTRACT_DEFAULTS if k in layer})
+    checks["arch_id"] = runtime.get("arch_id")
+
+    for field, allowed in _MTPLX_CONTRACT_ALLOWLIST.items():
+        if checks.get(field) not in allowed:
+            raise ValueError(
+                f"Unsupported MTPLX contract {field}={checks.get(field)!r}; "
+                f"oMLX's MTP runtime supports {' / '.join(allowed)}"
+            )
+
+
+def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
+    """Import an MTPLX side-car head into the model's checkpoint index.
+
+    Fail-closed on unsupported runtime contracts. Normalizes the side-car
+    onto a ``model-mtp.safetensors`` shard (zero-copy rename when the tensor
+    keys already match the checkpoint's naming, remapped copy otherwise) so
+    the stock mlx-lm/mlx-vlm weight globs and the index-based MTP detection
+    see the head with no load-time special casing. mlx_lm only ever opens
+    ``model*.safetensors``, which is why pointing the index at the original
+    side-car name is not enough. Idempotent: re-running is a no-op.
+    """
+    output = Path(model_path)
+    with open(output / "config.json") as f:
+        config = json.load(f)
+
+    sidecar = _resolve_mtplx_sidecar(output, config)
+    if sidecar is None:
+        raise ValueError(f"No MTPLX side-car weights found in {output}")
+    _validate_mtplx_runtime_contract(output, config)
+
+    audit = config.get("mtplx_mtp_payload_audit")
+    if isinstance(audit, dict) and not bool(audit.get("passed", True)):
+        raise ValueError("mtplx_mtp_payload_audit.passed is false")
+
+    output_keys = _shard_key_map(output)
+    recipient_prefix = (
+        "language_model."
+        if any(k.startswith("language_model.") for k in output_keys)
+        else ""
+    )
+
+    sidecar_weights = mx.load(str(sidecar))
+    mtp_weights = {}
+    for key, value in sidecar_weights.items():
+        bare = _strip_mtp_key_prefix(key)
+        if bare is not None:
+            mtp_weights[recipient_prefix + bare] = value
+    if not mtp_weights:
+        raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
+
+    # Idempotency: the index (not the header fallback of _shard_key_map,
+    # which would see the not-yet-imported side-car itself) is what the MTP
+    # weight detection reads, so it is the import-completed marker.
+    index_path = output / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            indexed = json.load(f).get("weight_map") or {}
+        if all(key in indexed for key in mtp_weights):
+            logger.info("MTPLX side-car already imported into %s", output.name)
+            return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
+
+    shard_path = output / GEMMA4_ASSISTANT_MTP_SHARD
+    if set(mtp_weights) == set(sidecar_weights):
+        merge_mode = "rename"
+        if sidecar != shard_path:
+            sidecar.replace(shard_path)
+        mtp_size = _write_mtp_shard_and_merge_index(
+            output, mtp_weights, write_shard=False
+        )
+    else:
+        # VLM-shaped checkpoints need the language_model. prefix on disk.
+        # Materialize before touching files: the loaded arrays lazily
+        # reference the side-car file.
+        merge_mode = "remap"
+        mx.eval(*mtp_weights.values())
+        mtp_size = _write_mtp_shard_and_merge_index(output, mtp_weights)
+        if sidecar.parent == output:
+            # Keep the consumed side-car out of mlx-vlm's *.safetensors
+            # glob; sub-directory side-cars are invisible to it already.
+            sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))
+
+    donor_quant = (
+        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
+    )
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
+        recipient_prefix=recipient_prefix,
+    )
+    if quant_entries:
+        for section in ("quantization", "quantization_config"):
+            section_cfg = config.get(section)
+            if isinstance(section_cfg, dict):
+                section_cfg.update(quant_entries)
+
+    scope = _mtp_text_scope(config)
+    scope["mtp_num_hidden_layers"] = max(_mtp_declared_layers(config), 1)
+    _atomic_write_json(output / "config.json", config)
+
+    logger.info(
+        "Imported MTPLX side-car into %s (%s, %d tensors, %.2f GB)",
+        output.name,
+        merge_mode,
+        len(mtp_weights),
+        mtp_size / 1e9,
+    )
+    return {"merge_mode": merge_mode, "mtp_tensors": len(mtp_weights)}
 
 
 def _file_sha256(path: Path) -> str:
@@ -1581,38 +1815,11 @@ def combine_mtp_donor(
     # mlx-lm's class_predicate applies the recipient's *global* bits to the
     # donor-packed arrays and the strict load fails on shape mismatch.
     donor_quant = donor_config.get("quantization") or {}
-    donor_global = {
-        k: donor_quant[k] for k in ("group_size", "bits", "mode") if k in donor_quant
-    }
-    quant_entries: dict = {}
-    for key in mtp_key_shards:
-        if not key.endswith(".scales"):
-            continue
-        base = key[: -len(".scales")]
-        bare_module = _strip_mtp_key_prefix(base)
-        if bare_module is None:
-            continue
-        candidates = (
-            base,
-            bare_module,
-            "language_model." + bare_module,
-            "model." + bare_module,
-            "model.language_model." + bare_module,
-        )
-        spec = None
-        for candidate in candidates:
-            value = donor_quant.get(candidate)
-            if isinstance(value, dict):
-                spec = value
-                break
-        if spec is None:
-            if not donor_global:
-                raise ValueError(
-                    "Donor MTP head is quantized but its config declares no "
-                    "global quantization parameters"
-                )
-            spec = donor_global
-        quant_entries[recipient_prefix + bare_module] = dict(spec)
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        mtp_key_shards,
+        recipient_prefix=recipient_prefix,
+    )
 
     if quant_entries:
         for section in ("quantization", "quantization_config"):
@@ -1624,8 +1831,7 @@ def combine_mtp_donor(
     # re-declare it where the recipient keeps its num_hidden_layers.
     scope = _mtp_text_scope(config)
     scope["mtp_num_hidden_layers"] = _mtp_declared_layers(donor_config)
-    with open(output / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(output / "config.json", config)
 
     logger.info(
         "Grafted donor MTP head into %s (%d tensors, %.2f GB, source=%s)",
@@ -3528,6 +3734,12 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_inkling_compat_patch()
+                if model_type == "muse_glimmer":
+                    from omlx.patches.mlx_vlm_muse_glimmer_compat import (
+                        apply_mlx_vlm_muse_glimmer_compat_patch,
+                    )
+
+                    apply_mlx_vlm_muse_glimmer_compat_patch()
             except Exception as patch_err:
                 logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
 
@@ -3679,6 +3891,21 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
             except Exception as patch_err:
                 logger.debug(f"laguna patch not applied: {patch_err}")
 
+        # Hy3 is vendored into ``sys.modules`` like Laguna, but its published
+        # Hy-MT2 checkpoints also use the legacy root-level ``rope_theta``
+        # schema. Sanitizer/proxy discovery consumes this in-memory config
+        # directly (without ``mlx_lm.utils.load_config``), so register the
+        # model and normalize the schema before ``ModelArgs.from_dict``.
+        if config.get("model_type") == "hy_v3":
+            try:
+                from omlx.patches.hy_v3 import apply_hy_v3_patch
+                from omlx.utils.model_loading import normalize_hy_v3_rope_config
+
+                normalize_hy_v3_rope_config(config)
+                apply_hy_v3_patch()
+            except Exception as patch_err:
+                logger.debug(f"hy_v3 patch not applied: {patch_err}")
+
         if config.get("model_type") == "mimo_v2":
             try:
                 from omlx.patches.mimo_v2 import apply_mimo_v2_patch
@@ -3686,6 +3913,14 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 apply_mimo_v2_patch()
             except Exception as patch_err:
                 logger.debug(f"mimo_v2 patch not applied: {patch_err}")
+
+        if config.get("model_type") == "bailing_hybrid":
+            try:
+                from omlx.patches.bailing_hybrid import apply_bailing_hybrid_patch
+
+                apply_bailing_hybrid_patch()
+            except Exception as patch_err:
+                logger.debug(f"bailing_hybrid patch not applied: {patch_err}")
 
         # Apply mlx-lm MTP patch so the patched __init__/sanitize handle
         # mtp.* tensors correctly. Idempotent — apply() is a no-op once
@@ -6248,6 +6483,9 @@ def _find_model_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
+    elif hasattr(model, "model") and hasattr(model.model, "word_embeddings"):
+        embed_fn = model.model.word_embeddings
+        layers = model.model.layers
     elif hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
@@ -6529,14 +6767,20 @@ def _forward_layer(block, inputs, mask, position_ids):
 def _layer_masks_for_model(model, layers, inputs):
     """Build the per-layer mask schedule used by the original model."""
     if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") for layer in layers
+        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
+        for layer in layers
     ):
         try:
             from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
             cache = model.make_cache()
-            fa_idx = getattr(getattr(model, "model", model), "fa_idx", 0)
-            ssm_idx = getattr(getattr(model, "model", model), "ssm_idx", 0)
+            model_core = getattr(model, "model", model)
+            fa_idx = getattr(
+                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
+            )
+            ssm_idx = getattr(
+                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
+            )
             fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
             ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
             try:
@@ -6556,8 +6800,15 @@ def _layer_masks_for_model(model, layers, inputs):
                 # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
                 # (S, S) causal mask.  During calibration there is no padding,
                 # so None is the correct mask for SSM layers.
+                def _is_ssm_layer(layer):
+                    if hasattr(layer, "is_linear"):
+                        return bool(layer.is_linear)
+                    if hasattr(layer, "is_global"):
+                        return not bool(layer.is_global)
+                    return False
+
                 return [
-                    ssm_mask if getattr(layer, "is_linear", False) else fa_mask
+                    ssm_mask if _is_ssm_layer(layer) else fa_mask
                     for layer in layers
                 ]
         except (ImportError, AttributeError):
@@ -7602,12 +7853,33 @@ def _measure_sensitivity(
 
 
 _REQUANT_VALID_BITS = {2, 3, 4, 5, 6, 8}
+_AFFINE_GROUP_SIZES = (32, 64, 128)
 
 
 def _perturb_bits_for(bits: int):
     """Closest valid re-quantization width below ``bits``, or None."""
     lower = [b for b in _REQUANT_VALID_BITS if b < bits]
     return max(lower) if lower else None
+
+
+def _affine_perturb_group_size(group_size: int, in_dim: int):
+    """Group size for an affine perturbation re-quant of a row of ``in_dim``.
+
+    The sensitivity perturbation always re-quantizes with ``mode="affine"``,
+    and affine kernels only implement group sizes 32/64/128. The source
+    module's own group size is therefore not always reusable: nvfp4 modules
+    carry ``group_size=16``, which mx.quantize rejects. Keep the module's size
+    whenever affine supports it, so affine/mxfp4/mxfp8 sources perturb exactly
+    as before; otherwise take the supported size closest to it (smallest on a
+    tie) that still divides the row. Returns None when none divides it, in
+    which case the module cannot be perturbed and is skipped.
+    """
+    usable = [g for g in _AFFINE_GROUP_SIZES if in_dim % g == 0]
+    if not usable:
+        return None
+    if group_size in usable:
+        return group_size
+    return min(usable, key=lambda g: (abs(g - group_size), g))
 
 
 def _build_proxy_for_sensitivity(
@@ -8042,15 +8314,28 @@ def _measure_sensitivity_from_quantized_model(
                 bits=bits,
                 mode=mode,
             )
-            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode)
+            # Affine kernels only ship group sizes 32/64/128, so the module's
+            # own size cannot always be reused for the perturbation re-quant.
+            perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
+            if perturb_gs is None:
+                logger.debug(
+                    f"Sensitivity perturbation skipped for {p}: no affine group "
+                    f"size divides an input dim of {w_float.shape[-1]}"
+                )
+                continue
+            saved[p] = (m.weight, m.scales, getattr(m, "biases", None), bits, mode, gs)
             qw, sc, *rest = mx.quantize(
-                w_float, group_size=gs, bits=perturb_bits, mode="affine"
+                w_float, group_size=perturb_gs, bits=perturb_bits, mode="affine"
             )
             m.weight = qw
             m.scales = sc
             m.biases = rest[0] if rest else None
             m.bits = perturb_bits
             m.mode = "affine"
+            # The perturbed forward reads group_size off the module, so it has
+            # to track the re-quantized layout; the restore below puts the
+            # source module's own size back.
+            m.group_size = perturb_gs
             # Force re-quant materialization so the next forward sees the
             # perturbed weights instead of the lazy reference to the originals.
             if m.biases is not None:
@@ -8071,7 +8356,7 @@ def _measure_sensitivity_from_quantized_model(
         modules_by_path = dict(
             tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module)
         )
-        for p, (w, s, b, orig_bits, orig_mode) in saved.items():
+        for p, (w, s, b, orig_bits, orig_mode, orig_gs) in saved.items():
             if p in modules_by_path:
                 mod = modules_by_path[p]
                 mod.weight = w
@@ -8082,6 +8367,7 @@ def _measure_sensitivity_from_quantized_model(
                     del mod.biases
                 mod.bits = orig_bits
                 mod.mode = orig_mode
+                mod.group_size = orig_gs
 
         if out_perturbed is not None:
             # Cast to float32 first: float16 squared differences overflow
