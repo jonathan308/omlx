@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental full-replica prefill/decode disaggregation worker.
 
-Rank 0 owns prompt processing. Rank 1 owns the handed-off decode cache. Both
-ranks load the same full model; only cache tensors and the first sampled token
+One selected rank owns prompt processing and the other owns handed-off decode.
+Both load the same full model; only cache tensors and the first sampled token
 cross the data plane. This is intentionally a bounded worker/benchmark, not a
-serving route. It proves the universal cache wire contract before scheduler and
-HTTP lifecycle integration.
+serving route. It proves the universal cache wire contract and two-request
+pipeline before scheduler and HTTP lifecycle integration.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--completion-tokens", type=int, default=32)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--prefill-rank", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--pipeline-requests", type=int, choices=(1, 2), default=1)
     parser.add_argument("--control-host", required=True)
     parser.add_argument("--control-port", type=int, required=True)
     parser.add_argument("--control-token", required=True)
@@ -52,11 +53,14 @@ def _event(payload: dict[str, Any]) -> None:
     print(EVENT_PREFIX + json.dumps(payload, sort_keys=True), flush=True)
 
 
-def _prompt_tokens(tokenizer: Any, count: int) -> list[int]:
+def _prompt_tokens(
+    tokenizer: Any, count: int, *, request_index: int = 0
+) -> list[int]:
     if count < 2:
         raise ValueError("disaggregated prompt must contain at least two tokens")
     seed = tokenizer.encode(
-        " Apple Silicon prefill decode disaggregation over RDMA.",
+        " Apple Silicon prefill decode disaggregation over RDMA. "
+        f"Request {request_index}.",
         add_special_tokens=False,
     )
     if not seed:
@@ -133,6 +137,272 @@ def _token_hash(tokens: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _send_first_token(mx: Any, token: int, *, dst: int, group: Any) -> None:
+    value = mx.array([token], dtype=mx.int32)
+    mx.eval(mx.distributed.send(value, dst, group=group))
+    mx.synchronize()
+
+
+def _recv_first_token(mx: Any, *, src: int, group: Any) -> int:
+    value = mx.distributed.recv((1,), mx.int32, src, group=group)
+    mx.eval(value)
+    mx.synchronize()
+    return int(value.item())
+
+
+def _send_result_array(mx: Any, value: Any, *, dst: int, group: Any) -> None:
+    mx.eval(mx.distributed.send(value, dst, group=group))
+    mx.synchronize()
+
+
+def _recv_result_array(
+    mx: Any, shape: tuple[int, ...], dtype: Any, *, src: int, group: Any
+) -> Any:
+    value = mx.distributed.recv(shape, dtype, src, group=group)
+    mx.eval(value)
+    mx.synchronize()
+    return value
+
+
+def _run_two_request_pipeline(
+    *,
+    mx: Any,
+    model: Any,
+    tokenizer: Any,
+    make_prompt_cache: Any,
+    control: Any,
+    group: Any,
+    rank: int,
+    prefill_rank: int,
+    decode_rank: int,
+    model_identity: str,
+    model_path: Path,
+    prompt_tokens: int,
+    completion_tokens: int,
+    prefill_step_size: int,
+    backend: str,
+) -> int:
+    prompts = [
+        _prompt_tokens(tokenizer, prompt_tokens, request_index=index)
+        for index in range(2)
+    ]
+    if rank == prefill_rank:
+        pipeline_started = time.perf_counter()
+        caches: list[list[Any]] = []
+        first_tokens: list[int] = []
+        prefill_seconds: list[float] = []
+        prefill_calls: list[int] = []
+        transfers = []
+
+        cache0 = make_prompt_cache(model)
+        first0, seconds0, calls0 = _prefill(
+            mx,
+            model,
+            cache0,
+            prompts[0],
+            step=prefill_step_size,
+        )
+        prepared0 = prepare_cache_transfer(
+            cache0,
+            model_identity=model_identity,
+            prompt_tokens=prompt_tokens,
+        )
+        caches.append(cache0)
+        first_tokens.append(first0)
+        prefill_seconds.append(seconds0)
+        prefill_calls.append(calls0)
+
+        control.broadcast_owned_bytes(
+            b"\x01", source_rank=prefill_rank, expected_size=1
+        )
+        control.barrier()
+        transfers.append(
+            send_cache_transfer(mx, prepared0, dst=decode_rank, group=group)
+        )
+        _send_first_token(mx, first0, dst=decode_rank, group=group)
+
+        # Request 1 prefills while request 0 decodes on the other GPU. No RDMA
+        # operation remains posted inside this measured overlap window.
+        control.barrier()
+        overlap_started = time.perf_counter()
+        cache1 = make_prompt_cache(model)
+        first1, seconds1, calls1 = _prefill(
+            mx,
+            model,
+            cache1,
+            prompts[1],
+            step=prefill_step_size,
+        )
+        prepared1 = prepare_cache_transfer(
+            cache1,
+            model_identity=model_identity,
+            prompt_tokens=prompt_tokens,
+        )
+        caches.append(cache1)
+        first_tokens.append(first1)
+        prefill_seconds.append(seconds1)
+        prefill_calls.append(calls1)
+        control.barrier()
+        overlap_seconds = time.perf_counter() - overlap_started
+
+        transfers.append(
+            send_cache_transfer(mx, prepared1, dst=decode_rank, group=group)
+        )
+        _send_first_token(mx, first1, dst=decode_rank, group=group)
+        control.barrier()
+        control.barrier()
+        pipeline_seconds = time.perf_counter() - pipeline_started
+
+        remote_arrays = [
+            _recv_result_array(
+                mx,
+                (completion_tokens,),
+                mx.int32,
+                src=decode_rank,
+                group=group,
+            )
+            for _ in range(2)
+        ]
+        remote_metrics_array = _recv_result_array(
+            mx, (4,), mx.float32, src=decode_rank, group=group
+        )
+        remote_tokens = [
+            [int(value) for value in array.tolist()] for array in remote_arrays
+        ]
+        raw_remote_metrics = [
+            float(value) for value in remote_metrics_array.tolist()
+        ]
+        decode_seconds = raw_remote_metrics[:2]
+        recv_seconds = raw_remote_metrics[2:]
+
+        baseline_tokens = []
+        baseline_decode_seconds = []
+        for cache, first in zip(caches, first_tokens):
+            result, seconds = _fixed_greedy_decode(
+                mx, model, cache, first, completion_tokens
+            )
+            baseline_tokens.append(result)
+            baseline_decode_seconds.append(seconds)
+        parity_by_request = [
+            baseline == remote
+            for baseline, remote in zip(baseline_tokens, remote_tokens)
+        ]
+        parity = all(parity_by_request)
+        serial_source_seconds = sum(prefill_seconds) + sum(
+            baseline_decode_seconds
+        )
+        report = {
+            "type": "pipeline_result",
+            "backend": backend,
+            "prefill_rank": prefill_rank,
+            "decode_rank": decode_rank,
+            "model": str(model_path),
+            "model_identity": model_identity,
+            "requests": 2,
+            "prompt_tokens_per_request": prompt_tokens,
+            "completion_tokens_per_request": completion_tokens,
+            "prefill_calls": prefill_calls,
+            "prefill_seconds": prefill_seconds,
+            "prefill_tokens_per_second": [
+                prompt_tokens / seconds for seconds in prefill_seconds
+            ],
+            "cache_tensor_bytes": [item.tensor_bytes for item in transfers],
+            "cache_send_seconds": [item.elapsed_seconds for item in transfers],
+            "cache_send_bytes_per_second": [
+                item.bytes_per_second for item in transfers
+            ],
+            "cache_recv_seconds": recv_seconds,
+            "remote_decode_seconds": decode_seconds,
+            "remote_decode_tokens_per_second": [
+                max(0, completion_tokens - 1) / seconds
+                for seconds in decode_seconds
+            ],
+            "baseline_decode_seconds": baseline_decode_seconds,
+            "overlap_window_seconds": overlap_seconds,
+            "pipeline_seconds": pipeline_seconds,
+            "pipeline_seconds_per_request": pipeline_seconds / 2,
+            "serial_source_seconds": serial_source_seconds,
+            "measured_pipeline_speedup": (
+                serial_source_seconds / pipeline_seconds
+                if pipeline_seconds > 0
+                else 0.0
+            ),
+            "parity": parity,
+            "parity_by_request": parity_by_request,
+            "baseline_token_sha256": [
+                _token_hash(value) for value in baseline_tokens
+            ],
+            "remote_token_sha256": [
+                _token_hash(value) for value in remote_tokens
+            ],
+        }
+        _event(report)
+        return 0 if parity else 2
+
+    control.broadcast_owned_bytes(
+        None, source_rank=prefill_rank, expected_size=1
+    )
+    control.barrier()
+    cache0, manifest0, recv0 = recv_cache_transfer(
+        mx,
+        src=prefill_rank,
+        group=group,
+        expected_model_identity=model_identity,
+    )
+    first0 = _recv_first_token(mx, src=prefill_rank, group=group)
+    control.barrier()
+    remote0, decode0 = _fixed_greedy_decode(
+        mx, model, cache0, first0, completion_tokens
+    )
+    control.barrier()
+    del cache0
+    mx.clear_cache()
+
+    cache1, manifest1, recv1 = recv_cache_transfer(
+        mx,
+        src=prefill_rank,
+        group=group,
+        expected_model_identity=model_identity,
+    )
+    first1 = _recv_first_token(mx, src=prefill_rank, group=group)
+    control.barrier()
+    remote1, decode1 = _fixed_greedy_decode(
+        mx, model, cache1, first1, completion_tokens
+    )
+    control.barrier()
+
+    for result in (remote0, remote1):
+        _send_result_array(
+            mx,
+            mx.array(result, dtype=mx.int32),
+            dst=prefill_rank,
+            group=group,
+        )
+    _send_result_array(
+        mx,
+        mx.array(
+            [decode0, decode1, recv0.elapsed_seconds, recv1.elapsed_seconds],
+            dtype=mx.float32,
+        ),
+        dst=prefill_rank,
+        group=group,
+    )
+    _event(
+        {
+            "type": "pipeline_decode_complete",
+            "rank": rank,
+            "prompt_tokens": [
+                manifest0["prompt_tokens"],
+                manifest1["prompt_tokens"],
+            ],
+            "cache_tensor_bytes": [recv0.tensor_bytes, recv1.tensor_bytes],
+            "decode_seconds": [decode0, decode1],
+            "token_sha256": [_token_hash(remote0), _token_hash(remote1)],
+        }
+    )
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     if args.prompt_tokens < 2 or args.completion_tokens < 1:
         raise ValueError("prompt/completion sizes are too small")
@@ -201,6 +471,25 @@ def run(args: argparse.Namespace) -> int:
                     "peak_memory_bytes": int(mx.get_peak_memory()),
                 }
             )
+
+            if args.pipeline_requests == 2:
+                return _run_two_request_pipeline(
+                    mx=mx,
+                    model=model,
+                    tokenizer=tokenizer,
+                    make_prompt_cache=make_prompt_cache,
+                    control=control,
+                    group=group,
+                    rank=rank,
+                    prefill_rank=prefill_rank,
+                    decode_rank=decode_rank,
+                    model_identity=identity,
+                    model_path=model_path,
+                    prompt_tokens=args.prompt_tokens,
+                    completion_tokens=args.completion_tokens,
+                    prefill_step_size=args.prefill_step_size,
+                    backend=args.backend,
+                )
 
             if rank == prefill_rank:
                 cache = make_prompt_cache(model)
