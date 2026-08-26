@@ -731,6 +731,40 @@ def _configure_distributed_mtp(
     return fixed_depth
 
 
+def _configure_distributed_qwen_mtp_runtime(
+    model: Any,
+    *,
+    model_type: str,
+    enabled: bool,
+) -> int | None:
+    """Start Qwen TP qualification on the synchronous depth-1 protocol.
+
+    Qwen's local depth-k chain asynchronously consumes the returned hidden
+    sibling after a distributed backbone pass.  The depth-1 PR-990 protocol
+    materializes each verify/head decision synchronously and is the first
+    rank-safe production baseline.  DS4 keeps its separately qualified
+    multi-depth implementation; Qwen depth-k remains a later promotion gate.
+    """
+
+    if not enabled or not model_type.startswith(("qwen3_5", "qwen3_6")):
+        return None
+    configured = False
+    for candidate in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        if candidate is None:
+            continue
+        if bool(getattr(candidate, "_omlx_mtp_decode_enabled", False)):
+            candidate._omlx_mtp_chain = False
+            candidate._omlx_mtp_depth = 1
+            configured = True
+    if not configured:
+        raise RuntimeError("Qwen distributed MTP head was not attached")
+    return 1
+
+
 def _configure_tensor_shard_weights(
     assignments: Sequence[PipelineAssignment],
     *,
@@ -1880,6 +1914,11 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
             ):
                 provider.load_default()
+                qwen_mtp_depth = _configure_distributed_qwen_mtp_runtime(
+                    provider.model,
+                    model_type=_distributed_model_type(args.model),
+                    enabled=mtp_enabled,
+                )
                 _enable_distributed_deepseek_ane_prefill(
                     provider.model,
                     execution.deepseek_ane_prefill,
@@ -1936,6 +1975,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     optimizations=optimizations,
                     mtp_enabled=mtp_enabled,
                     mtp_fixed_depth=mtp_fixed_depth,
+                    mtp_effective_depth=qwen_mtp_depth or mtp_fixed_depth,
                     pipeline_stages=parallel_groups.pipeline_stages,
                     pipeline_stage=parallel_groups.pipeline_stage,
                     tensor_parallel_rank=parallel_groups.tensor_rank,

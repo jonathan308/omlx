@@ -18,6 +18,7 @@ from omlx.cluster.inference_worker import (
     _bind_generation_thread_stream,
     _configure_distributed_mtp,
     _configure_indexer_decode_owner,
+    _configure_distributed_qwen_mtp_runtime,
     _configure_tensor_shard_weights,
     _cross_thread_generation_stream,
     _execution_settings,
@@ -334,6 +335,34 @@ def test_distributed_qwen_mtp_defaults_to_coordinated_adaptive_depth(
 
     assert fixed is None
     assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
+
+
+def test_distributed_qwen_mtp_uses_synchronous_depth_one_protocol():
+    inner = SimpleNamespace(
+        _omlx_mtp_decode_enabled=True,
+        _omlx_mtp_chain=True,
+        _omlx_mtp_depth=3,
+    )
+    model = SimpleNamespace(language_model=inner)
+
+    depth = _configure_distributed_qwen_mtp_runtime(
+        model,
+        model_type="qwen3_5",
+        enabled=True,
+    )
+
+    assert depth == 1
+    assert inner._omlx_mtp_chain is False
+    assert inner._omlx_mtp_depth == 1
+
+
+def test_distributed_qwen_mtp_requires_an_attached_head():
+    with pytest.raises(RuntimeError, match="head was not attached"):
+        _configure_distributed_qwen_mtp_runtime(
+            SimpleNamespace(),
+            model_type="qwen3_5",
+            enabled=True,
+        )
 
 
 def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):

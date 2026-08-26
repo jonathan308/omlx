@@ -3524,7 +3524,8 @@ def _run_verify_cycle_legacy(gen_batch: Any, state: _MtpState) -> None:
     )
     verify_logits = logits[:, 0, :]
     bonus_logits = logits[:, 1, :]
-    mx.eval(logits)
+    if not _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx):
+        mx.eval(logits)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
