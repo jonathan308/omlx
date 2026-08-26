@@ -1367,6 +1367,10 @@ def _create_cluster_plan(
 class ClusterAutoconfigureRequest(BaseModel):
     """Everything one-click activation needs; the server decides the rest."""
 
+    # Active-cluster membership changes keep the durable deployment identity
+    # while recomputing every rank/host/transport field. First-time setup omits
+    # this and receives the normal model+plan-derived ID.
+    deployment_id: str | None = Field(default=None, max_length=128)
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
     model_source_python: str | None = Field(default=None, max_length=4096)
@@ -2311,6 +2315,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         "plan": plan_payload,
         # Ready to POST straight to /deployments once the user approves.
         "activation": {
+            "deployment_id": request.deployment_id,
             "model_path": request.model_path,
             "model_source": request.model_source,
             "model_source_python": request.model_source_python,
