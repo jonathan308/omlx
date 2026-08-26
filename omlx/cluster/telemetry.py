@@ -1068,6 +1068,13 @@ def install_server_telemetry(
             self.__dict__["_omlx_local_should_stop"] = bool(value)
 
     class TelemetryResponseGenerator(original):
+        def _share_object(self, obj: Any) -> Any:
+            if not bool(getattr(self, "_is_distributed", False)):
+                return super()._share_object(obj)
+            if control_plane is not None:
+                return control_plane.broadcast_object(obj)
+            return super()._share_object(obj)
+
         def _share_request(self, request: Any) -> Any:
             shared = super()._share_request(request)
             if shared is None:

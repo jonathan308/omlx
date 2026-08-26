@@ -31,6 +31,7 @@ _request_clock = time.monotonic
 # per peer, paid once per window) and how long a half-dead cluster can keep
 # answering 200s before requests start failing cleanly (#2708).
 _PEER_HEALTH_TTL = 10.0
+_MAX_TARGETED_CANCEL_REQUESTS = 256
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
 
 
@@ -150,6 +151,8 @@ class _DistributedRequestState:
 class DistributedBatchedEngine(BatchedEngine):
     """Keep oMLX's API/tokenizer layer while proxying model work to MLX ranks."""
 
+    supports_request_scoped_abort = True
+
     # The coordinator does not own a local Scheduler: each rank process
     # creates and enforces its own prefill guard from the signed deployment.
     # This marker prevents ProcessMemoryEnforcer from reporting that expected
@@ -215,6 +218,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._orphan_reap_grace = float(orphan_reap_grace)
         self._request_states: dict[str, _DistributedRequestState] = {}
         self._next_request_seq = 0
+        self._last_cancel_epoch = 0
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -771,6 +775,10 @@ class DistributedBatchedEngine(BatchedEngine):
         if state is None:
             return False
         state.aborted = True
+        self._write_rank_cancel_request(
+            reason=reason or error_code,
+            request_id=request_id,
+        )
         response = state.response
         if response is not None:
             with suppress(Exception):
@@ -782,8 +790,13 @@ class DistributedBatchedEngine(BatchedEngine):
         )
         return True
 
-    def _write_rank_cancel_request(self, *, reason: str | None) -> Path | None:
-        """Ask rank zero to force-cancel every active request at a step boundary.
+    def _write_rank_cancel_request(
+        self,
+        *,
+        reason: str | None,
+        request_id: str | None = None,
+    ) -> Path | None:
+        """Ask rank zero to cancel request(s) at a shared step boundary.
 
         The rank's telemetry heartbeat consumes this file and cancels through
         ``BatchGenerator.remove`` — MLX-LM's own cancel path, which the batch
@@ -794,14 +807,69 @@ class DistributedBatchedEngine(BatchedEngine):
 
         root = Path(self._supervisor.state_dir).expanduser()
         path = root / f"{self.deployment.deployment_id}-cancel.json"
+        if request_id is not None and not _valid_transport_request_id(request_id):
+            logger.warning("Refusing malformed targeted cancel id")
+            return None
+
+        pending_request_ids: set[str] = set()
+        scope = "all" if request_id is None else "requests"
+        if request_id is not None:
+            pending_request_ids.add(request_id)
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing = None
+        ack_path = path.with_name(path.stem + "-ack.json")
+        try:
+            ack = json.loads(ack_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            ack = None
+        ack_epoch = (
+            int(ack.get("epoch", -1))
+            if isinstance(ack, dict)
+            and ack.get("deployment_id") == self.deployment.deployment_id
+            and ack.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(ack.get("epoch"), int)
+            and not isinstance(ack.get("epoch"), bool)
+            else -1
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("deployment_id") == self.deployment.deployment_id
+            and existing.get("plan_hash") == self.deployment.plan_hash
+            and isinstance(existing.get("epoch"), int)
+            and not isinstance(existing.get("epoch"), bool)
+            and int(existing["epoch"]) > ack_epoch
+        ):
+            if existing.get("scope") == "all":
+                scope = "all"
+            elif scope != "all":
+                candidates = existing.get("request_ids")
+                if existing.get("scope") == "request":
+                    candidates = [existing.get("request_id")]
+                if isinstance(candidates, list):
+                    pending_request_ids.update(
+                        candidate
+                        for candidate in candidates
+                        if _valid_transport_request_id(candidate)
+                    )
+
+        self._last_cancel_epoch = max(
+            int(time.time() * 1000),
+            self._last_cancel_epoch + 1,
+        )
         payload = {
             "schema_version": 1,
             "deployment_id": self.deployment.deployment_id,
             "plan_hash": self.deployment.plan_hash,
-            "epoch": int(time.time() * 1000),
-            "scope": "all",
+            "epoch": self._last_cancel_epoch,
+            "scope": scope,
             "reason": reason or "coordinator abort_all_requests",
         }
+        if scope == "requests":
+            newest = [request_id] if request_id in pending_request_ids else []
+            older = sorted(pending_request_ids.difference(newest))
+            payload["request_ids"] = (newest + older)[:_MAX_TARGETED_CANCEL_REQUESTS]
         try:
             root.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name(path.name + ".tmp")
@@ -1649,7 +1717,8 @@ class DistributedBatchedEngine(BatchedEngine):
         if state is not None:
             state.aborted = True
         self._write_rank_cancel_request(
-            reason=f"read timeout on {request_id}; possible rank stall"
+            reason=f"read timeout on {request_id}; possible rank stall",
+            request_id=request_id,
         )
 
     def get_stats(self) -> dict[str, Any]:
