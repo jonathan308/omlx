@@ -1279,6 +1279,13 @@ def install_server_telemetry(
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
+            entries, nbytes = self._omlx_cache_inventory()
+            telemetry.observe_cache_lookup(
+                prompt_tokens=len(tokens),
+                remaining_tokens=len(rest) if cache is not None else len(tokens),
+                entries=entries,
+                nbytes=nbytes,
+            )
             return cache, rest
 
         def prefetch_nearest_cache(self, model: Any, tokens: list[int]) -> Any:
