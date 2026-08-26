@@ -3537,6 +3537,8 @@ class ClusterReplanRequest(BaseModel):
     revert a heterogeneous-path cluster to same-path resolution.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     deployment_id: str | None = Field(default=None, max_length=128)
     model_path: str | None = Field(default=None, max_length=4096)
     model_source: str | None = Field(default=None, max_length=255)
