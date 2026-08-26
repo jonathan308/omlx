@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -1126,6 +1127,7 @@ def build_mlx_launch_argv(
     state_dir: str = "~/.omlx/cluster/runtime",
     control_host: str | None = None,
     control_port: int | None = None,
+    control_token: str | None = None,
 ) -> list[str]:
     """Build an argument vector without a user-controlled shell fragment.
 
@@ -1153,8 +1155,11 @@ def build_mlx_launch_argv(
             raise ValueError(f"{label} must be between 1 and 65535")
     if api_port == collective_port:
         raise ValueError("API and collective ports must be distinct")
-    if (control_host is None) != (control_port is None):
-        raise ValueError("rank-control host and port must be provided together")
+    control_values = (control_host, control_port, control_token)
+    if any(value is not None for value in control_values) and not all(
+        value is not None for value in control_values
+    ):
+        raise ValueError("rank-control host, port, and token must be provided together")
     if control_host is not None:
         try:
             control_host = str(ipaddress.ip_address(control_host))
@@ -1162,6 +1167,12 @@ def build_mlx_launch_argv(
             raise ValueError("rank-control host must be an IP address") from exc
         if not 1 <= int(control_port) <= 65535:
             raise ValueError("rank-control port must be between 1 and 65535")
+        try:
+            encoded_control_token = str(control_token).encode("ascii", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("rank-control token must be ASCII") from exc
+        if len(encoded_control_token) != 64:
+            raise ValueError("rank-control token must be 64 ASCII bytes")
     if cwd is not None and not cwd.is_absolute():
         raise ValueError("distributed working directory must be absolute")
 
@@ -1234,7 +1245,11 @@ def build_mlx_launch_argv(
             deployment.execution.tuning_reason,
         ]
     )
-    if control_host is not None and control_port is not None:
+    if (
+        control_host is not None
+        and control_port is not None
+        and control_token is not None
+    ):
         argv.extend(
             [
                 "--control-host",
@@ -1242,7 +1257,7 @@ def build_mlx_launch_argv(
                 "--control-port",
                 str(control_port),
                 "--control-token",
-                deployment.plan_hash,
+                control_token,
             ]
         )
     if deployment.execution.prompt_cache_bytes is not None:
@@ -2595,6 +2610,7 @@ class DistributedJobSupervisor:
         self.port: int | None = None
         self.collective_port: int | None = None
         self.control_port: int | None = None
+        self.control_token: str | None = None
         self.ready_event: dict[str, Any] | None = None
         self.rank_ready_events: dict[int, dict[str, Any]] = {}
         self.failure_event: dict[str, Any] | None = None
@@ -2648,6 +2664,10 @@ class DistributedJobSupervisor:
         self.port, self.collective_port = _available_launch_ports(self.deployment)
         control_host = self.deployment.hosts[0].ips[0]
         self.control_port = _available_control_port(control_host)
+        # The plan hash is public deployment identity, not authentication.
+        # Mint a fresh launch-scoped secret so an unauthenticated peer on the
+        # fabric cannot join rank control by reading the signed plan.
+        self.control_token = secrets.token_hex(32)
         argv = build_mlx_launch_argv(
             self.deployment,
             hostfile=hostfile,
@@ -2658,6 +2678,7 @@ class DistributedJobSupervisor:
             state_dir=self.state_dir,
             control_host=control_host,
             control_port=self.control_port,
+            control_token=self.control_token,
         )
         self._phase = "loading"
         try:
@@ -2994,6 +3015,7 @@ class DistributedJobSupervisor:
         self.port = None
         self.collective_port = None
         self.control_port = None
+        self.control_token = None
         self.ready_event = None
         self.rank_ready_events.clear()
         self.failure_event = None
