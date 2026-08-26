@@ -175,7 +175,21 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "synchronized count-bounded prompt cache" in tuned.tuning_reason
+
+
+def test_execution_tuner_retains_one_cache_slot_per_concurrent_prompt():
+    settings = execution_profile("balanced")
+    assignments = [
+        SimpleNamespace(headroom_bytes=32 * 1024**3),
+        SimpleNamespace(headroom_bytes=24 * 1024**3),
+    ]
+
+    tuned = tune_execution_settings(settings, assignments, backend="jaccl")
+
+    assert tuned.prompt_concurrency == 4
+    assert tuned.prompt_cache_size == 4
+    assert tuned.prompt_cache_bytes is None
 
 
 def test_execution_settings_require_a_positive_ssd_snapshot_budget():
@@ -230,9 +244,9 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     )
 
     assert tuned.decode_concurrency == settings.decode_concurrency
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == settings.prompt_concurrency
     assert tuned.prompt_cache_bytes is None
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "synchronized count-bounded prompt cache" in tuned.tuning_reason
 
 
 def test_performance_profiles_reject_nonfinite_measurements():

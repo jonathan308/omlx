@@ -60,6 +60,29 @@
         color: #a1a1aa !important;
     }
 
+    /* Cluster setup is an operational surface, often viewed while two Macs
+       are being wired side by side. Keep its dense labels legible without
+       changing the page title or the typography used by the rest of oMLX. */
+    [data-cluster-v2-wizard] .text-\[9px\] {
+        font-size: 0.6875rem !important;
+        line-height: 1rem !important;
+    }
+    [data-cluster-v2-wizard] .text-\[10px\],
+    [data-cluster-v2-wizard] .text-\[11px\] {
+        font-size: 0.75rem !important;
+        line-height: 1rem !important;
+    }
+    [data-cluster-v2-wizard] .text-xs {
+        font-size: 0.8125rem !important;
+        line-height: 1.125rem !important;
+    }
+    [data-cluster-v2-wizard] .text-neutral-400 {
+        color: #737373 !important;
+    }
+    [data-theme="dark"] [data-cluster-v2-wizard] .text-neutral-400 {
+        color: #b3b3b3 !important;
+    }
+
     /* === Borders === */
     [data-theme="dark"] .border-neutral-100 { border-color: var(--border-faint) !important; }
     [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
