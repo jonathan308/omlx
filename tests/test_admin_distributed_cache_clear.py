@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Admin cache maintenance must reach every rank of a loaded cluster."""
 
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -78,6 +79,11 @@ async def test_ssd_clear_removes_cold_cluster_and_legacy_roots(tmp_path):
     with (
         patch.object(admin_routes, "_get_engine_pool", return_value=pool),
         patch.object(admin_routes, "_get_global_settings", return_value=settings),
+        patch.object(
+            admin_routes,
+            "_clear_cold_remote_cluster_cache_roots",
+            return_value=(0, 0),
+        ),
     ):
         result = await admin_routes.clear_ssd_cache(is_admin=True)
 
@@ -85,3 +91,43 @@ async def test_ssd_clear_removes_cold_cluster_and_legacy_roots(tmp_path):
     assert result["total_deleted"] == 2
     assert not cluster_root.exists()
     assert not legacy_root.exists()
+
+
+def test_cold_ssd_clear_reaches_every_unique_configured_peer(tmp_path, monkeypatch):
+    from omlx.cluster.deployment import ClusterHost
+
+    roots = (
+        tmp_path / "cache/cluster-prompt-snapshots",
+        tmp_path / "state/cluster/runtime/prompt-cache-ssd",
+    )
+    hosts = (
+        ClusterHost("local", "127.0.0.1", ("10.0.0.1",)),
+        ClusterHost("peer", "peer.local", ("10.0.0.2",)),
+    )
+    registry = SimpleNamespace(
+        list=lambda: (
+            SimpleNamespace(hosts=hosts),
+            SimpleNamespace(hosts=hosts),
+        )
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "7\n", "")
+
+    monkeypatch.setattr(
+        "omlx.cluster.registry.get_cluster_registry",
+        lambda: registry,
+    )
+
+    deleted, ranks = admin_routes._clear_cold_remote_cluster_cache_roots(
+        roots,
+        runner=run,
+    )
+
+    assert deleted == 7
+    assert ranks == 2
+    assert len(calls) == 1
+    assert calls[0][0][-2] == "peer.local"
+    assert "cluster-prompt-snapshots" in calls[0][0][-1]
