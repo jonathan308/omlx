@@ -136,6 +136,7 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
         cwd=Path("/opt/omlx"),
         control_host="10.0.0.1",
         control_port=32140,
+        control_token="e" * 64,
     )
 
     assert argv[0] == "/opt/omlx/bin/python"
@@ -145,7 +146,8 @@ def test_launcher_argv_keeps_model_as_one_argument(tmp_path):
     assert argv[argv.index("--port") + 1] == "32100"
     assert argv[argv.index("--control-host") + 1] == "10.0.0.1"
     assert argv[argv.index("--control-port") + 1] == "32140"
-    assert argv[argv.index("--control-token") + 1] == deployment.plan_hash
+    assert argv[argv.index("--control-token") + 1] == "e" * 64
+    assert argv[argv.index("--control-token") + 1] != deployment.plan_hash
     assert argv[argv.index("--plan-hash") + 1] == deployment.plan_hash
     assert argv[argv.index("--connections-per-ip") + 1] == "2"
     assert argv[argv.index("--execution-profile") + 1] == "balanced"
@@ -163,6 +165,25 @@ def test_launcher_rejects_overlapping_api_and_collective_ports(tmp_path):
             api_port=32100,
             collective_port=32100,
             python_executable="/opt/omlx/bin/python",
+        )
+
+
+def test_launcher_requires_an_explicit_random_control_token(tmp_path):
+    kwargs = {
+        "hostfile": (tmp_path / "hosts.json").resolve(),
+        "api_port": 32100,
+        "collective_port": 32120,
+        "python_executable": "/opt/omlx/bin/python",
+        "control_host": "10.0.0.1",
+        "control_port": 32140,
+    }
+    with pytest.raises(ValueError, match="host, port, and token"):
+        build_mlx_launch_argv(_deployment(), **kwargs)
+    with pytest.raises(ValueError, match="64 ASCII bytes"):
+        build_mlx_launch_argv(
+            _deployment(),
+            **kwargs,
+            control_token="public-plan-hash-is-not-a-secret",
         )
 
 
@@ -2206,7 +2227,10 @@ def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
 
     failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
 
-    assert any("pid 424242" in failure and "survived SIGKILL" in failure for failure in failures)
+    assert any(
+        "pid 424242" in failure and "survived SIGKILL" in failure
+        for failure in failures
+    )
     assert any("Reboot this Mac" in failure for failure in failures)
 
 
