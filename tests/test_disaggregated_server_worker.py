@@ -114,6 +114,34 @@ def test_phase_hot_cache_reuses_exact_cache_and_logits():
     assert tier == "memory"
 
 
+def test_phase_hot_cache_keeps_two_alternating_conversations():
+    class Cache:
+        nbytes = 16
+
+        def is_trimmable(self):
+            return False
+
+    manager = _PhasePromptCache(
+        model=object(),
+        model_key="model-a",
+        max_size=2,
+        max_bytes=None,
+        ssd_directory=None,
+        ssd_max_bytes=1024,
+        step=2048,
+    )
+    first_logits = object()
+    second_logits = object()
+    manager.insert([1, 2, 3], [Cache()], first_logits)
+    manager.insert([4, 5, 6], [Cache()], second_logits)
+
+    first = manager.lookup([1, 2, 3])
+    second = manager.lookup([4, 5, 6])
+
+    assert first[1:] == ([], first_logits, "memory")
+    assert second[1:] == ([], second_logits, "memory")
+
+
 def test_phase_cache_maintenance_uses_existing_rank_ack_protocol(tmp_path):
     class Cache:
         def __init__(self):

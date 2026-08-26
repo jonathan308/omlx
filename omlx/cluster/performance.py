@@ -439,22 +439,32 @@ def tune_execution_settings(
     evicts. The next request then starts at different token offsets and blocks
     forever in the first unmatched collective.
 
-    Keep exactly one shared conversation prefix and disable byte-based
-    eviction. The sequence-count policy is deterministic across ranks and one
-    slot still accelerates the common follow-up-chat path. This correctness
+    Disable byte-based eviction, but retain one deterministic cache slot per
+    admitted prompt.  The sequence-count policy is rank-symmetric because all
+    ranks see the same ordered request stream.  Collapsing it to one slot made
+    two active conversations evict one another on every turn, paying a full
+    prefill tax despite the advertised prompt concurrency.  This correctness
     invariant applies even when the user disables the other automatic tuning.
     """
 
-    synchronized_cache = {
-        "prompt_cache_size": 1,
-        "prompt_cache_bytes": None,
-    }
+    def synchronized_cache(prompt_limit: int) -> dict[str, int | None]:
+        return {
+            "prompt_cache_size": max(
+                1,
+                min(settings.prompt_cache_size, prompt_limit),
+            ),
+            # Unequal pipeline stages hold different byte counts for the same
+            # logical prefix. A per-rank byte LRU can therefore evict different
+            # keys; the shared sequence-count LRU cannot.
+            "prompt_cache_bytes": None,
+        }
+
     if not settings.auto_tune or not assignments:
         return replace(
             settings,
-            **synchronized_cache,
+            **synchronized_cache(settings.prompt_concurrency),
             tuning_reason=(
-                f"{settings.tuning_reason}; synchronized single-prefix cache"
+                f"{settings.tuning_reason}; synchronized count-bounded prompt cache"
             ),
         )
     minimum_headroom = min(
@@ -489,13 +499,13 @@ def tune_execution_settings(
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache,
+        **synchronized_cache(prompt),
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
             f"{settings.profile} profile auto-tuned for {tier}; "
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
-            "synchronized single-prefix cache"
+            "synchronized count-bounded prompt cache"
         ),
     )
 
