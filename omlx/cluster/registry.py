@@ -77,10 +77,8 @@ class ClusterRegistry:
                 # file described. Persist the upgrade so the migration happens
                 # once, but never let an unwritable file block server startup.
                 self.migrated_from = int(payload.get("schema_version", 1))
-                try:
+                with suppress(OSError):
                     self._save()
-                except OSError:
-                    pass
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

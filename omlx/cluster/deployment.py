@@ -75,7 +75,7 @@ def _validate_ip(value: str) -> str:
     return value
 
 
-def _hostfile_ips(host: "ClusterHost") -> list[str]:
+def _hostfile_ips(host: ClusterHost) -> list[str]:
     """Communication IPs in the order a rank should try them.
 
     Routable addresses first: a link-local IPv6 without its (machine-local)
@@ -132,7 +132,9 @@ def validate_model_path_map(
         if not isinstance(node_id, str) or _NODE_ID.fullmatch(node_id) is None:
             raise ValueError(f"invalid path_map node ID: {node_id!r}")
         if known is not None and node_id not in known:
-            raise ValueError(f"path_map names a node outside the deployment: {node_id!r}")
+            raise ValueError(
+                f"path_map names a node outside the deployment: {node_id!r}"
+            )
         if not isinstance(raw_path, str):
             raise ValueError(f"path_map path for {node_id!r} must be a string")
         path = raw_path.strip()
@@ -340,17 +342,13 @@ class ClusterDeployment:
                 "tensor_parallel_size must be between 1 and the host count"
             )
         if len(self.hosts) % self.tensor_parallel_size != 0:
-            raise ValueError(
-                "host count must be divisible by tensor_parallel_size"
-            )
+            raise ValueError("host count must be divisible by tensor_parallel_size")
         if (
             not isinstance(self.target_context_tokens, int)
             or isinstance(self.target_context_tokens, bool)
             or not 1 <= self.target_context_tokens <= 1_048_576
         ):
-            raise ValueError(
-                "target_context_tokens must be between 1 and 1,048,576"
-            )
+            raise ValueError("target_context_tokens must be between 1 and 1,048,576")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
         if self.hosts[0].ssh != "127.0.0.1":
@@ -609,7 +607,9 @@ def decode_worker_contract(
         raise ValueError("worker performance profiles do not match the shard plan")
     tensor_parallel_size = int(payload.get("tensor_parallel_size", 1))
     if not 1 <= tensor_parallel_size <= len(parsed):
-        raise ValueError("tensor_parallel_size must be between 1 and the assignment count")
+        raise ValueError(
+            "tensor_parallel_size must be between 1 and the assignment count"
+        )
     return payload["plan_hash"], parsed, profiles, tensor_parallel_size
 
 

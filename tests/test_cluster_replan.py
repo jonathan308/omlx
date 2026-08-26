@@ -13,9 +13,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from omlx.cluster import routes
-from omlx.cluster.deployment import ClusterDeployment, ClusterHost
-from omlx.cluster.planner import ModelLayout
+from omlx.cluster.deployment import ClusterDeployment
 from omlx.cluster.performance import NodePerformanceProfile
+from omlx.cluster.planner import ModelLayout
 from omlx.cluster.registry import configure_cluster_registry
 from omlx.cluster.replan import (
     hosts_from_deployment,
@@ -360,13 +360,17 @@ def test_replan_preview_detects_changed_split(active_deployment):
 
 
 def test_replan_applied_runs_full_dance(active_deployment):
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": active_deployment.deployment["deployment_id"],
-            "target_context_tokens": 16384,
-        },
-    ).json()
+    preview = (
+        _client()
+        .post(
+            "/admin/api/cluster/replan",
+            json={
+                "deployment_id": active_deployment.deployment["deployment_id"],
+                "target_context_tokens": 16384,
+            },
+        )
+        .json()
+    )
 
     response = _client().post(
         "/admin/api/cluster/replan",
@@ -381,8 +385,9 @@ def test_replan_applied_runs_full_dance(active_deployment):
     payload = response.json()
     assert payload["mode"] == "applied"
     assert payload["readiness"]["canary_passed"] is True
-    assert payload["replan"]["previous"]["deployment_id"] == (
-        active_deployment.deployment["deployment_id"]
+    assert (
+        payload["replan"]["previous"]["deployment_id"]
+        == (active_deployment.deployment["deployment_id"])
     )
     # One reload for the initial activation, one for the replan.
     assert active_deployment.pool.reloads == 2
@@ -425,13 +430,17 @@ def test_replan_refuses_to_interrupt_active_requests(tmp_path, monkeypatch):
     deployment_id = response.json()["deployment"]["deployment_id"]
     pool.busy = True
 
-    preview = _client().post(
-        "/admin/api/cluster/replan",
-        json={
-            "deployment_id": deployment_id,
-            "target_context_tokens": 16384,
-        },
-    ).json()
+    preview = (
+        _client()
+        .post(
+            "/admin/api/cluster/replan",
+            json={
+                "deployment_id": deployment_id,
+                "target_context_tokens": 16384,
+            },
+        )
+        .json()
+    )
     response = _client().post(
         "/admin/api/cluster/replan",
         json={
@@ -481,7 +490,6 @@ def test_replan_without_context_requires_explicit_cluster(tmp_path, monkeypatch)
 def test_replan_membership_change_adds_a_node(active_deployment):
     """N-node replan: explicit nodes/hosts express the membership change."""
 
-    model_path = active_deployment.model_path
     nodes = [
         {"node_id": "large", "capacity_bytes": 100, "reserve_bytes": 10},
         {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
@@ -515,11 +523,10 @@ def test_replan_membership_change_adds_a_node(active_deployment):
 
     assert response.status_code == 200, response.json()
     payload = response.json()
-    assert payload["deployment"]["world_size"] if "world_size" in payload["deployment"] else True
+    assert payload["deployment"].get("world_size", True)
     assert len(payload["deployment"]["assignments"]) == 3
     assert payload["replan"]["previous"]["world_size"] == 2
     ranks = sorted(
-        (item["rank"], item["node_id"])
-        for item in payload["deployment"]["assignments"]
+        (item["rank"], item["node_id"]) for item in payload["deployment"]["assignments"]
     )
     assert ranks == [(0, "large"), (1, "small"), (2, "mini")]
