@@ -624,9 +624,7 @@ class SSDPromptSnapshotStore:
                     entry is None
                     or (
                         entry.tokens != token_tuple[:boundary]
-                        and not (
-                            not entry.tokens and entry.boundary == boundary
-                        )
+                        and not (not entry.tokens and entry.boundary == boundary)
                     )
                     or not self._path(key).is_file()
                 ):
@@ -650,9 +648,7 @@ class SSDPromptSnapshotStore:
                 expected_boundary = (position + 1) * self.step
                 if entry is None or (
                     entry.tokens != prefix
-                    and not (
-                        not entry.tokens and entry.boundary == expected_boundary
-                    )
+                    and not (not entry.tokens and entry.boundary == expected_boundary)
                 ):
                     return None
                 if not self._path(key).is_file():

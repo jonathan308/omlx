@@ -192,9 +192,7 @@ async def test_real_uvicorn_socket_disconnect_aborts_only_its_request():
             await asyncio.sleep(0.01)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
-            b"GET /stream HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"Connection: close\r\n\r\n"
+            b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
         await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
@@ -348,7 +346,9 @@ class TestChatKeepaliveCarriesRole:
     def test_id_sharing_frame_carries_assistant_role(self):
         from omlx.server import _chat_keepalive_chunk
 
-        assert self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        assert (
+            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+        )
 
 
 class TestResolveKeepalive:
@@ -376,7 +376,9 @@ class TestResolveKeepalive:
         try:
             self._set_mode("chunk")
             assert _resolve_keepalive("openai_chat") == _KEEPALIVE_CHAT_CHUNK
-            assert _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            assert (
+                _resolve_keepalive("openai_completion") == _KEEPALIVE_COMPLETION_CHUNK
+            )
             assert _resolve_keepalive("anthropic") == _KEEPALIVE_ANTHROPIC_PING
             # Responses API has no official ping; chunk mode disables keepalive
             assert _resolve_keepalive("openai_responses") is None
@@ -391,7 +393,12 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("comment")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) == _KEEPALIVE_COMMENT
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
@@ -404,7 +411,12 @@ class TestResolveKeepalive:
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("off")
-            for protocol in ("openai_chat", "openai_completion", "anthropic", "openai_responses"):
+            for protocol in (
+                "openai_chat",
+                "openai_completion",
+                "anthropic",
+                "openai_responses",
+            ):
                 assert _resolve_keepalive(protocol) is None
         finally:
             _server_state.global_settings.server.sse_keepalive_mode = original
