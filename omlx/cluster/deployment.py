@@ -30,6 +30,19 @@ from .tp_qualifications import TPQualificationProvenance
 DistributedBackend = Literal["ring", "jaccl", "jaccl-ring"]
 ServingMode = Literal["sharded", "disaggregated"]
 
+_DISTRIBUTED_MTP_MODEL_PREFIXES = (
+    "deepseek_v4",
+    "qwen3_5",
+    "qwen3_6",
+)
+
+
+def distributed_mtp_model_supported(model_type: object) -> bool:
+    """Whether the rank-lockstep MTP runtime is qualified for this family."""
+
+    normalized = str(model_type or "").strip().lower()
+    return normalized.startswith(_DISTRIBUTED_MTP_MODEL_PREFIXES)
+
 # Version 3 adds the signed serving mode and prefill/decode rank ownership.
 # Version 2 adds ``path_map``: an optional per-node absolute model path, so
 # nodes no longer need the model at the same absolute path on every Mac.

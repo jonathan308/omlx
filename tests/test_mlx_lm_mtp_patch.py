@@ -132,6 +132,50 @@ def test_mtp_runtime_stats_accumulate_structured_cycle_economics():
     assert after["tokens_per_cycle"] == after["tokens"] / after["cycles"]
 
 
+def test_distributed_mtp_materializes_logits_and_hidden_as_one_graph():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    calls = []
+
+    class Group:
+        @staticmethod
+        def size():
+            return 2
+
+    fake_mx = SimpleNamespace(
+        distributed=SimpleNamespace(init=lambda: Group()),
+        eval=lambda *values: calls.append(values),
+    )
+    logits = object()
+    hidden = object()
+
+    assert bg._materialize_distributed_hidden_sibling(
+        logits, hidden, mx_module=fake_mx
+    ) is True
+    assert calls == [(logits, hidden)]
+
+
+def test_single_node_mtp_keeps_lazy_hidden_overlap():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    calls = []
+
+    class Group:
+        @staticmethod
+        def size():
+            return 1
+
+    fake_mx = SimpleNamespace(
+        distributed=SimpleNamespace(init=lambda: Group()),
+        eval=lambda *values: calls.append(values),
+    )
+
+    assert bg._materialize_distributed_hidden_sibling(
+        object(), object(), mx_module=fake_mx
+    ) is False
+    assert calls == []
+
+
 class TestMtpBoundaryCommit:
     @staticmethod
     def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):

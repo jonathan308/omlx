@@ -2599,6 +2599,35 @@ def _chain_next_drafts(
     state.draft_accept_lps = draft_accept_lps
 
 
+def _materialize_distributed_hidden_sibling(
+    logits: Any,
+    hidden: Any,
+    *,
+    mx_module: Any = None,
+) -> bool:
+    """Evaluate logits and returned hidden in one distributed graph pass.
+
+    Sampling materializes the logits dependency, but MLX does not necessarily
+    materialize a lazy sibling output.  MTP subsequently feeds that hidden
+    sibling into its local head; on TP ranks this used to replay the backbone's
+    already-consumed collective graph and fence every rank together.  Bind the
+    two outputs to the same evaluation only for a real distributed world. The
+    single-node path keeps its existing lazy overlap and pays no extra sync.
+    """
+
+    if mx_module is None:
+        import mlx.core as mx_module
+
+    try:
+        group = mx_module.distributed.init()
+        distributed = int(group.size()) > 1
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        distributed = False
+    if distributed:
+        mx_module.eval(logits, hidden)
+    return distributed
+
+
 # ---------------------------------------------------------------------------
 # Post-init: run one extra backbone forward + MTP forward; queue the two
 # emitted tokens; stash a draft for the first verify cycle.
@@ -2648,6 +2677,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     logits, hidden, _ = _call_backbone(
         gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
     )
+    _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx)
     _clear_rollback(gen_batch.prompt_cache)
 
     next_main_logits = _mtp_prepare_logits(
@@ -3103,6 +3133,7 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
         gen_batch.prompt_cache,
         n_confirmed=1,
     )
+    _materialize_distributed_hidden_sibling(logits, hidden, mx_module=mx)
     rows = _mtp_prepare_logits(gen_batch, logits[0])  # (k+1, vocab)
     row_snaps: List[Optional[Any]] = [None] * (k + 1)
     if procs is not None:
