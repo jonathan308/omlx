@@ -658,7 +658,7 @@ process.stdout.write(JSON.stringify({ loading, ready }));
         "visible": True,
         "percent": 60,
         "label": "Materializing model layers",
-        "detail": "0 of 1 ranks ready · readiness canary runs last",
+        "detail": "0 of 2 ranks ready · readiness canary runs last",
         "steps": ["done", "done", "done", "done", "active"],
     }
     assert result["ready"] == {
@@ -670,6 +670,55 @@ process.stdout.write(JSON.stringify({ loading, ready }));
     assert "data-cluster-v2-activation-progress" in template
     assert "data-cluster-v2-activation-progress-bar" in template
     assert '<i data-lucide="check" class="w-3 h-3"></i>' not in template
+
+
+def test_retry_loading_ownership_supersedes_retained_failure_marker():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [{ deployment_id: 'pool-a', model: '/models/qwen' }];
+component.deploymentsLoaded = true;
+component.runtimeLoaded = true;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'pool-a', rank: 0, world_size: 2,
+  phase: 'failed', load_stage: 'loading_weights',
+  live: false, ownership: 'loading', error: 'failure from the previous attempt',
+}], launchers: [] };
+const retry = {
+  state: component.deploymentRuntimeState(),
+  label: component.deploymentStatus().label,
+  progress: component.activationProgressVisible(),
+  progressLabel: component.activationProgressLabel(),
+  steps: component.wizardSteps().map((step) => step.state),
+};
+component.runtimePayload.jobs.push({
+  deployment_id: 'pool-a', rank: 0, world_size: 2,
+  phase: 'ready', load_stage: 'ready',
+  live: true, ownership: 'loaded',
+});
+// Reconciliation assigns deployment ownership to every retained marker. A
+// current live ready rank must likewise outrank the old diagnostic failure.
+component.runtimePayload.jobs[0].ownership = 'loaded';
+const ready = {
+  state: component.deploymentRuntimeState(),
+  label: component.deploymentStatus().label,
+  progress: component.activationProgressVisible(),
+};
+process.stdout.write(JSON.stringify({ retry, ready }));
+"""
+    )
+
+    assert result["retry"] == {
+        "state": "loading",
+        "label": "Loading",
+        "progress": True,
+        "progressLabel": "Loading model weights",
+        "steps": ["done", "done", "done", "done", "active"],
+    }
+    assert result["ready"] == {
+        "state": "ready",
+        "label": "Ready",
+        "progress": False,
+    }
 
 
 def test_cold_saved_setups_open_one_model_picker_instead_of_a_fake_active_card():
