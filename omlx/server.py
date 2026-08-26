@@ -2081,11 +2081,16 @@ def init_server(
         device_registry = None
     # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
     # available (DeviceRegistryBridge adapts the API and fails loudly on
-    # drift); otherwise the schema-compatible fallback store is used.
+    # drift); otherwise the schema-compatible fallback store is used. Resolve
+    # capabilities lazily because the discovery service starts later.
+    from .cluster.discovery import announced_addrs, announced_caps
+
     configure_pairing_manager(
         base_path,
         registry=device_registry,
         enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
+        address_provider=announced_addrs,
     )
 
     # Discover models (use pinned models from settings file)

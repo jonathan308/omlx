@@ -6,16 +6,16 @@ both directions) with an exo-style flow:
 
 1. The JOINER shows a 6-digit code (valid 10 minutes).
 2. The joiner POSTs ``/api/cluster/pair/request`` to the coordinator carrying
-   its identity and ``code_hash = blake2s(code + node_id)`` — never the code.
+   its identity and a salted, slow code verifier bound to the node and SSH
+   identities — never the code itself.
 3. The coordinator dashboard lists the pending request
    (``state: "awaiting_approval"``) and the operator types the code shown on
    the joiner into ``/api/cluster/pair/approve``.
-4. Approval verifies the code hash (3 attempts, then a 10-minute lockout),
+4. Approval verifies the code-bound identities (3 attempts, then a 10-minute lockout),
    generates the 32-byte ``cluster_key``, wraps it under a key derived from
    the code with PBKDF2-HMAC-SHA256 (100k iterations), persists the peer as
-   paired, and DRIVES the existing fail-closed SSH TOFU enrollment
-   (``ssh_keys.install_authorized_key`` / ``add_verified_peer_host_key`` —
-   same changed-host fail-closed semantics as the legacy flow).
+   paired, and drives symmetric, fail-closed SSH enrollment with the
+   authenticated user key and daemon host key.
 5. The joiner polls ``/api/cluster/pair/status/{node_id}`` and unwraps the
    cluster key locally with the code only it possesses.
 
@@ -35,8 +35,10 @@ method names looked up on Module A's registry.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -49,10 +51,11 @@ import threading
 import time
 import urllib.request
 import uuid
+from collections.abc import Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ CODE_DIGITS = 6
 CODE_TTL_SECONDS = 10 * 60
 MAX_CODE_ATTEMPTS = 3
 LOCKOUT_SECONDS = 10 * 60
-PBKDF2_ITERATIONS = 100_000
+PBKDF2_ITERATIONS = 210_000
 CLUSTER_KEY_BYTES = 32
 WRAP_KDF = "PBKDF2-HMAC-SHA256"
 _WRAP_TAG_DOMAIN = b"omlx-cluster-key-v1"
@@ -120,10 +123,32 @@ def validate_pairing_code(code: str) -> str:
     return code
 
 
-def pairing_code_hash(code: str, node_id: str) -> str:
-    """``blake2s(code + node_id)`` — the only code material that crosses the wire."""
+def pairing_code_hash(
+    code: str,
+    node_id: str,
+    ssh_public_key: str = "",
+    ssh_host_public_key: str = "",
+    salt: bytes = b"",
+) -> str:
+    """Slowly derive a verifier bound to the node and both SSH identities."""
 
-    return hashlib.blake2s((code + node_id).encode("utf-8")).hexdigest()
+    payload = json.dumps(
+        {
+            "node_id": node_id,
+            "ssh_public_key": ssh_public_key,
+            "ssh_host_public_key": ssh_host_public_key,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    verifier_salt = bytes(salt) + hashlib.sha256(payload).digest()
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        code.encode("utf-8"),
+        verifier_salt,
+        PBKDF2_ITERATIONS,
+        dklen=32,
+    ).hex()
 
 
 def _derive_wrap_key(code: str, salt: bytes, iterations: int) -> bytes:
@@ -169,12 +194,30 @@ def unwrap_cluster_key(package: dict[str, Any], code: str) -> bytes:
     if package.get("kdf") != WRAP_KDF or not 1 <= iterations <= 10_000_000:
         raise PairingRequestError("unsupported cluster-key wrap parameters")
     wrap_key = _derive_wrap_key(code, salt, iterations)
-    expected = hmac.new(wrap_key, _WRAP_TAG_DOMAIN + ciphertext, hashlib.sha256).digest()
+    expected = hmac.new(
+        wrap_key, _WRAP_TAG_DOMAIN + ciphertext, hashlib.sha256
+    ).digest()
     if not hmac.compare_digest(tag, expected):
         raise PairingCodeError("cluster key unwrap failed (wrong code or tampering)")
     if len(ciphertext) != CLUSTER_KEY_BYTES:
         raise PairingRequestError("malformed wrapped cluster key")
     return bytes(a ^ b for a, b in zip(ciphertext, wrap_key))
+
+
+def coordinator_identity_tag(
+    cluster_key: bytes,
+    coordinator: dict[str, Any],
+) -> str:
+    """Bind the approved coordinator identity to the unwrapped cluster key."""
+
+    payload = json.dumps(
+        coordinator,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        cluster_key, b"omlx-coordinator-v1\0" + payload, hashlib.sha256
+    ).hexdigest()
 
 
 # --- Small persisted stores (same conventions as registry.py/enrollment.py) -
@@ -356,9 +399,7 @@ class JsonDeviceStore:
             self.path,
             {
                 "schema_version": DEVICE_SCHEMA_VERSION,
-                "devices": [
-                    self._devices[key] for key in sorted(self._devices)
-                ],
+                "devices": [self._devices[key] for key in sorted(self._devices)],
             },
         )
 
@@ -531,7 +572,9 @@ def load_node_identity(base_path: Path) -> dict[str, Any]:
     """Prefer Module A's ``identity.load_or_create``; fall back locally."""
 
     try:
-        from .identity import load_or_create as _load_or_create  # type: ignore[import-not-found]
+        from .identity import (
+            load_or_create as _load_or_create,  # type: ignore[import-not-found]
+        )
     except ImportError:
         return _fallback_identity(base_path)
     identity = _load_or_create(base_path / "cluster" / "identity.json")
@@ -552,9 +595,11 @@ class _PendingRequest:
     friendly_name: str
     caps: dict[str, Any]
     code_hash: str
+    code_salt: bytes
     addrs: list[str]
     http_port: int | None
     ssh_public_key: str | None
+    ssh_host_public_key: str
     created_at: float
     expires_at: float
     attempts: int = 0
@@ -590,15 +635,14 @@ def default_enrollment_driver(peer: dict[str, Any]) -> dict[str, Any]:
       ``~/.ssh/omlx_cluster`` identity must exist;
     * ``ssh_keys.install_authorized_key`` — the joiner's user key (sent in
       the join request) is authorized locally so the joiner can be a client;
-    * ``ssh_keys.add_verified_peer_host_key`` — TOFU host-key pinning for
-      each announced address, with the same changed-host fail-closed rule
-      every cluster SSH call already enforces.
+    * ``ssh_keys.pin_enrolled_host_key`` — pin the code-authenticated daemon
+      host key for each coordinator-observed address, refusing changed hosts.
     """
 
     from .ssh_keys import (
-        add_verified_peer_host_key,
         get_or_create_ssh_key,
         install_authorized_key,
+        pin_enrolled_host_key,
     )
 
     key_pair = get_or_create_ssh_key()
@@ -606,19 +650,19 @@ def default_enrollment_driver(peer: dict[str, Any]) -> dict[str, Any]:
         "coordinator_fingerprint": key_pair.fingerprint,
         "authorized_key_installed": False,
         "host_keys_pinned": [],
-        "errors": [],
     }
-    peer_public_key = peer.get("ssh_public_key")
-    if peer_public_key:
-        result["authorized_key_installed"] = install_authorized_key(
-            public_key=peer_public_key
-        )
-    for address in peer.get("addrs") or []:
-        try:
-            if add_verified_peer_host_key(hostname=address):
-                result["host_keys_pinned"].append(address)
-        except Exception as exc:  # host may not run sshd yet; first SSH is TOFU anyway
-            result["errors"].append(f"{address}: {exc}")
+    peer_public_key = normalize_ssh_public_key(peer.get("ssh_public_key") or "")
+    peer_host_key = normalize_ssh_public_key(peer.get("ssh_host_public_key") or "")
+    addresses = [str(address) for address in (peer.get("addrs") or []) if address]
+    if not addresses:
+        raise EnrollmentDriveError("SSH enrollment requires a verified peer address")
+    result["authorized_key_installed"] = install_authorized_key(
+        public_key=peer_public_key
+    )
+    for address in addresses:
+        target = ssh_host_target(address)
+        if pin_enrolled_host_key(hostname=target, public_key=peer_host_key):
+            result["host_keys_pinned"].append(address)
     return result
 
 
@@ -691,6 +735,63 @@ def _local_ssh_public_key() -> str | None:
         return None
 
 
+def _local_ssh_host_public_key() -> str | None:
+    """Read the public half of the local SSH daemon host identity."""
+
+    override = os.environ.get("OMLX_CLUSTER_SSH_HOST_PUBLIC_KEY")
+    candidates = (
+        [Path(override).expanduser()]
+        if override
+        else [
+            Path("/etc/ssh/ssh_host_ed25519_key.pub"),
+            Path("/etc/ssh/ssh_host_rsa_key.pub"),
+        ]
+    )
+    for path in candidates:
+        try:
+            return normalize_ssh_public_key(path.read_text(encoding="utf-8").strip())
+        except (OSError, PairingRequestError):
+            continue
+    return None
+
+
+def normalize_ssh_public_key(public_key: str) -> str:
+    """Validate and strip an OpenSSH user key to its type and key data."""
+
+    if not isinstance(public_key, str) or "\n" in public_key or "\r" in public_key:
+        raise PairingRequestError("join request carries an invalid SSH public key")
+    parts = public_key.strip().split()
+    if len(parts) < 2:
+        raise PairingRequestError("join request carries an invalid SSH public key")
+    normalized = " ".join(parts[:2])
+    try:
+        from .ssh_keys import ssh_public_key_fingerprint
+
+        ssh_public_key_fingerprint(normalized)
+    except (ImportError, RuntimeError, ValueError) as exc:
+        raise PairingRequestError(
+            "join request carries an invalid SSH public key"
+        ) from exc
+    return normalized
+
+
+def ssh_host_target(address: str) -> str:
+    """Format one validated IP for the existing known_hosts API."""
+
+    raw = str(address).strip()
+    if "%" in raw:
+        raise EnrollmentDriveError(
+            "SSH enrollment requires an address without an IPv6 scope suffix"
+        )
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError as exc:
+        raise EnrollmentDriveError(
+            "SSH enrollment received an invalid address"
+        ) from exc
+    return f"[{parsed}]" if parsed.version == 6 else str(parsed)
+
+
 # --- PairingManager -----------------------------------------------------------
 
 
@@ -724,7 +825,9 @@ class PairingManager:
         identity: dict[str, Any] | None = None,
         key_store: PairingKeyStore | None = None,
         caps_provider: Callable[[], dict[str, Any]] | None = None,
+        address_provider: Callable[[], list[str]] | None = None,
         ssh_key_provider: Callable[[], str | None] | None = None,
+        ssh_host_key_provider: Callable[[], str | None] | None = None,
         enrollment_driver: Callable[[dict[str, Any]], Any] | None = None,
         revocation_driver: Callable[[dict[str, Any]], Any] | None = None,
         http_post: Callable[[str, dict[str, Any], float], Any] | None = None,
@@ -734,7 +837,9 @@ class PairingManager:
     ) -> None:
         self.base_path = Path(base_path) if base_path is not None else DEFAULT_BASE_PATH
         self._identity = (
-            dict(identity) if identity is not None else load_node_identity(self.base_path)
+            dict(identity)
+            if identity is not None
+            else load_node_identity(self.base_path)
         )
         self._devices = _coerce_device_store(registry, self.base_path)
         self._enrollment_store = enrollment_store
@@ -744,7 +849,11 @@ class PairingManager:
             else PairingKeyStore(self.base_path, clock=clock)
         )
         self._caps_provider = caps_provider
+        self._address_provider = address_provider
         self._ssh_key_provider = ssh_key_provider or _local_ssh_public_key
+        self._ssh_host_key_provider = (
+            ssh_host_key_provider or _local_ssh_host_public_key
+        )
         self._enrollment_driver = enrollment_driver or default_enrollment_driver
         self._revocation_driver = revocation_driver or default_revocation_driver
         self._http_post = http_post or _default_http_post
@@ -767,6 +876,48 @@ class PairingManager:
     @property
     def friendly_name(self) -> str:
         return self._identity["friendly_name"]
+
+    def local_addrs(self) -> list[str]:
+        """Validated local IPs included in the peer's approved trust record."""
+
+        if self._address_provider is None:
+            return []
+        try:
+            candidates = self._address_provider()
+        except Exception:
+            return []
+        addresses: list[str] = []
+        for candidate in candidates or []:
+            raw = str(candidate).strip()
+            try:
+                ipaddress.ip_address(raw.split("%", 1)[0])
+            except ValueError:
+                continue
+            normalized = raw
+            if normalized not in addresses:
+                addresses.append(normalized)
+            if len(addresses) >= 8:
+                break
+        return addresses
+
+    def local_ssh_material(self) -> dict[str, Any]:
+        """Complete local trust material the opposite peer must install."""
+
+        addresses = self.local_addrs()
+        if not addresses:
+            raise EnrollmentDriveError(
+                "SSH enrollment requires a verified local address"
+            )
+        return {
+            "node_id": self.node_id,
+            "friendly_name": self.friendly_name,
+            "caps": self._caps_provider() if self._caps_provider else {},
+            "addrs": addresses,
+            "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
+            "ssh_host_public_key": normalize_ssh_public_key(
+                self._ssh_host_key_provider() or ""
+            ),
+        }
 
     def _record_audit(
         self, event: str, *, node_id: str = "", detail: dict[str, Any] | None = None
@@ -797,7 +948,11 @@ class PairingManager:
 
         code = generate_pairing_code()
         now = self._clock()
-        self._local_code = {"code": code, "created_at": now, "expires_at": now + CODE_TTL_SECONDS}
+        self._local_code = {
+            "code": code,
+            "created_at": now,
+            "expires_at": now + CODE_TTL_SECONDS,
+        }
         return {"code": code, "expires_at": self._local_code["expires_at"]}
 
     def build_join_request(self, code: str | None = None) -> dict[str, Any]:
@@ -811,14 +966,27 @@ class PairingManager:
             code = self._local_code["code"]
         validate_pairing_code(code)
         caps = self._caps_provider() if self._caps_provider else {}
+        ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
+        ssh_host_public_key = normalize_ssh_public_key(
+            self._ssh_host_key_provider() or ""
+        )
+        code_salt = secrets.token_bytes(16)
         return {
             "node_id": self.node_id,
             "friendly_name": self.friendly_name,
             "caps": dict(caps),
-            "code_hash": pairing_code_hash(code, self.node_id),
+            "code_hash": pairing_code_hash(
+                code,
+                self.node_id,
+                ssh_public_key,
+                ssh_host_public_key,
+                code_salt,
+            ),
+            "code_salt": base64.b64encode(code_salt).decode("ascii"),
             "http_port": None,
-            "addrs": [],
-            "ssh_public_key": self._ssh_key_provider(),
+            "addrs": self.local_addrs(),
+            "ssh_public_key": ssh_public_key,
+            "ssh_host_public_key": ssh_host_public_key,
         }
 
     def request_join(
@@ -848,7 +1016,9 @@ class PairingManager:
         url = f"http://{coordinator_addr}/api/cluster/pair/status/{self.node_id}"
         return self._http_get(url, timeout)
 
-    def complete_join(self, status: dict[str, Any], code: str | None = None) -> dict[str, Any]:
+    def complete_join(
+        self, status: dict[str, Any], code: str | None = None
+    ) -> dict[str, Any]:
         """Unwrap the approved cluster key and persist the coordinator as paired.
 
         ``status`` is the payload from :meth:`poll_join` (or the loopback
@@ -872,13 +1042,36 @@ class PairingManager:
         coordinator_id = str(coordinator.get("node_id") or "")
         if not coordinator_id:
             raise PairingRequestError("approval status is missing coordinator identity")
+        coordinator_peer = {
+            "node_id": coordinator_id,
+            "friendly_name": coordinator.get("friendly_name", ""),
+            "caps": coordinator.get("caps") or {},
+            "addrs": list(coordinator.get("addrs") or []),
+            "ssh_public_key": coordinator.get("ssh_public_key"),
+            "ssh_host_public_key": coordinator.get("ssh_host_public_key"),
+        }
+        observed_tag = str(status.get("coordinator_identity_tag") or "")
+        expected_tag = coordinator_identity_tag(cluster_key, coordinator_peer)
+        if not hmac.compare_digest(observed_tag, expected_tag):
+            raise PairingCodeError("approval status coordinator identity was altered")
+        try:
+            self._enrollment_driver(coordinator_peer)
+        except Exception as exc:
+            self._record_audit(
+                "join_enrollment_failed",
+                node_id=coordinator_id,
+                detail={"error": str(exc)},
+            )
+            raise EnrollmentDriveError(
+                f"SSH enrollment failed; coordinator was not paired: {exc}"
+            ) from exc
         paired_at = self._clock()
         record = {
             "node_id": coordinator_id,
             "friendly_name": coordinator.get("friendly_name", ""),
             "caps": coordinator.get("caps") or {},
             "paired_at": paired_at,
-            "last_addrs": list(coordinator.get("addrs") or []),
+            "last_addrs": coordinator_peer["addrs"],
             "state": "paired",
             "role": "coordinator",
         }
@@ -888,7 +1081,7 @@ class PairingManager:
             {
                 "cluster_key": cluster_key.hex(),
                 "peer_public_key": coordinator.get("ssh_public_key"),
-                "addrs": list(coordinator.get("addrs") or []),
+                "addrs": coordinator_peer["addrs"],
                 "paired_at": paired_at,
                 "role": "coordinator",
             },
@@ -912,10 +1105,12 @@ class PairingManager:
         node_id = str(payload.get("node_id") or "").strip()
         friendly_name = str(payload.get("friendly_name") or "").strip()
         code_hash = str(payload.get("code_hash") or "").strip()
+        code_salt_encoded = str(payload.get("code_salt") or "").strip()
         caps = payload.get("caps")
         addrs = payload.get("addrs") or []
         http_port = payload.get("http_port")
         ssh_public_key = payload.get("ssh_public_key")
+        ssh_host_public_key = payload.get("ssh_host_public_key")
         if not node_id or len(node_id) > 255:
             raise PairingRequestError("join request is missing a node_id")
         if node_id == self.node_id:
@@ -924,18 +1119,51 @@ class PairingManager:
             raise PairingRequestError("join request is missing a friendly_name")
         if len(code_hash) != 64 or any(c not in "0123456789abcdef" for c in code_hash):
             raise PairingRequestError("join request carries a malformed code_hash")
+        try:
+            code_salt = base64.b64decode(code_salt_encoded, validate=True)
+        except (binascii.Error, ValueError, TypeError) as exc:
+            raise PairingRequestError(
+                "join request carries a malformed code_salt"
+            ) from exc
+        if len(code_salt) != 16:
+            raise PairingRequestError("join request carries a malformed code_salt")
         if not isinstance(caps, dict):
             raise PairingRequestError("join request caps must be an object")
         if not isinstance(addrs, list) or not all(isinstance(a, str) for a in addrs):
             raise PairingRequestError("join request addrs must be a list of strings")
+        normalized_addrs: list[str] = []
+        for address in addrs:
+            raw = address.strip()
+            try:
+                ipaddress.ip_address(raw.split("%", 1)[0])
+            except ValueError as exc:
+                raise PairingRequestError(
+                    "join request carries an invalid peer address"
+                ) from exc
+            if raw not in normalized_addrs:
+                normalized_addrs.append(raw)
         if http_port is not None and not (1 <= int(http_port) <= 65535):
             raise PairingRequestError("join request http_port is out of range")
-        if ssh_public_key is not None and not isinstance(ssh_public_key, str):
-            raise PairingRequestError("join request ssh_public_key must be text")
+        ssh_public_key = normalize_ssh_public_key(ssh_public_key or "")
+        ssh_host_public_key = normalize_ssh_public_key(ssh_host_public_key or "")
 
         with self._lock:
             now = self._clock()
             self._prune_pending(now)
+            existing = self._pending.get(node_id)
+            if existing is not None:
+                same_request = (
+                    hmac.compare_digest(existing.code_hash, code_hash)
+                    and hmac.compare_digest(existing.code_salt, code_salt)
+                    and existing.ssh_public_key == ssh_public_key
+                    and existing.ssh_host_public_key == ssh_host_public_key
+                    and existing.addrs == normalized_addrs[:8]
+                )
+                if same_request:
+                    return existing.to_dict(now)
+                raise PairingStateError(
+                    "a different join request is already pending for this node_id"
+                )
             live = [p for p in self._pending.values() if p.node_id != node_id]
             if len(live) >= MAX_PENDING_REQUESTS:
                 raise PairingRequestError(
@@ -946,9 +1174,11 @@ class PairingManager:
                 friendly_name=friendly_name,
                 caps=dict(caps),
                 code_hash=code_hash,
-                addrs=list(addrs)[:8],
+                code_salt=code_salt,
+                addrs=normalized_addrs[:8],
                 http_port=int(http_port) if http_port is not None else None,
-                ssh_public_key=ssh_public_key[:8192] if ssh_public_key else None,
+                ssh_public_key=ssh_public_key,
+                ssh_host_public_key=ssh_host_public_key,
                 created_at=now,
                 expires_at=now + CODE_TTL_SECONDS,
             )
@@ -967,9 +1197,7 @@ class PairingManager:
         with self._lock:
             now = self._clock()
             self._prune_pending(now)
-            return [
-                self._pending[key].to_dict(now) for key in sorted(self._pending)
-            ]
+            return [self._pending[key].to_dict(now) for key in sorted(self._pending)]
 
     def approve(self, node_id: str, code: str) -> dict[str, Any]:
         """Verify the displayed code, issue the cluster key, enroll the peer.
@@ -1007,14 +1235,22 @@ class PairingManager:
                 # Lockout served: fresh set of attempts, code still valid by TTL.
                 pending.locked_until = None
                 pending.attempts = 0
-            expected = pairing_code_hash(code, node_id)
+            expected = pairing_code_hash(
+                code,
+                node_id,
+                pending.ssh_public_key or "",
+                pending.ssh_host_public_key,
+                pending.code_salt,
+            )
             if not hmac.compare_digest(expected, pending.code_hash):
                 pending.attempts += 1
                 detail = {"attempts": pending.attempts}
                 if pending.attempts >= MAX_CODE_ATTEMPTS:
                     pending.locked_until = now + LOCKOUT_SECONDS
                     detail["locked_until"] = pending.locked_until
-                    self._record_audit("approve_lockout", node_id=node_id, detail=detail)
+                    self._record_audit(
+                        "approve_lockout", node_id=node_id, detail=detail
+                    )
                     raise PairingLockoutError(
                         f"too many wrong codes; locked until {pending.locked_until:.0f}"
                     )
@@ -1024,8 +1260,24 @@ class PairingManager:
                     "attempts left)"
                 )
 
+        try:
+            coordinator_material = self.local_ssh_material()
+        except Exception as exc:
+            self._record_audit(
+                "approve_enrollment_failed",
+                node_id=node_id,
+                detail={"error": str(exc)},
+            )
+            raise EnrollmentDriveError(
+                f"SSH enrollment failed; peer was not paired: {exc}"
+            ) from exc
+
         cluster_key = secrets.token_bytes(CLUSTER_KEY_BYTES)
         package = wrap_cluster_key(cluster_key, code)
+        coordinator_tag = coordinator_identity_tag(
+            cluster_key,
+            coordinator_material,
+        )
 
         peer = {
             "node_id": pending.node_id,
@@ -1034,6 +1286,7 @@ class PairingManager:
             "addrs": list(pending.addrs),
             "http_port": pending.http_port,
             "ssh_public_key": pending.ssh_public_key,
+            "ssh_host_public_key": pending.ssh_host_public_key,
         }
         try:
             enrollment = self._enrollment_driver(peer)
@@ -1063,6 +1316,8 @@ class PairingManager:
                 # The joiner retrieves this package via pair/status and
                 # unwraps it with the code; safe to persist (0600) and serve.
                 "cluster_key_package": package,
+                "coordinator": coordinator_material,
+                "coordinator_identity_tag": coordinator_tag,
                 "peer_public_key": pending.ssh_public_key,
                 "addrs": list(pending.addrs),
                 "paired_at": paired_at,
@@ -1081,13 +1336,8 @@ class PairingManager:
             "state": "paired",
             "paired_at": paired_at,
             "cluster_key_package": package,
-            "coordinator": {
-                "node_id": self.node_id,
-                "friendly_name": self.friendly_name,
-                "caps": self._caps_provider() if self._caps_provider else {},
-                "addrs": [],
-                "ssh_public_key": self._ssh_key_provider(),
-            },
+            "coordinator": coordinator_material,
+            "coordinator_identity_tag": coordinator_tag,
             "enrollment": enrollment,
         }
 
@@ -1127,13 +1377,8 @@ class PairingManager:
                 # Same coordinator block approve() returns: the joiner
                 # persists it via complete_join, so caps/ssh key must ride
                 # here too — the poll path is the only one the UI drives.
-                "coordinator": {
-                    "node_id": self.node_id,
-                    "friendly_name": self.friendly_name,
-                    "caps": self._caps_provider() if self._caps_provider else {},
-                    "addrs": [],
-                    "ssh_public_key": self._ssh_key_provider(),
-                },
+                "coordinator": key_record.get("coordinator") or {},
+                "coordinator_identity_tag": key_record.get("coordinator_identity_tag"),
             }
             package = key_record.get("cluster_key_package")
             if package is not None:

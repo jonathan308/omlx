@@ -7,9 +7,10 @@ happy path wires two real PairingManagers together through their public
 joiner/coordinator APIs.
 """
 
-import hashlib
+import base64
 import json
 import stat
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -22,6 +23,7 @@ from omlx.cluster.pairing import (
     MAX_CODE_ATTEMPTS,
     PBKDF2_ITERATIONS,
     DeviceRegistryBridge,
+    EnrollmentDriveError,
     JsonDeviceStore,
     PairingAuditLog,
     PairingCodeError,
@@ -32,6 +34,7 @@ from omlx.cluster.pairing import (
     PairingManager,
     PairingRequestError,
     PairingStateError,
+    default_enrollment_driver,
     generate_pairing_code,
     pairing_code_hash,
     unwrap_cluster_key,
@@ -88,6 +91,11 @@ class _FakeModuleARegistry:
         return list(self.records.values())
 
 
+def _test_public_key(node_id: str) -> str:
+    payload = base64.b64encode(f"key-{node_id}".encode()).decode()
+    return f"ssh-ed25519 {payload}"
+
+
 def _manager(
     tmp_path,
     *,
@@ -123,7 +131,9 @@ def _manager(
             "schema_version": 1,
         },
         caps_provider=lambda: {"chip": "M4 Max", "ram_gb": 128},
-        ssh_key_provider=lambda: f"ssh-ed25519 AAAA-{node_id}",
+        address_provider=lambda: ["127.0.0.1"],
+        ssh_key_provider=lambda: _test_public_key(node_id),
+        ssh_host_key_provider=lambda: _test_public_key(f"host-{node_id}"),
         enrollment_driver=driver,
         revocation_driver=revocation,
         clock=clock or _Clock(),
@@ -146,7 +156,13 @@ def _loopback_pair(tmp_path):
         driver_calls=driver_calls,
         revocation_calls=revocation_calls,
     )
-    joiner = _manager(tmp_path, node_id="join-node", name="Joiner", clock=joiner_clock)
+    joiner = _manager(
+        tmp_path,
+        node_id="join-node",
+        name="Joiner",
+        clock=joiner_clock,
+        driver_calls=driver_calls,
+    )
 
     def http_post(url, payload, timeout):
         assert url.endswith("/api/cluster/pair/request")
@@ -170,13 +186,24 @@ def test_pairing_code_is_six_digits_with_leading_zeros():
         assert code.isdigit() and len(code) == 6
 
 
-def test_code_hash_matches_spec_blake2s():
+def test_code_hash_authenticates_node_and_ssh_identities():
     code, node_id = "042517", "node-abc"
-    assert pairing_code_hash(code, node_id) == hashlib.blake2s(
-        (code + node_id).encode("utf-8")
-    ).hexdigest()
-    # Bound to the node: a different node_id cannot reuse the hash.
-    assert pairing_code_hash(code, "other") != pairing_code_hash(code, node_id)
+    user_key = _test_public_key(node_id)
+    host_key = _test_public_key(f"host-{node_id}")
+    salt = b"s" * 16
+    digest = pairing_code_hash(code, node_id, user_key, host_key, salt)
+
+    assert len(digest) == 64
+    assert pairing_code_hash(code, "other", user_key, host_key, salt) != digest
+    assert (
+        pairing_code_hash(code, node_id, _test_public_key("other"), host_key, salt)
+        != digest
+    )
+    assert (
+        pairing_code_hash(code, node_id, user_key, _test_public_key("other"), salt)
+        != digest
+    )
+    assert pairing_code_hash(code, node_id, user_key, host_key, b"x" * 16) != digest
 
 
 def test_cluster_key_wrap_round_trip_and_wrong_code_fails_closed():
@@ -231,13 +258,17 @@ def test_two_manager_loopback_happy_path(tmp_path):
     approved = coordinator.approve("join-node", code)
     assert approved["state"] == "paired"
     assert driver_calls and driver_calls[0]["node_id"] == "join-node"
-    assert driver_calls[0]["ssh_public_key"] == "ssh-ed25519 AAAA-join-node"
+    assert driver_calls[0]["ssh_public_key"] == _test_public_key("join-node")
 
     # Joiner polls, unwraps, persists: both sides hold the same cluster key.
     status = joiner.poll_join("coordinator.local:8080")
     assert status["state"] == "approved"
     joined = joiner.complete_join(status)
     assert joined["node_id"] == "coord-node"
+    assert [call["node_id"] for call in driver_calls] == [
+        "join-node",
+        "coord-node",
+    ]
 
     coord_key = coordinator._key_store.get("join-node")["cluster_key"]
     joiner_key = joiner._key_store.get("coord-node")["cluster_key"]
@@ -263,13 +294,15 @@ def test_request_join_without_start_join_fails(tmp_path):
 
 def test_wrong_code_lockout_then_code_dies(tmp_path):
     clock = _Clock()
-    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator", clock=clock)
+    coordinator = _manager(
+        tmp_path, node_id="coord-node", name="Coordinator", clock=clock
+    )
     joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
     code = joiner.start_join()["code"]
     coordinator.handle_join_request(joiner.build_join_request(code))
 
     wrong = "000000" if code != "000000" else "000001"
-    for attempt in range(1, MAX_CODE_ATTEMPTS):
+    for _attempt in range(1, MAX_CODE_ATTEMPTS):
         with pytest.raises(PairingCodeError, match="attempts left"):
             coordinator.approve("join-node", wrong)
     with pytest.raises(PairingLockoutError, match="locked until"):
@@ -297,7 +330,9 @@ def test_attempts_reset_after_lockout_within_code_validity(tmp_path):
     """If a lockout ends while the code is still valid, attempts reset."""
 
     clock = _Clock()
-    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator", clock=clock)
+    coordinator = _manager(
+        tmp_path, node_id="coord-node", name="Coordinator", clock=clock
+    )
     joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
     code = joiner.start_join()["code"]
     coordinator.handle_join_request(joiner.build_join_request(code))
@@ -319,7 +354,9 @@ def test_attempts_reset_after_lockout_within_code_validity(tmp_path):
 
 def test_expired_request_cannot_be_approved(tmp_path):
     clock = _Clock()
-    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator", clock=clock)
+    coordinator = _manager(
+        tmp_path, node_id="coord-node", name="Coordinator", clock=clock
+    )
     joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
     code = joiner.start_join()["code"]
     coordinator.handle_join_request(joiner.build_join_request(code))
@@ -363,7 +400,9 @@ def test_deny_removes_pending_and_is_audited(tmp_path):
 
 
 def test_unpair_revokes_everything(tmp_path):
-    coordinator, joiner, enrollment_store, _, revocation_calls = _loopback_pair(tmp_path)
+    coordinator, joiner, enrollment_store, _, revocation_calls = _loopback_pair(
+        tmp_path
+    )
     code = joiner.start_join()["code"]
     joiner.request_join("coordinator.local:8080")
     coordinator.approve("join-node", code)
@@ -379,8 +418,8 @@ def test_unpair_revokes_everything(tmp_path):
     assert enrollment_store.removed == ["join-node"]
     assert revocation_calls == [
         {
-            "peer_public_key": "ssh-ed25519 AAAA-join-node",
-            "addrs": [],
+            "peer_public_key": _test_public_key("join-node"),
+            "addrs": ["127.0.0.1"],
         }
     ]
     assert coordinator.join_status("join-node")["state"] == "unknown"
@@ -431,6 +470,110 @@ def test_enrollment_failure_does_not_pair(tmp_path):
     assert "approve_enrollment_failed" in coordinator._audit.names()
 
 
+def test_joiner_enrollment_failure_does_not_persist_coordinator(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    joiner._enrollment_driver = lambda _peer: (_ for _ in ()).throw(
+        RuntimeError("host key mismatch")
+    )
+
+    with pytest.raises(EnrollmentDriveError, match="coordinator was not paired"):
+        joiner.complete_join(joiner.poll_join("coordinator.local:8080"))
+
+    assert joiner.paired_devices() == []
+    assert joiner._key_store.get("coord-node") is None
+    assert "join_enrollment_failed" in joiner._audit.names()
+
+
+def test_approval_requires_coordinator_ssh_material(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator._address_provider = lambda: []
+
+    with pytest.raises(EnrollmentDriveError, match="peer was not paired"):
+        coordinator.approve("join-node", code)
+
+    assert coordinator.paired_devices() == []
+    assert [row["node_id"] for row in coordinator.pending_requests()] == ["join-node"]
+
+
+def test_default_enrollment_requires_key_and_verified_address(monkeypatch):
+    from omlx.cluster import ssh_keys
+
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(fingerprint="SHA256:local"),
+    )
+    with pytest.raises(PairingRequestError, match="SSH public key"):
+        default_enrollment_driver({"ssh_public_key": None, "addrs": ["127.0.0.1"]})
+    with pytest.raises(EnrollmentDriveError, match="verified peer address"):
+        default_enrollment_driver(
+            {
+                "ssh_public_key": _test_public_key("peer"),
+                "ssh_host_public_key": _test_public_key("host-peer"),
+                "addrs": [],
+            }
+        )
+
+
+def test_default_enrollment_propagates_host_key_failure(monkeypatch):
+    from omlx.cluster import ssh_keys
+
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(fingerprint="SHA256:local"),
+    )
+    monkeypatch.setattr(ssh_keys, "install_authorized_key", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        ssh_keys,
+        "pin_enrolled_host_key",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("refusing changed SSH host key")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="changed SSH host key"):
+        default_enrollment_driver(
+            {
+                "ssh_public_key": _test_public_key("peer"),
+                "ssh_host_public_key": _test_public_key("host-peer"),
+                "addrs": ["127.0.0.1"],
+            }
+        )
+
+
+def test_default_enrollment_formats_ipv6_known_host_target(monkeypatch):
+    from omlx.cluster import ssh_keys
+
+    targets: list[str] = []
+    monkeypatch.setattr(
+        ssh_keys,
+        "get_or_create_ssh_key",
+        lambda: SimpleNamespace(fingerprint="SHA256:local"),
+    )
+    monkeypatch.setattr(ssh_keys, "install_authorized_key", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        ssh_keys,
+        "pin_enrolled_host_key",
+        lambda *, hostname, public_key: targets.append(hostname) or True,
+    )
+
+    default_enrollment_driver(
+        {
+            "ssh_public_key": _test_public_key("peer"),
+            "ssh_host_public_key": _test_public_key("host-peer"),
+            "addrs": ["::1"],
+        }
+    )
+
+    assert targets == ["[::1]"]
+
+
 # --- Input validation -------------------------------------------------------------
 
 
@@ -444,10 +587,21 @@ def test_join_request_validation(tmp_path):
         coordinator.handle_join_request(good | {"node_id": "coord-node"})
     with pytest.raises(PairingRequestError, match="code_hash"):
         coordinator.handle_join_request(good | {"code_hash": "zz"})
+    with pytest.raises(PairingRequestError, match="code_salt"):
+        coordinator.handle_join_request(good | {"code_salt": "not-base64"})
     with pytest.raises(PairingRequestError, match="friendly_name"):
         coordinator.handle_join_request(good | {"friendly_name": ""})
     with pytest.raises(PairingRequestError, match="caps"):
         coordinator.handle_join_request(good | {"caps": ["not", "a", "dict"]})
+    with pytest.raises(PairingRequestError, match="SSH public key"):
+        coordinator.handle_join_request(
+            good
+            | {
+                "ssh_public_key": (
+                    _test_public_key("join-node") + "\n" + _test_public_key("attacker")
+                )
+            }
+        )
     with pytest.raises(PairingRequestError, match="http_port"):
         coordinator.handle_join_request(good | {"http_port": 70000})
     with pytest.raises(PairingRequestError, match="6 digits"):
@@ -456,7 +610,9 @@ def test_join_request_validation(tmp_path):
 
 def test_pending_requests_are_memory_only_and_capped(tmp_path):
     clock = _Clock()
-    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator", clock=clock)
+    coordinator = _manager(
+        tmp_path, node_id="coord-node", name="Coordinator", clock=clock
+    )
     for index in range(5):
         joiner = _manager(tmp_path, node_id=f"join-{index}", name=f"J{index}")
         code = joiner.start_join()["code"]
@@ -465,6 +621,22 @@ def test_pending_requests_are_memory_only_and_capped(tmp_path):
     # Nothing pending was persisted to devices.json.
     store = JsonDeviceStore(tmp_path / "coord-node")
     assert store.list_paired() == []
+
+
+def test_pending_request_is_idempotent_but_cannot_be_overwritten(tmp_path):
+    coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    joiner.start_join()
+    request = joiner.build_join_request()
+
+    first = coordinator.handle_join_request(request)
+    repeated = coordinator.handle_join_request(dict(request))
+    assert repeated == first
+
+    with pytest.raises(PairingStateError, match="different join request"):
+        coordinator.handle_join_request(
+            request | {"ssh_host_public_key": _test_public_key("attacker-host")}
+        )
 
 
 # --- Persistence ------------------------------------------------------------------
@@ -615,9 +787,14 @@ def _restore_manager_getter():
     pairing_routes.set_pairing_manager_getter(None)
 
 
-def test_endpoints_full_flow(tmp_path):
+def test_endpoints_full_flow(tmp_path, monkeypatch):
     client, manager, _ = _client(tmp_path)
     joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    paired_marks: list[str] = []
+    monkeypatch.setattr(
+        "omlx.cluster.discovery.get_discovery_service",
+        lambda: SimpleNamespace(mark_paired=paired_marks.append),
+    )
     code = joiner.start_join()["code"]
     payload = joiner.build_join_request(code)
 
@@ -644,6 +821,7 @@ def test_endpoints_full_flow(tmp_path):
     )
     assert response.status_code == 200
     assert response.json()["state"] == "paired"
+    assert paired_marks == ["join-node"]
 
     status = client.get("/api/cluster/pair/status/join-node").json()
     assert status["state"] == "approved"
@@ -655,6 +833,37 @@ def test_endpoints_full_flow(tmp_path):
     assert response.status_code == 200
     assert response.json()["unpaired"] is True
     assert client.get("/api/cluster/pair/status/join-node").json()["state"] == "unknown"
+
+
+def test_pair_request_binds_enrollment_to_http_source(tmp_path):
+    captured: list[dict] = []
+
+    class _CaptureManager:
+        @staticmethod
+        def handle_join_request(payload):
+            captured.append(payload)
+            return {"state": "awaiting_approval"}
+
+    pairing_routes.set_pairing_manager_getter(lambda: _CaptureManager())
+    app = FastAPI()
+    app.include_router(pairing_routes.pair_router)
+    client = TestClient(app, client=("198.51.100.23", 50000))
+    payload = {
+        "node_id": "join-node",
+        "friendly_name": "Joiner",
+        "caps": {},
+        "code_hash": "a" * 64,
+        "code_salt": base64.b64encode(b"0" * 16).decode(),
+        "http_port": 8000,
+        "addrs": ["203.0.113.99"],
+        "ssh_public_key": _test_public_key("join-node"),
+        "ssh_host_public_key": _test_public_key("host-join-node"),
+    }
+
+    response = client.post("/api/cluster/pair/request", json=payload)
+
+    assert response.status_code == 202
+    assert captured[0]["addrs"] == ["198.51.100.23"]
 
 
 def test_endpoint_error_mapping(tmp_path):
@@ -707,8 +916,16 @@ def test_request_validation_rejects_bad_payloads(tmp_path):
     joiner.start_join()
     good = joiner.build_join_request()
 
-    assert client.post("/api/cluster/pair/request", json=good | {"code_hash": "x"}).status_code == 422
-    assert client.post("/api/cluster/pair/request", json=good | {"extra": 1}).status_code == 422
+    assert (
+        client.post(
+            "/api/cluster/pair/request", json=good | {"code_hash": "x"}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post("/api/cluster/pair/request", json=good | {"extra": 1}).status_code
+        == 422
+    )
     assert (
         client.post(
             "/api/cluster/pair/approve", json={"node_id": "n", "code": "12345"}
@@ -777,13 +994,32 @@ def test_join_status_carries_coordinator_caps_and_key(tmp_path):
     same caps/ssh key that approve() returns synchronously."""
 
     coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
-    joiner.begin_join("coord:8000")
-    coordinator.approve("join-node", joiner._local_code["code"])
+    shown = joiner.start_join()
+    joiner.request_join("coord:8000")
+    coordinator.approve("join-node", shown["code"])
 
     status = coordinator.join_status("join-node")
     assert status["state"] == "approved"
     assert status["coordinator"]["caps"] == {"chip": "M4 Max", "ram_gb": 128}
-    assert status["coordinator"]["ssh_public_key"] == "ssh-ed25519 AAAA-coord-node"
+    assert status["coordinator"]["ssh_public_key"] == _test_public_key("coord-node")
+    assert status["coordinator"]["ssh_host_public_key"] == _test_public_key(
+        "host-coord-node"
+    )
 
     record = joiner.complete_join(status)
     assert record["caps"] == {"chip": "M4 Max", "ram_gb": 128}
+
+
+def test_join_status_rejects_substituted_coordinator_identity(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.start_join()
+    joiner.request_join("coord:8000")
+    coordinator.approve("join-node", shown["code"])
+    status = coordinator.join_status("join-node")
+    status["coordinator"] = dict(status["coordinator"])
+    status["coordinator"]["ssh_host_public_key"] = _test_public_key("attacker-host")
+
+    with pytest.raises(PairingCodeError, match="identity was altered"):
+        joiner.complete_join(status)
+
+    assert joiner.paired_devices() == []

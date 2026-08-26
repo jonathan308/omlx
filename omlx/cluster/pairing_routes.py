@@ -5,11 +5,11 @@ Two routers, both under ``/api/cluster`` (the v2 surface; the legacy 3-step
 copy-paste endpoints stay untouched under ``/admin/api/cluster`` as
 "Advanced (legacy)"):
 
-* ``pair_router`` — unauthenticated joiner-facing endpoints.  Mounted like
-  ``join_router`` (public but pinned): the pair request carries only
-  ``blake2s(code + node_id)``, and the served cluster key is encrypted under
-  a PBKDF2 key derived from the code, so the admin's approve step remains
-  the sole trust decision.
+* ``pair_router`` — unauthenticated joiner-facing endpoints. The pair request
+  carries a salted PBKDF2 verifier binding the node and both SSH identities,
+  and the coordinator binds enrollment to the HTTP source address. The served
+  cluster key is separately encrypted under a code-derived key, so the admin's
+  approve step remains the sole trust decision.
 * ``pair_admin_router`` — admin-facing approve/deny/unpair.  Mounted with
   ``Depends(require_admin)`` exactly like the existing cluster router.
 
@@ -19,9 +19,10 @@ Both are wired in ``omlx/server.py:_register_cluster_routes``.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from .pairing import (
@@ -32,7 +33,6 @@ from .pairing import (
     PairingExpiredError,
     PairingLockoutError,
     PairingManager,
-    PairingRequestError,
     PairingStateError,
     get_pairing_manager,
 )
@@ -64,9 +64,11 @@ class PairRequestBody(BaseModel):
     friendly_name: str = Field(min_length=1, max_length=255)
     caps: dict[str, Any] = Field(default_factory=dict)
     code_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    code_salt: str = Field(min_length=24, max_length=64)
     http_port: int | None = Field(default=None, ge=1, le=65535)
     addrs: list[str] = Field(default_factory=list, max_length=8)
-    ssh_public_key: str | None = Field(default=None, max_length=8192)
+    ssh_public_key: str = Field(min_length=32, max_length=8192)
+    ssh_host_public_key: str = Field(min_length=32, max_length=8192)
 
 
 class PairApproveBody(BaseModel):
@@ -97,14 +99,22 @@ def _pairing_http_error(exc: PairingError) -> HTTPException:
 
 
 @pair_router.post("/pair/request", status_code=202)
-async def cluster_pair_request(body: PairRequestBody):
+async def cluster_pair_request(body: PairRequestBody, request: Request):
     """Register a joiner's request as awaiting_approval (code never crosses)."""
 
     manager = _manager()
+    payload = body.model_dump()
+    source = request.client.host if request.client is not None else ""
     try:
-        snapshot = await asyncio.to_thread(
-            manager.handle_join_request, body.model_dump()
-        )
+        ipaddress.ip_address(source.split("%", 1)[0])
+    except ValueError:
+        payload["addrs"] = []
+    else:
+        # Never enroll an arbitrary address supplied in the public JSON body.
+        # The HTTP source is the only coordinator-observed endpoint.
+        payload["addrs"] = [source]
+    try:
+        snapshot = await asyncio.to_thread(manager.handle_join_request, payload)
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
     return snapshot
@@ -126,9 +136,17 @@ async def cluster_pair_approve(body: PairApproveBody):
 
     manager = _manager()
     try:
-        return await asyncio.to_thread(manager.approve, body.node_id, body.code)
+        result = await asyncio.to_thread(manager.approve, body.node_id, body.code)
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
+    try:
+        from .discovery import get_discovery_service
+
+        get_discovery_service().mark_paired(body.node_id)
+    except Exception:
+        # Pairing remains authoritative when discovery is disabled or stopped.
+        pass
+    return result
 
 
 @pair_admin_router.post("/pair/deny")
