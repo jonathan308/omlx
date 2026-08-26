@@ -75,12 +75,6 @@ def _prompt_tokens(
     return prefix + (seed * math.ceil(needed / len(seed)))[:needed]
 
 
-def _prefill_call_count(prompt_tokens: int, step: int) -> int:
-    if prompt_tokens < 2 or step < 1:
-        raise ValueError("invalid prompt/step size")
-    return math.ceil((prompt_tokens - 1) / step) + 1
-
-
 def _cache_states(cache: list[Any]) -> list[Any]:
     return [entry.state for entry in cache]
 
