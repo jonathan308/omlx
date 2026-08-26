@@ -125,5 +125,31 @@
       "decode_tokens_per_second_range": [31.281211466886383, 32.641643163073105]
     }
   ],
-  "scope": "standalone full-replica parity and two-request overlap prototype; no HTTP scheduler claim"
+  "integrated_serving": {
+    "commit": "cc29d5fbf47c407eaaff2a69f47a049b17d33173",
+    "public_model": "Qwen3.8-27B-4bit",
+    "serving_mode": "disaggregated",
+    "prefill_rank": 1,
+    "decode_rank": 0,
+    "cold_prompt_tokens": 9410,
+    "cold_completion_tokens": 32,
+    "prefill_compute_average_tokens_per_second": 991.3617555418816,
+    "prefill_headline_tokens_per_second": 966.2581945351149,
+    "decode_tokens_per_second": 29.589626490854403,
+    "cache_tensor_bytes": 770637824,
+    "cache_array_count": 128,
+    "cache_transfer_window": 8,
+    "cache_handoff_seconds": 0.10497087499970803,
+    "cache_handoff_bytes_per_second": 7341444224.430285,
+    "exact_prefix_first_wall_seconds": 12.312,
+    "exact_prefix_repeat_wall_seconds": 1.395,
+    "b4_prompt_tokens_per_request": 2219,
+    "b4_completion_tokens_per_request": 32,
+    "b4_wall_seconds": 10.863,
+    "b4_estimated_speedup_vs_sequential": 1.29,
+    "tool_call_structured_without_marker_leak": true,
+    "unload_reload_canary": true,
+    "runtime_marker_visible": true
+  },
+  "scope": "standalone parity/overlap evidence plus persistent public HTTP serving integration"
 }
