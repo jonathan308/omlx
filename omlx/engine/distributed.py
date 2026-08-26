@@ -18,18 +18,35 @@ import httpx
 
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
-from ..cluster.liveness import check_peers, describe_failure
+from ..cluster.liveness import check_peers, describe_failure, read_marker
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+_request_clock = time.monotonic
 
 # How long one per-rank marker health read stays authoritative. Every request
 # preflights the cluster, so this bounds both the added latency (one SSH read
 # per peer, paid once per window) and how long a half-dead cluster can keep
 # answering 200s before requests start failing cleanly (#2708).
 _PEER_HEALTH_TTL = 10.0
+_MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+
+
+def _valid_transport_request_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > _MAX_TRANSPORT_REQUEST_ID_BYTES:
+        return False
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+    )
+    return all(character in allowed for character in value)
 
 
 def _reasoning_effort_retry_payloads(
@@ -81,13 +98,9 @@ def _reasoning_effort_retry_payloads(
     if candidate is not None and candidate != normalized:
         variants.append(_variant(candidate))
     logger.info(
-        "rank-zero rejected reasoning_effort=%r; retrying with %s, then "
-        "without it",
+        "rank-zero rejected reasoning_effort=%r; retrying with %s, then without it",
         value,
-        [
-            var["chat_template_kwargs"]["reasoning_effort"]
-            for var in variants
-        ],
+        [var["chat_template_kwargs"]["reasoning_effort"] for var in variants],
     )
 
     dropped_kwargs = {
@@ -108,7 +121,7 @@ class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
 
-class DistributedRequestAborted(DistributedInferenceError):
+class DistributedRequestAborted(DistributedInferenceError):  # noqa: N818
     """Raised into a proxied request the coordinator has aborted."""
 
 
@@ -154,6 +167,8 @@ class DistributedBatchedEngine(BatchedEngine):
         cwd: Path | None = None,
         load_timeout: float = 1800.0,
         request_read_timeout: float | None = None,
+        abort_drain_timeout: float = 15.0,
+        orphan_reap_grace: float = 5.0,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -169,6 +184,8 @@ class DistributedBatchedEngine(BatchedEngine):
                 "distributed request read timeout must be a finite positive "
                 f"number, got {request_read_timeout!r}"
             )
+        if abort_drain_timeout < 0 or orphan_reap_grace < 0:
+            raise ValueError("distributed abort timeouts must be non-negative")
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -194,6 +211,10 @@ class DistributedBatchedEngine(BatchedEngine):
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
         self._peer_health_lock = asyncio.Lock()
+        self._abort_drain_timeout = float(abort_drain_timeout)
+        self._orphan_reap_grace = float(orphan_reap_grace)
+        self._request_states: dict[str, _DistributedRequestState] = {}
+        self._next_request_seq = 0
 
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -625,18 +646,24 @@ class DistributedBatchedEngine(BatchedEngine):
             return f"<think>{reasoning_text}</think>{content_text}"
         return content_text
 
-    async def _enter_request(self) -> str:
+    async def _enter_request(self, request_id: str | None = None) -> str:
         async with self._active_lock:
             self._active_requests += 1
             self._next_request_seq += 1
-            request_id = (
-                f"{self.deployment.deployment_id}-{self._next_request_seq}"
-            )
+            if (
+                not _valid_transport_request_id(request_id)
+                or request_id in self._request_states
+            ):
+                request_id = f"{self.deployment.deployment_id}-{self._next_request_seq}"
             self._request_states[request_id] = _DistributedRequestState(
                 request_id,
-                time.monotonic(),
+                _request_clock(),
             )
             return request_id
+
+    @staticmethod
+    def _backend_request_headers(request_id: str) -> dict[str, str]:
+        return {"X-oMLX-Request-ID": request_id}
 
     async def _leave_request(self, request_id: str | None = None) -> None:
         async with self._active_lock:
@@ -659,7 +686,7 @@ class DistributedBatchedEngine(BatchedEngine):
 
         state = self._request_states.get(request_id)
         if state is not None and state.finished_at is None:
-            state.finished_at = time.monotonic()
+            state.finished_at = _request_clock()
 
     def reap_orphaned_generators(
         self,
@@ -681,13 +708,12 @@ class DistributedBatchedEngine(BatchedEngine):
 
         if not self._request_states:
             return 0
-        current = time.monotonic() if now is None else now
+        current = _request_clock() if now is None else now
         limit = self._orphan_reap_grace if grace is None else grace
         stale = [
             request_id
             for request_id, state in self._request_states.items()
-            if state.finished_at is not None
-            and current - state.finished_at >= limit
+            if state.finished_at is not None and current - state.finished_at >= limit
         ]
         for request_id in stale:
             self._request_states.pop(request_id, None)
@@ -816,7 +842,6 @@ class DistributedBatchedEngine(BatchedEngine):
                 return False
             await asyncio.sleep(0.1)
 
-
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -850,6 +875,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -864,15 +890,20 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/chat/completions", json=payload)
+            response = await client.post(
+                "/v1/chat/completions", json=payload, headers=headers
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/chat/completions", json=retry_payload
+                        "/v1/chat/completions",
+                        json=retry_payload,
+                        headers=headers,
                     )
                     if response.status_code < 400:
                         break
@@ -883,6 +914,7 @@ class DistributedBatchedEngine(BatchedEngine):
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -958,6 +990,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._chat_payload(
             messages=messages,
             tools=tools,
@@ -982,7 +1015,8 @@ class DistributedBatchedEngine(BatchedEngine):
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
 
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # A client that always sends an unsupported reasoning_effort must
             # never turn this into an unbounded retry loop: `attempts` is
@@ -993,8 +1027,14 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/chat/completions", json=attempt_payload
+                    "POST",
+                    "/v1/chat/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
+                    state = self._request_state(request_id)
+                    if state is not None:
+                        state.response = response
                     if response.status_code >= 400:
                         await response.aread()
                         if attempt_index == 0:
@@ -1009,6 +1049,7 @@ class DistributedBatchedEngine(BatchedEngine):
                             continue
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
+                        self._raise_if_aborted(request_id)
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
@@ -1087,9 +1128,9 @@ class DistributedBatchedEngine(BatchedEngine):
                                 if isinstance(function.get("name"), str):
                                     target["function"]["name"] += function["name"]
                                 if isinstance(function.get("arguments"), str):
-                                    target["function"]["arguments"] += (
-                                        function["arguments"]
-                                    )
+                                    target["function"]["arguments"] += function[
+                                        "arguments"
+                                    ]
 
                         new_text = ""
                         reasoning = delta.get("reasoning") or delta.get(
@@ -1140,6 +1181,7 @@ class DistributedBatchedEngine(BatchedEngine):
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
@@ -1194,6 +1236,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1207,15 +1250,20 @@ class DistributedBatchedEngine(BatchedEngine):
             stream=False,
             kwargs=kwargs,
         )
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         started_at = time.monotonic()
         try:
-            response = await client.post("/v1/completions", json=payload)
+            response = await client.post(
+                "/v1/completions", json=payload, headers=headers
+            )
             if response.status_code >= 400:
                 detail = self._backend_error_detail(response)
                 for retry_payload in _reasoning_effort_retry_payloads(payload, detail):
                     response = await client.post(
-                        "/v1/completions", json=retry_payload
+                        "/v1/completions",
+                        json=retry_payload,
+                        headers=headers,
                     )
                     if response.status_code < 400:
                         break
@@ -1226,6 +1274,7 @@ class DistributedBatchedEngine(BatchedEngine):
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=False) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=False,
@@ -1274,6 +1323,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if not self._loaded:
             await self.start()
         client = self._ensure_available()
+        requested_id = kwargs.pop("_request_id", None)
         payload = self._completion_payload(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -1296,7 +1346,8 @@ class DistributedBatchedEngine(BatchedEngine):
         first_token_at: float | None = None
         request_started_at = time.monotonic()
 
-        request_id = await self._enter_request()
+        request_id = await self._enter_request(requested_id)
+        headers = self._backend_request_headers(request_id)
         try:
             # See stream_chat for the retry-bound rationale.
             attempts = [payload]
@@ -1304,8 +1355,14 @@ class DistributedBatchedEngine(BatchedEngine):
             while True:
                 attempt_payload = attempts[attempt_index]
                 async with client.stream(
-                    "POST", "/v1/completions", json=attempt_payload
+                    "POST",
+                    "/v1/completions",
+                    json=attempt_payload,
+                    headers=headers,
                 ) as response:
+                    state = self._request_state(request_id)
+                    if state is not None:
+                        state.response = response
                     if response.status_code >= 400:
                         await response.aread()
                         if attempt_index == 0:
@@ -1320,6 +1377,7 @@ class DistributedBatchedEngine(BatchedEngine):
                             continue
                         self._raise_for_backend(response)
                     async for line in response.aiter_lines():
+                        self._raise_if_aborted(request_id)
                         if not line.startswith("data:"):
                             continue
                         data = line.removeprefix("data:").strip()
@@ -1402,6 +1460,7 @@ class DistributedBatchedEngine(BatchedEngine):
             self._cancel_backend_after_timeout(request_id)
             raise self._read_timeout_error(stream=True) from exc
         except httpx.HTTPError as exc:
+            self._raise_if_aborted(request_id)
             raise await self._transport_failure_error(
                 exc,
                 stream=True,
@@ -1531,9 +1590,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
             async with self._peer_health_lock:
                 cached = self._peer_health
-                if cached is None or (
-                    time.monotonic() - cached[0] >= _PEER_HEALTH_TTL
-                ):
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
                     hosts_by_rank = {
                         rank: (host.node_id, host.ssh)
                         for rank, host in enumerate(self.deployment.hosts)
@@ -1560,9 +1617,7 @@ class DistributedBatchedEngine(BatchedEngine):
                         )
                     self._peer_health = cached
         if not cached[1]:
-            raise DistributedInferenceError(
-                f"cluster is not serving: {cached[2]}"
-            )
+            raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
 
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)

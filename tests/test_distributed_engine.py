@@ -2,7 +2,6 @@
 
 import json
 import tempfile
-import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -877,9 +876,7 @@ def test_reasoning_effort_retry_payloads_ignores_when_not_requested():
 
     payload = {"chat_template_kwargs": {}}
     assert (
-        _reasoning_effort_retry_payloads(
-            payload, "Unexpected reasoning effort high."
-        )
+        _reasoning_effort_retry_payloads(payload, "Unexpected reasoning effort high.")
         == []
     )
 
@@ -905,7 +902,10 @@ async def test_distributed_chat_retries_unsupported_reasoning_effort():
             200,
             json={
                 "choices": [
-                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
                 ],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
