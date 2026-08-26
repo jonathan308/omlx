@@ -496,6 +496,125 @@ def _sweep_rank_processes(
     return failures
 
 
+def stop_deployment_processes(
+    deployment: ClusterDeployment,
+    *,
+    state_dir: str | Path = "~/.omlx/cluster/runtime",
+    kill_grace: float = 3.0,
+    runner: SSHRunner = subprocess.run,
+) -> dict[str, Any]:
+    """Stop and prove exit of one deployment without trusting pool ownership.
+
+    The normal engine path owns a :class:`DistributedJobSupervisor`, but an
+    admin unload can arrive after that Python object was lost while its local
+    or SSH-launched rank still owns unified memory.  This deployment-scoped
+    backstop verifies the persisted launcher identity, terminates its process
+    group when present, sweeps exact worker argv/marker PIDs on every signed
+    host, and returns only after the final process-table checks pass.
+    """
+
+    manifest_path = _launch_manifest_path(state_dir, deployment.deployment_id)
+    manifest = _read_launch_manifest(manifest_path) if manifest_path.exists() else None
+    failures: list[str] = []
+    process_group: int | None = None
+    if manifest_path.exists() and manifest is None:
+        failures.append("launch manifest is unreadable; refusing unverified unload")
+    elif manifest is not None:
+        if (
+            manifest.get("deployment_id") != deployment.deployment_id
+            or manifest.get("plan_hash") not in {None, deployment.plan_hash}
+        ):
+            failures.append("launch manifest identity does not match deployment")
+        else:
+            candidate_group = int(manifest["process_group"])
+            if _process_group_alive(candidate_group):
+                processes, process_error = _read_local_process_table()
+                if processes is None:
+                    failures.append(process_error)
+                else:
+                    members = tuple(
+                        process
+                        for process in processes
+                        if process.process_group == candidate_group
+                        and not process.zombie
+                    )
+                    foreign = tuple(
+                        process
+                        for process in members
+                        if not _belongs_to_launch(
+                            process,
+                            deployment_id=deployment.deployment_id,
+                        )
+                    )
+                    if foreign:
+                        identities = ", ".join(
+                            f"pid {process.pid} state {process.status!r}"
+                            for process in foreign[:4]
+                        )
+                        failures.append(
+                            "launch process-group identity changed "
+                            f"({identities}); refusing to signal a reused PGID"
+                        )
+                    elif members:
+                        process_group = candidate_group
+                        with suppress(ProcessLookupError):
+                            os.killpg(candidate_group, signal.SIGTERM)
+                        group_gone = _wait_for_process_group_exit(
+                            candidate_group,
+                            max(0.0, kill_grace),
+                        )
+                        if not group_gone:
+                            with suppress(ProcessLookupError):
+                                os.killpg(candidate_group, signal.SIGKILL)
+                            group_gone = _wait_for_process_group_exit(
+                                candidate_group,
+                                2.0,
+                            )
+                        if not group_gone:
+                            failures.append(
+                                f"process group {candidate_group} survived unload"
+                            )
+
+    hosts = [
+        {"rank": rank, "node_id": host.node_id, "ssh": host.ssh}
+        for rank, host in enumerate(deployment.hosts)
+    ]
+    failures.extend(
+        _sweep_rank_processes(
+            deployment.deployment_id,
+            hosts,
+            state_dir=state_dir,
+            plan_hash=deployment.plan_hash,
+            process_group=process_group,
+            kill_grace=kill_grace,
+            runner=runner,
+        )
+    )
+    failures = list(dict.fromkeys(failures))
+    if failures:
+        detail = "; ".join(failures)
+        if any("survived" in item for item in failures):
+            detail += f". {_REBOOT_REQUIRED_GUIDANCE}"
+        raise DistributedTeardownError(
+            f"distributed unload of {deployment.deployment_id} could not be "
+            f"verified: {detail}"
+        )
+    if manifest_path.exists():
+        try:
+            manifest_path.unlink()
+        except OSError as exc:
+            raise DistributedTeardownError(
+                "rank exit was verified but the launch manifest could not be "
+                f"retired: {exc}"
+            ) from exc
+    return {
+        "verified": True,
+        "deployment_id": deployment.deployment_id,
+        "ranks_checked": len(hosts),
+        "manifest_retired": manifest is not None,
+    }
+
+
 def reap_orphaned_launches(
     state_dir: str | Path = "~/.omlx/cluster/runtime",
     *,
