@@ -293,12 +293,6 @@ def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
     )
 
 
-def _launcher_log_path(state_dir: str | Path, deployment_id: str) -> Path:
-    """Private, durable output from every rank relayed by ``mlx.launch``."""
-
-    return Path(state_dir).expanduser() / f"{deployment_id}-launcher.log"
-
-
 def _serve_release_path(state_dir: str | Path, deployment_id: str) -> Path:
     """Coordinator-owned gate that releases loaded ranks into serving."""
 
