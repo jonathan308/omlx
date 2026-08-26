@@ -77,10 +77,7 @@ def _wait_for_serve_release(
     them and atomically writes this local release marker on every host.
     """
 
-    path = (
-        Path(state_dir).expanduser()
-        / f"{deployment_id}-serve.json"
-    )
+    path = Path(state_dir).expanduser() / f"{deployment_id}-serve.json"
     deadline = float(clock()) + max(0.0, float(timeout))
     while True:
         try:
@@ -628,9 +625,7 @@ def _write_cancel_request(
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"{deployment_id}-cancel.json"
         temporary = path.with_name(path.name + ".tmp")
-        descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-        )
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, sort_keys=True)
         os.replace(temporary, path)
@@ -798,9 +793,7 @@ def _start_peer_watchdog(
             plan_hash=marker.payload.get("plan_hash"),
         )
 
-    abort_grace = float(
-        os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0
-    )
+    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,

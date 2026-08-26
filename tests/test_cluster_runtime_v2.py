@@ -101,8 +101,11 @@ def test_backend_selection_endpoint():
         "/admin/api/cluster/backend-selection",
         json={
             "members": [
-                {"node_id": "studio", "rdma_ctl_enabled": True,
-                 "rdma_devices": ["rdma_en5"]},
+                {
+                    "node_id": "studio",
+                    "rdma_ctl_enabled": True,
+                    "rdma_devices": ["rdma_en5"],
+                },
                 {"node_id": "macbook", "rdma_ctl_enabled": False},
             ]
         },
@@ -120,10 +123,16 @@ def test_backend_selection_endpoint_all_rdma_picks_jaccl():
         "/admin/api/cluster/backend-selection",
         json={
             "members": [
-                {"node_id": "a", "rdma_ctl_enabled": True,
-                 "rdma_devices": ["rdma_en1"]},
-                {"node_id": "b", "rdma_ctl_enabled": True,
-                 "rdma_devices": ["rdma_en5"]},
+                {
+                    "node_id": "a",
+                    "rdma_ctl_enabled": True,
+                    "rdma_devices": ["rdma_en1"],
+                },
+                {
+                    "node_id": "b",
+                    "rdma_ctl_enabled": True,
+                    "rdma_devices": ["rdma_en5"],
+                },
             ]
         },
     )
@@ -164,10 +173,18 @@ def test_replan_auto_selects_jaccl_from_complete_matrix(tmp_path, monkeypatch):
         {"node_id": "small", "capacity_bytes": 60, "reserve_bytes": 10},
     ]
     hosts = [
-        {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"],
-         "rdma": [None, "rdma_en5"]},
-        {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"],
-         "rdma": ["rdma_en5", None]},
+        {
+            "node_id": "large",
+            "ssh": "127.0.0.1",
+            "ips": ["192.168.5.1"],
+            "rdma": [None, "rdma_en5"],
+        },
+        {
+            "node_id": "small",
+            "ssh": "studio.local",
+            "ips": ["192.168.5.2"],
+            "rdma": ["rdma_en5", None],
+        },
     ]
 
     response = _client().post(
@@ -204,8 +221,7 @@ def test_replan_auto_falls_back_to_ring(tmp_path, monkeypatch):
             ],
             "hosts": [
                 {"node_id": "large", "ssh": "127.0.0.1", "ips": ["192.168.5.1"]},
-                {"node_id": "small", "ssh": "studio.local",
-                 "ips": ["192.168.5.2"]},
+                {"node_id": "small", "ssh": "studio.local", "ips": ["192.168.5.2"]},
             ],
         },
     )
@@ -384,14 +400,10 @@ def test_ring_teardown_reports_unkillable_leftover_rank(monkeypatch):
     monkeypatch.setattr(
         launch,
         "_sweep_rank_processes",
-        lambda *args, **kwargs: [
-            "rank 2 (mini): pid 999 survived SIGKILL"
-        ],
+        lambda *args, **kwargs: ["rank 2 (mini): pid 999 survived SIGKILL"],
     )
 
-    with pytest.raises(
-        launch.DistributedTeardownError, match="rank 2 \\(mini\\)"
-    ):
+    with pytest.raises(launch.DistributedTeardownError, match="rank 2 \\(mini\\)"):
         supervisor.stop()
 
     assert supervisor.process is not None
