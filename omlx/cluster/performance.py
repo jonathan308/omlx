@@ -439,19 +439,22 @@ def tune_execution_settings(
     evicts. The next request then starts at different token offsets and blocks
     forever in the first unmatched collective.
 
-    Disable byte-based eviction, but retain one deterministic cache slot per
-    admitted prompt.  The sequence-count policy is rank-symmetric because all
-    ranks see the same ordered request stream.  Collapsing it to one slot made
-    two active conversations evict one another on every turn, paying a full
-    prefill tax despite the advertised prompt concurrency.  This correctness
-    invariant applies even when the user disables the other automatic tuning.
+    Disable byte-based eviction, but retain the profile's deterministic entry
+    budget.  The sequence-count policy is rank-symmetric because all ranks see
+    the same ordered request stream.  MLX-LM may retain system, user and
+    assistant segment boundaries separately, so one slot per admitted prompt
+    is still too small: two active conversations can consume more than four
+    entries.  Collapsing the cache to one slot made every alternating turn pay
+    a full prefill tax despite the advertised prompt concurrency.  This
+    correctness invariant applies even when the user disables the other
+    automatic tuning.
     """
 
-    def synchronized_cache(prompt_limit: int) -> dict[str, int | None]:
+    def synchronized_cache(entry_limit: int) -> dict[str, int | None]:
         return {
             "prompt_cache_size": max(
                 1,
-                min(settings.prompt_cache_size, prompt_limit),
+                min(settings.prompt_cache_size, entry_limit),
             ),
             # Unequal pipeline stages hold different byte counts for the same
             # logical prefix. A per-rank byte LRU can therefore evict different
@@ -462,7 +465,7 @@ def tune_execution_settings(
     if not settings.auto_tune or not assignments:
         return replace(
             settings,
-            **synchronized_cache(settings.prompt_concurrency),
+            **synchronized_cache(settings.prompt_cache_size),
             tuning_reason=(
                 f"{settings.tuning_reason}; synchronized count-bounded prompt cache"
             ),
@@ -492,6 +495,7 @@ def tune_execution_settings(
     decode = min(settings.decode_concurrency, caps[0])
     prompt = min(settings.prompt_concurrency, caps[1], decode)
     prefill = min(settings.prefill_step_size, caps[2])
+    prompt_cache_size = min(settings.prompt_cache_size, caps[3])
     microbatch = min(settings.pipeline_microbatch_size, caps[4], decode)
     connections = settings.ring_connections_per_ip if backend == "ring" else 1
     return replace(
@@ -499,7 +503,7 @@ def tune_execution_settings(
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache(prompt),
+        **synchronized_cache(prompt_cache_size),
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(

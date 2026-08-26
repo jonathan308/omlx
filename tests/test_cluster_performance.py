@@ -171,14 +171,14 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_concurrency == 1
     assert tuned.prefill_step_size == 512
     assert tuned.pipeline_microbatch_size == 1
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 2
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
     assert "synchronized count-bounded prompt cache" in tuned.tuning_reason
 
 
-def test_execution_tuner_retains_one_cache_slot_per_concurrent_prompt():
+def test_execution_tuner_retains_profile_cache_entries_for_prompt_segments():
     settings = execution_profile("balanced")
     assignments = [
         SimpleNamespace(headroom_bytes=32 * 1024**3),
@@ -188,7 +188,7 @@ def test_execution_tuner_retains_one_cache_slot_per_concurrent_prompt():
     tuned = tune_execution_settings(settings, assignments, backend="jaccl")
 
     assert tuned.prompt_concurrency == 4
-    assert tuned.prompt_cache_size == 4
+    assert tuned.prompt_cache_size == 8
     assert tuned.prompt_cache_bytes is None
 
 
@@ -244,7 +244,7 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     )
 
     assert tuned.decode_concurrency == settings.decode_concurrency
-    assert tuned.prompt_cache_size == settings.prompt_concurrency
+    assert tuned.prompt_cache_size == settings.prompt_cache_size
     assert tuned.prompt_cache_bytes is None
     assert "synchronized count-bounded prompt cache" in tuned.tuning_reason
 
