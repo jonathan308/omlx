@@ -2699,6 +2699,7 @@ def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
     loaded_deployments: set[str] = set()
     loading_deployments: set[str] = set()
     launchers: list[dict[str, Any]] = []
+    live_metrics: dict[str, dict[str, Any]] = {}
 
     get_loaded = getattr(pool, "get_loaded_model_ids", None)
     loaded_ids = get_loaded() if callable(get_loaded) else []
@@ -2714,6 +2715,16 @@ def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
         deployment_id = launcher.get("deployment_id")
         if isinstance(deployment_id, str) and deployment_id:
             loaded_deployments.add(deployment_id)
+            get_live_metrics = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live_metrics):
+                try:
+                    snapshot = get_live_metrics()
+                except Exception:  # noqa: BLE001
+                    snapshot = None
+                if isinstance(snapshot, dict) and isinstance(
+                    snapshot.get("metrics"), dict
+                ):
+                    live_metrics[deployment_id] = snapshot["metrics"]
         launchers.append(launcher)
 
     get_model_ids = getattr(pool, "get_model_ids", None)
@@ -2736,6 +2747,11 @@ def _reconcile_runtime_ownership(payload: dict[str, Any], pool: Any) -> None:
         deployment_id = job.get("deployment_id")
         if deployment_id in loaded_deployments:
             job["ownership"] = "loaded"
+            if "metrics" not in job and deployment_id in live_metrics:
+                # A reversed Phase split hosts decode telemetry on the peer.
+                # Mirror the already-validated engine snapshot onto the local
+                # coordinator row so the dashboard keeps end-to-end rates.
+                job["metrics"] = live_metrics[deployment_id]
         elif deployment_id in loading_deployments:
             job["ownership"] = "loading"
         else:

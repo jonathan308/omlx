@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
@@ -251,11 +251,6 @@ def build_full_replica_shard_plan(
     if len(nodes) != 2 or {prefill_rank, decode_rank} != {0, 1}:
         raise PlanningError(
             "disaggregated serving requires two distinct phase ranks"
-        )
-    if (prefill_rank, decode_rank) != (1, 0):
-        raise PlanningError(
-            "persistent phase-split serving currently requires rank 0 decode "
-            "and rank 1 prefill"
         )
     layer_weights = tuple(int(value) for value in model.layer_weight_bytes)
     if not layer_weights:
