@@ -391,6 +391,7 @@ function clusterV2Wizard() {
                 const payload = await this.apiFetch(CLUSTER_V2_API.deployments);
                 this.deploymentsPayload = payload?.deployments || [];
                 this.deploymentsLoaded = true;
+                this.ensureColdModelSelection();
             } catch (error) {
                 // Deployments are the pre-existing API; a failure here should
                 // not tear down the discovery UI, just surface a toast once.
@@ -409,6 +410,7 @@ function clusterV2Wizard() {
                 this.runtimePayload = payload || { jobs: [], launchers: [] };
                 this.runtimeLoaded = true;
                 this.runtimeError = '';
+                this.ensureColdModelSelection();
             } catch (error) {
                 // Fail closed. A previous ready snapshot must never remain green
                 // when the ownership endpoint can no longer prove residency.
@@ -581,7 +583,26 @@ function clusterV2Wizard() {
                         ? deploymentForId(launcher.deployment_id)
                         : null;
                 })();
-            return loading || deployments[0];
+            // Once runtime ownership is known, a durable-but-cold setup is not
+            // an active deployment. Present the model picker instead of
+            // arbitrarily choosing the first registry row (which may be an old
+            // DS4 plan while Qwen was the model the user just unloaded).
+            return loading || (this.runtimeLoaded ? null : deployments[0]);
+        },
+
+        ensureColdModelSelection() {
+            if (
+                !this.runtimeLoaded ||
+                !this.deploymentsLoaded ||
+                !this.deploymentsPayload.length ||
+                this.configuredDeployment() ||
+                this.stage === 'plan' ||
+                !this.pairedDevices().length
+            ) {
+                return;
+            }
+            this.resetModelPicker();
+            this.enterPlan();
         },
 
         deploymentRuntimeJobs(deployment = this.configuredDeployment()) {
@@ -3059,6 +3080,7 @@ function clusterV2Wizard() {
             }
             this.confirmUnloadFor = '';
             this.clusterLifecycleBusy = true;
+            this.hydratePlannerFromDeployment(deployment);
             try {
                 await this.apiFetch(CLUSTER_V2_API.deploymentUnload(id), {
                     method: 'POST',
