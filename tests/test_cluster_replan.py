@@ -82,6 +82,9 @@ def _approval_for(payload):
             nodes=payload["nodes"],
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
+            serving_mode=payload.get("serving_mode", "sharded"),
+            prefill_rank=payload.get("prefill_rank"),
+            decode_rank=payload.get("decode_rank"),
             target_context_tokens=payload.get("target_context_tokens", 8192),
             prompt_cache_ssd=payload.get("prompt_cache_ssd"),
         )
@@ -322,6 +325,38 @@ def test_replan_snapshot_toggle_is_signed_and_forces_reload(active_deployment):
     assert applied.status_code == 200, applied.json()
     assert active_deployment.pool.reloads == 2
     assert active_deployment.pool.entry.engine.deployment.execution.prompt_cache_ssd
+
+
+def test_replan_preserves_disaggregated_phase_ownership(tmp_path, monkeypatch):
+    configure_cluster_registry(tmp_path)
+    model_path = tmp_path / "models" / "phase-model"
+    model_path.mkdir(parents=True)
+    _install_layout(monkeypatch)
+    pool = _RecordingPool(model_path)
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+
+    body = _deployment_payload(model_path, capacity_large=100, capacity_small=100)
+    body.update(
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+    )
+    body["approved_placement"] = _approval_for(body)
+    activation = _client().post("/admin/api/cluster/deployments", json=body)
+    assert activation.status_code == 200, activation.json()
+
+    deployment_id = activation.json()["deployment"]["deployment_id"]
+    preview = _client().post(
+        "/admin/api/cluster/replan",
+        json={"deployment_id": deployment_id, "execution_profile": "throughput"},
+    )
+
+    assert preview.status_code == 200, preview.json()
+    plan = preview.json()["plan"]
+    assert plan["serving_mode"] == "disaggregated"
+    assert plan["prefill_rank"] == 1
+    assert plan["decode_rank"] == 0
+    assert all(item["start_layer"] == 0 for item in plan["assignments"])
 
 
 def test_replan_carries_path_map_forward(tmp_path, monkeypatch):
