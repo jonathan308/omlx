@@ -76,8 +76,7 @@ def hosts_from_deployment(deployment: ClusterDeployment) -> list[dict[str, Any]]
             "ssh": host.ssh,
             "ips": list(host.ips),
             "rdma": [
-                list(path) if isinstance(path, tuple) else path
-                for path in host.rdma
+                list(path) if isinstance(path, tuple) else path for path in host.rdma
             ],
         }
         if host.python_executable:
@@ -105,9 +104,7 @@ def summarize_deployment(deployment: ClusterDeployment) -> dict[str, Any]:
                 "planned_weight_bytes": assignment.planned_weight_bytes,
                 "kv_cache_bytes": assignment.kv_cache_bytes,
             }
-            for assignment in sorted(
-                deployment.assignments, key=lambda item: item.rank
-            )
+            for assignment in sorted(deployment.assignments, key=lambda item: item.rank)
         ],
     }
 
@@ -121,7 +118,5 @@ def placement_view(deployment: ClusterDeployment) -> dict[str, Any]:
     """
 
     return {
-        "assignments": [
-            assignment.to_dict() for assignment in deployment.assignments
-        ]
+        "assignments": [assignment.to_dict() for assignment in deployment.assignments]
     }

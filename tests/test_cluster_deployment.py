@@ -159,6 +159,7 @@ def test_deployment_round_trip_preserves_tensor_parallel_size():
     import base64
     import json
     import zlib
+
     compressed = base64.b64decode(encoded, altchars=b"-_")
     raw = zlib.decompress(compressed)
     payload = json.loads(raw)
@@ -360,9 +361,7 @@ def test_the_role_survives_the_worker_plan_and_the_registry_file():
     )
 
     # The registry writes and reloads this.
-    restored = ClusterDeployment.from_dict(
-        json.loads(json.dumps(deployment.to_dict()))
-    )
+    restored = ClusterDeployment.from_dict(json.loads(json.dumps(deployment.to_dict())))
     # The rank decodes this.
     _hash, decoded = decode_worker_plan(deployment.encode_worker_plan())
 
