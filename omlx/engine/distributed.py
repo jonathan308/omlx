@@ -219,7 +219,30 @@ class DistributedBatchedEngine(BatchedEngine):
         self._request_states: dict[str, _DistributedRequestState] = {}
         self._next_request_seq = 0
         self._last_cancel_epoch = 0
+        self._runtime_failed_reason: str | None = None
 
+    @property
+    def runtime_failed_reason(self) -> str | None:
+        """Terminal worker failure observed by the coordinator, if any."""
+
+        if self._runtime_failed_reason is None and self._loaded:
+            status = self._supervisor.status()
+            reason = status.failure_reason
+            if reason is None and status.returncode is not None:
+                reason = f"distributed job exited with code {status.returncode}"
+            if reason:
+                self._mark_runtime_failed(reason)
+        return self._runtime_failed_reason
+
+    def _mark_runtime_failed(self, reason: str) -> None:
+        reason = str(reason).strip()[:2000] or "distributed worker stopped"
+        if self._runtime_failed_reason is None:
+            self._runtime_failed_reason = reason
+            logger.error(
+                "Distributed runtime is no longer serviceable (%s): %s",
+                self.deployment.deployment_id,
+                reason,
+            )
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=endpoint,
@@ -258,6 +281,7 @@ class DistributedBatchedEngine(BatchedEngine):
         if self._loaded:
             return
         self._validate_model_settings()
+        self._runtime_failed_reason = None
 
         # Tokenizer/config metadata stays in the oMLX process. No model weights
         # are loaded here.
@@ -354,6 +378,9 @@ class DistributedBatchedEngine(BatchedEngine):
             if tail and tail not in detail:
                 detail = f"{detail} · Worker log: {tail}" if detail else tail
             suffix = f": {detail}" if detail else ""
+            self._mark_runtime_failed(
+                detail or f"distributed job exited with code {status.returncode}"
+            )
             raise DistributedInferenceError(
                 f"distributed job exited with code {status.returncode}{suffix}"
             )

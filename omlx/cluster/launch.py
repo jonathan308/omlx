@@ -52,6 +52,13 @@ _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+_LAUNCHER_RANK_EXIT_RE = re.compile(
+    r"Node with rank\s+(?P<rank>\d+)\s+exited with code\s+(?P<code>-?\d+)"
+)
+_JACCL_NO_PROGRESS_RE = re.compile(
+    r"\[jaccl\]\s+(?P<reason>[^\r\n]*made no progress[^\r\n]*)",
+    re.IGNORECASE,
+)
 _REBOOT_REQUIRED_GUIDANCE = (
     "A distributed rank survived SIGKILL and may be stuck in the macOS "
     "Metal driver. Reboot this Mac before starting another distributed launch."
