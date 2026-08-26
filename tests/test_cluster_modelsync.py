@@ -262,14 +262,14 @@ def test_path_map_validation():
     assert validate_model_path_map({"a": "/m"}, ("a",)) == {"a": "/m"}
 
 
-def test_deployment_v2_round_trip_preserves_path_map():
+def test_current_deployment_round_trip_preserves_path_map():
     deployment = _deployment(path_map={"peer": "/Volumes/models/copy"})
 
     restored = ClusterDeployment.from_dict(deployment.to_dict())
 
     assert restored == deployment
     assert restored.path_map == {"peer": "/Volumes/models/copy"}
-    assert deployment.to_dict()["schema_version"] == 2
+    assert deployment.to_dict()["schema_version"] == 3
 
 
 def test_legacy_v1_deployment_decodes_without_path_map():
@@ -386,11 +386,11 @@ def test_legacy_deployments_json_migrates_on_load(tmp_path):
     assert loaded.path_map == {}
     assert loaded.model_path_for("peer") == str(model)
     assert registry.migrated_from == 1
-    # The upgrade is persisted: the file now carries schema v2 and an
-    # explicit (empty) path_map, at the same private permissions.
+    # The registry remains schema v2 while each upgraded deployment now carries
+    # schema v3 (signed phase ownership) and an explicit empty path_map.
     on_disk = json.loads(path.read_text())
     assert on_disk["schema_version"] == 2
-    assert on_disk["deployments"][0]["schema_version"] == 2
+    assert on_disk["deployments"][0]["schema_version"] == 3
     assert on_disk["deployments"][0]["path_map"] == {}
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     # A v2 file loads cleanly on the next start, with no migration flagged.
