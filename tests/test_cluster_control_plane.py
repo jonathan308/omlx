@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reliable TCP control plane kept independent of MLX/JACCL collectives."""
 
+import pickle
 import socket
 import struct
 import threading
+import zlib
 
 import pytest
 
@@ -138,21 +140,58 @@ def test_worker_requires_a_valid_coordinator_acknowledgement():
             ready.set()
             stream, _ = listener.accept()
             with stream:
-                stream.recv(struct.calcsize("!4sII64s"))
-                stream.sendall(struct.pack("!4sI", b"NOPE", 1))
+                challenge = b"q" * 32
+                stream.sendall(struct.pack("!4sI32s", b"OC2C", 1, challenge))
+                handshake = stream.recv(struct.calcsize("!4sII32s"))
+                assert b"c" * 64 not in handshake
+                stream.sendall(struct.pack("!4sI32s", b"NOPE", 1, b"\0" * 32))
 
     thread = threading.Thread(target=fake_coordinator)
     thread.start()
     assert ready.wait(2)
-    with pytest.raises(RuntimeError, match="not acknowledged"), RankControlPlane(
-        rank=1,
-        world_size=2,
-        host="127.0.0.1",
-        port=port,
-        token="c" * 64,
-        connect_timeout=2,
-        io_timeout=2,
+    with (
+        pytest.raises(RuntimeError, match="not acknowledged"),
+        RankControlPlane(
+            rank=1,
+            world_size=2,
+            host="127.0.0.1",
+            port=port,
+            token="c" * 64,
+            connect_timeout=2,
+            io_timeout=2,
+        ),
     ):
         pass
     thread.join(2)
     assert not thread.is_alive()
+
+
+def test_worker_authenticates_payload_before_unpickling():
+    sender, receiver = socket.socketpair()
+    control = RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="127.0.0.1",
+        port=12345,
+        token="d" * 64,
+    )
+    control._stream = receiver
+    payload = pickle.dumps({"unsafe": "payload"})
+    sender.sendall(
+        struct.pack(
+            "!4sIIII32s",
+            b"OC2M",
+            1,
+            1,
+            len(payload),
+            zlib.crc32(payload),
+            b"\0" * 32,
+        )
+        + payload
+    )
+    try:
+        with pytest.raises(RuntimeError, match="authentication"):
+            control.broadcast_object(None)
+    finally:
+        sender.close()
+        control.close()
