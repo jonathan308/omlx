@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -58,6 +60,80 @@ from .auth import (
 logger = logging.getLogger(__name__)
 
 PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
+
+
+def _clear_cold_remote_cluster_cache_roots(
+    roots: tuple[Path, ...],
+    *,
+    runner: Any = subprocess.run,
+) -> tuple[int, int]:
+    """Remove unloaded cluster snapshots from every configured peer Mac.
+
+    Loaded ranks clear through their live cache managers. With no resident
+    engine, the normal SSD-clear action still has to reach peer-local snapshot
+    trees; deleting only the coordinator root makes the next load silently
+    restore data the user explicitly cleared.
+    """
+
+    from ..cluster.launch import _run_cluster_ssh
+    from ..cluster.registry import get_cluster_registry
+
+    try:
+        deployments = get_cluster_registry().list()
+    except RuntimeError:
+        return 0, 0
+    if not deployments:
+        return 0, 0
+
+    normalized = tuple(str(path.expanduser()) for path in roots)
+    allowed = {"cluster-prompt-snapshots", "prompt-cache-ssd"}
+    if any(Path(path).name not in allowed for path in normalized):
+        raise RuntimeError("refusing to clear an unexpected cluster cache root")
+
+    node_ids: set[str] = set()
+    remote_targets: set[str] = set()
+    for deployment in deployments:
+        for rank, host in enumerate(deployment.hosts):
+            node_ids.add(host.node_id)
+            if rank > 0:
+                remote_targets.add(host.ssh)
+
+    script = r"""
+import json, shutil, sys
+from pathlib import Path
+roots = [Path(value).expanduser() for value in json.loads(sys.argv[1])]
+allowed = {'cluster-prompt-snapshots', 'prompt-cache-ssd'}
+if any(root.name not in allowed for root in roots):
+    raise SystemExit(3)
+deleted = 0
+for root in roots:
+    if not root.exists():
+        continue
+    deleted += sum(1 for item in root.rglob('*') if item.is_file())
+    shutil.rmtree(root)
+print(deleted)
+""".strip()
+    command = shlex.join(["python3", "-c", script, json.dumps(normalized)])
+    deleted = 0
+    for target in sorted(remote_targets):
+        completed = _run_cluster_ssh(
+            target,
+            command,
+            timeout=45.0,
+            runner=runner,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                f"cold cluster SSD clear failed on {target}: {detail[:300]}"
+            )
+        try:
+            deleted += max(0, int(completed.stdout.strip() or "0"))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"cold cluster SSD clear returned invalid output on {target}"
+            ) from exc
+    return deleted, len(node_ids)
 
 
 # =============================================================================

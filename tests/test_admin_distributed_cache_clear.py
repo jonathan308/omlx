@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Admin cache maintenance must reach every rank of a loaded cluster."""
 
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
