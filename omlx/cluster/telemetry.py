@@ -37,6 +37,7 @@ _MAX_CANCEL_FILE_BYTES = 64 * 1024
 # it never competes with generation for the lock.
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+_MAX_TARGETED_CANCEL_REQUESTS = 256
 
 
 def _transport_request_id(value: Any) -> str | None:

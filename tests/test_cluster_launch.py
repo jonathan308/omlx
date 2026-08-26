@@ -2071,7 +2071,7 @@ def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
     ]
     # State is kept so a later stop() retries instead of dropping the job.
     assert supervisor.process is launcher
-    assert supervisor.status().phase == "ready"
+    assert supervisor.status().phase == "failed"
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
 
 

@@ -2415,6 +2415,56 @@ async def _safe_anext(ait):
         return _KEEPALIVE_SENTINEL
 
 
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Close an async generator when the response transport ends."""
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
+
+
+def _request_abort_id(engine: BaseEngine) -> str | None:
+    """Mint an opaque id only for engines with targeted abort semantics."""
+
+    if not getattr(engine, "supports_request_scoped_abort", False):
+        return None
+    abort = getattr(engine, "abort_request", None)
+    if not callable(abort):
+        return None
+    return f"transport-{uuid.uuid4().hex}"
+
+
+async def _with_request_disconnect_abort(
+    generator: AsyncIterator[str],
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    request_id: str | None,
+) -> AsyncIterator[str]:
+    """Bind one public response transport to one inference request."""
+
+    signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    token: int | None = None
+    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
+        abort = getattr(engine, "abort_request")
+
+        async def abort_disconnected_request() -> None:
+            await abort(
+                request_id,
+                reason="public client transport disconnected",
+                error_code="client_disconnected",
+            )
+
+        token = signal.register(abort_disconnected_request)
+
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        await _aclose_async_iterator(generator)
+
+
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
     http_request: Optional["FastAPIRequest"] = None,
