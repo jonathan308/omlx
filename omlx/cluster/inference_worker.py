@@ -33,7 +33,6 @@ from .deployment import (
     decode_worker_contract,
     decode_worker_path_map,
     decode_worker_speculation,
-    distributed_mtp_model_supported,
 )
 from .jaccl_lease import acquire_jaccl_communicator_lease
 from .liveness import PeerWatchdog
@@ -700,7 +699,7 @@ def _configure_distributed_mtp(
             "distributed MTP is not yet validated for hybrid TP x pipeline"
         )
     model_type = _distributed_model_type(model_path)
-    if not distributed_mtp_model_supported(model_type):
+    if not model_type.startswith("deepseek_v4"):
         raise RuntimeError(
             "distributed MTP is not validated for model type "
             f"{model_type or 'unknown'!r}"
@@ -717,13 +716,7 @@ def _configure_distributed_mtp(
     lockstep = os.environ.get(
         "OMLX_MTP_DISTRIBUTED_LOCKSTEP_DEPTH", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
-    # Qwen's multi-token verification economics vary sharply with content.
-    # The distributed batch runtime already broadcasts rank zero's selected
-    # depth and park decision before each collective, so use that coordinated
-    # adaptive controller by default. DS4 retains its physically qualified
-    # fixed-depth production contract unless an operator opts into adaptation.
-    qwen_adaptive = model_type.startswith(("qwen3_5", "qwen3_6"))
-    if adaptive or lockstep or qwen_adaptive:
+    if adaptive or lockstep:
         os.environ.pop("OMLX_MTP_FIXED_DEPTH", None)
         return None
     fixed_depth = depth or 3

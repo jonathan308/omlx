@@ -319,25 +319,8 @@ def test_distributed_mtp_can_qualify_lockstep_acceptance_depth(
     assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
 
 
-def test_distributed_qwen_mtp_defaults_to_coordinated_adaptive_depth(
-    tmp_path, monkeypatch
-):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
-    monkeypatch.setenv("OMLX_MTP_FIXED_DEPTH", "3")
-
-    fixed = _configure_distributed_mtp(
-        tmp_path,
-        enabled=True,
-        depth=3,
-        tensor_parallel_size=2,
-    )
-
-    assert fixed is None
-    assert "OMLX_MTP_FIXED_DEPTH" not in os.environ
-
-
 def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
 
     with pytest.raises(RuntimeError, match="not validated"):
         _configure_distributed_mtp(
