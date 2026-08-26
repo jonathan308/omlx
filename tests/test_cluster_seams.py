@@ -77,6 +77,14 @@ def test_no_cluster_route_is_unreachable_from_the_dashboard():
     # The backend PR intentionally lands before the Cluster v2 dashboard. The
     # UI follow-up will call replan after the deployment contract settles.
     allowed_without_caller: set[str] = {"/admin/api/cluster/replan"}
+    # Runtime lifecycle APIs land before the Cluster v2 dashboard follow-up.
+    allowed_without_caller.update(
+        {
+            "/admin/api/cluster/backend-selection",
+            "/admin/api/cluster/deployments/{parameter}/load",
+            "/admin/api/cluster/deployments/{parameter}/unload",
+        }
+    )
     unreachable = _registered_routes() - _js_called_paths() - allowed_without_caller
     assert not unreachable, (
         f"cluster routes nothing calls: {sorted(unreachable)} — wire them up or "
