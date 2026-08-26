@@ -19,7 +19,10 @@ from typing import Any
 
 import httpx
 
-from ..cluster.deployment import ClusterDeployment
+from ..cluster.deployment import (
+    ClusterDeployment,
+    distributed_mtp_model_supported,
+)
 from ..cluster.launch import (
     DistributedJobSupervisor,
     DistributedLaunchError,
@@ -551,11 +554,12 @@ raise SystemExit(2)
             ],
         )
         config = await asyncio.to_thread(load_config, metadata_path)
-        if self.deployment.mtp_enabled and not str(
-            config.get("model_type") or ""
-        ).startswith("deepseek_v4"):
+        if self.deployment.mtp_enabled and not distributed_mtp_model_supported(
+            config.get("model_type")
+        ):
             raise ValueError(
-                "distributed MTP is currently validated only for DeepSeek V4"
+                "distributed MTP is validated only for DeepSeek V4 and "
+                "Qwen3.5/Qwen3.6/Qwen3.8 families"
             )
         self._model_type = config.get("model_type")
         self._tokenizer = await asyncio.to_thread(
