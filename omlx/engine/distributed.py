@@ -19,7 +19,11 @@ from typing import Any
 import httpx
 
 from ..cluster.deployment import ClusterDeployment
-from ..cluster.launch import DistributedJobSupervisor, DistributedLaunchError
+from ..cluster.launch import (
+    DistributedJobSupervisor,
+    DistributedLaunchError,
+    _run_cluster_ssh,
+)
 from ..cluster.liveness import check_peers, describe_failure, read_marker
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
