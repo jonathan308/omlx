@@ -591,6 +591,37 @@ component.apiFetch = async () => {{ throw new Error('runtime endpoint down'); }}
     assert "runtime endpoint down" in result["detail"]
 
 
+def test_active_card_prefers_loaded_runtime_owner_over_stale_registry_order():
+    result = _run_wizard(
+        """
+component.deploymentsPayload = [
+  { deployment_id: 'ds4-cold', model: '/models/ds4', serving_mode: 'sharded' },
+  { deployment_id: 'qwen-phase', model: '/models/qwen',
+    serving_mode: 'disaggregated', prefill_rank: 1, decode_rank: 0 },
+];
+const fallback = component.configuredDeployment().deployment_id;
+component.runtimePayload = { jobs: [{
+  deployment_id: 'qwen-phase', rank: 0, live: true,
+  phase: 'ready', ownership: 'loaded', metrics: {},
+}], launchers: [] };
+component.runtimeLoaded = true;
+process.stdout.write(JSON.stringify({
+  fallback,
+  selected: component.configuredDeployment().deployment_id,
+  mode: component.configuredDeployment().serving_mode,
+  state: component.deploymentRuntimeState(),
+}));
+"""
+    )
+
+    assert result == {
+        "fallback": "ds4-cold",
+        "selected": "qwen-phase",
+        "mode": "disaggregated",
+        "state": "ready",
+    }
+
+
 def test_active_panel_preserves_per_request_prefill_and_decode_rates():
     result = _run_wizard(
         """

@@ -538,9 +538,50 @@ function clusterV2Wizard() {
         },
 
         configuredDeployment() {
-            return this.deploymentsPayload.length
-                ? this.deploymentsPayload[0]
-                : null;
+            const deployments = Array.isArray(this.deploymentsPayload)
+                ? this.deploymentsPayload
+                : [];
+            if (!deployments.length) return null;
+
+            // A registry may retain several signed setups (for example, a
+            // cold DS4 TP plan plus the currently loaded Qwen phase plan).
+            // The active card must follow runtime ownership, not registry
+            // insertion order, or it presents an unloaded model as running.
+            const jobs = Array.isArray(this.runtimePayload?.jobs)
+                ? this.runtimePayload.jobs
+                : [];
+            const launchers = Array.isArray(this.runtimePayload?.launchers)
+                ? this.runtimePayload.launchers
+                : [];
+            const deploymentForId = (id) =>
+                deployments.find((deployment) => deployment?.deployment_id === id);
+            const selectJob = (predicate) => {
+                const job = jobs.find(
+                    (candidate) => candidate?.deployment_id && predicate(candidate),
+                );
+                return job ? deploymentForId(job.deployment_id) : null;
+            };
+            const loaded =
+                selectJob(
+                    (job) =>
+                        job.ownership === 'loaded' &&
+                        job.live === true &&
+                        job.phase === 'ready',
+                ) || selectJob((job) => job.ownership === 'loaded');
+            if (loaded) return loaded;
+            const loading =
+                selectJob((job) => job.ownership === 'loading') ||
+                (() => {
+                    const launcher = launchers.find(
+                        (candidate) =>
+                            candidate?.deployment_id &&
+                            ['preflight', 'loading'].includes(candidate.phase),
+                    );
+                    return launcher
+                        ? deploymentForId(launcher.deployment_id)
+                        : null;
+                })();
+            return loading || deployments[0];
         },
 
         deploymentRuntimeJobs(deployment = this.configuredDeployment()) {
