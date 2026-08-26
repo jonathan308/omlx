@@ -664,7 +664,12 @@ def _rdma_fabric_caps(
         return
     rdma_ctl = "/usr/bin/rdma_ctl"
     ibv_devices = "/usr/bin/ibv_devices"
-    if not (os.path.exists(rdma_ctl) and os.path.exists(ibv_devices)):
+    # A supplied runner is an explicit probe seam (used by offline tests and
+    # embedders); only the production subprocess runner depends on these paths
+    # existing on the current host.
+    if runner is subprocess.run and not (
+        os.path.exists(rdma_ctl) and os.path.exists(ibv_devices)
+    ):
         return
     try:
         status = runner(  # noqa: S603 - fixed system executable
