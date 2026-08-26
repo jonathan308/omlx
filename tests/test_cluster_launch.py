@@ -81,9 +81,7 @@ def test_stop_deployment_processes_sweeps_even_without_a_live_supervisor(
     assert calls[0][2]["plan_hash"] == deployment.plan_hash
 
 
-def test_stop_deployment_processes_refuses_unverified_rank_exit(
-    tmp_path, monkeypatch
-):
+def test_stop_deployment_processes_refuses_unverified_rank_exit(tmp_path, monkeypatch):
     deployment = _deployment()
     monkeypatch.setattr(
         launch,
@@ -257,7 +255,7 @@ def test_launcher_selects_the_probed_python_path_for_each_rank(tmp_path):
     worker = argv[argv.index("--") + 1 :]
 
     assert worker[:2] == ["/bin/sh", "-c"]
-    assert '${MLX_RANK:-}' in worker[2]
+    assert "${MLX_RANK:-}" in worker[2]
     assert "/Applications/oMLX/python" in worker[2]
     assert "/opt/omlx/bin/python" in worker[2]
     assert worker[3:6] == [
@@ -856,9 +854,7 @@ def test_peer_probe_discovers_a_different_linux_python_path():
 
     assert result["runtime_compatible"] is True
     assert commands[-1].startswith("/opt/omlx/bin/python")
-    assert result["status"]["runtime"]["python_executable"] == (
-        "/opt/omlx/bin/python"
-    )
+    assert result["status"]["runtime"]["python_executable"] == ("/opt/omlx/bin/python")
 
 
 def test_peer_probe_preserves_packaged_cluster_wrapper_path():
@@ -878,9 +874,10 @@ def test_peer_probe_preserves_packaged_cluster_wrapper_path():
 
     def runner(argv, **_kwargs):
         command = argv[-1]
-        if command.startswith(
-            "~/.omlx/bin/omlx-cluster-python"
-        ) and "import os,omlx" in command:
+        if (
+            command.startswith("~/.omlx/bin/omlx-cluster-python")
+            and "import os,omlx" in command
+        ):
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -951,8 +948,7 @@ def test_remote_python_discovery_falls_back_to_packaged_source_launcher():
 
     assert discovered == "/Users/test/.omlx/bin/omlx-source-python"
     assert any(
-        command.startswith("~/.omlx/bin/omlx-source-python")
-        for command in commands
+        command.startswith("~/.omlx/bin/omlx-source-python") for command in commands
     )
 
 
@@ -1328,9 +1324,7 @@ def test_preinstall_inventory_will_not_claim_missing_when_omlx_is_installed():
 
     assert result["bootstrap_required"] is True
     assert result["runtime_compatible"] is False
-    assert result["runtime_mismatches"] == [
-        "oMLX worker runtime could not be verified"
-    ]
+    assert result["runtime_mismatches"] == ["oMLX worker runtime could not be verified"]
     assert result["worker_runtime_evidence"] == ["/Applications/oMLX.app"]
     assert result["status"]["warnings"] == [
         "oMLX is installed on this node but its worker runtime could not be run."
@@ -1748,7 +1742,9 @@ def test_supervisor_reaps_remote_ranks_via_ssh_sigterm(monkeypatch, tmp_path):
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=2.0)
         assert victim.poll() is not None
-        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+        assert (
+            marker_file.exists()
+        )  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1814,7 +1810,9 @@ def test_supervisor_reaps_remote_ranks_escalates_to_sigkill(monkeypatch, tmp_pat
         assert result.returncode == 0, result.stderr
         victim.wait(timeout=5.0)
         assert victim.poll() is not None
-        assert marker_file.exists()  # kept as crash evidence for _runtime_failure_reason
+        assert (
+            marker_file.exists()
+        )  # kept as crash evidence for _runtime_failure_reason
     finally:
         if victim.poll() is None:
             victim.kill()
@@ -1936,6 +1934,8 @@ def test_supervisor_reap_rejects_mismatched_deployment_or_plan(monkeypatch, tmp_
     finally:
         victim.kill()
         victim.wait()
+
+
 def _fake_launcher(pid: int = 43210):
     class Launcher:
         stdout = None
@@ -2054,9 +2054,7 @@ def test_supervisor_stop_raises_and_keeps_state_when_group_survives(
     assert launch._launch_manifest_path(tmp_path, "cluster-test").exists()
 
 
-def test_supervisor_stop_raises_on_unkillable_leftover_rank(
-    tmp_path, monkeypatch
-):
+def test_supervisor_stop_raises_on_unkillable_leftover_rank(tmp_path, monkeypatch):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
         preflight=False,
@@ -2121,9 +2119,7 @@ def test_verified_stop_writes_then_removes_launch_manifest(tmp_path, monkeypatch
     assert supervisor.status().phase == "stopped"
 
 
-def test_teardown_sweep_kills_leftover_local_rank_by_marker_pid(
-    tmp_path, monkeypatch
-):
+def test_teardown_sweep_kills_leftover_local_rank_by_marker_pid(tmp_path, monkeypatch):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),
         preflight=False,
@@ -2139,6 +2135,23 @@ def test_teardown_sweep_kills_leftover_local_rank_by_marker_pid(
             kills.append((pid, sig))
 
     monkeypatch.setattr(launch.os, "kill", fake_kill)
+    process = launch._LocalProcessState(
+        424242,
+        1,
+        424242,
+        "S",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: (
+            ((), "")
+            if any(sig == signal.SIGKILL for _, sig in kills)
+            else ((process,), "")
+        ),
+    )
     # The pid stays "alive" until the SIGKILL lands.
     monkeypatch.setattr(
         launch,
@@ -2170,6 +2183,19 @@ def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
     marker_path = tmp_path / "cluster-test-rank-0.json"
     marker_path.write_text(json.dumps(_rank_marker(424242, 0)), encoding="utf-8")
     monkeypatch.setattr(launch.os, "kill", lambda _pid, _sig: None)
+    process = launch._LocalProcessState(
+        424242,
+        1,
+        424242,
+        "D",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: ((process,), ""),
+    )
     monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
     monkeypatch.setattr(
@@ -2180,7 +2206,8 @@ def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
 
     failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
 
-    assert failures == ["rank 0 (local) pid 424242 survived SIGKILL"]
+    assert any("pid 424242" in failure and "survived SIGKILL" in failure for failure in failures)
+    assert any("Reboot this Mac" in failure for failure in failures)
 
 
 def test_teardown_sweep_kills_live_remote_rank_over_ssh(tmp_path, monkeypatch):
@@ -2202,8 +2229,7 @@ def test_teardown_sweep_kills_live_remote_rank_over_ssh(tmp_path, monkeypatch):
     monkeypatch.setattr(
         launch,
         "_run_cluster_ssh",
-        lambda target, command, **kw: commands.append((target, command))
-        or Result(),
+        lambda target, command, **kw: commands.append((target, command)) or Result(),
     )
 
     failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
@@ -2267,12 +2293,31 @@ def test_reap_orphaned_launches_reaps_ranks_of_a_dead_coordinator(
         )
     )["coordinator_pid"]
     monkeypatch.setattr(launch.os, "kill", fake_kill)
+    process = launch._LocalProcessState(
+        424243,
+        1,
+        424243,
+        "S",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: (
+            ((), "")
+            if any(sig == signal.SIGKILL for _, sig in kills)
+            else ((process,), "")
+        ),
+    )
     # The crashed coordinator and its launcher are gone; the rank pid lives.
     monkeypatch.setattr(
         launch,
         "_pid_alive",
-        lambda pid: pid not in (coordinator_pid, 433000)
-        and not any(sig == signal.SIGKILL for _, sig in kills),
+        lambda pid: (
+            pid not in (coordinator_pid, 433000)
+            and not any(sig == signal.SIGKILL for _, sig in kills)
+        ),
     )
     monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: False)
     monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
@@ -2298,9 +2343,7 @@ def test_reap_orphaned_launches_leaves_an_active_job_alone(tmp_path, monkeypatch
         tmp_path, _deployment(), launcher_pid=433000, api_port=18081
     )
     kills = []
-    monkeypatch.setattr(
-        launch.os, "kill", lambda pid, sig: kills.append((pid, sig))
-    )
+    monkeypatch.setattr(launch.os, "kill", lambda pid, sig: kills.append((pid, sig)))
     monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(launch, "_process_group_alive", lambda _pgid: True)
 

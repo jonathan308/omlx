@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import shutil
 import threading
 import time
@@ -13,9 +15,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-
-import json
-import os
 
 from .performance import ExecutionSettings
 from .planner import PipelineAssignment
@@ -250,17 +249,15 @@ class RuntimeTelemetry:
                 and now > previous_at
                 and processed > previous_processed
             ):
-                sample.prefill_speed = (
-                    processed - previous_processed
-                ) / (now - previous_at)
+                sample.prefill_speed = (processed - previous_processed) / (
+                    now - previous_at
+                )
             elif (
                 processed > 0
                 and now > sample.prefill_started_at
                 and sample.prefill_speed <= 0
             ):
-                sample.prefill_speed = processed / (
-                    now - sample.prefill_started_at
-                )
+                sample.prefill_speed = processed / (now - sample.prefill_started_at)
             prefill_elapsed = now - sample.prefill_started_at
             if processed > 0 and prefill_elapsed > 0:
                 sample.prefill_average_speed = processed / prefill_elapsed

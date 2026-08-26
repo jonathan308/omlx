@@ -20,9 +20,9 @@ from omlx.cluster.inference_worker import (
     _execution_settings,
     _install_distributed_model_protocol,
     _server_arguments,
-    _wait_for_serve_release,
     _validate_loaded_stage,
     _validate_measured_weight_bytes,
+    _wait_for_serve_release,
     _watch_launcher_parent,
     _write_cancel_request,
     build_parser,
@@ -1221,15 +1221,15 @@ def test_launcher_watchdog_ignores_a_fresh_lease(tmp_path):
 
     polls = [0]
 
-    class StopLoop(Exception):
+    class StopLoopError(Exception):
         pass
 
     def wait(_seconds):
         polls[0] += 1
         if polls[0] >= 3:
-            raise StopLoop
+            raise StopLoopError
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(StopLoopError):
         _watch_launcher_parent(
             42,
             marker,
@@ -1251,15 +1251,15 @@ def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
 
     polls = [0]
 
-    class StopLoop(Exception):
+    class StopLoopError(Exception):
         pass
 
     def wait(_seconds):
         polls[0] += 1
         if polls[0] >= 3:
-            raise StopLoop
+            raise StopLoopError
 
-    with pytest.raises(StopLoop):
+    with pytest.raises(StopLoopError):
         _watch_launcher_parent(
             42,
             marker,
@@ -1275,7 +1275,9 @@ def test_launcher_watchdog_ignores_a_lease_that_never_appeared(tmp_path):
 
 
 def test_cancel_request_file_matches_the_telemetry_contract(tmp_path):
-    _write_cancel_request(str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64)
+    _write_cancel_request(
+        str(tmp_path), "dep-9", "peer watchdog test", plan_hash="e" * 64
+    )
 
     payload = json.loads((tmp_path / "dep-9-cancel.json").read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
@@ -1360,9 +1362,7 @@ def test_release_metal_memory_without_mlx_is_a_noop(monkeypatch):
 
 def test_sigterm_handler_releases_metal_before_interrupt(monkeypatch):
     releases: list[str] = []
-    monkeypatch.setattr(
-        inference_worker, "_release_metal_memory", releases.append
-    )
+    monkeypatch.setattr(inference_worker, "_release_metal_memory", releases.append)
     previous_term = signal.getsignal(signal.SIGTERM)
     previous_int = signal.getsignal(signal.SIGINT)
     previous_alrm = signal.getsignal(signal.SIGALRM)
@@ -1432,6 +1432,8 @@ def test_peer_watchdog_on_lost_releases_metal_before_exit(monkeypatch, tmp_path)
     assert isinstance(watchdog, FakePeerWatchdog)
     captured["on_lost"]("peer vanished")
     assert order == ["release", "exit:1"]
+
+
 class _ThinkTokenizer:
     think_end_id = 55
     think_start_id = 54

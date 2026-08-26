@@ -777,7 +777,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -1119,24 +1119,9 @@ class EnginePool:
         if not callable(has_active_requests):
             return False
         try:
-            if has_active_requests() is True:
-                return True
+            return has_active_requests() is True
         except Exception:
             return True
-        # Distributed engines: the coordinator counter draining only proves
-        # the httpx side closed. Rank-side telemetry reporting active
-        # requests means the ranks are still generating and the entry is NOT
-        # quiescent (G5); no marker evidence (None) falls through, since a
-        # dead rank's marker is handled by the supervisor failure paths.
-        rank_side = getattr(engine, "rank_side_active_requests", None)
-        if callable(rank_side):
-            try:
-                remaining = rank_side()
-            except Exception:
-                remaining = None
-            if remaining:
-                return True
-        return False
 
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)

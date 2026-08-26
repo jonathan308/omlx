@@ -8,7 +8,7 @@ import socket
 import struct
 import time
 import zlib
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from typing import Any
 
 from .system_socket_proxy import (
@@ -76,7 +76,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self._stream_proxy: SystemSocketProxy | None = None
         self._sequence = 0
 
-    def __enter__(self) -> "RankControlPlane":
+    def __enter__(self) -> RankControlPlane:
         if self.rank == 0:
             self._accept_workers()
         else:
@@ -167,9 +167,7 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 last_error = exc
                 stream.close()
                 time.sleep(0.05)
-        raise TimeoutError(
-            f"rank-control coordinator was unreachable: {last_error}"
-        )
+        raise TimeoutError(f"rank-control coordinator was unreachable: {last_error}")
 
     def broadcast_object(self, obj: Any) -> Any:
         """Broadcast one rank-zero-owned Python object in strict sequence."""
@@ -213,25 +211,19 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
 
     def close(self) -> None:
         for stream in self._peers.values():
-            try:
+            with suppress(OSError):
                 stream.close()
-            except OSError:
-                pass
         self._peers.clear()
         if self._stream is not None:
-            try:
+            with suppress(OSError):
                 self._stream.close()
-            except OSError:
-                pass
             self._stream = None
         if self._stream_proxy is not None:
             self._stream_proxy.close()
             self._stream_proxy = None
         if self._listener is not None:
-            try:
+            with suppress(OSError):
                 self._listener.close()
-            except OSError:
-                pass
             self._listener = None
 
     def __exit__(self, *_exc: Any) -> None:

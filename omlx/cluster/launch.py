@@ -51,6 +51,10 @@ _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+_REBOOT_REQUIRED_GUIDANCE = (
+    "A distributed rank survived SIGKILL and may be stuck in the macOS "
+    "Metal driver. Reboot this Mac before starting another distributed launch."
+)
 
 
 class DistributedLaunchError(RuntimeError):
@@ -68,6 +72,129 @@ class DistributedTeardownError(DistributedLaunchError):
     were still wired. Callers must treat this as "teardown NOT complete"
     and keep enough state to retry.
     """
+
+
+@dataclass(frozen=True)
+class _LocalProcessState:
+    """One read-only row from the macOS/Linux process table."""
+
+    pid: int
+    ppid: int
+    process_group: int
+    status: str
+    rss_kib: int
+    command: str
+
+    @property
+    def zombie(self) -> bool:
+        return self.status.upper().startswith("Z")
+
+
+def _read_local_process_table(
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[tuple[_LocalProcessState, ...] | None, str]:
+    """Read process state; an unreadable table is not teardown evidence."""
+
+    argv = ["ps", "-axo", "pid=,ppid=,pgid=,stat=,rss=,command="]
+    try:
+        completed = runner(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"could not read the local process table: {exc}"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"ps exited {completed.returncode}"
+        return None, f"could not read the local process table: {detail}"
+
+    rows: list[_LocalProcessState] = []
+    for line_number, raw_line in enumerate(completed.stdout.splitlines(), 1):
+        fields = raw_line.strip().split(None, 5)
+        if not fields:
+            continue
+        if len(fields) != 6:
+            return None, (
+                "could not verify the local process table: malformed ps row "
+                f"{line_number}"
+            )
+        pid, ppid, process_group, status, rss_kib, command = fields
+        try:
+            numeric = tuple(int(value) for value in (pid, ppid, process_group, rss_kib))
+        except ValueError:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        if numeric[0] <= 0 or numeric[2] < 0 or numeric[3] < 0:
+            return None, (
+                "could not verify the local process table: invalid ps row "
+                f"{line_number}"
+            )
+        rows.append(
+            _LocalProcessState(
+                pid=numeric[0],
+                ppid=numeric[1],
+                process_group=numeric[2],
+                status=status,
+                rss_kib=numeric[3],
+                command=command,
+            )
+        )
+    return tuple(rows), ""
+
+
+def _command_deployment_id(command: str) -> str | None:
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return None
+    for index, argument in enumerate(arguments):
+        if argument == "--deployment-id" and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if argument.startswith("--deployment-id="):
+            return argument.partition("=")[2]
+    return None
+
+
+def _belongs_to_launch(process: _LocalProcessState, *, deployment_id: str) -> bool:
+    return _command_deployment_id(process.command) == deployment_id and (
+        "mlx._distributed_utils.launch" in process.command
+        or "omlx.cluster.inference_worker" in process.command
+    )
+
+
+def _local_launch_survivors(
+    processes: tuple[_LocalProcessState, ...],
+    *,
+    deployment_id: str,
+    process_group: int | None = None,
+    known_pids: set[int] | None = None,
+) -> tuple[_LocalProcessState, ...]:
+    return tuple(
+        process
+        for process in processes
+        if not process.zombie
+        and (
+            (known_pids is not None and process.pid in known_pids)
+            or (process_group is not None and process.process_group == process_group)
+            or _belongs_to_launch(process, deployment_id=deployment_id)
+        )
+    )
+
+
+def _survivor_description(process: _LocalProcessState) -> str:
+    return (
+        f"pid {process.pid} (ppid {process.ppid}, pgid {process.process_group}, "
+        f"state {process.status!r}, rss {process.rss_kib} KiB) survived SIGKILL"
+    )
+
+
+def _is_macos_exit_wedge(process: _LocalProcessState) -> bool:
+    return "E" in process.status.upper() and process.rss_kib == 0
 
 
 @dataclass(frozen=True)
@@ -162,8 +289,7 @@ _LOOPBACK_SSH_TARGETS = {"127.0.0.1", "localhost", "::1"}
 
 def _launch_manifest_path(state_dir: str | Path, deployment_id: str) -> Path:
     return (
-        Path(state_dir).expanduser()
-        / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
+        Path(state_dir).expanduser() / f"{_LAUNCH_MANIFEST_PREFIX}{deployment_id}.json"
     )
 
 
@@ -191,8 +317,7 @@ _REMOTE_SERVE_MARKER_SCRIPT = (
 )
 
 _REMOTE_CLEAR_SERVE_MARKER_SCRIPT = (
-    "import pathlib,sys;"
-    "pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
+    "import pathlib,sys;pathlib.Path(sys.argv[1]).expanduser().unlink(missing_ok=True)"
 )
 
 
@@ -201,7 +326,7 @@ def _set_serve_release(
     state_dir: str | Path,
     payload: dict[str, Any] | None,
     *,
-    runner: "SSHRunner" = subprocess.run,
+    runner: SSHRunner = subprocess.run,
 ) -> None:
     """Atomically publish or clear the post-load serve gate on every rank."""
 
@@ -384,6 +509,65 @@ def _kill_remote_pid(
     return "gone" in completed.stdout and "alive" not in completed.stdout
 
 
+_REMOTE_WORKER_SCAN_SCRIPT = (
+    "import json,shlex,subprocess,sys;"
+    "dep=sys.argv[1];"
+    "r=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,check=False);"
+    "p=[];"
+    "\nfor line in r.stdout.splitlines():"
+    "\n s=line.strip(); fields=s.split(None,1)"
+    "\n if len(fields)!=2 or not fields[0].isdigit(): continue"
+    "\n try: args=shlex.split(fields[1])"
+    "\n except ValueError: continue"
+    "\n if 'omlx.cluster.inference_worker' not in args: continue"
+    "\n try: i=args.index('--deployment-id')"
+    "\n except ValueError: continue"
+    "\n if i+1<len(args) and args[i+1]==dep: p.append(int(fields[0]))"
+    "\nprint(json.dumps({'returncode':r.returncode,'pids':p},separators=(',',':')))"
+)
+
+
+def _remote_deployment_worker_pids(
+    ssh_target: str,
+    deployment_id: str,
+    *,
+    runner: SSHRunner = subprocess.run,
+) -> tuple[list[int] | None, str]:
+    """Find rank workers even when a hard crash removed their marker."""
+
+    command = " ".join(
+        (
+            "python3",
+            "-c",
+            shlex.quote(_REMOTE_WORKER_SCAN_SCRIPT),
+            shlex.quote(deployment_id),
+        )
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=10.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        return None, str(exc)
+    if len(completed.stdout.encode()) > _REMOTE_OUTPUT_LIMIT:
+        return None, "remote worker scan response was too large"
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"remote worker scan response was invalid: {exc}"
+    pids = payload.get("pids")
+    if payload.get("returncode") != 0 or not isinstance(pids, list):
+        return None, "remote worker process table could not be read"
+    if any(
+        isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids
+    ):
+        return None, "remote worker scan returned an invalid pid"
+    return pids, ""
+
+
 def _rank_marker_matches(
     marker: dict[str, Any] | None,
     *,
@@ -396,9 +580,9 @@ def _rank_marker_matches(
     if marker.get("deployment_id") != deployment_id or marker.get("rank") != rank:
         return False
     recorded = marker.get("plan_hash")
-    if plan_hash is not None and recorded is not None and recorded != plan_hash:
-        return False
-    return True
+    return not (
+        plan_hash is not None and recorded is not None and recorded != plan_hash
+    )
 
 
 def _sweep_rank_processes(
@@ -407,6 +591,7 @@ def _sweep_rank_processes(
     *,
     state_dir: str | Path,
     plan_hash: str | None = None,
+    process_group: int | None = None,
     kill_grace: float = 3.0,
     runner: SSHRunner = subprocess.run,
 ) -> list[str]:
@@ -417,8 +602,17 @@ def _sweep_rank_processes(
     """
 
     failures: list[str] = []
+    attempted_local_pids: set[int] = set()
     local_root = Path(state_dir).expanduser()
     remote_root = str(state_dir).rstrip("/") or "."
+    initial_processes, process_error = _read_local_process_table()
+    processes_by_pid = (
+        {process.pid: process for process in initial_processes}
+        if initial_processes is not None
+        else {}
+    )
+    if initial_processes is None:
+        failures.append(process_error)
     local_markers: dict[int, dict[str, Any]] = {}
     try:
         for job in read_runtime_markers(local_root).get("jobs", []):
@@ -448,6 +642,28 @@ def _sweep_rank_processes(
             if not marker_owner_is_live(marker):
                 continue
             pid = marker.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                failures.append(f"rank {rank} ({node_id}) marker has an invalid pid")
+                continue
+            process_state = processes_by_pid.get(pid)
+            if process_state is None:
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} is addressable but "
+                    "absent from the process table; refusing an unverified signal"
+                )
+                continue
+            if process_state.zombie:
+                continue
+            if not _belongs_to_launch(
+                process_state,
+                deployment_id=deployment_id,
+            ) and not _is_macos_exit_wedge(process_state):
+                failures.append(
+                    f"rank {rank} ({node_id}) pid {pid} identity changed; "
+                    "refusing to signal a reused PID"
+                )
+                continue
+            attempted_local_pids.add(pid)
             if _kill_local_pid(pid, grace=kill_grace):
                 logger.warning(
                     "Reaped leftover rank %d (%s) pid %d of deployment %s",
@@ -457,9 +673,7 @@ def _sweep_rank_processes(
                     deployment_id,
                 )
             else:
-                failures.append(
-                    f"rank {rank} ({node_id}) pid {pid} survived SIGKILL"
-                )
+                failures.append(f"rank {rank} ({node_id}) pid {pid} survived SIGKILL")
             continue
         # Remote rank: its marker lives on the peer.
         marker, process_live, _, error = read_remote_marker(
@@ -467,7 +681,27 @@ def _sweep_rank_processes(
             f"{remote_root}/{filename}",
         )
         if error:
-            failures.append(f"rank {rank} ({node_id}) marker unreadable: {error}")
+            pids, scan_error = _remote_deployment_worker_pids(
+                ssh_target,
+                deployment_id,
+                runner=runner,
+            )
+            if scan_error:
+                failures.append(
+                    f"rank {rank} ({node_id}) marker unreadable ({error}) and "
+                    f"worker scan failed: {scan_error}"
+                )
+                continue
+            for pid in pids or ():
+                if not _kill_remote_pid(
+                    ssh_target,
+                    pid,
+                    grace=kill_grace,
+                    runner=runner,
+                ):
+                    failures.append(
+                        f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
+                    )
             continue
         if not _rank_marker_matches(
             marker,
@@ -493,7 +727,38 @@ def _sweep_rank_processes(
             failures.append(
                 f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
             )
-    return failures
+
+    # Markers and successful signal calls are not exit evidence. Sweep any
+    # markerless local worker by its exact deployment argv, then require a
+    # fresh process-table snapshot to contain neither its PID nor launch group.
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return list(dict.fromkeys(failures))
+    for process in _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+    ):
+        if process.pid in attempted_local_pids:
+            continue
+        attempted_local_pids.add(process.pid)
+        if not _kill_local_pid(process.pid, grace=kill_grace):
+            failures.append("markerless local rank " + _survivor_description(process))
+
+    processes, process_error = _read_local_process_table()
+    if processes is None:
+        failures.append(process_error)
+        return list(dict.fromkeys(failures))
+    survivors = _local_launch_survivors(
+        processes,
+        deployment_id=deployment_id,
+        process_group=process_group,
+        known_pids=attempted_local_pids,
+    )
+    failures.extend(_survivor_description(process) for process in survivors)
+    if survivors:
+        failures.append(_REBOOT_REQUIRED_GUIDANCE)
+    return list(dict.fromkeys(failures))
 
 
 def stop_deployment_processes(
@@ -520,10 +785,9 @@ def stop_deployment_processes(
     if manifest_path.exists() and manifest is None:
         failures.append("launch manifest is unreadable; refusing unverified unload")
     elif manifest is not None:
-        if (
-            manifest.get("deployment_id") != deployment.deployment_id
-            or manifest.get("plan_hash") not in {None, deployment.plan_hash}
-        ):
+        if manifest.get("deployment_id") != deployment.deployment_id or manifest.get(
+            "plan_hash"
+        ) not in {None, deployment.plan_hash}:
             failures.append("launch manifest identity does not match deployment")
         else:
             candidate_group = int(manifest["process_group"])
@@ -2589,7 +2853,12 @@ class DistributedJobSupervisor:
                 self.deployment.deployment_id,
             ).unlink(missing_ok=True)
 
-    def _sweep_rank_leftovers(self, *, kill_grace: float = 3.0) -> list[str]:
+    def _sweep_rank_leftovers(
+        self,
+        *,
+        process_group: int | None = None,
+        kill_grace: float = 3.0,
+    ) -> list[str]:
         """Kill rank processes that outlived the launcher group.
 
         Returns failure descriptions; empty means nothing resident remains.
@@ -2603,6 +2872,7 @@ class DistributedJobSupervisor:
             ],
             state_dir=self.state_dir,
             plan_hash=self.deployment.plan_hash,
+            process_group=process_group,
             kill_grace=kill_grace,
         )
 
