@@ -299,6 +299,20 @@ def _install_ready_pool(
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    pool.verified_teardowns = []
+    monkeypatch.setattr(
+        routes,
+        "stop_deployment_processes",
+        lambda deployment: (
+            pool.verified_teardowns.append(deployment.deployment_id)
+            or {
+                "verified": True,
+                "deployment_id": deployment.deployment_id,
+                "ranks_checked": deployment.world_size,
+                "manifest_retired": False,
+            }
+        ),
+    )
     return pool
 
 
@@ -1395,6 +1409,8 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     assert unloaded.status_code == 200, unloaded.json()
     assert unloaded.json()["configured"] is True
     assert unloaded.json()["stopped"] is True
+    assert unloaded.json()["teardown"]["verified"] is True
+    assert pool.verified_teardowns == ["nemotron-pool"]
     assert pool.entry.engine is None
     assert routes.get_cluster_registry().get("nemotron-pool") is not None
 

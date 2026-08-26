@@ -68,12 +68,14 @@ from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
     DistributedLaunchError,
+    DistributedTeardownError,
     preflight_remote_hosts,
     probe_remote_admission_ceiling,
     probe_remote_host,
     resolve_remote_python,
     run_cluster_performance_probe,
     run_cuda_fabric_probe,
+    stop_deployment_processes,
 )
 from .liveness import (
     PeerLostError,
@@ -5228,6 +5230,7 @@ async def deactivate_cluster_deployment(deployment_id: str):
             model_id = None
         if model_id is not None:
             await pool.prepare_cluster_reload(model_id)
+        await asyncio.to_thread(stop_deployment_processes, deployment)
         removed = await asyncio.to_thread(registry.remove, deployment_id)
         unregister = getattr(pool, "unregister_cluster_model", None)
         if model_id is not None and callable(unregister):
@@ -5259,6 +5262,7 @@ async def unload_cluster_deployment(deployment_id: str):
     deployment = await asyncio.to_thread(registry.get, deployment_id)
     if deployment is None:
         raise HTTPException(status_code=404, detail="cluster deployment not found")
+    model_id = None
     try:
         pool = _engine_pool()
         model_id = pool.resolve_cluster_model_id(deployment.model)
@@ -5280,12 +5284,17 @@ async def unload_cluster_deployment(deployment_id: str):
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        teardown = await asyncio.to_thread(stop_deployment_processes, deployment)
+    except (DistributedTeardownError, DistributedLaunchError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "ok": True,
         "deployment_id": deployment_id,
         "model_id": model_id,
         "stopped": True,
         "configured": True,
+        "teardown": teardown,
     }
 
 
