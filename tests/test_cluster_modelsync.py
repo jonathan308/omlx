@@ -8,6 +8,7 @@ touches the Hugging Face hub.
 import base64
 import json
 import platform
+import shlex
 import stat
 import struct
 import subprocess
@@ -258,6 +259,8 @@ def test_path_map_validation():
         _deployment(path_map={"peer": "relative/dir"})
     with pytest.raises(ValueError, match="outside the deployment"):
         _deployment(path_map={"stranger": "/models/x"})
+    with pytest.raises(ValueError, match="absolute"):
+        _deployment(path_map={"peer": "/models/x\nmalformed"})
     assert validate_model_path_map(None) == {}
     assert validate_model_path_map({"a": "/m"}, ("a",)) == {"a": "/m"}
 
@@ -599,6 +602,21 @@ def test_build_rsync_argv_is_resumable_and_noninteractive():
     assert "BatchMode=yes" in ssh and "omlx_cluster" in ssh
     assert argv[-2] == "/models/src/"
     assert argv[-1] == "user@peer.local:/Volumes/models/dst"
+
+
+def test_build_rsync_argv_protects_remote_paths_and_validates_targets():
+    destination = "/Volumes/model copies/$(touch should-not-run)"
+    argv = build_rsync_argv(
+        "/models/src",
+        "user@peer.local",
+        destination,
+    )
+
+    assert argv[-1] == f"user@peer.local:{shlex.quote(destination)}"
+    with pytest.raises(ValueError, match="SSH target"):
+        build_rsync_argv("/models/src", "peer;touch-nope", "/models/dst")
+    with pytest.raises(ValueError, match="single-line"):
+        build_rsync_argv("/models/src", "peer.local", "/models/dst\nother")
 
 
 def test_parse_rsync_progress_lines():

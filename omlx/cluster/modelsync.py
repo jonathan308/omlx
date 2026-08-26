@@ -34,6 +34,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 
 from ..exceptions import ModelNotFoundError
+from .deployment import validate_ssh_target
 from .ssh_policy import cluster_ssh_options
 from .staging import (
     index_shards,
@@ -311,11 +312,23 @@ def build_rsync_argv(
     host keys, BatchMode) — never a hand-rolled option set.
     """
 
+    ssh_target = validate_ssh_target(ssh_target)
+    target_dir = str(destination_dir)
+    if (
+        not Path(target_dir).is_absolute()
+        or "\x00" in target_dir
+        or "\n" in target_dir
+        or "\r" in target_dir
+    ):
+        raise ValueError("rsync destination must be an absolute single-line path")
     ssh_argv = ["ssh", *cluster_ssh_options()]
     if ssh_identity is not None:
         ssh_argv.extend(["-i", str(ssh_identity)])
     source = str(Path(source_dir).expanduser()).rstrip("/") + "/"
-    destination = f"{ssh_target}:{destination_dir}"
+    # macOS ships openrsync 2.6.9 without --protect-args/-s. Quote the remote
+    # path inside the host:path operand so the peer shell receives one literal
+    # filename while retaining compatibility with the system binary.
+    destination = f"{ssh_target}:{shlex.quote(target_dir)}"
     return [
         "rsync",
         "-a",

@@ -141,6 +141,8 @@ def validate_model_path_map(
         if (
             not path
             or "\x00" in path
+            or "\n" in path
+            or "\r" in path
             or len(path.encode()) > _MAX_MODEL_PATH_BYTES
             or not Path(path).is_absolute()
         ):
