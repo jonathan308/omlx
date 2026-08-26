@@ -46,7 +46,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1164,6 +1164,93 @@ class DebugRequestLoggingMiddleware:
         await self.app(scope, cached_receive, send)
 
 
+_DISCONNECT_SIGNAL_SCOPE_KEY = "omlx.client_disconnect_signal"
+_disconnect_callback_tasks: set[asyncio.Task] = set()
+
+
+class _ClientDisconnectSignal:
+    """Fan one ASGI disconnect message out to request-owned cleanup hooks.
+
+    Starlette's ``StreamingResponse`` and ``Request.is_disconnected()`` both
+    consume the same one-shot ``http.disconnect`` receive message.  Whichever
+    one wins used to hide it from the other.  In particular, a real Uvicorn
+    socket could close while a long distributed prefill kept running because
+    the response generator never reached its nested ``aclose()`` chain.
+
+    The outer ASGI middleware records the message before either consumer sees
+    it, then schedules request-scoped callbacks outside Starlette's response
+    cancellation scope.  A callback is keyed by the inference request id, so
+    cancelling one client can never fall back to aborting every active request.
+    """
+
+    def __init__(self) -> None:
+        self._disconnected = False
+        self._next_token = 0
+        self._callbacks: dict[int, Callable[[], Awaitable[None]]] = {}
+
+    def register(self, callback: Callable[[], Awaitable[None]]) -> int:
+        self._next_token += 1
+        token = self._next_token
+        if self._disconnected:
+            self._spawn(callback)
+        else:
+            self._callbacks[token] = callback
+        return token
+
+    def unregister(self, token: int) -> None:
+        self._callbacks.pop(token, None)
+
+    def disconnect(self) -> None:
+        if self._disconnected:
+            return
+        self._disconnected = True
+        callbacks = tuple(self._callbacks.values())
+        self._callbacks.clear()
+        for callback in callbacks:
+            self._spawn(callback)
+
+    @staticmethod
+    def _spawn(callback: Callable[[], Awaitable[None]]) -> None:
+        async def run_callback() -> None:
+            try:
+                await callback()
+            except Exception:
+                logger.exception("Request-scoped disconnect callback failed")
+
+        task = asyncio.create_task(run_callback())
+        # asyncio only holds weak task references.  Retain the detached abort
+        # until it completes; Starlette may already be cancelling the response
+        # task that observed the disconnect.
+        _disconnect_callback_tasks.add(task)
+        task.add_done_callback(_disconnect_callback_tasks.discard)
+
+
+class ClientDisconnectTrackingMiddleware:
+    """Record ``http.disconnect`` before competing ASGI consumers receive it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        signal = _ClientDisconnectSignal()
+        scope[_DISCONNECT_SIGNAL_SCOPE_KEY] = signal
+
+        async def tracked_receive():
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                signal.disconnect()
+            return message
+
+        await self.app(scope, tracked_receive, send)
+
+
+# Keep this outside response middleware so every consumer of ASGI ``receive``
+# passes through the same one-shot disconnect fan-out.
+app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
 
 
@@ -2326,6 +2413,56 @@ async def _safe_anext(ait):
         return await ait.__anext__()
     except StopAsyncIteration:
         return _KEEPALIVE_SENTINEL
+
+
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Close an async generator when the response transport ends."""
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
+
+
+def _request_abort_id(engine: BaseEngine) -> str | None:
+    """Mint an opaque id only for engines with targeted abort semantics."""
+
+    if not getattr(engine, "supports_request_scoped_abort", False):
+        return None
+    abort = getattr(engine, "abort_request", None)
+    if not callable(abort):
+        return None
+    return f"transport-{uuid.uuid4().hex}"
+
+
+async def _with_request_disconnect_abort(
+    generator: AsyncIterator[str],
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    request_id: str | None,
+) -> AsyncIterator[str]:
+    """Bind one public response transport to one inference request."""
+
+    signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    token: int | None = None
+    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
+        abort = getattr(engine, "abort_request")
+
+        async def abort_disconnected_request() -> None:
+            await abort(
+                request_id,
+                reason="public client transport disconnected",
+                error_code="client_disconnected",
+            )
+
+        token = signal.register(abort_disconnected_request)
+
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        await _aclose_async_iterator(generator)
 
 
 async def _with_sse_keepalive(
@@ -3503,6 +3640,7 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3511,18 +3649,24 @@ async def create_completion(
                 keepalive = _completion_keepalive_chunk(response_id)
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            model_load_duration=model_load_duration,
-                            prompt_token_ids=prompt_token_ids_by_prompt[0],
-                            resolved_model=resolved_model,
-                            response_id=response_id,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_completion(
+                                engine,
+                                prompts[0],
+                                request,
+                                model_load_duration=model_load_duration,
+                                prompt_token_ids=prompt_token_ids_by_prompt[0],
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                inference_request_id=inference_request_id,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -4038,6 +4182,9 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -4051,18 +4198,23 @@ async def create_chat_completion(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_chat_completion(
-                            engine,
-                            messages,
-                            request,
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_id=response_id,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_chat_completion(
+                                engine,
+                                messages,
+                                request,
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -4617,6 +4769,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    inference_request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -5986,20 +6139,28 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_anthropic_messages(
-                            engine,
-                            messages,
-                            request,
-                            resolved_model=resolved_model,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_anthropic_messages(
+                                engine,
+                                messages,
+                                request,
+                                resolved_model=resolved_model,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("anthropic"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("anthropic"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -6498,6 +6659,9 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
@@ -6505,21 +6669,26 @@ async def create_response(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_responses_api(
-                            engine,
-                            messages,
-                            request,
-                            input_messages=current_input_messages,
-                            store_response=_should_store_response(request.store),
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_format=response_format,
-                            native_reasoning=native_reasoning,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_responses_api(
+                                engine,
+                                messages,
+                                request,
+                                input_messages=current_input_messages,
+                                store_response=_should_store_response(request.store),
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_format=response_format,
+                                native_reasoning=native_reasoning,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("openai_responses"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("openai_responses"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),

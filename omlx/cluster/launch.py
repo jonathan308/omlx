@@ -52,6 +52,13 @@ _LOG_HISTORY = 200
 _REMOTE_OUTPUT_LIMIT = 64 * 1024
 _FABRIC_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _DEFAULT_CONNECTX_MIN_BYTES_PER_SECOND = 2 * 1024**3
+_LAUNCHER_RANK_EXIT_RE = re.compile(
+    r"Node with rank\s+(?P<rank>\d+)\s+exited with code\s+(?P<code>-?\d+)"
+)
+_JACCL_NO_PROGRESS_RE = re.compile(
+    r"\[jaccl\]\s+(?P<reason>[^\r\n]*made no progress[^\r\n]*)",
+    re.IGNORECASE,
+)
 _REBOOT_REQUIRED_GUIDANCE = (
     "A distributed rank survived SIGKILL and may be stuck in the macOS "
     "Metal driver. Reboot this Mac before starting another distributed launch."
@@ -2769,6 +2776,33 @@ class DistributedJobSupervisor:
                                 self.rank_ready_events[rank] = event
                         elif event.get("reason") or event.get("error"):
                             self.failure_event = event
+                # mlx.launch does not emit a structured event when a native
+                # JACCL watchdog terminates a rank.  Worse, its SSH cleanup
+                # thread can raise after that and leave the launcher itself
+                # exiting with code zero.  Promote the exact native terminal
+                # lines into the same failure surface used by peer_lost so a
+                # dead rank can never remain phase=ready.
+                no_progress = _JACCL_NO_PROGRESS_RE.search(line)
+                if no_progress is not None:
+                    self.failure_event = {
+                        "type": "collective_stall",
+                        "reason": "JACCL " + no_progress.group("reason").strip(),
+                    }
+                rank_exit = _LAUNCHER_RANK_EXIT_RE.search(line)
+                if rank_exit is not None and int(rank_exit.group("code")) != 0:
+                    reason = (
+                        f"rank {rank_exit.group('rank')} exited with code "
+                        f"{rank_exit.group('code')}"
+                    )
+                    prior = self._failure_reason()
+                    if prior and prior not in reason:
+                        reason += f" after {prior}"
+                    self.failure_event = {
+                        "type": "rank_exit",
+                        "rank": int(rank_exit.group("rank")),
+                        "returncode": int(rank_exit.group("code")),
+                        "reason": reason,
+                    }
                 self._condition.notify_all()
 
     def _wait_for_ready(self) -> dict[str, Any]:
@@ -3239,12 +3273,27 @@ class DistributedJobSupervisor:
 
     def status(self) -> DistributedJobStatus:
         process = self.process
+        returncode = process.poll() if process is not None else None
+        phase = self._phase
+        failure_reason = self._failure_reason()
+        if phase != "stopped" and (failure_reason or returncode is not None):
+            phase = "failed"
+            if failure_reason is None:
+                failure_reason = self._runtime_failure_reason()
+            if failure_reason is None:
+                # A serving launcher ending is terminal even when mlx.launch
+                # accidentally reports success after a worker's cleanup thread
+                # failed.  Stop/unload clears ``process`` and phase afterwards;
+                # while it remains registered this is always unexpected.
+                failure_reason = (
+                    f"distributed launcher exited unexpectedly with code {returncode}"
+                )
         return DistributedJobStatus(
             deployment_id=self.deployment.deployment_id,
-            phase=self._phase,
+            phase=phase,
             endpoint=self.endpoint,
             pid=process.pid if process is not None else None,
-            returncode=process.poll() if process is not None else None,
+            returncode=returncode,
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
             stderr_tail=tuple(self._stderr)[-20:],
