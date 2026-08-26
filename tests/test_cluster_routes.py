@@ -210,6 +210,20 @@ def _install_ready_pool(
     # established. Do not let their synthetic ``studio.local`` host escape to
     # the real SSH liveness probe; peer-loss behavior has dedicated coverage.
     monkeypatch.setattr(routes, "check_peers", lambda *args, **kwargs: ())
+    pool.verified_teardowns = []
+    monkeypatch.setattr(
+        routes,
+        "stop_deployment_processes",
+        lambda deployment: (
+            pool.verified_teardowns.append(deployment.deployment_id)
+            or {
+                "verified": True,
+                "deployment_id": deployment.deployment_id,
+                "ranks_checked": deployment.world_size,
+                "manifest_retired": False,
+            }
+        ),
+    )
     return pool
 
 
@@ -874,6 +888,26 @@ def test_cluster_deployment_recomputes_plan_and_preflights(tmp_path, monkeypatch
     listed = _client().get("/admin/api/cluster/deployments")
     assert listed.status_code == 200
     assert listed.json()["deployments"][0]["deployment_id"] == "nemotron-pool"
+
+    unloaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/unload"
+    )
+    assert unloaded.status_code == 200, unloaded.json()
+    assert unloaded.json()["configured"] is True
+    assert unloaded.json()["stopped"] is True
+    assert unloaded.json()["teardown"]["verified"] is True
+    assert pool.verified_teardowns == ["nemotron-pool"]
+    assert pool.entry.engine is None
+    assert routes.get_cluster_registry().get("nemotron-pool") is not None
+
+    loaded = _client().post(
+        "/admin/api/cluster/deployments/nemotron-pool/load"
+    )
+    assert loaded.status_code == 200, loaded.json()
+    assert loaded.json()["loaded"] is True
+    assert loaded.json()["canary_completion_tokens"] == 1
+    assert len(loaded.json()["ranks"]) == 2
+    assert pool.entry.engine is not None
 
     removed = _client().delete("/admin/api/cluster/deployments/nemotron-pool")
     assert removed.status_code == 200

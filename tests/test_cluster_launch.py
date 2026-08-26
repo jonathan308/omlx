@@ -53,6 +53,48 @@ def _deployment(model: str = "org/model") -> ClusterDeployment:
     )
 
 
+def test_stop_deployment_processes_sweeps_even_without_a_live_supervisor(
+    tmp_path, monkeypatch
+):
+    deployment = _deployment()
+    calls = []
+
+    def sweep(deployment_id, hosts, **kwargs):
+        calls.append((deployment_id, hosts, kwargs))
+        return []
+
+    monkeypatch.setattr(launch, "_sweep_rank_processes", sweep)
+
+    report = launch.stop_deployment_processes(deployment, state_dir=tmp_path)
+
+    assert report == {
+        "verified": True,
+        "deployment_id": deployment.deployment_id,
+        "ranks_checked": 2,
+        "manifest_retired": False,
+    }
+    assert calls[0][0] == deployment.deployment_id
+    assert calls[0][1] == [
+        {"rank": 0, "node_id": "local", "ssh": "127.0.0.1"},
+        {"rank": 1, "node_id": "studio", "ssh": "user@studio.local"},
+    ]
+    assert calls[0][2]["plan_hash"] == deployment.plan_hash
+
+
+def test_stop_deployment_processes_refuses_unverified_rank_exit(
+    tmp_path, monkeypatch
+):
+    deployment = _deployment()
+    monkeypatch.setattr(
+        launch,
+        "_sweep_rank_processes",
+        lambda *_args, **_kwargs: ["rank 1 is still resident"],
+    )
+
+    with pytest.raises(launch.DistributedTeardownError, match="still resident"):
+        launch.stop_deployment_processes(deployment, state_dir=tmp_path)
+
+
 def test_serve_release_is_atomic_and_mirrored_to_remote(tmp_path):
     calls = []
 
