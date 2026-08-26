@@ -69,6 +69,10 @@ _RANK_ENV_DEFAULTS = (
     ("MLX_METAL_FAST_SYNCH", "1"),
     ("MLX_MAX_OPS_PER_BUFFER", "16"),
     ("MLX_MAX_MB_PER_BUFFER", "512"),
+    # One JACCL communicator remains strictly ordered, but batching eight
+    # adjacent cache tensors per eval removes 112 Python/Metal submission
+    # fences from a typical 128-array phase handoff.
+    ("OMLX_CLUSTER_CACHE_TRANSFER_WINDOW", "8"),
     ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),
     ("JACCL_TIMEOUT_ACTION", "teardown-exit"),
     # Live two-Mac RDMA A/B showed the experimental one-buffer two-rank path
@@ -330,7 +334,7 @@ def _validate_ip(value: str) -> str:
     return value
 
 
-def _hostfile_ips(host: "ClusterHost") -> list[str]:
+def _hostfile_ips(host: ClusterHost) -> list[str]:
     """Communication IPs in the order a rank should try them.
 
     Routable addresses first: a link-local IPv6 without its (machine-local)
@@ -695,8 +699,7 @@ class ClusterDeployment:
                 for item in assignments
             }
             replica_kv = {
-                (item.kv_cache_bytes, item.kv_bytes_per_token)
-                for item in assignments
+                (item.kv_cache_bytes, item.kv_bytes_per_token) for item in assignments
             }
             if len(replica_ranges) != 1 or len(replica_weights) != 1:
                 raise ValueError(

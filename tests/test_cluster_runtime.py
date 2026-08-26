@@ -184,6 +184,41 @@ def test_runtime_markers_expose_full_unequal_shard_map_and_pipeline_rates(
         "eta": None,
         "elapsed": 2.0,
     }
+
+
+def test_runtime_markers_admit_full_replica_phase_ownership_and_handoff(tmp_path):
+    assignments = _assignments()
+    for assignment in assignments:
+        assignment["start_layer"] = 0
+        assignment["end_layer"] = 80
+        assignment["layer_count"] = 80
+    phase = {
+        "handoffs_completed": 3,
+        "last_handoff_bytes": 2_000_000_000,
+        "last_handoff_arrays": 128,
+        "last_handoff_seconds": 0.25,
+        "last_handoff_bytes_per_second": 8_000_000_000.0,
+        "queue_depth": 1,
+    }
+    payload = _marker(
+        start_layer=0,
+        end_layer=80,
+        assignments=assignments,
+        serving_mode="disaggregated",
+        prefill_rank=1,
+        decode_rank=0,
+        metrics=_metrics() | {"phase_split": phase},
+    )
+    (tmp_path / "job.json").write_text(json.dumps(payload))
+
+    result = read_runtime_markers(tmp_path)
+
+    assert result["warnings"] == []
+    job = result["jobs"][0]
+    assert job["serving_mode"] == "disaggregated"
+    assert job["prefill_rank"] == 1
+    assert job["decode_rank"] == 0
+    assert job["metrics"]["phase_split"] == phase
     assert job["metrics"]["requests_cancelled"] == 1
 
 
@@ -346,14 +381,18 @@ def test_runtime_markers_reject_partial_or_disabled_ssd_tier_metrics(tmp_path):
     disabled["ssd_enabled"] = False
     (tmp_path / "disabled.json").write_text(
         json.dumps(
-            _marker(assignments=_assignments(), metrics=_metrics() | {"cache": disabled})
+            _marker(
+                assignments=_assignments(), metrics=_metrics() | {"cache": disabled}
+            )
         )
     )
 
     result = read_runtime_markers(tmp_path)
 
     assert result["jobs"] == []
-    assert any("cache tier metrics are incomplete" in item for item in result["warnings"])
+    assert any(
+        "cache tier metrics are incomplete" in item for item in result["warnings"]
+    )
     assert any(
         "SSD tier is populated while disabled" in item for item in result["warnings"]
     )
@@ -583,10 +622,7 @@ def test_runtime_markers_validate_performance_controls_and_live_pipeline_metrics
     assert job["optimizations"]["prefill_logits_skip"]["active"] is True
     assert job["optimizations"]["prefill_allocator_reuse"]["active"] is True
     assert job["optimizations"]["sparse_indexer_row_parallel"]["active"] is True
-    assert (
-        job["optimizations"]["deepseek_v4_fused_decode_attention"]["active"]
-        is True
-    )
+    assert job["optimizations"]["deepseek_v4_fused_decode_attention"]["active"] is True
     assert job["optimizations"]["deepseek_v4_adaptive_prefill"]["active"] is True
     assert job["optimizations"]["deepseek_v4_prefill_yield"]["active"] is True
     assert job["optimizations"]["deepseek_v4_prefill_async"]["active"] is True
