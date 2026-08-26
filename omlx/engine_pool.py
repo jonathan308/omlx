@@ -1119,9 +1119,22 @@ class EnginePool:
         if not callable(has_active_requests):
             return False
         try:
-            return has_active_requests() is True
+            if has_active_requests() is True:
+                return True
         except Exception:
             return True
+        # Do not use instance getattr here: test doubles and dynamic proxies
+        # can manufacture a truthy method for any name. Only engines whose
+        # class explicitly implements rank-side telemetry participate.
+        rank_side = getattr(type(engine), "rank_side_active_requests", None)
+        if callable(rank_side):
+            try:
+                remaining = rank_side(engine)
+            except Exception:
+                remaining = None
+            if remaining:
+                return True
+        return False
 
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
