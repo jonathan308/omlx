@@ -738,10 +738,10 @@ def _register_cluster_routes() -> None:
         discovery_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
     )
-    # Cluster v2 pairing (Module B): the joiner's pair/request + pair/status
-    # are public but carry only blake2s(code + node_id) and a code-encrypted
-    # cluster key — the admin's approve step is the trust decision. Approve,
-    # deny, and unpair are admin-only like every other cluster mutation.
+    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # verifier bound to the node and SSH identities; pair/status returns a
+    # code-encrypted cluster key only after admin approval. Approve, deny, and
+    # unpair are admin-only like every other cluster mutation.
     from .cluster.pairing_routes import pair_admin_router, pair_router
 
     app.include_router(

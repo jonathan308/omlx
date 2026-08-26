@@ -10,6 +10,7 @@ joiner/coordinator APIs.
 import base64
 import json
 import stat
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -107,6 +108,8 @@ def _manager(
     enrollment_store=None,
     driver_calls=None,
     revocation_calls=None,
+    enrollment_driver=None,
+    revocation_driver=None,
 ):
     """A PairingManager with every side effect faked or sandboxed."""
 
@@ -134,8 +137,8 @@ def _manager(
         address_provider=lambda: ["127.0.0.1"],
         ssh_key_provider=lambda: _test_public_key(node_id),
         ssh_host_key_provider=lambda: _test_public_key(f"host-{node_id}"),
-        enrollment_driver=driver,
-        revocation_driver=revocation,
+        enrollment_driver=enrollment_driver or driver,
+        revocation_driver=revocation_driver or revocation,
         clock=clock or _Clock(),
         audit=audit if audit is not None else _Audit(),
     )
@@ -470,6 +473,106 @@ def test_enrollment_failure_does_not_pair(tmp_path):
     assert "approve_enrollment_failed" in coordinator._audit.names()
 
 
+def test_approval_reservation_blocks_deny_unpair_and_duplicate_approval(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_enrollment(_peer):
+        entered.set()
+        assert release.wait(5), "test did not release enrollment"
+        return {"ok": True}
+
+    coordinator = _manager(
+        tmp_path,
+        node_id="coord-node",
+        name="Coordinator",
+        enrollment_driver=blocking_enrollment,
+    )
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    code = joiner.start_join()["code"]
+    coordinator.handle_join_request(joiner.build_join_request(code))
+    result = []
+    errors = []
+
+    def approve():
+        try:
+            result.append(coordinator.approve("join-node", code))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = threading.Thread(target=approve)
+    thread.start()
+    assert entered.wait(5), "approval never reached enrollment"
+
+    with pytest.raises(PairingStateError, match="already in progress"):
+        coordinator.approve("join-node", code)
+    with pytest.raises(PairingStateError, match="already in progress"):
+        coordinator.deny("join-node")
+    with pytest.raises(PairingStateError, match="already in progress"):
+        coordinator.unpair("join-node")
+
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert result[0]["state"] == "paired"
+    assert coordinator._key_store.get("join-node") is not None
+
+
+def test_persistence_failure_revokes_enrollment_and_releases_reservation(tmp_path):
+    revocations = []
+    coordinator = _manager(
+        tmp_path,
+        node_id="coord-node",
+        name="Coordinator",
+        revocation_calls=revocations,
+    )
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    code = joiner.start_join()["code"]
+    coordinator.handle_join_request(joiner.build_join_request(code))
+    coordinator._key_store.set = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        OSError("read-only pairing store")
+    )
+
+    with pytest.raises(PairingError, match="could not be persisted"):
+        coordinator.approve("join-node", code)
+
+    assert coordinator.paired_devices() == []
+    assert coordinator._key_store.get("join-node") is None
+    assert coordinator.pending_requests()[0]["approving"] is False
+    assert revocations == [
+        {
+            "peer_public_key": _test_public_key("join-node"),
+            "addrs": ["127.0.0.1"],
+        }
+    ]
+    assert "approve_persistence_failed" in coordinator._audit.names()
+
+
+def test_device_persistence_failure_rolls_back_cluster_key(tmp_path):
+    revocations = []
+    coordinator = _manager(
+        tmp_path,
+        node_id="coord-node",
+        name="Coordinator",
+        revocation_calls=revocations,
+    )
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    code = joiner.start_join()["code"]
+    coordinator.handle_join_request(joiner.build_join_request(code))
+    coordinator._devices.put_paired = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        OSError("read-only device registry")
+    )
+
+    with pytest.raises(PairingError, match="could not be persisted"):
+        coordinator.approve("join-node", code)
+
+    assert coordinator._key_store.get("join-node") is None
+    assert coordinator.paired_devices() == []
+    assert coordinator.pending_requests()[0]["approving"] is False
+    assert len(revocations) == 1
+
+
 def test_joiner_enrollment_failure_does_not_persist_coordinator(tmp_path):
     coordinator, joiner, *_ = _loopback_pair(tmp_path)
     code = joiner.start_join()["code"]
@@ -485,6 +588,48 @@ def test_joiner_enrollment_failure_does_not_persist_coordinator(tmp_path):
     assert joiner.paired_devices() == []
     assert joiner._key_store.get("coord-node") is None
     assert "join_enrollment_failed" in joiner._audit.names()
+
+
+def test_joiner_persistence_failure_revokes_enrollment_and_keeps_retry_state(
+    tmp_path,
+):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    revocations = []
+    joiner._revocation_driver = lambda material: revocations.append(material) or {}
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    status = joiner.poll_join("coordinator.local:8080")
+    joiner._key_store.set = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        OSError("read-only pairing store")
+    )
+
+    with pytest.raises(PairingError, match="coordinator was not paired"):
+        joiner.complete_join(status)
+
+    assert joiner.paired_devices() == []
+    assert joiner._key_store.get("coord-node") is None
+    assert joiner._local_code["completing"] is False
+    assert revocations[-1] == {
+        "peer_public_key": _test_public_key("coord-node"),
+        "addrs": ["127.0.0.1"],
+    }
+    assert "join_persistence_failed" in joiner._audit.names()
+
+
+def test_join_completion_rejects_an_expired_local_code(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    status = joiner.poll_join("coordinator.local:8080")
+    joiner._clock.now += CODE_TTL_SECONDS + 1
+
+    with pytest.raises(PairingExpiredError, match="expired"):
+        joiner.complete_join(status)
+
+    assert joiner._local_code is None
+    assert joiner.paired_devices() == []
 
 
 def test_approval_requires_coordinator_ssh_material(tmp_path):

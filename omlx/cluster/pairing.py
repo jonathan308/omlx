@@ -13,7 +13,7 @@ both directions) with an exo-style flow:
    the joiner into ``/api/cluster/pair/approve``.
 4. Approval verifies the code-bound identities (3 attempts, then a 10-minute lockout),
    generates the 32-byte ``cluster_key``, wraps it under a key derived from
-   the code with PBKDF2-HMAC-SHA256 (100k iterations), persists the peer as
+   the code with PBKDF2-HMAC-SHA256 (210k iterations), persists the peer as
    paired, and drives symmetric, fail-closed SSH enrollment with the
    authenticated user key and daemon host key.
 5. The joiner polls ``/api/cluster/pair/status/{node_id}`` and unwraps the
@@ -604,6 +604,7 @@ class _PendingRequest:
     expires_at: float
     attempts: int = 0
     locked_until: float | None = None
+    approving: bool = False
 
     def to_dict(self, now: float) -> dict[str, Any]:
         locked = self.locked_until is not None and self.locked_until > now
@@ -619,6 +620,7 @@ class _PendingRequest:
             "attempts": self.attempts,
             "locked": locked,
             "locked_until": self.locked_until if locked else None,
+            "approving": self.approving,
         }
 
 
@@ -952,6 +954,7 @@ class PairingManager:
             "code": code,
             "created_at": now,
             "expires_at": now + CODE_TTL_SECONDS,
+            "completing": False,
         }
         return {"code": code, "expires_at": self._local_code["expires_at"]}
 
@@ -1033,14 +1036,31 @@ class PairingManager:
         package = status.get("cluster_key_package")
         if not isinstance(package, dict):
             raise PairingRequestError("approval status is missing the wrapped key")
-        if code is None:
-            if self._local_code is None:
+        with self._lock:
+            local_code = self._local_code
+            if local_code is None:
                 raise PairingStateError("no join in progress; call start_join first")
-            code = self._local_code["code"]
-        cluster_key = unwrap_cluster_key(package, code)
+            if local_code["expires_at"] < self._clock():
+                self._local_code = None
+                raise PairingExpiredError("the displayed pairing code has expired")
+            if local_code.get("completing"):
+                raise PairingStateError("join completion is already in progress")
+            if code is None:
+                code = local_code["code"]
+            local_code["completing"] = True
+        try:
+            cluster_key = unwrap_cluster_key(package, code)
+        except Exception:
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
+            raise
         coordinator = status.get("coordinator") or {}
         coordinator_id = str(coordinator.get("node_id") or "")
         if not coordinator_id:
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
             raise PairingRequestError("approval status is missing coordinator identity")
         coordinator_peer = {
             "node_id": coordinator_id,
@@ -1051,17 +1071,31 @@ class PairingManager:
             "ssh_host_public_key": coordinator.get("ssh_host_public_key"),
         }
         observed_tag = str(status.get("coordinator_identity_tag") or "")
-        expected_tag = coordinator_identity_tag(cluster_key, coordinator_peer)
+        try:
+            expected_tag = coordinator_identity_tag(cluster_key, coordinator_peer)
+        except Exception:
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
+            raise
         if not hmac.compare_digest(observed_tag, expected_tag):
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
             raise PairingCodeError("approval status coordinator identity was altered")
+        enrolled = False
         try:
             self._enrollment_driver(coordinator_peer)
+            enrolled = True
         except Exception as exc:
             self._record_audit(
                 "join_enrollment_failed",
                 node_id=coordinator_id,
                 detail={"error": str(exc)},
             )
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
             raise EnrollmentDriveError(
                 f"SSH enrollment failed; coordinator was not paired: {exc}"
             ) from exc
@@ -1075,18 +1109,60 @@ class PairingManager:
             "state": "paired",
             "role": "coordinator",
         }
-        self._devices.put_paired(record)
-        self._key_store.set(
-            coordinator_id,
-            {
-                "cluster_key": cluster_key.hex(),
-                "peer_public_key": coordinator.get("ssh_public_key"),
-                "addrs": coordinator_peer["addrs"],
-                "paired_at": paired_at,
-                "role": "coordinator",
-            },
-        )
-        self._local_code = None
+        key_record = {
+            "cluster_key": cluster_key.hex(),
+            "peer_public_key": coordinator.get("ssh_public_key"),
+            "addrs": coordinator_peer["addrs"],
+            "paired_at": paired_at,
+            "role": "coordinator",
+        }
+        key_written = False
+        try:
+            with self._lock:
+                if self._local_code is not local_code or not local_code.get(
+                    "completing"
+                ):
+                    raise PairingStateError(
+                        "join state changed while completion was in progress"
+                    )
+                self._key_store.set(coordinator_id, key_record)
+                key_written = True
+                self._devices.put_paired(record)
+                self._local_code = None
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            if key_written:
+                try:
+                    self._key_store.remove(coordinator_id)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"pairing key: {rollback_exc}")
+            if enrolled:
+                try:
+                    self._revocation_driver(
+                        {
+                            "peer_public_key": coordinator.get("ssh_public_key"),
+                            "addrs": coordinator_peer["addrs"],
+                        }
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"SSH enrollment: {rollback_exc}")
+            with self._lock:
+                if self._local_code is local_code:
+                    local_code["completing"] = False
+            self._record_audit(
+                "join_persistence_failed",
+                node_id=coordinator_id,
+                detail={"error": str(exc), "rollback_errors": rollback_errors},
+            )
+            suffix = (
+                "; rollback issues: " + "; ".join(rollback_errors)
+                if rollback_errors
+                else ""
+            )
+            raise PairingError(
+                "join state could not be persisted; coordinator was not paired: "
+                f"{exc}{suffix}"
+            ) from exc
         self._record_audit("join_completed", node_id=coordinator_id)
         return record
 
@@ -1095,9 +1171,10 @@ class PairingManager:
     def handle_join_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Register a joiner's pair/request as ``awaiting_approval``.
 
-        The code itself never arrives — only ``blake2s(code + node_id)`` —
-        so this endpoint can stay unauthenticated; the admin's approve step
-        (typing the code shown on the joiner) is the trust decision.
+        The code itself never arrives — only a salted PBKDF2 verifier bound to
+        the node and both SSH identities — so this endpoint can stay
+        unauthenticated; the admin's approve step (typing the code shown on the
+        joiner) is the trust decision.
         """
 
         if not isinstance(payload, dict):
@@ -1222,6 +1299,8 @@ class PairingManager:
                 del self._pending[node_id]
                 self._record_audit("join_request_expired", node_id=node_id)
                 raise PairingExpiredError("the pairing code has expired")
+            if pending.approving:
+                raise PairingStateError("approval is already in progress")
             if pending.locked_until is not None and pending.locked_until > now:
                 self._record_audit(
                     "approve_locked_out",
@@ -1259,6 +1338,10 @@ class PairingManager:
                     f"code does not match ({MAX_CODE_ATTEMPTS - pending.attempts} "
                     "attempts left)"
                 )
+            # Reserve this exact pending request before leaving the manager
+            # lock for SSH I/O. Deny, unpair, and duplicate approval must not
+            # race an enrollment that has already passed code verification.
+            pending.approving = True
 
         try:
             coordinator_material = self.local_ssh_material()
@@ -1268,6 +1351,9 @@ class PairingManager:
                 node_id=node_id,
                 detail={"error": str(exc)},
             )
+            with self._lock:
+                if self._pending.get(node_id) is pending:
+                    pending.approving = False
             raise EnrollmentDriveError(
                 f"SSH enrollment failed; peer was not paired: {exc}"
             ) from exc
@@ -1294,6 +1380,9 @@ class PairingManager:
             self._record_audit(
                 "approve_enrollment_failed", node_id=node_id, detail={"error": str(exc)}
             )
+            with self._lock:
+                if self._pending.get(node_id) is pending:
+                    pending.approving = False
             raise EnrollmentDriveError(
                 f"SSH enrollment failed; peer was not paired: {exc}"
             ) from exc
@@ -1308,24 +1397,63 @@ class PairingManager:
             "state": "paired",
             "role": "peer",
         }
-        self._devices.put_paired(record)
-        self._key_store.set(
-            pending.node_id,
-            {
-                "cluster_key": cluster_key.hex(),
-                # The joiner retrieves this package via pair/status and
-                # unwraps it with the code; safe to persist (0600) and serve.
-                "cluster_key_package": package,
-                "coordinator": coordinator_material,
-                "coordinator_identity_tag": coordinator_tag,
-                "peer_public_key": pending.ssh_public_key,
-                "addrs": list(pending.addrs),
-                "paired_at": paired_at,
-                "role": "peer",
-            },
-        )
-        with self._lock:
-            self._pending.pop(node_id, None)
+        key_record = {
+            "cluster_key": cluster_key.hex(),
+            # The joiner retrieves this package via pair/status and unwraps it
+            # with the code; safe to persist (0600) and serve.
+            "cluster_key_package": package,
+            "coordinator": coordinator_material,
+            "coordinator_identity_tag": coordinator_tag,
+            "peer_public_key": pending.ssh_public_key,
+            "addrs": list(pending.addrs),
+            "paired_at": paired_at,
+            "role": "peer",
+        }
+        key_written = False
+        try:
+            with self._lock:
+                if self._pending.get(node_id) is not pending or not pending.approving:
+                    raise PairingStateError(
+                        "join request changed while approval was in progress"
+                    )
+                self._key_store.set(pending.node_id, key_record)
+                key_written = True
+                self._devices.put_paired(record)
+                self._pending.pop(node_id, None)
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            if key_written:
+                try:
+                    self._key_store.remove(pending.node_id)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"pairing key: {rollback_exc}")
+            try:
+                self._revocation_driver(
+                    {
+                        "peer_public_key": pending.ssh_public_key,
+                        "addrs": list(pending.addrs),
+                    }
+                )
+            except Exception as rollback_exc:
+                rollback_errors.append(f"SSH enrollment: {rollback_exc}")
+            with self._lock:
+                if self._pending.get(node_id) is pending:
+                    pending.approving = False
+            detail = {"error": str(exc), "rollback_errors": rollback_errors}
+            self._record_audit(
+                "approve_persistence_failed",
+                node_id=node_id,
+                detail=detail,
+            )
+            suffix = (
+                "; rollback issues: " + "; ".join(rollback_errors)
+                if rollback_errors
+                else ""
+            )
+            raise PairingError(
+                f"pairing state could not be persisted; peer was not paired: "
+                f"{exc}{suffix}"
+            ) from exc
         self._record_audit(
             "approve_success",
             node_id=node_id,
@@ -1347,8 +1475,12 @@ class PairingManager:
         with self._lock:
             now = self._clock()
             self._prune_pending(now)
-            if self._pending.pop(node_id, None) is None:
+            pending = self._pending.get(node_id)
+            if pending is None:
                 return False
+            if pending.approving:
+                raise PairingStateError("approval is already in progress")
+            self._pending.pop(node_id, None)
             self._denied[node_id] = now
         self._record_audit("join_request_denied", node_id=node_id)
         return True
@@ -1402,6 +1534,9 @@ class PairingManager:
         with self._lock:
             now = self._clock()
             self._prune_pending(now)
+            pending = self._pending.get(node_id)
+            if pending is not None and pending.approving:
+                raise PairingStateError("approval is already in progress")
             was_pending = self._pending.pop(node_id, None) is not None
         device = self._devices.get(node_id)
         removed_device = self._devices.remove(node_id)
