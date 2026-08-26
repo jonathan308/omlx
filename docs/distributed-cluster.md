@@ -7,7 +7,9 @@ oMLX can run one downloaded MLX model across a capability-matched group of
 Macs while preserving its existing OpenAI-compatible API. Automatic planning
 chooses tensor parallelism for supported models and fast links, contiguous
 pipeline stages for capacity-oriented or non-TP models, or a capability-gated
-TP x pipeline factorization. Rank zero remains the API coordinator; it never
+TP x pipeline factorization. An explicit, default-off **Phase split** mode can
+instead load two complete replicas and overlap prefill on rank 1 with decode
+and API work on rank 0. Rank zero remains the API coordinator; it never
 silently loads a second full local model when a distributed launch fails.
 
 Experimental Mac + NVIDIA execution is available through the outer MLX Ring
@@ -49,6 +51,9 @@ The implementation currently provides:
   disconnect cancellation, bounded failure propagation and orphan recovery
   through the normal oMLX engine interface;
 - rank-unanimous hot/SSD prompt snapshot reuse and all-rank cache clearing;
+- model-independent full-replica prefill/decode cache handoff for compatible
+  text models, with signed ownership, exact/nearest-prefix reuse, optional
+  persistent snapshots, chunk-boundary cancellation and measured RDMA handoff;
 - a Cluster dashboard on every Mac with a full live shard map, local-rank
   highlighting, memory headroom, rank-local KV ownership, TTFT, prefill tok/s,
   per-request and aggregate decode tok/s, pipeline utilization, prompt-cache hit
@@ -82,6 +87,14 @@ rank 0 tensor shard ───────── Thunderbolt RDMA / JACCL ──�
 For a pipeline plan, replace each tensor shard above with its signed contiguous
 layer range. For a hybrid plan, each stage owns a layer range and each rank
 inside that stage owns one tensor shard of those layers.
+
+For **Phase split**, both Macs load the complete model. Rank 1 processes the
+prompt and sends the lossless MLX-LM cache state and final prefill logits over
+the selected fabric; rank 0 reconstructs the cache and owns sampling, decode and
+the private API. While rank 0 decodes request N, rank 1 can prefill request N+1.
+This improves queued throughput rather than making two Macs compute one prompt.
+The mode is admitted only when weights plus the requested KV reservation fit on
+both Macs and every cache state has a validated transfer contract.
 
 The cluster runtime lives outside oMLX's main MLX scheduler process. This keeps
 the existing API adapters and model lifecycle intact while allowing MLX-LM to
@@ -211,7 +224,9 @@ On the coordinator:
 4. Select any model in the unioned cluster inventory. Missing checkpoint and
    sidecar files are staged before activation, including different per-node
    paths.
-5. Leave strategy on **Automatic** or choose Tensor/Pipeline. Automatic inspects
+5. Leave strategy on **Automatic** or choose Tensor/Pipeline. For a compatible
+   two-Mac text model, **Phase split** is also available as an explicit
+   experimental choice. Automatic inspects
    model capabilities, per-node memory and measured fabric, then returns a
    signed shard recommendation. Unequal tensor vectors require exact persisted
    parity qualification; otherwise the plan safely uses equal tensor shards.
@@ -233,6 +248,26 @@ Layer range, planned weights, headroom, and KV ownership remain rank-specific.
 Activation records the approved deployment. Loading from either the normal
 model control or the first request starts its signed ranks; a one-action replan
 quiesces, unloads, replaces the signed placement and reloads.
+
+The active card follows the live runtime owner when several signed deployments
+exist. It can unload resident weights while preserving the setup, reload them
+with a readiness canary, or drain/remove the setup and reopen the model picker.
+Model staging/synchronization runs before activation for Phase split exactly as
+for TP and pipeline, so each full-replica owner must hold a complete manifest.
+
+### Phase split boundaries
+
+The current Beta contract is deliberately narrow and fail-closed:
+
+- exactly two Macs, with rank 1 prefill and rank 0 decode/API;
+- text requests only; VLM media inputs are rejected;
+- no MTP/speculative decode or guided grammar state across the handoff;
+- both Macs must fit complete weights and the full requested KV reservation;
+- cache types are universal by serialization contract, not by model name: every
+  state leaf must be an MLX array and the installed cache class must implement
+  `from_state`; unfamiliar state fails the readiness canary;
+- DS4 Flash does not fit as two full replicas on the 128 GB reference M5 and
+  therefore stays on TP. A future phase-shard-group topology is separate work.
 
 Deactivation prevents future distributed loads. An already-loaded engine
 continues until the normal unload lifecycle so an admin click cannot interrupt
