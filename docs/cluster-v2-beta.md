@@ -52,6 +52,34 @@ loaded adapter/runtime.
   parity qualification is persisted. Drift falls back to equal safe shards.
 - Model files may live at different absolute paths. A signed `path_map` and
   complete sidecar staging replace the former same-path requirement.
+- Phase split is a separate, default-off two-rank full-replica strategy for
+  compatible text models. The planner independently proves full weights plus
+  KV fit on both Macs, signs prefill/decode ownership, stages a complete model
+  manifest to each owner and launches the persistent phase server. It is not a
+  fallback for a model that fails TP/pipeline fit.
+
+## Full-replica Phase split Beta contract
+
+The coordinator UI covers selection, role display, context reservation,
+serving profile, hot/SSD prompt reuse, staging/synchronization, signed
+activation, live per-request/phase metrics, all-rank cache clear, unload/reload
+and change-model flow. Replans preserve phase ownership, and the active card
+follows the runtime-loaded deployment rather than stale registry order.
+
+The backend uses a model-independent cache manifest carrying model identity,
+cache class, tree path, shape, dtype and metadata. Tensor leaves transfer
+directly over Ring/JACCL; rank 0 reconstructs each installed cache through its
+`from_state` contract. Unknown/non-array cache state fails closed. Public chat,
+streaming, reasoning, structured tool calls, sampling/logit processors,
+chunk-boundary prefill cancellation, decode cancellation and exact/nearest hot
+prefix reuse are wired. Persistent SSD snapshots use the normal cluster cache
+root and clear workflow.
+
+This is not yet phase-sharded universal execution. The present contract is two
+full replicas, rank 1 prefill and rank 0 decode/API, text only, with MTP,
+multimodal inputs and guided grammar disabled. DS4 Flash cannot enter this mode
+on the reference 128 GB M5 because it does not fit twice; it remains a TP model
+until a logical phase can itself be a shard group.
 
 ## Stability mechanisms replacing the old surface
 
@@ -91,6 +119,11 @@ measured weights per rank, with a one-million-token context reservation.
 | Qwen3-30B-A3B TP2 cold-prefix 30K | 1,533.73 tok/s |
 | Qwen3-30B-A3B TP2 B1 decode | 56.83 tok/s |
 | Qwen3-30B-A3B TP2 B4 aggregate | 216.3 tok/s |
+| Qwen3.8-27B Phase split 9,410-token cold prefill compute average | 991.36 tok/s |
+| Qwen3.8-27B Phase split decode | 29.59 tok/s |
+| Phase cache handoff, 770.64 MB / 128 arrays | 104.97 ms / 7.34 GB/s |
+| Exact 9,410-token Phase prefix repeat | 12.31 s -> 1.40 s |
+| Phase B4 queued throughput gain | about 1.29x vs sequential stage time |
 
 An outer DS4 `3:5` split reached about 826 tok/s at 30K but changed a greedy
 completion on the parity corpus. It is persisted as rejected and is not an
