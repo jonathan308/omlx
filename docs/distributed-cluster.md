@@ -254,6 +254,11 @@ exist. It can unload resident weights while preserving the setup, reload them
 with a readiness canary, or drain/remove the setup and reopen the model picker.
 Model staging/synchronization runs before activation for Phase split exactly as
 for TP and pipeline, so each full-replica owner must hold a complete manifest.
+The ordinary **Clear SSD Cache** action clears active rank stores through their
+cache managers. If the deployment is already unloaded, it uses the existing
+enrolled SSH policy to remove the same validated cluster snapshot and legacy
+roots from every configured peer; an unreachable peer makes the clear fail
+visibly instead of leaving a silent restore behind.
 
 ### Phase split boundaries
 
