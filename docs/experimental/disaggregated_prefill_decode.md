@@ -1,7 +1,55 @@
 # Disaggregated prefill/decode over JACCL RDMA
 
-Status: physically proven single-request and two-request pipeline prototype,
-default off, not connected to the public HTTP scheduler.
+Status: beta-grade persistent serving mode, default off and selectable as
+**Phase split** in Cluster v2. Physical public-API, tool-call, cache-reuse,
+cancellation, B4 overlap, unload/reload and telemetry gates pass on the two-Mac
+JACCL/RDMA reference cluster.
+
+## Persistent serving integration (2026-08-25)
+
+The signed deployment schema now carries `serving_mode=disaggregated` plus
+explicit prefill/decode rank ownership. The dashboard plans two complete
+replicas, proves that weights plus the requested KV budget fit independently,
+labels each Mac's phase, and launches a dedicated persistent worker. Rank 1
+prefills request N+1 while rank 0 decodes request N; rank 0 remains the public
+OpenAI-compatible API owner.
+
+Production behavior now includes:
+
+- streaming and non-streaming chat/completions, reasoning and structured tool
+  calls without protocol-marker leakage;
+- chunk-boundary prefill cancellation, decode cancellation, queue overlap and
+  clean communicator reuse after a disconnected client;
+- per-request compute-boundary prefill/decode rates, queue depth and measured
+  cache-handoff bytes/time/bandwidth in the Cluster dashboard;
+- hot exact/nearest-prefix reuse on the prefill owner, including exact final
+  logits, plus optional persistent SSD snapshots in the existing
+  `~/.omlx/cache/cluster-prompt-snapshots/<deployment>/<plan>/rank-1` tree;
+- the existing all-rank hot/SSD clear protocol and quiescence-gated
+  unload/reload/model-change workflow; and
+- serving-profile replans that preserve phase ownership instead of silently
+  reverting to sharded mode.
+
+Latest integrated public-API evidence after batching eight ordered JACCL cache
+operations per Metal evaluation:
+
+| gate | result |
+|---|---:|
+| 9,410-token cold prefill compute average | **991.36 tok/s** |
+| same request headline cold prefill | **966.26 tok/s** |
+| decode | **29.59 tok/s** |
+| 770.64 MB / 128-array cache handoff | **104.97 ms / 7.34 GB/s** |
+| pre-window handoff baseline | ~6.1 GB/s |
+| exact 9,410-token prefix repeat | **12.31 s → 1.40 s** |
+| B4 2,219-token + 32 overlap | **10.86 s wall / ~1.29x** vs sequential |
+| direct prefill disconnect | retired cleanly; following request HTTP 200 |
+| registered `get_weather` tool | `finish_reason=tool_calls`, no leaked tag |
+
+This is a throughput mode, not a claim that two full replicas accelerate one
+request's prefill compute. The M5 Max supplies the roughly 1K tok/s prefill;
+the second Mac overlaps decode and API work. DeepSeek-V4-Flash still cannot use
+this exact two-full-replica topology because it does not fit on the 128 GB Mac;
+its future phase topology must make each logical phase a shard group.
 
 ## Contract
 
@@ -101,23 +149,19 @@ mode improves sustained throughput rather than single-request latency.
   `tests/test_disaggregated_worker.py`: schema/class/tensor guards and scheduler
   frontier helpers.
 
-## Before serving integration
+## Remaining beta work
 
-1. Feed live per-node phase probes, model admission budgets and fabric metrics
-   into the implemented pure role planner; persist the resulting capability in
-   signed deployment state.
-2. Port the proven bounded B2/B4/B8 queue into the persistent HTTP serving
-   lifecycle. While decode handles request N, prefill processes N+1 and cache
-   transfer occurs at the stage boundary.
-3. Preserve request IDs, cancellation, steering, grammar state, sampler state,
-   logit processors, tool-call parsing and per-request telemetry across the
-   ownership transition.
-4. Add bounded cache-transfer admission, timeout/CRC failure handling, receiver
-   teardown, and cache ownership/garbage collection.
-5. Gate MTP/speculative state separately; the current prototype proves fixed
-   greedy decode only.
-6. Run mixed prompt/decode lengths, 100K cache transfer, cancellation during
-   prefill/handoff/decode, forced rank loss and reload.
-7. Expose the mode only when the planner proves it useful. Models that do not
-   fit twice, single-request interactive workloads, and slow fabrics should
-   remain on tensor/pipeline/single-node execution automatically.
+1. Reduce worst-case cancellation latency by adding a smaller interrupt quantum
+   without regressing the 4,096-token prefill shape (current observed retirement
+   was about 8.7 seconds after a 4,096-token progress boundary at long context).
+2. Soak mixed prompt/decode lengths, 100K transfer, forced rank loss and repeated
+   reloads; preserve the current fail-closed communicator replacement behavior.
+3. Profile ordered handoff windows 4/8/16 at 30K and 100K. Window 8 is the first
+   promoted physical win; multi-communicator/multi-rail transfer remains off.
+4. Add VLM input transfer and grammar-constrained generation only after each
+   has an exact cross-phase ownership contract.
+5. Keep MTP/speculative state fail-closed. DS4 cannot enter this two-replica
+   topology on the current 128 GB node, and no speculative cache handoff has
+   yet passed parity.
+6. Complete a packaged-app visual click-through. Source/UI tests pass, but the
+   final browser surface was unavailable during this maintenance run.
