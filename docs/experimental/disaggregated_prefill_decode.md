@@ -45,6 +45,29 @@ operations per Metal evaluation:
 | direct prefill disconnect | retired cleanly; following request HTTP 200 |
 | registered `get_weather` tool | `finish_reason=tool_calls`, no leaked tag |
 
+Persistent Phase SSD qualification uses the same root as ordinary oMLX cache
+settings: `GlobalSettings.cache.get_ssd_cache_dir(base_path) /
+cluster-prompt-snapshots`. The server places that resolved value in the signed
+rank hostfile, so a configured custom SSD cache directory is inherited by peer
+ranks too.
+
+The physical 18,259-token persistence gate passed end to end:
+
+- cold request: 0 cached tokens, 21.30 s;
+- immediate hot repeat: 18,259 cached tokens, 1.42 s;
+- four 4,096-boundary snapshots committed on rank 1 (1.69 GB, zero failures);
+- unload/reload: 16,384 tokens restored from SSD, only the 1,875-token suffix
+  prefetched, 3.66 s wall;
+- normal **Clear SSD Cache** while loaded deleted all four snapshots and
+  acknowledged both ranks;
+- unload/reload after clear returned to 0 cached tokens and 20.87 s cold;
+- normal **Clear SSD Cache** while the cluster was unloaded used the enrolled
+  SSH path to remove the peer snapshot root as well, reporting both configured
+  ranks. The remote root was absent afterward.
+
+The live cluster was returned to loaded/ready with persistent Phase caching
+enabled and the synthetic test cache cleared.
+
 This is a throughput mode, not a claim that two full replicas accelerate one
 request's prefill compute. The M5 Max supplies the roughly 1K tok/s prefill;
 the second Mac overlaps decode and API work. DeepSeek-V4-Flash still cannot use
