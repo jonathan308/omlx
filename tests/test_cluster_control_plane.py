@@ -2,7 +2,10 @@
 """Reliable TCP control plane kept independent of MLX/JACCL collectives."""
 
 import socket
+import struct
 import threading
+
+import pytest
 
 from omlx.cluster.control_plane import RankControlPlane
 
@@ -71,3 +74,85 @@ def test_rank_control_plane_rejects_invalid_identity():
         assert "identity" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("invalid rank identity was accepted")
+
+
+def test_invalid_handshake_is_dropped_without_blocking_a_valid_rank():
+    port = _free_port()
+    token = "b" * 64
+    failures = []
+
+    def coordinator():
+        try:
+            with RankControlPlane(
+                rank=0,
+                world_size=2,
+                host="127.0.0.1",
+                port=port,
+                token=token,
+                connect_timeout=3,
+                io_timeout=3,
+            ) as control:
+                control.broadcast_object({"ready": True})
+        except Exception as exc:  # pragma: no cover - relayed below
+            failures.append(exc)
+
+    thread = threading.Thread(target=coordinator)
+    thread.start()
+    rogue = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for _attempt in range(100):
+        try:
+            rogue.connect(("127.0.0.1", port))
+            break
+        except ConnectionRefusedError:
+            threading.Event().wait(0.01)
+    else:  # pragma: no cover - diagnostics for a wedged test host
+        pytest.fail("coordinator listener did not start")
+    rogue.sendall(b"x" * struct.calcsize("!4sII64s"))
+    rogue.close()
+
+    with RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="127.0.0.1",
+        port=port,
+        token=token,
+        connect_timeout=3,
+        io_timeout=3,
+    ) as control:
+        assert control.broadcast_object(None) == {"ready": True}
+    thread.join(3)
+
+    assert not thread.is_alive()
+    assert failures == []
+
+
+def test_worker_requires_a_valid_coordinator_acknowledgement():
+    port = _free_port()
+    ready = threading.Event()
+
+    def fake_coordinator():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen(1)
+            ready.set()
+            stream, _ = listener.accept()
+            with stream:
+                stream.recv(struct.calcsize("!4sII64s"))
+                stream.sendall(struct.pack("!4sI", b"NOPE", 1))
+
+    thread = threading.Thread(target=fake_coordinator)
+    thread.start()
+    assert ready.wait(2)
+    with pytest.raises(RuntimeError, match="not acknowledged"), RankControlPlane(
+        rank=1,
+        world_size=2,
+        host="127.0.0.1",
+        port=port,
+        token="c" * 64,
+        connect_timeout=2,
+        io_timeout=2,
+    ):
+        pass
+    thread.join(2)
+    assert not thread.is_alive()

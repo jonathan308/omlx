@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hmac
 import pickle
 import socket
 import struct
@@ -18,9 +19,11 @@ from .system_socket_proxy import (
 )
 
 _HANDSHAKE_MAGIC = b"OC2H"
+_HANDSHAKE_ACK_MAGIC = b"OC2A"
 _MESSAGE_MAGIC = b"OC2M"
 _VERSION = 1
 _HANDSHAKE = struct.Struct("!4sII64s")
+_HANDSHAKE_ACK = struct.Struct("!4sI")
 _HEADER = struct.Struct("!4sIIII")
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
 
@@ -77,10 +80,14 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self._sequence = 0
 
     def __enter__(self) -> RankControlPlane:
-        if self.rank == 0:
-            self._accept_workers()
-        else:
-            self._connect_to_coordinator()
+        try:
+            if self.rank == 0:
+                self._accept_workers()
+            else:
+                self._connect_to_coordinator()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def _configure(self, stream: socket.socket) -> None:
@@ -103,7 +110,8 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                 stream, _address = listener.accept()
             except TimeoutError:
                 continue
-            self._configure(stream)
+            remaining = max(0.1, deadline - time.monotonic())
+            stream.settimeout(min(5.0, remaining))
             try:
                 magic, version, rank, token = _HANDSHAKE.unpack(
                     _recv_exact(stream, _HANDSHAKE.size)
@@ -113,13 +121,16 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                     or version != _VERSION
                     or not 0 < rank < self.world_size
                     or rank in self._peers
-                    or token != self._token
+                    or not hmac.compare_digest(token, self._token)
                 ):
-                    raise RuntimeError("rank-control handshake is invalid")
+                    stream.close()
+                    continue
+                self._configure(stream)
+                stream.sendall(_HANDSHAKE_ACK.pack(_HANDSHAKE_ACK_MAGIC, _VERSION))
                 self._peers[rank] = stream
-            except Exception:
+            except (OSError, TimeoutError, ConnectionError, struct.error):
                 stream.close()
-                raise
+                continue
 
     def _connect_to_coordinator(self) -> None:
         if should_proxy_control_socket(self.host):
@@ -139,6 +150,11 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                         self._token,
                     )
                 )
+                ack_magic, ack_version = _HANDSHAKE_ACK.unpack(
+                    _recv_exact(stream, _HANDSHAKE_ACK.size)
+                )
+                if ack_magic != _HANDSHAKE_ACK_MAGIC or ack_version != _VERSION:
+                    raise RuntimeError("rank-control handshake was not acknowledged")
             except BaseException:
                 proxy.close()
                 raise
@@ -161,8 +177,16 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
                         self._token,
                     )
                 )
+                ack_magic, ack_version = _HANDSHAKE_ACK.unpack(
+                    _recv_exact(stream, _HANDSHAKE_ACK.size)
+                )
+                if ack_magic != _HANDSHAKE_ACK_MAGIC or ack_version != _VERSION:
+                    raise RuntimeError("rank-control handshake was not acknowledged")
                 self._stream = stream
                 return
+            except RuntimeError:
+                stream.close()
+                raise
             except OSError as exc:
                 last_error = exc
                 stream.close()
