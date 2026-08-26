@@ -829,10 +829,25 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
+        if request.allocation != "balanced":
+            raise PlanningError(
+                "RAM-proportional allocation is a pipeline-only rule; tensor "
+                "parallelism uses the hybrid planner (allocation='balanced')"
+            )
         plan = plan_hybrid(
             model,
             nodes,
             tensor_parallel_size=request.tensor_parallel_size,
+            workload_profile=request.execution_profile,
+            microbatch_size=(
+                request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
+            ),
+            context_tokens=request.target_context_tokens,
+        )
+    elif request.allocation == "proportional":
+        plan = plan_proportional_pipeline(
+            model,
+            nodes,
             workload_profile=request.execution_profile,
             microbatch_size=(
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size

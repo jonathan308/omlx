@@ -12,6 +12,7 @@ import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
