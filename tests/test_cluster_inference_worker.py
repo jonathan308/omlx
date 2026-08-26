@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -363,6 +364,15 @@ def test_distributed_qwen_mtp_requires_an_attached_head():
             model_type="qwen3_5",
             enabled=True,
         )
+
+
+def test_worker_materializes_lazy_state_before_qwen_mtp_runtime_setup():
+    source = Path(inference_worker.__file__).read_text(encoding="utf-8")
+    load_at = source.index("provider.load_default()")
+    materialize_at = source.index("materialize_lazy_state(provider.model)", load_at)
+    qwen_at = source.index("_configure_distributed_qwen_mtp_runtime(", materialize_at)
+
+    assert load_at < materialize_at < qwen_at
 
 
 def test_distributed_mtp_refuses_unvalidated_model_family(tmp_path):

@@ -1914,6 +1914,15 @@ def run_worker(args: argparse.Namespace) -> int:
                 ),
             ):
                 provider.load_default()
+                # The private rank server generates on a background thread.
+                # Parameter evaluation alone leaves frozen/helper arrays
+                # (notably grafted MTP-head buffers) lazily bound to this
+                # loader thread's CPU/GPU streams. Local BatchedEngine already
+                # performs this complete state pass; distributed ranks need
+                # the same boundary before their generation thread starts.
+                from omlx.utils.model_loading import materialize_lazy_state
+
+                materialize_lazy_state(provider.model)
                 qwen_mtp_depth = _configure_distributed_qwen_mtp_runtime(
                     provider.model,
                     model_type=_distributed_model_type(args.model),
