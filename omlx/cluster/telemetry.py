@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
+import os
 import shutil
 import struct
 import threading
@@ -15,9 +17,6 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-
-import json
-import os
 
 from .performance import (
     DEFAULT_PROMPT_CACHE_SSD_MAX_BYTES,
@@ -2292,7 +2291,6 @@ def install_server_telemetry(
             import zlib
 
             group = mx.distributed.init()
-            world_size = int(group.size())
             rank = int(getattr(self, "_rank", group.rank()))
             if rank == 0:
                 payload = pickle.dumps(obj) if obj is not None else b""

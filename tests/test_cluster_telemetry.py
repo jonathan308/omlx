@@ -12,11 +12,11 @@ import pytest
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
-    _capture_prompt_boundary_cache,
     RuntimeTelemetry,
-    _TelemetryQueue,
     _agreed_snapshot_capacity_charge,
+    _capture_prompt_boundary_cache,
     _python_token_id,
+    _TelemetryQueue,
     install_server_telemetry,
 )
 

@@ -15,9 +15,9 @@ import hashlib
 import json
 import math
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
-import time
 from typing import Any
 
 from .cache_transfer import (
@@ -25,7 +25,6 @@ from .cache_transfer import (
     recv_cache_transfer,
     send_cache_transfer,
 )
-
 
 EVENT_PREFIX = "OMLX_DISAGG_EVENT:"
 
@@ -423,15 +422,15 @@ def run(args: argparse.Namespace) -> int:
     install_torch_stub()
 
     import mlx.core as mx
-
     from mlx_lm import load
     from mlx_lm.models.cache import make_prompt_cache
 
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    from .control_plane import RankControlPlane
     from .jaccl_lease import acquire_jaccl_communicator_lease
     from .jaccl_side_channel import init_cluster_group
-    from .control_plane import RankControlPlane
     from .staging import model_identity_digest
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
     model_path = Path(args.model).expanduser().resolve()
     identity = model_identity_digest(model_path)
