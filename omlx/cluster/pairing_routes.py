@@ -25,6 +25,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from .discovery_routes import ProbeRateLimiter
 from .pairing import (
     CODE_DIGITS,
     EnrollmentDriveError,
@@ -41,6 +42,8 @@ pair_router = APIRouter(prefix="/api/cluster", tags=["cluster-v2-pairing"])
 pair_admin_router = APIRouter(prefix="/api/cluster", tags=["cluster-v2-pairing-admin"])
 
 _get_pairing_manager: Any = get_pairing_manager
+pair_request_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=8)
+pair_status_rate_limiter = ProbeRateLimiter(rate_per_second=5.0, burst=20)
 
 
 def set_pairing_manager_getter(getter: Any) -> None:
@@ -105,6 +108,8 @@ async def cluster_pair_request(body: PairRequestBody, request: Request):
     manager = _manager()
     payload = body.model_dump()
     source = request.client.host if request.client is not None else ""
+    if not pair_request_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair request rate limit exceeded")
     try:
         ipaddress.ip_address(source.split("%", 1)[0])
     except ValueError:
@@ -121,10 +126,13 @@ async def cluster_pair_request(body: PairRequestBody, request: Request):
 
 
 @pair_router.get("/pair/status/{node_id}")
-async def cluster_pair_status(node_id: str):
+async def cluster_pair_status(node_id: str, request: Request):
     """Joiner poll: pending/approved/denied plus the wrapped cluster key."""
 
     manager = _manager()
+    source = request.client.host if request.client is not None else ""
+    if not pair_status_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair status rate limit exceeded")
     if not node_id or len(node_id) > 255:
         raise HTTPException(status_code=400, detail="invalid node_id")
     return await asyncio.to_thread(manager.join_status, node_id)

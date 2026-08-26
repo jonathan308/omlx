@@ -980,6 +980,25 @@ def test_endpoints_full_flow(tmp_path, monkeypatch):
     assert client.get("/api/cluster/pair/status/join-node").json()["state"] == "unknown"
 
 
+def test_public_pairing_endpoints_are_rate_limited(tmp_path, monkeypatch):
+    client, _, _ = _client(tmp_path)
+    joiner = _manager(tmp_path, node_id="join-node", name="Joiner")
+    payload = joiner.build_join_request(joiner.start_join()["code"])
+    monkeypatch.setattr(
+        pairing_routes.pair_request_rate_limiter,
+        "allow",
+        lambda _client: False,
+    )
+    assert client.post("/api/cluster/pair/request", json=payload).status_code == 429
+
+    monkeypatch.setattr(
+        pairing_routes.pair_status_rate_limiter,
+        "allow",
+        lambda _client: False,
+    )
+    assert client.get("/api/cluster/pair/status/join-node").status_code == 429
+
+
 def test_pair_request_binds_enrollment_to_http_source(tmp_path):
     captured: list[dict] = []
 
