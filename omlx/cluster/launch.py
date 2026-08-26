@@ -3286,8 +3286,7 @@ class DistributedJobSupervisor:
                 # failed.  Stop/unload clears ``process`` and phase afterwards;
                 # while it remains registered this is always unexpected.
                 failure_reason = (
-                    "distributed launcher exited unexpectedly with code "
-                    f"{returncode}"
+                    f"distributed launcher exited unexpectedly with code {returncode}"
                 )
         return DistributedJobStatus(
             deployment_id=self.deployment.deployment_id,

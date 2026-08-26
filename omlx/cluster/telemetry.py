@@ -39,6 +39,8 @@ _MAX_CANCEL_FILE_BYTES = 64 * 1024
 _DEFAULT_HEARTBEAT_INTERVAL = 10.0
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
 _MAX_TARGETED_CANCEL_REQUESTS = 256
+_CANCEL_VOTE_KIND = "omlx.cancel_vote"
+_CANCEL_VOTE_SCHEMA_VERSION = 1
 
 
 def _transport_request_id(value: Any) -> str | None:
@@ -555,8 +557,7 @@ class RuntimeTelemetry:
             requested = [
                 self._request_to_uid[request_id]
                 for request_id in self._cancel_requested_requests
-                if request_id in self._request_to_uid
-                and request_id in self._requests
+                if request_id in self._request_to_uid and request_id in self._requests
             ]
         for uid in requested:
             if uid not in merged:
@@ -1097,6 +1098,11 @@ def install_server_telemetry(
         if isinstance(marker_payload, dict)
         else ""
     )
+    marker_plan_hash = (
+        str(marker_payload.get("plan_hash") or "")
+        if isinstance(marker_payload, dict)
+        else ""
+    )
     telemetry = RuntimeTelemetry(
         marker,
         execution=execution,
@@ -1189,9 +1195,7 @@ def install_server_telemetry(
         plans: list[tuple[int, int, int]] = []
         if control_plane is not None:
             for source in range(world_size):
-                payload = (
-                    struct.pack("!QQQ", *local) if rank == source else None
-                )
+                payload = struct.pack("!QQQ", *local) if rank == source else None
                 packet = control_plane.broadcast_owned_bytes(
                     payload,
                     source_rank=source,
@@ -1201,9 +1205,7 @@ def install_server_telemetry(
         else:
             fields = [0] * (3 * world_size)
             fields[3 * rank : 3 * rank + 3] = local
-            agreed = mx.distributed.all_sum(
-                mx.array(fields, dtype=mx.int32)
-            )
+            agreed = mx.distributed.all_sum(mx.array(fields, dtype=mx.int32))
             mx.eval(agreed)
             values = [int(value) for value in agreed.tolist()]
             plans = [
@@ -1501,8 +1503,7 @@ def install_server_telemetry(
         @staticmethod
         def _finish_shared_cancel_vote(shared: Any) -> Any:
             if not (
-                isinstance(shared, dict)
-                and shared.get("kind") == _CANCEL_VOTE_KIND
+                isinstance(shared, dict) and shared.get("kind") == _CANCEL_VOTE_KIND
             ):
                 return shared
             epoch, uids = telemetry.accept_cancel_vote(shared)
@@ -1603,9 +1604,7 @@ def install_server_telemetry(
     ) -> Any:
         """Attach the private coordinator id before ranks share the request."""
 
-        request_id = _transport_request_id(
-            handler.headers.get("X-oMLX-Request-ID")
-        )
+        request_id = _transport_request_id(handler.headers.get("X-oMLX-Request-ID"))
         if request_id is not None:
             request._omlx_transport_request_id = request_id
         return original_handle_completion(handler, request, stop_words)
@@ -1630,11 +1629,6 @@ def install_server_telemetry(
         telemetry.observe_cache_state(
             entries=memory_entries + disk_entries,
             nbytes=memory_bytes + disk_bytes,
-            memory_entries=memory_entries,
-            memory_bytes=memory_bytes,
-            ssd_entries=disk_entries,
-            ssd_bytes=disk_bytes,
-            **ssd_store_observability(),
         )
         return {
             "status": "ok",

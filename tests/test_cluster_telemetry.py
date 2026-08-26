@@ -4,15 +4,14 @@
 import json
 import threading
 import time
-from io import BytesIO
 from types import SimpleNamespace
 
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
 from omlx.cluster.telemetry import (
     RuntimeTelemetry,
-    _TelemetryQueue,
     _python_token_id,
+    _TelemetryQueue,
     install_server_telemetry,
 )
 
@@ -372,9 +371,7 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
         assert progress["active"] is True
         assert batch.remove([73]) == "removed"
         assert generator._tokenize(None, None, None)[0] == [1, 2, 3, 4]
-        assert generator.prompt_cache.fetch_nearest_cache(
-            "model", [1, 2, 3, 4]
-        ) == (
+        assert generator.prompt_cache.fetch_nearest_cache("model", [1, 2, 3, 4]) == (
             "cache",
             [3, 4],
         )
@@ -467,9 +464,7 @@ def test_an_idle_rank_still_refreshes_its_marker():
     """No requests, no tokens, nothing to report — and the marker still ages."""
 
     marker = _CountingMarker()
-    telemetry = RuntimeTelemetry(
-        marker, publish_interval=0, heartbeat_interval=0.01
-    )
+    telemetry = RuntimeTelemetry(marker, publish_interval=0, heartbeat_interval=0.01)
 
     telemetry.start_heartbeat()
     try:
@@ -485,9 +480,7 @@ def test_an_idle_rank_still_refreshes_its_marker():
 
 def test_stopping_the_heartbeat_ends_the_thread():
     marker = _CountingMarker()
-    telemetry = RuntimeTelemetry(
-        marker, publish_interval=0, heartbeat_interval=0.01
-    )
+    telemetry = RuntimeTelemetry(marker, publish_interval=0, heartbeat_interval=0.01)
     before = set(threading.enumerate())
 
     telemetry.start_heartbeat()
@@ -501,7 +494,8 @@ def test_stopping_the_heartbeat_ends_the_thread():
     leaked = {
         thread
         for thread in threading.enumerate()
-        if thread not in before and thread.is_alive()
+        if thread not in before
+        and thread.is_alive()
         and thread.name == "omlx-cluster-telemetry-heartbeat"
     }
     assert not leaked
@@ -646,7 +640,6 @@ def test_force_cancel_all_survives_a_failing_batch_loop(tmp_path):
 
 
 def test_cancel_file_is_consumed_once_and_acked(tmp_path):
-    import json
 
     telemetry = _cancel_telemetry(tmp_path)
     generator = _BatchGenerator()
@@ -671,9 +664,7 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
     assert generator.removed == [[9]]
-    ack = json.loads(
-        (tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8")
-    )
+    ack = json.loads((tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8"))
     assert ack["epoch"] == 42
     assert ack["cancelled"] == 1
 
@@ -683,7 +674,6 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
 
 
 def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
-    import json
 
     telemetry = _cancel_telemetry(tmp_path)
     generator = _BatchGenerator()

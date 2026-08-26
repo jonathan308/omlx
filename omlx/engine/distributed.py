@@ -249,6 +249,7 @@ class DistributedBatchedEngine(BatchedEngine):
                 self.deployment.deployment_id,
                 reason,
             )
+
     def _new_client(self, endpoint: str) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=endpoint,
@@ -314,7 +315,9 @@ class DistributedBatchedEngine(BatchedEngine):
                 )
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("status") != "ok":
-                raise DistributedInferenceError("rank 0 returned invalid cache-clear JSON")
+                raise DistributedInferenceError(
+                    "rank 0 returned invalid cache-clear JSON"
+                )
             return payload
 
         def clear_remote(rank: int, ssh_target: str) -> dict[str, Any]:
