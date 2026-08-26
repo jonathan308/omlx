@@ -82,6 +82,7 @@ def _validated_assignments(
     value: Any,
     *,
     world_size: int,
+    full_replicas: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) != world_size:
         raise ValueError("runtime shard map must contain every rank")
@@ -161,6 +162,14 @@ def _validated_assignments(
     if len(tensor_sizes) != 1:
         raise ValueError("runtime tensor parallel sizes disagree")
     tensor_size = tensor_sizes.pop()
+    if full_replicas:
+        ranges = {(item["start_layer"], item["end_layer"]) for item in assignments}
+        if tensor_size != 1 or len(ranges) != 1:
+            raise ValueError("runtime full-replica assignments disagree")
+        start_layer, _end_layer = ranges.pop()
+        if start_layer != 0:
+            raise ValueError("runtime full-replica assignment must start at layer zero")
+        return sorted(assignments, key=lambda item: item["rank"])
     if world_size % tensor_size:
         raise ValueError("runtime tensor parallel size does not divide world size")
     stage_ranges: list[tuple[int, int]] = []
@@ -392,10 +401,8 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             if (
                 memory_tier["entries"] + ssd_tier["entries"]
                 != validated_cache["entries"]
-                or memory_tier["bytes"] + ssd_tier["bytes"]
-                != validated_cache["bytes"]
-                or memory_tier["hits"] + ssd_tier["hits"]
-                != validated_cache["hits"]
+                or memory_tier["bytes"] + ssd_tier["bytes"] != validated_cache["bytes"]
+                or memory_tier["hits"] + ssd_tier["hits"] != validated_cache["hits"]
             ):
                 raise ValueError("runtime cache tier totals are inconsistent")
             if not ssd_enabled and any(ssd_tier.values()):
@@ -486,15 +493,11 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             "drafted_tokens",
             "zero_depth_cycles",
         ):
-            validated_mtp[key] = _nonnegative_int(
-                mtp.get(key), f"MTP metrics {key}"
-            )
+            validated_mtp[key] = _nonnegative_int(mtp.get(key), f"MTP metrics {key}")
         if validated_mtp["accepted_draft_tokens"] > validated_mtp["drafted_tokens"]:
             raise ValueError("runtime MTP accepted count exceeds drafted count")
         for key in ("acceptance_ratio", "tokens_per_cycle"):
-            validated_mtp[key] = _nonnegative_float(
-                mtp.get(key), f"MTP metrics {key}"
-            )
+            validated_mtp[key] = _nonnegative_float(mtp.get(key), f"MTP metrics {key}")
         if validated_mtp["acceptance_ratio"] > 1:
             raise ValueError("runtime MTP acceptance ratio is out of range")
         depth_drafted = mtp.get("depth_drafted")
@@ -532,6 +535,37 @@ def _validated_metrics(value: Any) -> dict[str, Any]:
             raise ValueError("runtime MTP finish reason is invalid")
         validated_mtp["last_finish_reason"] = finish_reason[:64]
         result["mtp"] = validated_mtp
+
+    phase_split = value.get("phase_split")
+    if phase_split is not None:
+        if not isinstance(phase_split, dict):
+            raise ValueError("runtime phase-split metrics are invalid")
+        result["phase_split"] = {
+            "handoffs_completed": _nonnegative_int(
+                phase_split.get("handoffs_completed"),
+                "phase handoffs completed",
+            ),
+            "last_handoff_bytes": _nonnegative_int(
+                phase_split.get("last_handoff_bytes"),
+                "phase handoff bytes",
+            ),
+            "last_handoff_arrays": _nonnegative_int(
+                phase_split.get("last_handoff_arrays"),
+                "phase handoff arrays",
+            ),
+            "last_handoff_seconds": _nonnegative_float(
+                phase_split.get("last_handoff_seconds"),
+                "phase handoff seconds",
+            ),
+            "last_handoff_bytes_per_second": _nonnegative_float(
+                phase_split.get("last_handoff_bytes_per_second"),
+                "phase handoff bandwidth",
+            ),
+            "queue_depth": _nonnegative_int(
+                phase_split.get("queue_depth"),
+                "phase queue depth",
+            ),
+        }
 
     current = value.get("last_request")
     if current is None:
@@ -591,6 +625,21 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
             and _marker_is_fresh(payload["updated_at"])
         ),
     }
+    serving_mode = payload.get("serving_mode", "sharded")
+    if serving_mode not in {"sharded", "disaggregated"}:
+        raise ValueError("runtime marker has an invalid serving mode")
+    marker["serving_mode"] = serving_mode
+    if serving_mode == "disaggregated":
+        prefill_rank = _nonnegative_int(payload.get("prefill_rank"), "prefill rank")
+        decode_rank = _nonnegative_int(payload.get("decode_rank"), "decode rank")
+        if (
+            world_size != 2
+            or {prefill_rank, decode_rank} != set(range(world_size))
+            or prefill_rank == decode_rank
+        ):
+            raise ValueError("runtime phase ownership is invalid")
+        marker["prefill_rank"] = prefill_rank
+        marker["decode_rank"] = decode_rank
     error = payload.get("error")
     if error is not None:
         if not isinstance(error, str):
@@ -623,6 +672,7 @@ def _validated_marker(payload: Any) -> dict[str, Any]:
         marker["assignments"] = _validated_assignments(
             assignments,
             world_size=world_size,
+            full_replicas=serving_mode == "disaggregated",
         )
         local = marker["assignments"][rank]
         if (

@@ -15,11 +15,12 @@ types fail closed before the first tensor is sent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+import os
 import time
-from typing import Any, Iterable, Sequence
-
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 CACHE_TRANSFER_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -41,6 +42,16 @@ _DTYPE_NAMES = (
     "float64",
     "complex64",
 )
+
+
+def _transfer_window() -> int:
+    """Number of ordered point-to-point ops submitted per Metal eval."""
+
+    try:
+        value = int(os.environ.get("OMLX_CLUSTER_CACHE_TRANSFER_WINDOW", "8"))
+    except ValueError:
+        value = 8
+    return max(1, min(16, value))
 
 
 @dataclass(frozen=True)
@@ -172,7 +183,10 @@ def _validate_manifest(
         raise ValueError("cache transfer manifest has no model identity")
     if expected_model_identity is not None and identity != expected_model_identity:
         raise ValueError("cache transfer model identity does not match decoder")
-    if not isinstance(manifest.get("prompt_tokens"), int) or manifest["prompt_tokens"] < 1:
+    if (
+        not isinstance(manifest.get("prompt_tokens"), int)
+        or manifest["prompt_tokens"] < 1
+    ):
         raise ValueError("cache transfer manifest has an invalid prompt length")
     tensors = manifest.get("tensors")
     metadata = manifest.get("metadata")
@@ -285,13 +299,17 @@ def send_cache_transfer(
     manifest_array = mx.array(list(payload), dtype=mx.uint8)
     mx.eval(mx.distributed.send(length, dst, group=group))
     mx.eval(mx.distributed.send(manifest_array, dst, group=group))
-    for value in prepared.arrays:
-        # Python ``mlx.core.array`` intentionally does not expose the C++
-        # ``flags()`` API. Always materialize a dense wire view; this is a
-        # no-op for already-contiguous cache tensors and preserves the same
-        # storage contract safetensors would reconstruct on the decoder.
-        wire_value = mx.contiguous(value)
-        mx.eval(mx.distributed.send(wire_value, dst, group=group))
+    window = _transfer_window()
+    for start in range(0, len(prepared.arrays), window):
+        operations = []
+        for value in prepared.arrays[start : start + window]:
+            # Python ``mlx.core.array`` intentionally does not expose the C++
+            # ``flags()`` API. Always materialize a dense wire view; this is a
+            # no-op for already-contiguous cache tensors and preserves the same
+            # storage contract safetensors would reconstruct on the decoder.
+            wire_value = mx.contiguous(value)
+            operations.append(mx.distributed.send(wire_value, dst, group=group))
+        mx.eval(*operations)
     mx.synchronize()
     return CacheTransferStats(
         array_count=len(prepared.arrays),
@@ -316,9 +334,7 @@ def recv_cache_transfer(
     manifest_length = int(length_array.item())
     if not 1 <= manifest_length <= MAX_MANIFEST_BYTES:
         raise ValueError("cache transfer received an invalid manifest length")
-    payload_array = mx.distributed.recv(
-        (manifest_length,), mx.uint8, src, group=group
-    )
+    payload_array = mx.distributed.recv((manifest_length,), mx.uint8, src, group=group)
     mx.eval(payload_array)
     try:
         manifest = json.loads(bytes(payload_array.tolist()))
@@ -329,15 +345,19 @@ def recv_cache_transfer(
         expected_model_identity=expected_model_identity,
     )
     arrays = []
-    for entry in tensors:
-        value = mx.distributed.recv(
-            tuple(entry["shape"]),
-            _dtype_from_name(mx, entry["dtype"]),
-            src,
-            group=group,
-        )
-        mx.eval(value)
-        arrays.append(value)
+    window = _transfer_window()
+    for start in range(0, len(tensors), window):
+        received = [
+            mx.distributed.recv(
+                tuple(entry["shape"]),
+                _dtype_from_name(mx, entry["dtype"]),
+                src,
+                group=group,
+            )
+            for entry in tensors[start : start + window]
+        ]
+        mx.eval(*received)
+        arrays.extend(received)
     mx.synchronize()
     cache = restore_cache_transfer(
         manifest,

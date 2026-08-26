@@ -536,7 +536,6 @@ class _PhaseResponseGenerator:
             for index in range(args.max_tokens):
                 if request.context._should_stop:
                     break
-                step_started = time.perf_counter()
                 adjusted = logits
                 for processor in processors:
                     adjusted = processor(history, adjusted)
@@ -544,16 +543,16 @@ class _PhaseResponseGenerator:
                 sampled = sampler(logprobs)
                 self.mx.eval(sampled, logprobs)
                 token = int(sampled.item())
-                self.telemetry.observe_batch_step(
-                    prompt_responses=0,
-                    generation_responses=1,
-                    elapsed_seconds=time.perf_counter() - step_started,
-                )
                 self.telemetry.observe_token(request.request_id)
                 state, matched, current_state = request.state_machine.match(
                     state, token
                 )
                 detokenizer.add_token(token)
+                # State delimiters are control tokens, not assistant content.
+                # Qwen's tool-call end token decodes to ``</tool_call>``; if it
+                # is forwarded as normal text, agents see a valid tool call plus
+                # a leaked protocol marker in ``message.content``.
+                visible_text = "" if matched is not None else detokenizer.last_segment
                 finish_reason = None
                 if matched is not None and current_state is None:
                     finish_reason = "stop"
@@ -561,7 +560,7 @@ class _PhaseResponseGenerator:
                     finish_reason = "length"
                 request.output.put(
                     Response(
-                        detokenizer.last_segment,
+                        visible_text,
                         token,
                         current_state,
                         matched,
@@ -576,6 +575,7 @@ class _PhaseResponseGenerator:
                 )
                 if finish_reason is not None or request.context._should_stop:
                     break
+                step_started = time.perf_counter()
                 history = self.mx.concatenate(
                     [history, self.mx.array([token], dtype=self.mx.int32)]
                 )
@@ -584,6 +584,11 @@ class _PhaseResponseGenerator:
                     cache=cache,
                 )[:, -1, :]
                 self.mx.eval(logits)
+                self.telemetry.observe_batch_step(
+                    prompt_responses=0,
+                    generation_responses=1,
+                    elapsed_seconds=time.perf_counter() - step_started,
+                )
         except BaseException as exc:
             failed = True
             request.output.put(exc)
@@ -641,6 +646,7 @@ class _PhaseResponseGenerator:
                     prompt_tokens=len(request.prompt),
                     cached_tokens=cached_tokens,
                 )
+                request.context.prompt_cache_count = cached_tokens
                 self.telemetry.observe_cache_lookup(
                     prompt_tokens=len(request.prompt),
                     remaining_tokens=uncached_tokens,

@@ -3,13 +3,26 @@ from __future__ import annotations
 import copy
 
 import mlx.core as mx
-from mlx_lm.models.cache import ArraysCache, KVCache
 import pytest
+from mlx_lm.models.cache import ArraysCache, KVCache
 
 from omlx.cluster.cache_transfer import (
+    _transfer_window,
     prepare_cache_transfer,
     restore_cache_transfer,
 )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    ((None, 8), ("garbage", 8), ("0", 1), ("4", 4), ("99", 16)),
+)
+def test_cache_transfer_window_is_bounded(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("OMLX_CLUSTER_CACHE_TRANSFER_WINDOW", raising=False)
+    else:
+        monkeypatch.setenv("OMLX_CLUSTER_CACHE_TRANSFER_WINDOW", raw)
+    assert _transfer_window() == expected
 
 
 def _fixture_cache():
@@ -86,9 +99,7 @@ def test_cache_transfer_rejects_unknown_cache_class():
         prompt_tokens=4,
     )
     manifest = copy.deepcopy(prepared.manifest)
-    class_item = next(
-        item for item in manifest["metadata"] if item[1] == "ArraysCache"
-    )
+    class_item = next(item for item in manifest["metadata"] if item[1] == "ArraysCache")
     class_item[1] = "ArbitraryCache"
     with pytest.raises(ValueError, match="does not admit class"):
         restore_cache_transfer(manifest, prepared.arrays)
