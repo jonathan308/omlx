@@ -117,6 +117,12 @@ class RuntimeTelemetry:
         self._requests: dict[int, _RequestSample] = {}
         self._uid_to_request: dict[Any, int] = {}
         self._request_to_uid: dict[int, Any] = {}
+        self._request_contexts: dict[int, Any] = {}
+        self._request_queues: dict[int, Any] = {}
+        self._transport_to_request: dict[str, int] = {}
+        self._request_to_transport: dict[int, str] = {}
+        self._pending_transport_cancels: set[str] = set()
+        self._cancel_requested_requests: set[int] = set()
         self._pending_uid = threading.local()
         self._last_completed: dict[str, Any] | None = None
         self._last_publish_at = float("-inf")
@@ -408,6 +414,31 @@ class RuntimeTelemetry:
         """Remember the queue request immediately preceding batch insertion."""
 
         self._pending_uid.request_id = request_id
+
+    def register_context(self, request_id: int, context: Any) -> None:
+        """Retain the server context used by its synchronized cancel path."""
+
+        cancel_immediately = False
+        with self._lock:
+            if request_id in self._requests:
+                self._request_contexts[request_id] = context
+                transport_request_id = self._request_to_transport.get(request_id)
+                if transport_request_id in self._pending_transport_cancels:
+                    self._pending_transport_cancels.discard(transport_request_id)
+                    self._cancel_requested_requests.add(request_id)
+                    cancel_immediately = True
+        if cancel_immediately:
+            stop = getattr(context, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception as exc:
+                    logger.warning("Rank-side pending context cancel failed: %s", exc)
+
+    def register_response_queue(self, request_id: int, queue: Any) -> None:
+        with self._lock:
+            if request_id in self._requests:
+                self._request_queues[request_id] = queue
 
     def bind_pending_uid(self, uids: Any) -> None:
         """Bind MLX-LM's generated batch UID to the observed queue request."""
@@ -725,6 +756,12 @@ class RuntimeTelemetry:
         if getattr(self._pending_uid, "request_id", None) == request_id:
             self._pending_uid.request_id = None
         uid = self._request_to_uid.pop(request_id, None)
+        self._request_contexts.pop(request_id, None)
+        self._request_queues.pop(request_id, None)
+        transport_request_id = self._request_to_transport.pop(request_id, None)
+        if transport_request_id is not None:
+            self._transport_to_request.pop(transport_request_id, None)
+            self._pending_transport_cancels.discard(transport_request_id)
         if uid is not None:
             self._uid_to_request.pop(uid, None)
         sample.updated_at = now
@@ -940,7 +977,8 @@ class _TelemetryQueue:
     ) -> None:
         self._queue = queue
         self._telemetry = telemetry
-        self._request_id = telemetry.begin_request()
+        self._request_id = telemetry.begin_request(transport_request_id)
+        telemetry.register_response_queue(self._request_id, queue)
         self._finished = False
 
     def put(self, item: Any, *args: Any, **kwargs: Any) -> Any:
@@ -960,6 +998,7 @@ class _TelemetryQueue:
                     cached_tokens=max(0, int(cache_count)),
                 )
                 self._telemetry.mark_pending_uid(self._request_id)
+                self._telemetry.register_context(self._request_id, item)
             elif hasattr(item, "token") and hasattr(item, "finish_reason"):
                 self._telemetry.observe_token(self._request_id)
         return self._queue.put(item, *args, **kwargs)
