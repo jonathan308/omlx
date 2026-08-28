@@ -389,6 +389,143 @@ def test_qwen4_exp_tiny_text_prefill_and_decode():
     assert next_logits.logits.shape == (1, 1, 64)
 
 
+def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    attention = Qwen4ExpAttention(config.text_config)
+    mx.eval(attention.parameters())
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+
+    calls = []
+    gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked(*args, **kwargs):
+        calls.append((args[0].shape, args[1].shape))
+        return gathered(*args, **kwargs)
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", tracked)
+    fast_cache = QSAKVCache()
+    actual = attention(hidden, mask="causal", cache=fast_cache)
+
+    monkeypatch.setattr(
+        Qwen4ExpAttention,
+        "_gathered_text_prefill_eligible",
+        staticmethod(lambda *args, **kwargs: False),
+    )
+    reference_cache = QSAKVCache()
+    expected = attention(hidden, mask="causal", cache=reference_cache)
+    mx.eval(actual, expected)
+
+    assert calls == [((1, 4, 20, 8), (1, 2, 20, 8))]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert fast_cache.offset == reference_cache.offset == 20
+    assert mx.array_equal(fast_cache.index_keys, reference_cache.index_keys).item()
+    assert mx.array_equal(
+        fast_cache.index_position_ids,
+        reference_cache.index_position_ids,
+    ).item()
+
+
+def test_qwen4_gathered_qsa_fails_closed_for_multimodal_positions(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("multimodal positions must use mlx-vlm's general QSA")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    hidden = mx.random.normal((1, 3, config.text_config.hidden_size))
+    position_ids = mx.array(
+        [
+            [[0, 1, 2]],
+            [[0, 1, 2]],
+            [[0, 0, 1]],
+        ],
+        dtype=mx.int32,
+    )
+
+    output = attention(
+        hidden,
+        mask="causal",
+        cache=QSAKVCache(),
+        position_ids=position_ids,
+    )
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_fails_closed_for_batched_prefill(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("batched requests must use mlx-vlm's general QSA")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    hidden = mx.random.normal((2, 3, config.text_config.hidden_size))
+
+    output = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_keeps_official_path_at_sparse_budget(monkeypatch):
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("at-budget prefill must use the official full path")
+
+    monkeypatch.setattr(language, "contiguous_causal_gathered_qsa", must_not_run)
+    attention = Qwen4ExpAttention(config.text_config)
+    budget = attention.indexer.token_budget
+    hidden = mx.random.normal((1, budget, config.text_config.hidden_size))
+
+    output = attention(hidden, mask="causal", cache=QSAKVCache())
+    mx.eval(output)
+
+    assert output.shape == hidden.shape
+
+
+def test_qwen4_gathered_qsa_chunk_grows_with_context():
+    _tiny_config()
+    from mlx_vlm.models.qwen4_exp.qsa_fast import contiguous_causal_query_chunk
+
+    assert contiguous_causal_query_chunk(4096) == 32
+    assert contiguous_causal_query_chunk(4097) == 64
+    assert contiguous_causal_query_chunk(16384) == 64
+    assert contiguous_causal_query_chunk(16385) == 128
+
+
+def test_qwen4_adapter_cache_only_prefill_skips_vocab_projection():
+    from mlx_vlm.models.qwen4_exp import Model
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    model = VLMModelAdapter(Model(_tiny_config()))
+    cache = model.make_cache()
+    result = model(
+        mx.array([[2, 3, 4, 5]], dtype=mx.int32),
+        cache=cache,
+        skip_lm_head=True,
+    )
+    mx.eval([member.state for member in cache])
+
+    assert result is None
+    offsets = [member.offset for member in cache if hasattr(member, "offset")]
+    assert offsets and max(offsets) == 4
+
+
+
 def test_qwen4_batch_factory_honors_model_owned_cache_conversion():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache

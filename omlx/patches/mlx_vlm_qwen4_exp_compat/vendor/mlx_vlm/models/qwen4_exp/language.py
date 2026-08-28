@@ -24,9 +24,11 @@ from ..qwen3_5.language import (
     _create_qwen3_5_attention_mask,
     _create_qwen3_5_ssm_mask,
     _target_verify_linear,
+    _target_verify_linears,
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+from .qsa_fast import contiguous_causal_gathered_qsa
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -792,6 +794,112 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         self.k_norm = Qwen4ExpRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.indexer = Qwen4ExpQSAIndexer(config, self.rotary_emb)
 
+    def _gathered_text_prefill_eligible(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[Any],
+        position_ids: Optional[mx.array],
+        position_embeddings: Optional[tuple[mx.array, mx.array]],
+        target_verify: bool,
+    ) -> bool:
+        """Fail closed outside the proven contiguous batch-one text shape."""
+
+        causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
+        return bool(
+            x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] > 1
+            # Below the QSA budget the official path attends the complete
+            # prefix directly and is faster than building gathered blocks.
+            # Switch only after sparse selection can reduce actual work.
+            and cache.offset + x.shape[1] > self.indexer.token_budget
+            and causal_mask
+            and type(cache) is QSAKVCache
+            and isinstance(cache.offset, int)
+            and position_ids is None
+            and position_embeddings is None
+            and not target_verify
+        )
+
+    def _gathered_text_prefill(
+        self,
+        x: mx.array,
+        cache: QSAKVCache,
+    ) -> mx.array:
+        """Project once, append both caches, and attend only to selected K/V."""
+
+        batch, length, _ = x.shape
+        q_proj_output, keys, values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj),
+            x,
+            False,
+        )
+        queries, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        values = values.reshape(
+            batch, length, self.num_key_value_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+        past_len = cache.offset
+        text_position_ids = mx.arange(
+            past_len, past_len + length, dtype=mx.int32
+        )[None]
+        position_ids = mx.broadcast_to(text_position_ids, (3, batch, length))
+        queries, keys = self.rotary_emb.apply_rotary(
+            queries,
+            keys,
+            position_ids,
+            unsqueeze_dim=1,
+        )
+        keys, values = cache.update_and_fetch(keys, values)
+
+        projected = self.indexer.index_qk_proj(x).reshape(
+            batch,
+            length,
+            self.indexer.n_heads + self.indexer.kv_heads,
+            self.indexer.head_dim,
+        )
+        index_queries = self.indexer.q_layernorm(
+            projected[:, :, : self.indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
+        raw_index_keys, full_position_ids = cache.update_indexer(
+            raw_index_keys,
+            text_position_ids,
+        )
+        index_queries = self.indexer._apply_rope(
+            index_queries,
+            text_position_ids,
+        ).transpose(0, 2, 1, 3)
+
+        output = contiguous_causal_gathered_qsa(
+            queries,
+            keys,
+            values,
+            index_queries,
+            raw_index_keys,
+            full_position_ids,
+            num_query_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            indexer_head_dim=self.indexer.head_dim,
+            compress_ratio=self.indexer.compress_ratio,
+            token_budget=self.indexer.token_budget,
+            index_key_norm=self.indexer.k_layernorm,
+            apply_index_rope=self.indexer._apply_rope,
+        )
+        output = output.reshape(batch, length, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
+
     def __call__(
         self,
         x: mx.array,
@@ -801,6 +909,16 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        if self._gathered_text_prefill_eligible(
+            x,
+            mask,
+            cache,
+            position_ids,
+            position_embeddings,
+            target_verify,
+        ):
+            return self._gathered_text_prefill(x, cache)
+
         qsa_mask = self.indexer(
             x,
             cache,
