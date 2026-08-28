@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact gathered QSA prefill for contiguous batch-one text prompts.
 
-This is the portable MLX path proven by Fusion's native Qwen4-Exp bring-up.
-It never constructs the full ``[query_tokens, key_tokens]`` main-attention
-matrix: QSA selects complete four-token micro-blocks, then main attention
-gathers only the selected K/V rows (plus the incomplete causal tail).
+This is the exact path proven by Fusion's native Qwen4-Exp bring-up. It never
+constructs the full ``[query_tokens, key_tokens]`` main-attention matrix: QSA
+selects complete four-token micro-blocks, then the production native kernel
+reads those rows directly from K/V. Portable MLX gathers only the selected
+rows (plus the incomplete causal tail) when that narrow ABI is unavailable.
 
 The caller owns eligibility.  In particular, this module is only used for a
 single contiguous text prompt.  Batched, padded, multimodal and target-verify
@@ -27,6 +28,8 @@ _NATIVE_QSA_SCORE_DISABLED = False
 _NATIVE_QSA_SCORE_PROVEN = False
 _NATIVE_QSA_TOPK_DISABLED = False
 _NATIVE_QSA_TOPK_PROVEN = False
+_NATIVE_QSA_MAIN_DISABLED = False
+_NATIVE_QSA_MAIN_PROVEN = False
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -213,6 +216,222 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         return None
 
 
+def _native_sparse_gqa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    *,
+    q_offset: int,
+) -> mx.array | None:
+    """Consume Qwen's selected rows directly in the exact native GQA kernel."""
+
+    global _NATIVE_QSA_MAIN_DISABLED, _NATIVE_QSA_MAIN_PROVEN
+    if _NATIVE_QSA_MAIN_DISABLED:
+        return None
+    if (
+        queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[-1] != 256
+        or keys.ndim != 4
+        or values.shape != keys.shape
+        or keys.shape[0] != 1
+        or keys.shape[1] != 2
+        or keys.shape[-1] != 256
+        or queries.dtype != keys.dtype
+        or queries.dtype != values.dtype
+        or queries.dtype not in {mx.float16, mx.bfloat16}
+        or selected_blocks.ndim != 3
+        or selected_blocks.shape != (1, queries.shape[2], 512)
+        or q_offset < 0
+        or q_offset + queries.shape[2] > keys.shape[2]
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "qwen4_qsa_sparse_gqa_attention"
+        ):
+            _NATIVE_QSA_MAIN_DISABLED = True
+            return None
+        native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
+        output = fast.qwen4_qsa_sparse_gqa_attention(
+            queries,
+            keys,
+            values,
+            native_blocks,
+            queries.shape[-1] ** -0.5,
+            q_offset,
+            key_tile=64,
+            dimension_tile=64,
+        )
+        if not _NATIVE_QSA_MAIN_PROVEN:
+            # Prove the rebuilt extension and Metal pipeline before the lazy
+            # graph advances cache state past a point where fallback is safe.
+            mx.eval(output)
+            _NATIVE_QSA_MAIN_PROVEN = True
+        return output.transpose(0, 2, 1, 3)
+    except Exception:
+        _NATIVE_QSA_MAIN_DISABLED = True
+        return None
+
+
+def _decode_qsa_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+) -> mx.array:
+    """Run exact unmasked singleton SDPA through the narrow native seam.
+
+    The gathered decode caller has already applied QSA selection, so there is
+    no causal or sparse mask left to interpret.  Only the decode_fast ABI's
+    explicitly supported shape/dtype contract may use the native primitive;
+    missing/stale extensions and every other shape fail closed to MLX SDPA.
+    Inputs are made contiguous by the caller, avoiding a lazy layout failure
+    after the model caches have advanced.
+    """
+
+    try:
+        from omlx.custom_kernels.decode_fast import fast
+
+        extension = getattr(fast, "_ext", None)
+        supported = getattr(extension, "sdpa_decode_supported", None)
+        if (
+            bool(getattr(fast, "NATIVE_AVAILABLE", False))
+            and supported is not None
+            and bool(supported(queries, keys, values))
+        ):
+            return fast.sdpa_decode(
+                queries,
+                keys,
+                values,
+                scale,
+                causal=False,
+            )
+    except Exception:
+        # Capability probing is eager and happens before a native primitive is
+        # added to the lazy graph, so this fallback cannot leave partial work.
+        pass
+
+    return mx.fast.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        scale=scale,
+    )
+
+
+def contiguous_causal_gathered_qsa_decode(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    index_queries: mx.array,
+    pooled_index_keys: mx.array,
+    *,
+    num_query_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    indexer_head_dim: int,
+    compress_ratio: int,
+    token_budget: int,
+) -> mx.array:
+    """Run exact batch-one QSA decode over only the selected K/V rows.
+
+    This is the singleton counterpart to :func:`contiguous_causal_gathered_qsa`.
+    The query is the final visible token, so every completed compressed block
+    is causal.  QSA chooses ``token_budget / compress_ratio`` complete blocks;
+    their token rows are gathered in chronological order and the zero-to-three
+    incomplete tail rows are appended.  Main attention therefore remains
+    bounded by ``token_budget + compress_ratio - 1`` instead of scanning a
+    dense full-length mask.
+    """
+
+    if queries.ndim != 4 or queries.shape[:3] != (1, num_query_heads, 1):
+        raise ValueError("gathered QSA decode requires [1, H, 1, D] queries")
+    if queries.shape[-1] != head_dim:
+        raise ValueError("QSA decode queries do not match the configured head dim")
+    if keys.ndim != 4 or values.shape != keys.shape:
+        raise ValueError("QSA decode K/V must be matching rank-four arrays")
+    if keys.shape[0] != 1 or keys.shape[1] != num_key_value_heads:
+        raise ValueError("QSA decode K/V do not match the configured head count")
+    if keys.shape[-1] != head_dim or keys.dtype != queries.dtype:
+        raise ValueError("QSA decode K/V dtype or head dim does not match queries")
+    if values.dtype != queries.dtype:
+        raise ValueError("QSA decode values must match the query dtype")
+    if (
+        index_queries.ndim != 4
+        or index_queries.shape[0] != 1
+        or index_queries.shape[1] != 1
+        or index_queries.shape[-1] != indexer_head_dim
+    ):
+        raise ValueError("QSA decode index queries must have shape [1, 1, H, D]")
+    if compress_ratio <= 0 or token_budget <= 0 or token_budget % compress_ratio:
+        raise ValueError("QSA decode token budget must contain complete blocks")
+    if num_query_heads % num_key_value_heads:
+        raise ValueError("QSA decode query heads must divide over K/V heads")
+
+    key_tokens = int(keys.shape[2])
+    max_blocks = key_tokens // compress_ratio
+    block_budget = token_budget // compress_ratio
+    if max_blocks <= block_budget:
+        raise ValueError("gathered QSA decode requires a sparse block crossover")
+    if pooled_index_keys.shape != (1, max_blocks, indexer_head_dim):
+        raise ValueError("QSA decode pooled index-key cache has the wrong shape")
+
+    block_scores = _native_indexer_scores(
+        index_queries,
+        pooled_index_keys,
+        head_dim=indexer_head_dim,
+        compress_ratio=compress_ratio,
+        mask_q_offset=key_tokens - 1,
+    )
+    if block_scores is None:
+        block_scores = _portable_indexer_scores(
+            index_queries,
+            pooled_index_keys,
+            indexer_head_dim,
+        )
+
+    selected_blocks = _native_topk_indices(block_scores, block_budget)
+    if selected_blocks is None:
+        selected_blocks = mx.argpartition(
+            block_scores,
+            kth=-block_budget,
+            axis=-1,
+        )[..., -block_budget:].astype(mx.int32)
+    # Argpartition/native radix order is not chronological.  Sorting the
+    # selected set preserves the official key order for deterministic SDPA.
+    selected_blocks = mx.sort(selected_blocks, axis=-1)
+    selected_tokens = (
+        selected_blocks[..., None] * compress_ratio
+        + mx.arange(compress_ratio, dtype=mx.int32)
+    ).reshape(1, block_budget * compress_ratio)
+
+    complete_key_len = max_blocks * compress_ratio
+    if complete_key_len < key_tokens:
+        tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
+        selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
+
+    key_rows = keys.transpose(0, 2, 1, 3)
+    value_rows = values.transpose(0, 2, 1, 3)
+    selected_keys = mx.contiguous(
+        _batch_gather_tokens(key_rows, selected_tokens).transpose(0, 2, 1, 3)
+    )
+    selected_values = mx.contiguous(
+        _batch_gather_tokens(value_rows, selected_tokens).transpose(0, 2, 1, 3)
+    )
+    output = _decode_qsa_sdpa(
+        queries,
+        selected_keys,
+        selected_values,
+        head_dim**-0.5,
+    )
+    return output.transpose(0, 2, 1, 3)
+
+
 def contiguous_causal_gathered_qsa(
     queries: mx.array,
     keys: mx.array,
@@ -279,6 +498,25 @@ def contiguous_causal_gathered_qsa(
 
     if query_chunk is None:
         query_chunk = contiguous_causal_query_chunk(key_tokens)
+        # The direct-index main-attention kernel carries no per-query gathered
+        # K/V tensor, so a 256-row score tile stays comfortably bounded and
+        # halves Python/Metal dispatch overhead. Preserve the smaller portable
+        # tiles whenever the exact production ABI is absent.
+        if (
+            queries.shape[1:] == (24, query_tokens, 256)
+            and keys.shape[1] == 2
+            and queries.dtype in {mx.float16, mx.bfloat16}
+            and not _NATIVE_QSA_MAIN_DISABLED
+        ):
+            try:
+                from omlx.custom_kernels.glm_moe_dsa import fast
+
+                if fast.is_native_available() and fast.has_symbol(
+                    "qwen4_qsa_sparse_gqa_attention"
+                ):
+                    query_chunk = max(query_chunk, 256)
+            except Exception:
+                pass
     if query_chunk <= 0:
         raise ValueError("QSA query chunk must be positive")
 
@@ -371,7 +609,24 @@ def contiguous_causal_gathered_qsa(
             else:
                 selected_block_rows = canonical
 
+            # The top-k set is unordered. Restore checkpoint/dense-mask token
+            # order before either the portable gathered SDPA or the direct
+            # native kernel performs its FP32 online-softmax reduction.
+            selected_block_rows = mx.sort(selected_block_rows, axis=-1)
+
             selected_count = mx.minimum(complete_counts, block_budget)
+
+            native_output = _native_sparse_gqa_attention(
+                queries[:, :, start:stop],
+                keys,
+                values,
+                selected_block_rows,
+                q_offset=query_start + start,
+            )
+            if native_output is not None:
+                outputs.append(native_output)
+                continue
+
             selected_indices = (
                 selected_block_rows[..., None] * ratio
                 + mx.arange(ratio, dtype=mx.int32)
@@ -398,6 +653,7 @@ def contiguous_causal_gathered_qsa(
         tail_valid = tail < visible_counts[..., None]
         selected_indices = mx.concatenate((selected_indices, tail), axis=-1)
         selected_valid = mx.concatenate((selected_valid, tail_valid), axis=-1)
+
         safe_selected = mx.where(selected_valid, selected_indices, 0).astype(mx.int32)
 
         selected_keys = _batch_gather_tokens(key_rows, safe_selected).transpose(
@@ -435,6 +691,7 @@ def contiguous_causal_gathered_qsa(
 
 __all__ = [
     "contiguous_causal_gathered_qsa",
+    "contiguous_causal_gathered_qsa_decode",
     "contiguous_causal_query_chunk",
     "pool_completed_index_keys",
 ]
