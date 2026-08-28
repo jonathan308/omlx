@@ -23,6 +23,12 @@ IndexKeyNorm = Callable[[mx.array], mx.array]
 IndexRoPE = Callable[[mx.array, mx.array], mx.array]
 
 
+_NATIVE_QSA_SCORE_DISABLED = False
+_NATIVE_QSA_SCORE_PROVEN = False
+_NATIVE_QSA_TOPK_DISABLED = False
+_NATIVE_QSA_TOPK_PROVEN = False
+
+
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
     """Keep long-context score sheets bounded without tiny launch overhead."""
 
@@ -45,6 +51,168 @@ def _batch_gather_tokens(values: mx.array, indices: mx.array) -> mx.array:
     return flat_values[flat_indices].reshape(*indices.shape, *trailing)
 
 
+def _portable_indexer_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    head_dim: int,
+) -> mx.array:
+    """Current float32 MLX QSA score reference."""
+
+    batch, query_tokens, query_heads, _ = queries.shape
+    # Flatten the query-token and index-head axes so MLX emits one FP32 GEMM
+    # for the chunk instead of a broadcasted batch of tiny matmuls.  Each
+    # output dot product and the following head reduction are unchanged.
+    scores = (
+        queries.astype(mx.float32).reshape(
+            batch, query_tokens * query_heads, head_dim
+        )
+        @ pooled_keys.astype(mx.float32).swapaxes(-1, -2)
+    ).reshape(batch, query_tokens, query_heads, pooled_keys.shape[1])
+    return mx.sum(mx.maximum(scores, 0), axis=-2) / math.sqrt(head_dim)
+
+
+def pool_completed_index_keys(
+    index_keys: mx.array,
+    index_position_ids: mx.array,
+    *,
+    compress_ratio: int,
+    index_key_norm: IndexKeyNorm,
+    apply_index_rope: IndexRoPE,
+    start_block: int = 0,
+    stop_block: int | None = None,
+) -> mx.array:
+    """Pool, normalize, and rotate a contiguous range of complete QSA blocks."""
+
+    if index_keys.ndim != 3:
+        raise ValueError("QSA raw index keys must have shape [B, S, D]")
+    if compress_ratio <= 0:
+        raise ValueError("QSA compression ratio must be positive")
+    complete_blocks = index_keys.shape[1] // compress_ratio
+    if stop_block is None:
+        stop_block = complete_blocks
+    if not 0 <= start_block <= stop_block <= complete_blocks:
+        raise ValueError(
+            "QSA pooled block range must lie within the complete raw-key prefix"
+        )
+    if index_position_ids.ndim not in {2, 3} or (
+        index_position_ids.shape[-1] != index_keys.shape[1]
+    ):
+        raise ValueError("QSA index positions do not match raw index keys")
+
+    block_count = stop_block - start_block
+    raw_start = start_block * compress_ratio
+    raw_stop = stop_block * compress_ratio
+    pooled = index_keys[:, raw_start:raw_stop].reshape(
+        index_keys.shape[0],
+        block_count,
+        compress_ratio,
+        index_keys.shape[-1],
+    )
+    pooled = mx.mean(pooled.astype(mx.float32), axis=-2).astype(index_keys.dtype)
+    pooled = index_key_norm(pooled)
+    block_starts = mx.arange(
+        raw_start,
+        raw_stop,
+        compress_ratio,
+        dtype=mx.int32,
+    )
+    pooled_positions = index_position_ids[..., block_starts]
+    return apply_index_rope(pooled[:, None], pooled_positions)[:, 0]
+
+
+def _native_indexer_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    mask_q_offset: int,
+) -> mx.array | None:
+    """Use the narrow native M3 score ABI or fail closed to the MLX path."""
+
+    global _NATIVE_QSA_SCORE_DISABLED, _NATIVE_QSA_SCORE_PROVEN
+    if _NATIVE_QSA_SCORE_DISABLED:
+        return None
+    if (
+        queries.ndim != 4
+        or queries.shape[0] != 1
+        or queries.shape[-2:] != (4, 128)
+        or pooled_keys.ndim != 3
+        or pooled_keys.shape[0] != 1
+        or pooled_keys.shape[-1] != 128
+        or queries.dtype != pooled_keys.dtype
+        or queries.dtype not in {mx.float16, mx.bfloat16}
+        or head_dim != 128
+        or compress_ratio != 4
+        or mask_q_offset < 0
+    ):
+        return None
+
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "qwen4_qsa_indexer_scores"
+        ):
+            _NATIVE_QSA_SCORE_DISABLED = True
+            return None
+        # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
+        # [B,H,M,D] ABI. The native wrapper only copies when the resulting
+        # view is not row-contiguous (for example an offset query chunk).
+        scores = fast.qwen4_qsa_indexer_scores(
+            queries.transpose(0, 2, 1, 3),
+            pooled_keys[:, None],
+            mask_ratio=compress_ratio,
+            mask_q_offset=mask_q_offset,
+        )
+        if not _NATIVE_QSA_SCORE_PROVEN:
+            # MLX primitives are lazy, so a missing Metal pipeline would not
+            # otherwise surface until the enclosing attention graph is
+            # evaluated and can no longer fall back. Pay one process-wide
+            # synchronization to prove the extension/pipeline pair.
+            mx.eval(scores)
+            _NATIVE_QSA_SCORE_PROVEN = True
+        return scores
+    except Exception:
+        # A stale binary or rejected ABI should cost one attempt per process.
+        # Shape misses were excluded above and remain eligible on later calls.
+        _NATIVE_QSA_SCORE_DISABLED = True
+        return None
+
+
+def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
+    """Use Qwen's exact FP32 top-k ABI or fail closed to argpartition."""
+
+    global _NATIVE_QSA_TOPK_DISABLED, _NATIVE_QSA_TOPK_PROVEN
+    if _NATIVE_QSA_TOPK_DISABLED:
+        return None
+    if (
+        scores.ndim != 3
+        or scores.shape[0] != 1
+        or scores.shape[1] < 1
+        or scores.shape[2] < topk
+        or scores.dtype != mx.float32
+        or topk != 512
+    ):
+        return None
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast
+
+        if not fast.is_native_available() or not fast.has_symbol(
+            "qwen4_qsa_topk_indices"
+        ):
+            _NATIVE_QSA_TOPK_DISABLED = True
+            return None
+        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk).astype(mx.int32)
+        if not _NATIVE_QSA_TOPK_PROVEN:
+            mx.eval(indices)
+            _NATIVE_QSA_TOPK_PROVEN = True
+        return indices
+    except Exception:
+        _NATIVE_QSA_TOPK_DISABLED = True
+        return None
+
+
 def contiguous_causal_gathered_qsa(
     queries: mx.array,
     keys: mx.array,
@@ -61,6 +229,7 @@ def contiguous_causal_gathered_qsa(
     token_budget: int,
     index_key_norm: IndexKeyNorm,
     apply_index_rope: IndexRoPE,
+    pooled_index_keys: mx.array | None = None,
     query_chunk: int | None = None,
 ) -> mx.array:
     """Run exact QSA over gathered K/V for one contiguous causal prompt.
@@ -120,18 +289,29 @@ def contiguous_causal_gathered_qsa(
     key_rows = keys.transpose(0, 2, 1, 3)
     value_rows = values.transpose(0, 2, 1, 3)
 
-    # A contiguous prompt shares the same block bank for every query.  Pool,
-    # normalize and rotate it once instead of once per query row.
+    # A contiguous prompt shares the same block bank for every query.  The
+    # caller can provide its cache of completed blocks; standalone users still
+    # get the exact one-shot construction.
     if max_blocks:
-        block_starts = mx.arange(max_blocks, dtype=mx.int32) * ratio
-        pooled = index_keys[:, : max_blocks * ratio].reshape(
-            batch, max_blocks, ratio, indexer_head_dim
-        )
-        pooled = mx.mean(pooled.astype(mx.float32), axis=-2).astype(index_keys.dtype)
-        pooled = index_key_norm(pooled)
-        pooled_positions = index_position_ids[..., block_starts]
-        pooled = apply_index_rope(pooled[:, None], pooled_positions)[:, 0]
+        if pooled_index_keys is None:
+            pooled = pool_completed_index_keys(
+                index_keys,
+                index_position_ids,
+                compress_ratio=ratio,
+                index_key_norm=index_key_norm,
+                apply_index_rope=apply_index_rope,
+            )
+        else:
+            if pooled_index_keys.shape != (batch, max_blocks, indexer_head_dim):
+                raise ValueError("QSA pooled index-key cache has the wrong shape")
+            pooled = pooled_index_keys
     else:
+        if pooled_index_keys is not None and pooled_index_keys.shape != (
+            batch,
+            0,
+            indexer_head_dim,
+        ):
+            raise ValueError("QSA pooled index-key cache has the wrong shape")
         pooled = None
 
     outputs: list[mx.array] = []
@@ -146,20 +326,29 @@ def contiguous_causal_gathered_qsa(
         complete_counts = visible_counts // ratio
 
         if max_blocks:
-            block_scores = index_queries[:, start:stop].astype(mx.float32) @ pooled[
-                :, None
-            ].astype(mx.float32).swapaxes(-1, -2)
-            block_scores = mx.sum(mx.maximum(block_scores, 0), axis=-2) / math.sqrt(
-                indexer_head_dim
+            chunk_index_queries = index_queries[:, start:stop]
+            block_scores = _native_indexer_scores(
+                chunk_index_queries,
+                pooled,
+                head_dim=indexer_head_dim,
+                compress_ratio=ratio,
+                mask_q_offset=query_start + start,
             )
-            valid_blocks = (
-                mx.arange(max_blocks)[None, None, :] < complete_counts[..., None]
-            )
-            block_scores = mx.where(
-                valid_blocks,
-                block_scores,
-                mx.finfo(block_scores.dtype).min,
-            )
+            if block_scores is None:
+                block_scores = _portable_indexer_scores(
+                    chunk_index_queries,
+                    pooled,
+                    indexer_head_dim,
+                )
+                valid_blocks = (
+                    mx.arange(max_blocks)[None, None, :]
+                    < complete_counts[..., None]
+                )
+                block_scores = mx.where(
+                    valid_blocks,
+                    block_scores,
+                    mx.finfo(block_scores.dtype).min,
+                )
 
             selected_width = min(max_blocks, block_budget)
             canonical = mx.broadcast_to(
@@ -167,11 +356,13 @@ def contiguous_causal_gathered_qsa(
                 (batch, chunk_tokens, selected_width),
             )
             if max_blocks > block_budget:
-                ranked = mx.argpartition(
-                    block_scores,
-                    kth=-block_budget,
-                    axis=-1,
-                )[..., -block_budget:].astype(mx.int32)
+                ranked = _native_topk_indices(block_scores, block_budget)
+                if ranked is None:
+                    ranked = mx.argpartition(
+                        block_scores,
+                        kth=-block_budget,
+                        axis=-1,
+                    )[..., -block_budget:].astype(mx.int32)
                 selected_block_rows = mx.where(
                     (complete_counts <= block_budget)[..., None],
                     canonical,
@@ -245,4 +436,5 @@ def contiguous_causal_gathered_qsa(
 __all__ = [
     "contiguous_causal_gathered_qsa",
     "contiguous_causal_query_chunk",
+    "pool_completed_index_keys",
 ]

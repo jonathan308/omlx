@@ -101,6 +101,8 @@ _EXT_MMA_SCORE = _probe_mma_score(_ext)
 NATIVE_SYMBOLS = (
     "dsa_decode_scores",
     "dsa_indexer_scores",
+    "qwen4_qsa_indexer_scores",
+    "qwen4_qsa_topk_indices",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "dspark_exact_mxfp8_qmv_pair",
@@ -255,6 +257,59 @@ def dsa_indexer_scores(
             mask[None, None], scores, mx.finfo(scores.dtype).min
         )
     return scores
+
+
+def qwen4_qsa_indexer_scores(
+    queries: mx.array,
+    pooled_keys: mx.array,
+    mask_ratio: int = 4,
+    mask_q_offset: int = 0,
+    *,
+    stream=None,
+) -> mx.array:
+    """Fused, fp32 Qwen4 QSA block scores for the M3 prefill geometry.
+
+    ``queries`` is ``[1, 4, M, 128]`` and ``pooled_keys`` is
+    ``[1, 1, N, 128]`` in matching bf16/fp16. The result is fp32
+    ``[1, M, N]`` after head-summed ReLU, ``1/sqrt(128)`` scaling, and the
+    pooled-causal mask. The dedicated ABI intentionally has no implicit
+    fallback; ``qsa_fast`` owns the portable float32 fallback.
+    """
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_indexer_scores"):
+        raise RuntimeError(
+            "qwen4_qsa_indexer_scores requires a local extension build that "
+            "exposes the Qwen4 QSA score kernel"
+        )
+    return _ext.qwen4_qsa_indexer_scores(
+        queries,
+        pooled_keys,
+        mask_ratio=mask_ratio,
+        mask_q_offset=mask_q_offset,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_topk_indices(
+    scores: mx.array,
+    topk: int = 512,
+    *,
+    stream=None,
+) -> mx.array:
+    """Select Qwen4's top 512 block indices from fp32 ``[1, M, N]`` scores.
+
+    The native radix path returns only ``[1, M, 512]`` uint32 indices, avoiding
+    the full-width index allocation made by ``mx.argpartition``. Exact cutoff
+    ties retain their highest-index members, matching the set selected by the
+    portable QSA expression. The ABI is deliberately fixed to ``topk=512`` and
+    fails closed when the rebuilt extension or production geometry is absent.
+    """
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_topk_indices"):
+        raise RuntimeError("Qwen4 QSA FP32 top-k kernel is unavailable")
+    return _ext.qwen4_qsa_topk_indices(
+        scores,
+        topk,
+        **_native_stream_kwargs(stream),
+    )
 
 
 def dsa_decode_scores(
