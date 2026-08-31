@@ -41,7 +41,11 @@ def _loaded_entry(clear_hot_cache_mock, executor, stream="engine-stream"):
         _cache_rate_tracker=None,
         _stream=stream,
     )
-    core = SimpleNamespace(scheduler=scheduler, _mlx_executor=executor)
+    core = SimpleNamespace(
+        scheduler=scheduler,
+        _mlx_executor=executor,
+        disarm_keepwarm_cache=MagicMock(),
+    )
     return SimpleNamespace(
         engine=SimpleNamespace(
             _engine=SimpleNamespace(engine=core),
@@ -109,6 +113,7 @@ class TestHotCacheClear:
                 result = _run_clear()
 
         assert clear_mock.called
+        entry.engine._engine.engine.disarm_keepwarm_cache.assert_called_once_with()
         assert result["total_cleared"] == 7
         assert env.clear_cache.called
         env.synchronize.assert_any_call("loaded-stream")
