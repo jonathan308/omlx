@@ -5078,8 +5078,10 @@ async def stream_chat_completion(
         return
 
     # Flush remaining buffered content from thinking/tool-call parsers
+    unfinished_thinking = False
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
+        unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5155,8 +5157,15 @@ async def stream_chat_completion(
     # Parse tool calls from accumulated text
     tool_calls = None
     cleaned_text = accumulated_text
-    terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
-    if last_output and last_output.tool_calls:
+    terminal_tool_calls_authoritative = bool(
+        not unfinished_thinking and last_output and last_output.tool_calls
+    )
+    if unfinished_thinking:
+        # A tool-like envelope inside an unfinished private reasoning region is
+        # not an executable assistant action, even if a model-side parser
+        # optimistically extracted it.
+        cleaned_text = ""
+    elif last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
@@ -5238,6 +5247,8 @@ async def stream_chat_completion(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        recovered_content = ""
     if not tool_calls:
         if recovered_thinking:
             chunk = ChatCompletionChunk(
@@ -5274,7 +5285,11 @@ async def stream_chat_completion(
     # so preserve each already-emitted validated occurrence even if malformed
     # later markup makes terminal extraction partial. Structured engine output
     # is authoritative and, by capability contract, can never race this path.
-    if streamed_tool_calls and not terminal_tool_calls_authoritative:
+    if (
+        streamed_tool_calls
+        and not terminal_tool_calls_authoritative
+        and not unfinished_thinking
+    ):
         tool_calls = _merge_streamed_tool_call_prefix(
             streamed_tool_calls,
             tool_calls,
@@ -5350,8 +5365,8 @@ async def stream_chat_completion(
     )
     if (
         not tool_calls
-        and thinking_parser.unfinished_thinking
-        and finish_reason == "stop"
+        and unfinished_thinking
+        and finish_reason != "length"
     ):
         # The target terminated inside a prompt-opened reasoning block. Treat
         # this as an incomplete response rather than a successful answer; the
@@ -5764,7 +5779,11 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
-    if last_output and last_output.tool_calls:
+    if unfinished_thinking:
+        # Never execute a tool candidate emitted inside a malformed/private
+        # reasoning region.
+        tool_calls = None
+    elif last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
     elif kwargs.get("tools"):
@@ -5783,6 +5802,8 @@ async def stream_anthropic_messages(
         thinking_filter.take_recovery_candidate() if thinking_filter else ""
     )
     recovered_content = tool_filter.take_recovery_candidate() if tool_filter else ""
+    if unfinished_thinking:
+        recovered_content = ""
     if not tool_calls:
         if recovered_thinking:
             if text_block_started:
@@ -5863,7 +5884,11 @@ async def stream_anthropic_messages(
 
     # 6. Send message_delta with stop_reason and actual token counts
     anthropic_finish_reason = output.finish_reason if output else "stop"
-    if not tool_calls and unfinished_thinking and anthropic_finish_reason == "stop":
+    if (
+        not tool_calls
+        and unfinished_thinking
+        and anthropic_finish_reason != "length"
+    ):
         anthropic_finish_reason = "length"
         logger.warning(
             "Anthropic stream ended before the thinking protocol closed; "
