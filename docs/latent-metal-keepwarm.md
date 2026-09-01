@@ -1,124 +1,151 @@
-# Latent Metal keepwarm (experimental)
+# Metal and exact prompt-tail keepwarm (experimental)
 
-Latent Metal keepwarm is an opt-in latency feature for cached follow-up turns
-on a loaded local engine. It keeps the Metal command path ready without reading
-or mutating model weights, KV state, prompt tokens, prefix-cache entries, or SSD
-artifacts.
+This opt-in latency stack makes cached follow-up turns feel immediate without
+changing model math. It has three separately gated layers:
 
-The mechanism is adapted from the Apache-2.0
-[ThunderMLX](https://github.com/jonathan308/ThunderMLX) keepwarm design, with
-oMLX-specific continuous-batching, cache-clear, model-load, and live-settings
-gates.
+1. **Metal readiness** — a tiny asynchronous kernel keeps the command path
+   responsive after idle time.
+2. **Exact resident L0** — a bounded, exclusive handoff retains validated live
+   cache state so a matching next turn avoids serialization/reconstruction.
+3. **Prompt-tail materialization** — while fully idle, oMLX reconstructs an
+   existing durable prefix, evaluates only a bounded uncached suffix through
+   the target model, and atomically publishes an exact all-token fallback.
 
-## How it works
+The third layer handles a common agent/tool case: a client re-renders the prior
+assistant transcript differently from the raw generated token stream. oMLX can
+retain both the longer terminal state and the guaranteed input-prompt prefix
+under one byte ceiling, then acquire the longest exact prefix that really
+matches the next request. If both cannot fit, the longer terminal wins.
 
-After useful request activity, idle or post-response work on the engine's
-existing one-worker MLX executor lazily creates a dedicated, thread-bound MLX
-stream and compiles one safe `mx.fast.metal_kernel`. The kernel dispatches a
-single fp32 element with a one-thread grid. Its serving path uses
-`mx.async_eval`: it submits without a host read, `mx.eval`, scalar access, or
-synchronization barrier, and retains only the latest four-byte output plus its
-four-byte input.
+The request-boundary design is adapted from Jonathan Spangler's Apache-2.0
+[ThunderMLX](https://github.com/jonathan308/ThunderMLX) work. The oMLX
+implementation is re-engineered around continuous batching, per-engine MLX
+executors, paged/SSD cache ownership, live settings, and unload/reload safety.
 
-A request-start action reuses an already prepared pulse. If idle preparation
-has not happened yet, request start performs zero Metal work: no allocation,
-stream creation, compilation, or fallback matmul. Active requests and queued
-admissions on that engine always win.
+## Support boundary
 
-The local cadence defaults are physically qualified for the asynchronous pulse:
+| Path | Current support |
+| --- | --- |
+| Asynchronous Metal pulse | Local Batched and VLM engines |
+| Exact resident L0 | Text-only non-speculative caches whose complete timeline validates |
+| Prompt-tail materialization | Eligible text-only non-speculative models |
+| Speculative decode | Fail closed unless that architecture proves an exact target-terminal transaction |
+| Qwen4 speculative decode | Qualified in Fusion with the separate cached-suffix/terminal transaction stack; the standalone upstream PR remains fail closed until that dependency lands |
+| Image/audio/video requests | Metal pulse only; media-keyed KV never enters text-only L0 or prompt-tail materialization |
 
-- periodic idle pulse every 2 seconds;
-- post-response pulse after 1 second;
-- the same 2-second cadence for a large resident cache.
+A later genuinely media-free request can arm the text tier. If an earlier image
+remains in the full conversation payload, the request remains multimodal and
+continues on the existing media-keyed cache path.
 
-Explicit environment overrides remain authoritative. On the development M3
-Ultra, hot submission after preparation measured 0.12–0.13 ms of host-side
-submission time. This is deliberately reported as submission latency—not GPU
-completion latency or a claim about end-to-end TTFT.
+## Metal readiness
+
+After useful request activity, idle/post-response work on the engine's existing
+one-worker executor lazily creates a dedicated thread-bound MLX stream and
+compiles one safe `mx.fast.metal_kernel`. It dispatches one fp32 element with a
+one-thread grid via `mx.async_eval`; the serving path performs no host read,
+`mx.eval`, scalar access, or synchronization barrier. Retained pulse state is
+one four-byte input and the latest four-byte output.
+
+Request-start uses only an already-prepared pulse. If off-path preparation has
+not happened, request-start performs zero Metal allocation or compilation.
+
+## Exact prompt-tail path
+
+- It is disabled unless the master toggle and prompt-tail subfeature are on.
+- A request must be text-only, cacheable, inside the token/byte limits, and
+  have an independently durable reusable prefix.
+- Only one hidden materializer runs process-wide.
+- New admission invalidates the lifecycle epoch and aborts between bounded
+  chunks; user work always wins.
+- Hidden forwards are target-only: no sampler, output, BatchGenerator row, MTP
+  draft, prompt-priming capture, or durable cache store is created.
+- Every retained cache must prove exact tokens, logical offsets, recurrent
+  counts, rollback cleanliness, and supported auxiliary state. QSA additionally
+  proves K/V capacity, raw index keys, index offsets, and text MRoPE positions.
+- Publication is atomic with admission and hot-cache clear.
+- The durable paged/SSD tier may be read/promoted but is never written by the
+  hidden pass. Hidden reads do not inflate user cache-rate, phase, prefill, or
+  decode telemetry.
+- The UI toggle temporarily provides two resident slots under the existing byte
+  ceiling. Turning it off restores the prior configured slot policy.
+- Hot-cache clear cancels in-flight work and cannot be followed by stale
+  repopulation. Unload drains maintenance before model/Metal teardown.
 
 ## Enable and observe
 
-Enable **Settings → Advanced → Performance → Latent Metal keepwarm**. The switch
-applies to loaded Batched and VLM engines immediately and is saved for engines
-loaded later. It is disabled by default because keeping the GPU command path
-active can use slightly more idle power.
+Enable **Settings → Advanced → Performance → Latent Metal keepwarm**. It applies
+live to loaded engines and persists for later loads. It is off by default
+because it can use additional idle power, GPU time, and resident cache memory.
 
-Engine telemetry records `execution_mode` as:
-
-- `async_prepared` when an off-path idle action created the stream, compiled
-  the kernel, and submitted its first pulse;
-- `async_submitted` when a prepared pulse was reused;
-- a skip event when request-start preparation was unavailable or request state
-  changed.
-
-Elapsed time is submission/preparation time. A failure or a submission exceeding
-the slow threshold enters bounded backoff and never makes inference unavailable.
-
-## Safety and lifecycle gates
-
-- no pulse runs before a real request completes or resident cache is observed;
-- an idle pulse rechecks queued admissions and scheduler work on the MLX lane;
-- stream creation, pulse use, and close share the engine's FIFO executor thread;
-- close drains only the dedicated pulse stream before scheduler/model teardown;
-- action width and repeats are validated even though the kernel always dispatches
-  one element and one thread;
-- the serving path retains exactly one four-byte output, not an accumulating
-  output list;
-- clearing the in-memory cache disarms warming until the next real request;
-- unload drops all synthetic arrays, the compiled callable, and the pulse stream;
-- cache reuse, cache serialization, SSD writes/restores, sampling, tool output,
-  MTP acceptance, and model math are untouched.
+Engine telemetry records pulse preparation/submission separately. Prompt-tail
+telemetry reports scheduled, published, skipped, cancelled, and failed results
+with bounded prompt/prefix/suffix counts. Hidden work is never reported as a
+user request speed.
 
 ## Environment controls
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `OMLX_KEEPWARM` | `0` | Master switch |
-| `OMLX_KEEPWARM_INTERVAL_SECONDS` | `2` | Periodic idle cadence |
-| `OMLX_KEEPWARM_IDLE_AFTER_SECONDS` | `2` | Idle time before periodic pulse |
-| `OMLX_KEEPWARM_MATRIX_SIZE` | `1` | Bounded compatibility/action metadata |
-| `OMLX_KEEPWARM_REPEATS` | `1` | Pulses per selected action |
+| `OMLX_KEEPWARM_INTERVAL_SECONDS` | `2` | Periodic idle pulse cadence |
+| `OMLX_KEEPWARM_IDLE_AFTER_SECONDS` | `2` | Idle gate before periodic pulse |
 | `OMLX_KEEPWARM_REQUEST_START` | `1` | Reuse a prepared pulse at request start |
 | `OMLX_KEEPWARM_REQUEST_START_IDLE_SECONDS` | `2` | Request-start idle gate |
-| `OMLX_KEEPWARM_REQUEST_START_MATRIX_SIZE` | `128` | Bounded compatibility metadata |
 | `OMLX_KEEPWARM_POST_RESPONSE` | `1` | Enable post-response pulse |
-| `OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS` | `1` | Post-response delay |
-| `OMLX_KEEPWARM_POST_RESPONSE_MATRIX_SIZE` | `128` | Bounded compatibility metadata |
+| `OMLX_KEEPWARM_POST_RESPONSE_DELAY_SECONDS` | `1` | Post-response pulse delay |
 | `OMLX_KEEPWARM_LARGE_CACHE_TOKENS` | `8192` | Long-cache cadence threshold |
 | `OMLX_KEEPWARM_LARGE_CACHE_INTERVAL_SECONDS` | `2` | Long-cache cadence |
 | `OMLX_KEEPWARM_SLOW_THRESHOLD_SECONDS` | `1` | Slow-submission threshold |
 | `OMLX_KEEPWARM_SLOW_BACKOFF_SECONDS` | `60` | Backoff after failure/slow work |
+| `OMLX_KEEPWARM_PROMPT_TAIL` | `0` | Exact idle prompt-tail materialization |
+| `OMLX_KEEPWARM_PROMPT_TAIL_DELAY_SECONDS` | `1` | Delay after completion |
+| `OMLX_KEEPWARM_PROMPT_TAIL_MIN_TOKENS` | `256` | Minimum eligible prompt |
+| `OMLX_KEEPWARM_PROMPT_TAIL_MAX_SUFFIX_TOKENS` | `4096` | Maximum hidden target suffix |
+| `OMLX_KEEPWARM_PROMPT_TAIL_MAX_TOKENS` | `262144` | Maximum complete prompt |
+| `OMLX_KEEPWARM_PROMPT_TAIL_CHUNK_SIZE` | `128` | Cancellation granularity |
+| `OMLX_EXACT_RESIDENT_MAX_ENTRIES` | explicit `0`; UI uses `2` temporarily | Resident exact-prefix slots |
+| `OMLX_EXACT_RESIDENT_MAX_BYTES` | `8 GiB` | Shared terminal/fallback ceiling |
+
+An explicit zero resident-slot setting is a hard disable.
+
+## Physical Fusion qualification
+
+Hardware: M3 Ultra, 256 GB unified memory. Model:
+Qwen3.8-Flash-Next oQ4e MTP. Prompt-tail Qwen measurements use the separately
+qualified Fusion terminal/cached-suffix stack; they are integration evidence,
+not a claim that this standalone PR enables speculative Qwen reuse by itself.
+
+| Gate | Result |
+| --- | --- |
+| 18,174-token transcript divergence, OFF | 16,384 cached; 3.80s model / 4.17s visible TTFT |
+| Same exact turn, ON | 18,152 cached; 0.23s model / 0.62s visible TTFT |
+| Improvement | 6.7× visible TTFT; exact output parity |
+| Ordinary matching terminal | About 0.47s visible TTFT; no regression |
+| Structured tool follow-up | 18,445/18,487 cached; 0.51s total; valid tool call/result flow |
+| Cold sustained performance | 9,994 prompt tokens at 907.7 tok/s; 500-token decode at 74.36 tok/s; 98.2% MTP acceptance |
+| Admission during hidden pass | Cancelled in 437ms; user request completed normally |
+| Hot-cache clear during hidden pass | Cancelled in 488ms; zero stale L0 repopulation |
+| Unload/reload | Unload completed in 1s; reload restored the durable 4,096-token prefix |
+| Idle memory/SSD soak | RSS and 1.60 GB resident L0 flat; SSD manifest hash unchanged |
+| B2/B4/B6 smoke | Every request completed with a unique exact marker and zero errors |
+| Multimodal → fresh text | Image request completed correctly; no media L0 arm; fresh text completed in 0.33s |
+
+The original pulse-only qualification also kept cold prefill and B1 throughput
+within run-to-run noise, survived cancellation/load/unload, and left the SSD
+manifest and repeated-idle memory samples unchanged.
 
 ## Release gate
 
-Compare cached-turn TTFT after 0, 5, 15, and 60 seconds of idle with the toggle
-off and on. Test first, second, and later turns plus independent sessions.
-Also gate B1/B2/B4/B6 throughput, concurrent cache hits, cancellation,
-cross-session restores, SSD writes, explicit cache clear, repeated load/unload,
-and process footprint over repeated pulses. Cold-prefill rate, generated tokens,
-tool calls, cache-hit lengths, and MTP acceptance must remain equivalent:
-keepwarm changes readiness only, never model math.
+Before enabling by default, compare OFF/ON across:
 
-## Physical qualification reference
+- ordinary exact-terminal turns and transcript-divergent agent/tool turns;
+- 0/5/15/60-second idle gaps;
+- B1/B2/B4/B6, active-prefill/decode overlap, and cancellation;
+- hot clear, SSD restore, restart, unload/reload, and memory pressure;
+- text, structured tools, image/audio/video exclusion, and a later media-free
+  request;
+- cold prefill, sustained 500-token decode, output hashes, and speculative
+  acceptance.
 
-The final implementation was qualified on an M3 Ultra with Qwen3.8 Flash Next
-oQ4e MTP and a 220K deterministic agent/tool conversation. The executable
-resident cache used by that test is separate Fusion work and is not included in
-this PR; the OFF/ON comparison changed only the persisted keepwarm switch.
-
-- OFF model TTFT after 5/15/60-second gaps: 1.84/1.76/1.76 seconds.
-- Repeated ON model-TTFT median: about 1.45 seconds; the 60-second result was
-  0.85 seconds model TTFT and 1.83 seconds visible TTFT.
-- Every measured turn emitted the exact expected structured tool call.
-- Live pulse submissions were about 0.3-1.5 ms after a 3-4 ms first prepare.
-- Seven memory samples over 60 seconds had exactly flat RSS and cache bytes.
-- The full 1,187-file cache manifest hash was unchanged across the pulse soak.
-- Same-binary B1 decode median was 55.56 tok/s OFF and 58.79 tok/s ON; cold
-  prefill was effectively unchanged at 887.01 versus 885.31 tok/s.
-- B1/B2/B4/B6 completed without request errors, and targeted cancellation
-  stopped one stream while all three survivors completed.
-
-These figures characterize one hardware/model stack, not a universal speed
-promise. They demonstrate that the asynchronous pulse can improve cached-turn
-readiness without changing inference outputs, cache persistence, active-work
-throughput, or memory growth.
+No speed claim is valid unless prompt/completion counts, cache coverage,
+hardware, quantization, and speculative acceptance are reported separately.

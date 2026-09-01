@@ -1448,6 +1448,11 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
 
+    def _notify_admission_pending(self) -> None:
+        notify = getattr(self._engine, "notify_admission_pending", None)
+        if callable(notify):
+            notify()
+
     async def _preflight_or_raise_with_eviction(
         self,
         scheduler: Any,
@@ -3463,6 +3468,7 @@ class VLMBatchedEngine(BaseEngine):
         """Generate a complete response (non-streaming)."""
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         if self.is_diffusion_model:
             full_text = ""
@@ -3524,6 +3530,14 @@ class VLMBatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        allow_prompt_tail_prewarm = bool(
+            vlm_inputs_embeds is None
+            and not vlm_extra_kwargs
+            and not vlm_image_hash
+            and not vlm_cache_key_ranges
+            and int(vlm_cache_key_start or 0) == 0
+            and not kwargs.get("skip_cache_store", False)
+        )
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3536,6 +3550,14 @@ class VLMBatchedEngine(BaseEngine):
             tools=tools,
             **specprefill_kwargs,
         )
+        if allow_prompt_tail_prewarm:
+            schedule_prewarm = getattr(
+                self._engine,
+                "schedule_prompt_tail_prewarm",
+                None,
+            )
+            if callable(schedule_prewarm):
+                schedule_prewarm(prompt)
 
         text = clean_special_tokens(output.output_text)
 
@@ -3570,6 +3592,7 @@ class VLMBatchedEngine(BaseEngine):
         """Stream generation token by token."""
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         if self.is_diffusion_model:
             if (
@@ -3636,6 +3659,14 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        allow_prompt_tail_prewarm = bool(
+            vlm_inputs_embeds is None
+            and not vlm_extra_kwargs
+            and not vlm_image_hash
+            and not vlm_cache_key_ranges
+            and int(vlm_cache_key_start or 0) == 0
+            and not kwargs.get("skip_cache_store", False)
+        )
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3660,7 +3691,7 @@ class VLMBatchedEngine(BaseEngine):
             async for output in engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
-                if output.finished:
+                if output.finished and not getattr(output, "error", None):
                     finished_normally = True
 
                 yield GenerationOutput(
@@ -3697,6 +3728,14 @@ class VLMBatchedEngine(BaseEngine):
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await engine.abort_request(request_id)
+            elif allow_prompt_tail_prewarm:
+                schedule_prewarm = getattr(
+                    engine,
+                    "schedule_prompt_tail_prewarm",
+                    None,
+                )
+                if callable(schedule_prewarm):
+                    schedule_prewarm(prompt)
 
     async def chat(
         self,
@@ -3714,6 +3753,7 @@ class VLMBatchedEngine(BaseEngine):
         """Chat completion with vision support (non-streaming)."""
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         if self.is_diffusion_model:
             full_text = ""
@@ -3820,6 +3860,7 @@ class VLMBatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
         if self.is_diffusion_model:
             _, _, audio = extract_images_from_messages(messages)
             self._validate_diffusion_request(
@@ -3892,6 +3933,7 @@ class VLMBatchedEngine(BaseEngine):
         """Early prefill memory check for plain /v1/completions calls (VLM)."""
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
         if self.is_diffusion_model:
             self._validate_diffusion_request(
                 stop=kwargs.get("stop"),
@@ -3932,6 +3974,7 @@ class VLMBatchedEngine(BaseEngine):
         """Stream chat completion with vision support."""
         if not self._loaded:
             await self.start()
+        self._notify_admission_pending()
 
         if self.is_diffusion_model:
             self._validate_diffusion_request(
