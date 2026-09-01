@@ -199,3 +199,27 @@ def test_capture_rejects_clone_that_shares_source_arrays(monkeypatch):
 
     assert not scheduler._stage_stable_prompt_boundary(request, source)
     assert request._stable_prompt_resident_candidate is None
+
+
+def test_qwen4_immediate_path_fails_closed_without_terminal_dependency():
+    scheduler = _scheduler()
+    del scheduler.model._omlx_mtp_terminal_commit_v1
+    del scheduler.model._omlx_mtp_suffix_local_capability
+    scheduler.model._omlx_mtp_decode_enabled = True
+    source = _qwen_cache()
+    request = _request()
+
+    assert not scheduler._resident_cache_qwen4_target_only_enabled()
+    assert not scheduler._stage_stable_prompt_boundary(request, source)
+    assert request._stable_prompt_resident_candidate is None
+
+    assert scheduler._exact_resident_cache.put(
+        [1, 2, 3, 4],
+        source,
+        cache_nbytes=Scheduler._resident_cache_nbytes(source),
+        durable_tokens=4,
+    )
+    assert not scheduler._restore_exact_resident_cache(
+        _request([1, 2, 3, 4, 42])
+    )
+    assert scheduler._exact_resident_cache.stats()["entries"] == 1

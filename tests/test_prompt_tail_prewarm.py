@@ -50,9 +50,9 @@ def _scheduler():
 
     def prepare(request):
         request.prompt_cache = cache
-        request.cached_tokens = 8
-        request.remaining_tokens = [8, 9]
-        request._exact_resident_durable_fallback_tokens = 8
+        request.cached_tokens = min(8, len(request.prompt_token_ids))
+        request.remaining_tokens = request.prompt_token_ids[request.cached_tokens :]
+        request._exact_resident_durable_fallback_tokens = request.cached_tokens
 
     scheduler._prepare_prefix_cache_for_request.side_effect = prepare
     return scheduler, cache, state
@@ -92,11 +92,14 @@ def test_prompt_tail_prewarm_processes_all_suffix_and_publishes_exact_l0(monkeyp
     )
 
     assert result["status"] == "published"
+    assert result["source_prompt_tokens"] == 10
+    assert result["prompt_tokens"] == 9
+    assert result["stable_boundary_trimmed_tokens"] == 1
     assert result["cached_tokens"] == 8
-    assert result["suffix_tokens"] == 2
+    assert result["suffix_tokens"] == 1
     scheduler._begin_prefill.assert_called_once()
     args, kwargs = scheduler._begin_prefill.call_args
-    assert args[1] == [8, 9]
+    assert args[1] == [8]
     assert args[2] == cache
     assert kwargs["process_all_tokens"] is True
     assert state.boundary_enabled is False
@@ -104,7 +107,7 @@ def test_prompt_tail_prewarm_processes_all_suffix_and_publishes_exact_l0(monkeyp
     assert drop_ctx.call_count == 2
     assert all(call.args == (scheduler.model,) for call in drop_ctx.call_args_list)
     scheduler._exact_resident_cache.put.assert_called_once_with(
-        list(range(10)),
+        list(range(9)),
         cache,
         cache_nbytes=1024,
         durable_tokens=8,

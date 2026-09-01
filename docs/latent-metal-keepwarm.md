@@ -9,13 +9,14 @@ changing model math. It has three separately gated layers:
    cache state so a matching next turn avoids serialization/reconstruction.
 3. **Prompt-tail materialization** — while fully idle, oMLX reconstructs an
    existing durable prefix, evaluates only a bounded uncached suffix through
-   the target model, and atomically publishes an exact all-token fallback.
+   the target model, and atomically publishes an exact stable-prefix fallback.
 
 The third layer handles a common agent/tool case: a client re-renders the prior
 assistant transcript differently from the raw generated token stream. oMLX can
 retain both the longer terminal state and the guaranteed input-prompt prefix
 under one byte ceiling, then acquire the longest exact prefix that really
-matches the next request. If both cannot fit, the longer terminal wins.
+matches the next request. If several terminal branches exist, the newest
+terminal and the shared stable boundary win; older branches use durable cache.
 
 The request-boundary design is adapted from Jonathan Spangler's Apache-2.0
 [ThunderMLX](https://github.com/jonathan308/ThunderMLX) work. The oMLX
@@ -28,6 +29,7 @@ executors, paged/SSD cache ownership, live settings, and unload/reload safety.
 | --- | --- |
 | Asynchronous Metal pulse | Local Batched and VLM engines |
 | Exact resident L0 | Text-only non-speculative caches whose complete timeline validates |
+| Immediate stable boundary | Exact, unwrapped B1 `KVCache` graphs; copied at the preceding durable block boundary |
 | Prompt-tail materialization | Eligible text-only non-speculative models |
 | Speculative decode | Fail closed unless that architecture proves an exact target-terminal transaction |
 | Qwen4 speculative decode | Qualified in Fusion with the separate cached-suffix/terminal transaction stack; the standalone upstream PR remains fail closed until that dependency lands |
@@ -52,6 +54,14 @@ not happened, request-start performs zero Metal allocation or compilation.
 ## Exact prompt-tail path
 
 - It is disabled unless the master toggle and prompt-tail subfeature are on.
+- A completed B1 plain-`KVCache` prefill can publish its already-computed stable
+  durable boundary immediately. The source cache remains untouched and the
+  detached prefix is fully evaluated before deferred terminal publication.
+- Plain chat templates may rewrite several generation-marker tokens, so the
+  generic provider uses the preceding durable block boundary and reprocesses at
+  most one block. Qwen4 keeps its more specific `N-1` provider only when the
+  separate target-terminal capability marker is present; this standalone PR
+  does not set that marker.
 - A request must be text-only, cacheable, inside the token/byte limits, and
   have an independently durable reusable prefix.
 - Only one hidden materializer runs process-wide.
@@ -63,6 +73,9 @@ not happened, request-start performs zero Metal allocation or compilation.
   counts, rollback cleanliness, and supported auxiliary state. QSA additionally
   proves K/V capacity, raw index keys, index offsets, and text MRoPE positions.
 - Publication is atomic with admission and hot-cache clear.
+- An already resident stable prefix suppresses redundant hidden materialization
+  only when it covers the expected durable boundary; short/unrelated entries do
+  not block useful work.
 - The durable paged/SSD tier may be read/promoted but is never written by the
   hidden pass. Hidden reads do not inflate user cache-rate, phase, prefill, or
   decode telemetry.
