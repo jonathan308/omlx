@@ -337,6 +337,17 @@ def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
 
     import mlx.core as mx
 
+    def detach_value(value: Any) -> Any:
+        if isinstance(value, mx.array):
+            return value + 0
+        if isinstance(value, list):
+            return [detach_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(detach_value(item) for item in value)
+        if isinstance(value, dict):
+            return {key: detach_value(item) for key, item in value.items()}
+        return value
+
     def clone_one(entry: Any) -> Any:
         if entry is None:
             return None
@@ -344,11 +355,19 @@ def _clone_mtp_cache(cache: List[Any]) -> List[Any]:
         if subs is not None:
             return type(entry)(*[clone_one(sub) for sub in subs])
         clone = copy.copy(entry)
+        # oMLX wraps restored recurrent ArraysCache state in
+        # SizedArraysCache. A shallow wrapper copy still shares ``_inner`` and
+        # its live slot list, so later decode would mutate a supposedly detached
+        # prompt-boundary candidate. Clone the owned inner cache recursively
+        # before copying the wrapper's remaining scalar/array metadata.
+        inner = vars(entry).get("_inner")
+        if inner is not None:
+            clone._inner = clone_one(inner)
         for attr, value in vars(entry).items():
-            if isinstance(value, mx.array):
-                setattr(clone, attr, value + 0)
-            elif isinstance(value, list):
-                setattr(clone, attr, list(value))
+            if attr == "_inner":
+                continue
+            if isinstance(value, (mx.array, list, tuple, dict)):
+                setattr(clone, attr, detach_value(value))
         return clone
 
     return [clone_one(entry) for entry in cache]

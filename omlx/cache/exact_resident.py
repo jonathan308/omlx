@@ -59,6 +59,7 @@ class ExactResidentPrefixCache:
         self._entries: OrderedDict[int, _ExactResidentEntry] = OrderedDict()
         self._size_bytes = 0
         self._next_id = 0
+        self._generation = 0
         self._lock = threading.RLock()
         self.hits = 0
         self.misses = 0
@@ -135,6 +136,7 @@ class ExactResidentPrefixCache:
         cache_nbytes: int = 0,
         durable_tokens: int = 0,
         protect_longer_prefix: bool = False,
+        expected_generation: int | None = None,
     ) -> bool:
         """Retain one detached cache, evicting oldest entries as needed."""
 
@@ -165,6 +167,11 @@ class ExactResidentPrefixCache:
             durable_tokens=durable_tokens,
         )
         with self._lock:
+            if (
+                expected_generation is not None
+                and int(expected_generation) != self._generation
+            ):
+                return False
             if protect_longer_prefix:
                 protected_ids = {
                     entry_id
@@ -214,6 +221,22 @@ class ExactResidentPrefixCache:
                 self.evictions += 1
         return True
 
+    def generation(self) -> int:
+        """Return the lifecycle generation used by deferred publishers."""
+
+        with self._lock:
+            return self._generation
+
+    def contains_exact(self, tokens: Iterable[int]) -> bool:
+        """Whether an independently owned entry has this exact token ledger."""
+
+        try:
+            token_array = array("I", [int(token) for token in tokens])
+        except (OverflowError, TypeError, ValueError):
+            return False
+        with self._lock:
+            return any(entry.tokens == token_array for entry in self._entries.values())
+
     def acquire_prefix(self, prompt_tokens: list[int]) -> ExactResidentHit | None:
         """Pop the longest ready entry that exactly prefixes ``prompt_tokens``."""
 
@@ -251,6 +274,7 @@ class ExactResidentPrefixCache:
             count = len(self._entries)
             self._entries.clear()
             self._size_bytes = 0
+            self._generation += 1
             return count
 
     def resize(self, max_entries: int) -> int:
@@ -259,6 +283,8 @@ class ExactResidentPrefixCache:
         max_entries = max(0, int(max_entries))
         evicted_count = 0
         with self._lock:
+            if max_entries != self.max_entries:
+                self._generation += 1
             self.max_entries = max_entries
             while len(self._entries) > self.max_entries:
                 _, evicted = self._entries.popitem(last=False)
@@ -287,4 +313,5 @@ class ExactResidentPrefixCache:
                 "evictions": self.evictions,
                 "oversize_rejections": self.oversize_rejections,
                 "protected_rejections": self.protected_rejections,
+                "generation": self._generation,
             }
