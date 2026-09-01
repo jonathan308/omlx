@@ -5054,6 +5054,20 @@ async def stream_chat_completion(
         if tool_calls
         else (last_output.finish_reason if last_output else "stop")
     )
+    if (
+        not tool_calls
+        and thinking_parser.unfinished_thinking
+        and finish_reason == "stop"
+    ):
+        # The target terminated inside a prompt-opened reasoning block. Treat
+        # this as an incomplete response rather than a successful answer; the
+        # private reasoning has already streamed on reasoning_content and must
+        # never be promoted into delta.content.
+        finish_reason = "length"
+        logger.warning(
+            "Chat stream ended before the thinking protocol closed; "
+            "reporting an incomplete response"
+        )
     final_chunk = ChatCompletionChunk(
         id=response_id,
         model=request.model,
@@ -5348,6 +5362,7 @@ async def stream_anthropic_messages(
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish()
+    unfinished_thinking = thinking_parser.unfinished_thinking
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5519,8 +5534,16 @@ async def stream_anthropic_messages(
             yield create_content_block_stop_event(index=i)
 
     # 6. Send message_delta with stop_reason and actual token counts
+    anthropic_finish_reason = output.finish_reason if output else "stop"
+    if not tool_calls and unfinished_thinking and anthropic_finish_reason == "stop":
+        anthropic_finish_reason = "length"
+        logger.warning(
+            "Anthropic stream ended before the thinking protocol closed; "
+            "reporting max_tokens"
+        )
     stop_reason = map_finish_reason_to_stop_reason(
-        output.finish_reason if output else "stop", bool(tool_calls)
+        anthropic_finish_reason,
+        bool(tool_calls),
     )
     # Use actual token counts from the last output
     actual_input_tokens = last_output.prompt_tokens if last_output else 0
@@ -6881,8 +6904,10 @@ async def stream_responses_api(
         return
 
     # Flush remaining content from parsers
+    unfinished_thinking = False
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish()
+        unfinished_thinking = thinking_parser.unfinished_thinking
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -7231,7 +7256,10 @@ async def stream_responses_api(
         }
 
     # 13. Emit the terminal event matching the final response status.
-    truncated = getattr(last_output, "finish_reason", None) == "length"
+    truncated = bool(
+        getattr(last_output, "finish_reason", None) == "length"
+        or (not tool_calls and unfinished_thinking)
+    )
     terminal_event = "response.incomplete" if truncated else "response.completed"
     final_response = {
         "id": response_id,
