@@ -220,14 +220,19 @@ class Scheduler:
         *,
         busy: bool = False,
         cache_tokens: int = 0,
+        exact_resident_tokens: int = 0,
     ) -> None:
         self.busy = busy
         self.added = []
+        self._exact_resident_tokens = exact_resident_tokens
         self.block_aware_cache = SimpleNamespace(
             paged_cache=SimpleNamespace(
                 stats=SimpleNamespace(total_tokens_cached=cache_tokens)
             )
         )
+
+    def _exact_resident_stats(self):
+        return {"max_token_count": self._exact_resident_tokens}
 
     def has_requests(self) -> bool:
         return self.busy
@@ -245,6 +250,14 @@ def core_with_scheduler(scheduler: Scheduler) -> EngineCore:
     core._pending_admissions = 0
     core._wake_engine_loop = lambda: None
     return core
+
+
+def test_resident_cache_tokens_include_exact_resident_l0():
+    core = core_with_scheduler(
+        Scheduler(cache_tokens=4096, exact_resident_tokens=220_000)
+    )
+
+    assert core._resident_cache_tokens() == 220_000
 
 
 def test_concurrent_admission_skips_keepwarm_and_still_adds_request():
