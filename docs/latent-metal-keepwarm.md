@@ -30,6 +30,7 @@ executors, paged/SSD cache ownership, live settings, and unload/reload safety.
 | Asynchronous Metal pulse | Local Batched and VLM engines |
 | Exact resident L0 | Text-only non-speculative caches whose complete timeline validates |
 | Immediate stable boundary | Exact, unwrapped B1 `KVCache` graphs; copied at the preceding durable block boundary |
+| Immediate hybrid boundary | Finalized B1 exact `ArraysCache`/`SizedArraysCache` plus exact `KVCache`, copied at `N-1` |
 | Prompt-tail materialization | Eligible text-only non-speculative models |
 | Speculative decode | Fail closed unless that architecture proves an exact target-terminal transaction |
 | Qwen4 speculative decode | Qualified in Fusion with the separate cached-suffix/terminal transaction stack; the standalone upstream PR remains fail closed until that dependency lands |
@@ -62,6 +63,10 @@ not happened, request-start performs zero Metal allocation or compilation.
   most one block. Qwen4 keeps its more specific `N-1` provider only when the
   separate target-terminal capability marker is present; this standalone PR
   does not set that marker.
+- Hybrid recurrent/KV models may publish exact `N-1` only when the complete
+  graph consists of finalized B1 upstream `ArraysCache` (optionally the exact
+  `SizedArraysCache` wrapper) plus plain `KVCache`. Every recurrent slot and
+  logical KV prefix is independently copied and eagerly evaluated.
 - A request must be text-only, cacheable, inside the token/byte limits, and
   have an independently durable reusable prefix.
 - Only one hidden materializer runs process-wide.
@@ -133,6 +138,8 @@ not a claim that this standalone PR enables speculative Qwen reuse by itself.
 | 18,174-token transcript divergence, OFF | 16,384 cached; 3.80s model / 4.17s visible TTFT |
 | Same exact turn, ON | 18,152 cached; 0.23s model / 0.62s visible TTFT |
 | Improvement | 6.7× visible TTFT; exact output parity |
+| Qwen3.8-27B hybrid rapid turns | 1.72–1.78s model / 1.89–1.94s visible baseline; 0.24s model / 0.40s visible with exact `N-1` resident reuse |
+| Hybrid clone overhead | 10.2–12.2ms; 0.42 GiB; hot and paged outputs byte-identical (`98d8670fc5f9e7f2c4b37ab13818cf46879cb5e8f914fb8642c317db4f7c24fe`) |
 | Ordinary matching terminal | About 0.47s visible TTFT; no regression |
 | Structured tool follow-up | 18,445/18,487 cached; 0.51s total; valid tool call/result flow |
 | Cold sustained performance | 9,994 prompt tokens at 907.7 tok/s; 500-token decode at 74.36 tok/s; 98.2% MTP acceptance |
