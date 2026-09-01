@@ -1398,6 +1398,24 @@ def _seed_text_only_mrope_delta_for_cached_prefill(model: Any, request: Any) -> 
     mx.eval(lm._rope_deltas)
 
 
+def _bind_text_prefill_rope_delta(model: Any, delta: float) -> None:
+    """Rebind one non-media prefill row without widening Qwen4 positions.
+
+    ``VLMModelAdapter`` exposes a dedicated seam that records the scheduler's
+    text-only proof. Other model wrappers retain the original generic mRoPE
+    binder. Looking up the dedicated method on the class avoids treating an
+    auto-created ``MagicMock`` instance attribute as a production capability.
+    """
+
+    text_setter = getattr(type(model), "set_text_prefill_rope_delta", None)
+    if callable(text_setter):
+        text_setter(model, delta)
+        return
+    generic_setter = getattr(model, "set_batch_rope_deltas", None)
+    if callable(generic_setter):
+        generic_setter(mx.array([delta]))
+
+
 def _vlm_extra_seq_slice(val: mx.array, s: slice) -> mx.array:
     """Slice a VLM extra tensor along its seq dimension.
 
@@ -3598,6 +3616,18 @@ class Scheduler:
             _trace_model_start = time.perf_counter()
             with mx.stream(self._stream):
                 model_kwargs: dict[str, Any] = {}
+                if embeds_array is None:
+                    # External text prefill is interleaved chunk-by-chunk with
+                    # active decode. A finishing VLM row clears the adapter's
+                    # process-local position state, and a decode step may leave
+                    # a differently shaped batch delta behind. Rebind this
+                    # request immediately before every forward so neither
+                    # event can make a singleton Qwen mRoPE chunk restart at
+                    # local position zero inside an absolute QSA timeline.
+                    _bind_text_prefill_rope_delta(
+                        self.model,
+                        getattr(request, "rope_deltas", 0.0),
+                    )
                 if embeds_array is not None and embeds_array.shape[1] > 0:
                     model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
                     if extra_kwargs:
@@ -5174,6 +5204,16 @@ class Scheduler:
         with mx.stream(self._stream):
             chunk = state.tokens_remaining[:, :n]
             state.tokens_remaining = state.tokens_remaining[:, n:]
+            # A chunked text prefill can yield to active decode between
+            # forwards. Completion cleanup or the intervening decode batch may
+            # replace the VLM adapter's process-local mRoPE state. Rebind this
+            # request at the model-call boundary so the next scalar-cache chunk
+            # continues from its absolute cache offset instead of restarting at
+            # local position zero.
+            _bind_text_prefill_rope_delta(
+                self.model,
+                getattr(state.request, "rope_deltas", 0.0),
+            )
             if self._supports_skip_lm_head():
                 self.model(chunk, cache=state.cache, skip_lm_head=True)
             else:
