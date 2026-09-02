@@ -33,6 +33,9 @@ def test_qwen4_sparse_gqa_route_forwards_compact_blocks_and_transposes(monkeypat
     )
     calls = []
 
+    # This test covers the single-pass route; split-K is exercised in
+    # test_qwen4_qsa_split_k.py.
+    monkeypatch.setenv("OMLX_QWEN4_QSA_SPLIT_K", "0")
     monkeypatch.setattr(fast, "is_native_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
 

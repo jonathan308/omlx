@@ -181,6 +181,7 @@ struct Qwen4QSASparseGQAParams {
   int64_t V_strides[3]; ///< Value strides (B, Hkv, L, D = 1)
   int64_t Topk_strides[3]; ///< Selected-token strides (B, 1, L, topk = 1)
   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
+  int tiles_per_split; ///< ktiles each split walks
 };
 
 struct AttnChunkReduceParams {

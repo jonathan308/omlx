@@ -79,6 +79,19 @@ NB_MODULE(_ext, m) {
       "dimension_tile"_a = 32,
       "stream"_a = nb::none());
   m.def(
+      "qwen4_qsa_sparse_gqa_attention_split",
+      &omlx::glm_kernels::qwen4_qsa_sparse_gqa_attention_split,
+      "queries"_a,
+      "keys"_a,
+      "values"_a,
+      "selected_blocks"_a,
+      "scale"_a,
+      "q_offset"_a,
+      "key_tile"_a = 128,
+      "dimension_tile"_a = 32,
+      "splits"_a = 8,
+      "stream"_a = nb::none());
+  m.def(
       "dsa_topk_indices",
       &omlx::glm_kernels::dsa_topk_indices,
       "scores"_a,

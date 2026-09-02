@@ -48,6 +48,8 @@ struct Qwen4QSASparseGQAParams {
   int64_t V_strides[3];
   int64_t Topk_strides[3];
   int64_t O_strides[3];
+  int splits;
+  int tiles_per_split;
 };
 
 class Qwen4QSASparseGQAPrimitive : public Primitive {
@@ -128,7 +130,8 @@ public:
         /* int64_t Topk_strides[3] = */
         {selected.strides(0), selected.strides(1), selected.strides(2)},
         /* int64_t O_strides[3] = */
-        {out.strides(0), out.strides(1), out.strides(2)}};
+        {out.strides(0), out.strides(1), out.strides(2)},
+        /* int tiles_per_split = */ 0};
 
     std::string kernel_name;
     concatenate(kernel_name, "qwen4_qsa_sparse_gqa_", type_to_name(q), "_bk",
@@ -168,6 +171,108 @@ private:
   int dimension_tile_;
 };
 
+// Split-K variant. The original kernel dispatches MTL::Size(qL, kv_heads, 1)
+// -- two threadgroups at qL == 1, six to eight at MTP verify widths -- and each
+// one walks all ~17 ktiles of the 2051 selected tokens serially, with at most
+// 64 threads (WM <= 2 follows from H_PAD % (WM * 8) == 0 at H_PAD == 16). The
+// GPU has 40 cores, so the kernel is occupancy-bound and its cost is FLAT in
+// query rows. Splitting the ktile loop over tid.z (batch is fixed to one here)
+// turns that into `splits` times as many threadgroups. Each split emits an
+// UNNORMALISED O plus its running (m, l); the host merges with the standard
+// online-softmax combine.
+class Qwen4QSASparseGQASplitPrimitive : public Primitive {
+public:
+  Qwen4QSASparseGQASplitPrimitive(Stream stream, float scale, int q_offset,
+                                  int key_tile, int dimension_tile, int splits)
+      : Primitive(stream), scale_(scale), q_offset_(q_offset),
+        key_tile_(key_tile), dimension_tile_(dimension_tile), splits_(splits) {}
+
+  void eval_cpu(const std::vector<array> &, std::vector<array> &) override {
+    throw std::runtime_error("Qwen4QSASparseGQASplitPrimitive has no CPU path.");
+  }
+
+  void eval_gpu(const std::vector<array> &inputs,
+                std::vector<array> &outputs) override {
+    auto &stream = this->stream();
+    auto &device = metal::device(stream.device);
+    const auto &q = inputs[0];
+    const auto &k = inputs[1];
+    const auto &v = inputs[2];
+    const auto &selected = inputs[3];
+    auto &out = outputs[0];
+
+    constexpr int gqa = 12;
+    constexpr int dim = 256;
+    constexpr int wm = 2;
+    constexpr int hpad = 16;
+    constexpr int kCompressRatio = 4;
+
+    out.set_data(allocator::malloc(out.nbytes()));
+
+    const int topk = selected.shape(3);
+    const int selected_tokens = topk * kCompressRatio + (kCompressRatio - 1);
+    const int n_tiles = (selected_tokens + key_tile_ - 1) / key_tile_;
+    const int tiles_per_split = (n_tiles + splits_ - 1) / splits_;
+
+    Qwen4QSASparseGQAParams params{
+        /* int B = */ 1,
+        /* int q_heads = */ 24,
+        /* int kv_heads = */ 2,
+        /* int qL = */ q.shape(2),
+        /* int kL = */ k.shape(2),
+        /* int topk = */ topk,
+        /* int gqa_factor = */ gqa,
+        /* int q_offset = */ q_offset_,
+        /* float scale = */ scale_,
+        /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+        /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+        /* int64_t Topk_strides[3] = */
+        {selected.strides(0), selected.strides(1), selected.strides(2)},
+        /* int64_t O_strides[3] = */ {0, 0, 0},
+        /* int tiles_per_split = */ tiles_per_split};
+
+    std::string kernel_name;
+    concatenate(kernel_name, "qwen4_qsa_sparse_gqa_split_", type_to_name(q),
+                "_bk", key_tile_, "_dc", dimension_tile_, "_gqa", gqa, "_hp",
+                hpad, "_d", dim, "_wm", wm);
+
+    auto library = device.get_library("omlx_glm_kernels", current_binary_dir());
+    auto kernel = device.get_kernel(kernel_name, library);
+    auto &encoder = metal::get_command_encoder(stream);
+    encoder.set_compute_pipeline_state(kernel);
+    encoder.set_input_array(q, 0);
+    encoder.set_input_array(k, 1);
+    encoder.set_input_array(v, 2);
+    encoder.set_input_array(selected, 3);
+    encoder.set_output_array(out, 4);
+    encoder.set_bytes(params, 5);
+    encoder.dispatch_threadgroups(
+        MTL::Size(q.shape(2), k.shape(1), splits_), MTL::Size(32, wm, 1));
+  }
+
+  DEFINE_NAME(OMLXQwen4QSASparseGQASplitAttention)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  bool is_equivalent(const Primitive &other) const override {
+    const auto &rhs =
+        static_cast<const Qwen4QSASparseGQASplitPrimitive &>(other);
+    return scale_ == rhs.scale_ && q_offset_ == rhs.q_offset_ &&
+           key_tile_ == rhs.key_tile_ &&
+           dimension_tile_ == rhs.dimension_tile_ && splits_ == rhs.splits_;
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, scale_, q_offset_, key_tile_,
+                           dimension_tile_, splits_);
+  }
+
+private:
+  float scale_;
+  int q_offset_;
+  int key_tile_;
+  int dimension_tile_;
+  int splits_;
+};
+
 } // namespace
 
 array qwen4_qsa_sparse_gqa_attention(const array &queries, const array &keys,
@@ -194,6 +299,30 @@ array qwen4_qsa_sparse_gqa_attention(const array &queries, const array &keys,
   return array(std::move(out_shape), queries.dtype(),
                std::make_shared<Qwen4QSASparseGQAPrimitive>(
                    stream, scale, q_offset, key_tile, dimension_tile),
+               std::vector<array>{queries, keys, values, selected_blocks});
+}
+
+array qwen4_qsa_sparse_gqa_attention_split(
+    const array &queries, const array &keys, const array &values,
+    const array &selected_blocks, float scale, int q_offset, int key_tile,
+    int dimension_tile, int splits, StreamOrDevice s) {
+  auto stream = to_stream(s);
+  if (splits < 1 || splits > 32 ||
+      Qwen4QSASparseGQAPrimitive::unsupported(queries, keys, values,
+                                              selected_blocks, q_offset,
+                                              key_tile, dimension_tile,
+                                              stream)) {
+    throw std::invalid_argument(
+        "[omlx_glm_kernels.qwen4_qsa_sparse_gqa_attention_split] unsupported "
+        "shapes/params, or splits outside [1, 32].");
+  }
+  // [splits, q_heads, qL, D + 2]: the trailing two floats are the split's
+  // running max and sum, which the host needs to merge softmax across splits.
+  Shape out_shape{splits, queries.shape(1), queries.shape(2),
+                  queries.shape(3) + 2};
+  return array(std::move(out_shape), float32,
+               std::make_shared<Qwen4QSASparseGQASplitPrimitive>(
+                   stream, scale, q_offset, key_tile, dimension_tile, splits),
                std::vector<array>{queries, keys, values, selected_blocks});
 }
 

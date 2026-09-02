@@ -8,6 +8,8 @@ multimodal, and target-verify requests use mlx-vlm's general implementation.
 
 from __future__ import annotations
 
+import os
+
 import math
 from collections.abc import Callable
 
@@ -209,6 +211,29 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         return None
 
 
+_LOG2_E_INV = math.log(2.0)
+
+
+_SPLIT_K_DEFAULT = 16
+
+
+def _split_k_splits() -> int:
+    """Split count for the sparse-GQA kernel; 0 selects the single-pass kernel.
+
+    The single-pass kernel dispatches a grid of (query_rows, kv_heads) -- about
+    six threadgroups at MTP verify widths -- and cannot fill the GPU. Splitting
+    its ktile loop recovers roughly 4x on the kernel and ~20% end-to-end at 92k.
+    """
+    raw = os.environ.get("OMLX_QWEN4_QSA_SPLIT_K", "").strip()
+    if not raw:
+        return _SPLIT_K_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        return _SPLIT_K_DEFAULT
+    return n if 1 <= n <= 32 else 0
+
+
 def _native_sparse_gqa_attention(
     queries: mx.array,
     keys: mx.array,
@@ -250,16 +275,40 @@ def _native_sparse_gqa_attention(
             _NATIVE_QSA_MAIN_DISABLED = True
             return None
         native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
-        output = fast.qwen4_qsa_sparse_gqa_attention(
-            queries,
-            keys,
-            values,
-            native_blocks,
-            queries.shape[-1] ** -0.5,
-            q_offset,
-            key_tile=64,
-            dimension_tile=64,
-        )
+        splits = _split_k_splits()
+        if splits and fast.has_symbol("qwen4_qsa_sparse_gqa_attention_split"):
+            dim = queries.shape[-1]
+            raw = fast.qwen4_qsa_sparse_gqa_attention_split(
+                queries,
+                keys,
+                values,
+                native_blocks,
+                dim**-0.5,
+                q_offset,
+                splits=splits,
+            )
+            part_o = raw[..., :dim]
+            part_m = raw[..., dim : dim + 1]
+            part_l = raw[..., dim + 1 : dim + 2]
+            # The kernel's running max is in LOG2 space (it uses exp2), so the
+            # merge must be base-2. Base-e is correct only at splits == 1.
+            max_m = mx.max(part_m, axis=0, keepdims=True)
+            weight = mx.exp((part_m - max_m) * _LOG2_E_INV)
+            output = (
+                mx.sum(part_o * weight, axis=0)
+                / mx.maximum(mx.sum(part_l * weight, axis=0), 1e-30)
+            )[None].astype(queries.dtype)
+        else:
+            output = fast.qwen4_qsa_sparse_gqa_attention(
+                queries,
+                keys,
+                values,
+                native_blocks,
+                queries.shape[-1] ** -0.5,
+                q_offset,
+                key_tile=64,
+                dimension_tile=64,
+            )
         if not _NATIVE_QSA_MAIN_PROVEN:
             # Prove the rebuilt extension and Metal pipeline before the lazy
             # graph advances cache state past a point where fallback is safe.

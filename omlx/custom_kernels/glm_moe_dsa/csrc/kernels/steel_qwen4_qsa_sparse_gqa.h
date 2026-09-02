@@ -8,6 +8,15 @@
 
 using namespace mlx::steel;
 
+// Split-K writes an unnormalised fp32 partial per split; the single-pass
+// instantiation writes the finished tile in the tensor dtype.
+template <bool Split, typename T> struct Qwen4SparseOutT {
+  using type = T;
+};
+template <typename T> struct Qwen4SparseOutT<true, T> {
+  using type = float;
+};
+
 struct Qwen4SparseMaxOp {
   template <typename T> METAL_FUNC static constexpr T apply(T x, T y) {
     return metal::max(x, y);
@@ -62,14 +71,15 @@ template <
     int D,
     int WM,
     typename IndexT,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool Split = false>
 [[kernel, max_total_threads_per_threadgroup(WM * 32)]] void
 qwen4_qsa_sparse_gqa_attention(
     const device T* Q [[buffer(0)]],
     const device T* K [[buffer(1)]],
     const device T* V [[buffer(2)]],
     const device IndexT* Topk [[buffer(3)]],
-    device T* O [[buffer(4)]],
+    device typename Qwen4SparseOutT<Split, T>::type* O [[buffer(4)]],
     const constant Qwen4QSASparseGQAParams* params [[buffer(5)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -102,7 +112,8 @@ qwen4_qsa_sparse_gqa_attention(
   const int lane = int(simd_group_id * 32 + simd_lane_id);
   const int q_pos = int(tid.x);
   const int kv_head = int(tid.y);
-  const int b = int(tid.z);
+  const int split = Split ? int(tid.z) : 0;
+  const int b = Split ? 0 : int(tid.z);
 
   threadgroup T Qs[H_PAD * LDQ];
   threadgroup T KVs[(BK * LDV > DC * LDK) ? BK * LDV : DC * LDK];
@@ -152,7 +163,15 @@ qwen4_qsa_sparse_gqa_attention(
   const int valid_blocks = metal::min(params->topk, complete_blocks);
   const int n_tiles = (selected_tokens + BK - 1) / BK;
 
-  for (int ktile = 0; ktile < n_tiles; ++ktile) {
+  // Split-K partitions the ktile loop over tid.z so a narrow query tile can
+  // occupy more than the (query rows x KV heads) threadgroups it would
+  // otherwise get. Each split emits an unnormalised partial plus its own
+  // (m, l); the host merges them with the usual online-softmax combine.
+  const int t_begin = Split ? split * params->tiles_per_split : 0;
+  const int t_end =
+      Split ? metal::min(n_tiles, t_begin + params->tiles_per_split) : n_tiles;
+
+  for (int ktile = t_begin; ktile < t_end; ++ktile) {
     const int topk_off = ktile * BK;
     for (int k = lane; k < BK; k += tgp_size) {
       const int slot = topk_off + k;
@@ -310,11 +329,49 @@ qwen4_qsa_sparse_gqa_attention(
     }
   }
 
+  const short rows_left = short(GQA - (tm + sm));
+
+  if (Split) {
+    // Leave O unnormalised and ship the running (m, l) with it, so the host
+    // merges splits with the standard online-softmax combine:
+    //   m = max(m_s);  l = sum(l_s * 2^(m_s - m));  O = sum(O_s * 2^(m_s - m)) / l
+    // With kElemRows == 1 each thread owns one row, and its sn == 0 lane
+    // writes m/l alongside the D columns.
+    const int part_row = D + 2;
+    const size_t row_base = size_t(split) * size_t(params->q_heads) *
+                                size_t(params->qL) * size_t(part_row) +
+                            size_t(query_head_base + tm + sm) *
+                                size_t(params->qL) * size_t(part_row) +
+                            size_t(q_pos) * size_t(part_row);
+    device float *outp = reinterpret_cast<device float *>(O) + row_base + sn;
+    const bool empty = (t_begin >= n_tiles);
+    if (rows_left > 0) {
+      if (empty) {
+        // No ktile fell to this split: contribute nothing, so the host merge
+        // sees O = 0, l = 0, m = -inf.
+        if (sn == 0) {
+          for (short d = 0; d < D; ++d) {
+            outp[d] = 0.0f;
+          }
+        }
+      } else {
+        Otile.template store_safe<float, 1, 1>(outp, part_row,
+                                               short2(D - sn, rows_left));
+      }
+      if (sn == 0) {
+        device float *ml = reinterpret_cast<device float *>(O) + row_base + D;
+        ml[0] = empty ? -INFINITY : float(max_score[0]);
+        ml[1] = empty ? 0.0f : float(sum_score[0]);
+      }
+    }
+    return;
+  }
+
   Otile.template row_bin_op<Qwen4SparseDivOp>(sum_score);
-  device T *out = O + size_t(b) * params->O_strides[0] +
+  device T *out = reinterpret_cast<device T *>(O) +
+                  size_t(b) * params->O_strides[0] +
                   size_t(query_head_base + tm + sm) * params->O_strides[1] +
                   size_t(q_pos) * params->O_strides[2] + sn;
-  const short rows_left = short(GQA - (tm + sm));
   if (rows_left > 0) {
     Otile.template store_safe<T, 1, 1>(out, params->O_strides[1],
                                        short2(D - sn, rows_left));

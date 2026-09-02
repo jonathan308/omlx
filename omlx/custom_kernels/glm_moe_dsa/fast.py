@@ -104,6 +104,7 @@ NATIVE_SYMBOLS = (
     "qwen4_qsa_indexer_scores",
     "qwen4_qsa_topk_indices",
     "qwen4_qsa_sparse_gqa_attention",
+    "qwen4_qsa_sparse_gqa_attention_split",
     "dsa_topk_indices",
     "dspark_fp32_topk_indices",
     "dspark_exact_mxfp8_qmv_pair",
@@ -345,6 +346,43 @@ def qwen4_qsa_sparse_gqa_attention(
         q_offset,
         key_tile,
         dimension_tile,
+        **_native_stream_kwargs(stream),
+    )
+
+
+def qwen4_qsa_sparse_gqa_attention_split(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    selected_blocks: mx.array,
+    scale: float,
+    q_offset: int,
+    *,
+    key_tile: int = 128,
+    dimension_tile: int = 32,
+    splits: int = 8,
+    stream=None,
+) -> mx.array:
+    """Key-split variant of :func:`qwen4_qsa_sparse_gqa_attention`.
+
+    Each split walks its own share of the key tiles and returns unnormalised
+    output with per-split softmax state as
+    ``[splits, q_heads, qL, head_dim + 2]`` in fp32; the caller merges the
+    splits. Geometry support matches the single-pass kernel.
+    """
+
+    if _ext is None or not hasattr(_ext, "qwen4_qsa_sparse_gqa_attention_split"):
+        raise RuntimeError("Qwen4 QSA split sparse GQA kernel is unavailable")
+    return _ext.qwen4_qsa_sparse_gqa_attention_split(
+        queries,
+        keys,
+        values,
+        selected_blocks,
+        scale,
+        q_offset,
+        key_tile,
+        dimension_tile,
+        splits,
         **_native_stream_kwargs(stream),
     )
 
