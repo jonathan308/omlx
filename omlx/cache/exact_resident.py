@@ -30,6 +30,7 @@ class ExactResidentHit:
     cached_tokens: int
     cache_nbytes: int
     durable_tokens: int
+    terminal_proof: str | None = None
 
 
 @dataclass
@@ -38,6 +39,7 @@ class _ExactResidentEntry:
     cache: list[Any]
     cache_nbytes: int
     durable_tokens: int
+    terminal_proof: str | None
 
 
 class ExactResidentPrefixCache:
@@ -151,6 +153,7 @@ class ExactResidentPrefixCache:
         durable_tokens: int = 0,
         protect_longer_prefix: bool = False,
         expected_generation: int | None = None,
+        terminal_proof: str | None = None,
     ) -> bool:
         """Retain one detached cache, evicting oldest entries as needed."""
 
@@ -179,6 +182,9 @@ class ExactResidentPrefixCache:
             cache=cache,
             cache_nbytes=cache_nbytes,
             durable_tokens=durable_tokens,
+            terminal_proof=(
+                str(terminal_proof) if terminal_proof is not None else None
+            ),
         )
         with self._lock:
             if (
@@ -265,7 +271,12 @@ class ExactResidentPrefixCache:
                 for entry in self._entries.values()
             )
 
-    def acquire_prefix(self, prompt_tokens: list[int]) -> ExactResidentHit | None:
+    def acquire_prefix(
+        self,
+        prompt_tokens: list[int],
+        *,
+        allowed_terminal_proofs: set[str] | None = None,
+    ) -> ExactResidentHit | None:
         """Pop the longest ready entry that exactly prefixes ``prompt_tokens``."""
 
         if self.max_entries <= 0 or not prompt_tokens:
@@ -275,6 +286,11 @@ class ExactResidentPrefixCache:
             best_id = None
             best_len = -1
             for entry_id, entry in reversed(self._entries.items()):
+                if (
+                    allowed_terminal_proofs is not None
+                    and entry.terminal_proof not in allowed_terminal_proofs
+                ):
+                    continue
                 if len(entry.tokens) <= best_len:
                     continue
                 if self._tokens_equal_prefix(entry.tokens, prompt_tokens):
@@ -293,6 +309,7 @@ class ExactResidentPrefixCache:
                 cached_tokens=len(entry.tokens),
                 cache_nbytes=entry.cache_nbytes,
                 durable_tokens=entry.durable_tokens,
+                terminal_proof=entry.terminal_proof,
             )
 
     def clear(self) -> int:

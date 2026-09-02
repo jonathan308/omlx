@@ -537,6 +537,26 @@ def test_scheduler_resident_cache_fails_closed_when_mtp_is_active():
     assert scheduler._exact_resident_cache.stats()["entries"] == 1
 
 
+def test_scheduler_restores_proven_generic_mtp_terminal_with_mtp_on():
+    scheduler = _scheduler()
+    scheduler.model = type(
+        "MtpModel", (), {"_omlx_mtp_decode_enabled": True}
+    )()
+    request = _request([1, 2, 3])
+    request._mtp_exact_terminal_proved = "mtp-standard-terminal-v1"
+    request._exact_resident_durable_fallback_tokens = 2
+    cache = [_OffsetCache(3, nbytes=9)]
+
+    scheduler._stage_exact_resident_cache(request, cache, [1, 2, 3])
+    assert request._exact_resident_candidate[0] == [1, 2, 3]
+    assert scheduler._publish_exact_resident_cache(request)
+
+    next_turn = _request([1, 2, 3, 4])
+    assert scheduler._restore_exact_resident_cache(next_turn)
+    assert next_turn.cached_tokens == 3
+    assert next_turn.remaining_tokens == [4]
+
+
 def test_scheduler_cancelled_lease_is_not_reinserted():
     scheduler = _scheduler()
     completed = _request([1, 2, 3])

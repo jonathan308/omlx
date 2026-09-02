@@ -33,6 +33,7 @@ executors, paged/SSD cache ownership, live settings, and unload/reload safety.
 | Immediate hybrid boundary | Finalized B1 exact `ArraysCache`/`SizedArraysCache` plus exact `KVCache`, copied at `N-1` |
 | Prompt-tail materialization | Eligible text-only non-speculative models |
 | Speculative decode | Fail closed unless that architecture proves an exact target-terminal transaction |
+| Qwen3.5/3.6 Lightning MTP | Exact target offsets plus empty rollback/undo state publish directly; other terminal shapes reconcile to a fresh standard target cache before publication |
 | Qwen4 speculative decode | Qualified in Fusion with the separate cached-suffix/terminal transaction stack; the standalone upstream PR remains fail closed until that dependency lands |
 | Image/audio/video requests | Metal pulse only; media-keyed KV never enters text-only L0 or prompt-tail materialization |
 
