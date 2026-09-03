@@ -46,25 +46,25 @@ def _batch(cache, *, uid=9):
     )
 
 
-def test_unproved_mtp_terminal_reconciles_before_cache_publish(monkeypatch):
+def test_unproved_mtp_terminal_never_replays_full_history(monkeypatch):
     calls = []
 
     def reconcile(batch, state):
         calls.append((batch, state))
-        return True
+        raise AssertionError("completed requests must not replay their prompt")
 
     monkeypatch.setattr(bg, "_reconcile_mtp_to_standard", reconcile)
     batch = _batch(["reconciled-cache"])
-    state = batch._omlx_mtp_state
     response = bg._emit_response(
         batch,
         token_id=7,
         logprobs_1d=mx.zeros((8,), dtype=mx.float32),
     )[0]
 
-    assert calls == [(batch, state)]
-    assert response.prompt_cache == ["reconciled-cache"]
-    assert response._omlx_mtp_standard_terminal_exact is True
+    assert calls == []
+    assert response.prompt_cache is None
+    assert response.all_tokens is None
+    assert not hasattr(response, "_omlx_mtp_standard_terminal_exact")
 
 
 def test_exact_qwen35_terminal_skips_full_replay(monkeypatch):
