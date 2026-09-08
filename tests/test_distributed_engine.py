@@ -55,6 +55,48 @@ def _ready_engine(handler) -> DistributedBatchedEngine:
 
 
 @pytest.mark.asyncio
+async def test_acknowledged_cancel_all_does_not_widen_later_targeted_cancel(tmp_path):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    engine._supervisor.state_dir = str(tmp_path)
+    cancel_path = tmp_path / "engine-test-cancel.json"
+    ack_path = tmp_path / "engine-test-cancel-ack.json"
+    old_epoch = 9_999_999_999_999
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ack_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "engine-test",
+                "plan_hash": "d" * 64,
+                "epoch": old_epoch,
+                "cancelled": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_id = await engine._enter_request("transport-new-client")
+    try:
+        assert await engine.abort_request(request_id, reason="socket closed") is True
+        payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+        assert payload["scope"] == "requests"
+        assert payload["request_ids"] == [request_id]
+    finally:
+        await engine._leave_request(request_id)
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_distributed_ssd_clear_reaches_every_rank(monkeypatch):
     requests = []
 

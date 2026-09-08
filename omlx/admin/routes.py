@@ -88,9 +88,8 @@ def _clear_cold_remote_cluster_cache_roots(
     if not deployments:
         return 0, 0
 
-    normalized = tuple(str(path.expanduser()) for path in roots)
     allowed = {"cluster-prompt-snapshots", "prompt-cache-ssd"}
-    if any(Path(path).name not in allowed for path in normalized):
+    if any(path.expanduser().name not in allowed for path in roots):
         raise RuntimeError("refusing to clear an unexpected cluster cache root")
 
     node_ids: set[str] = set()
@@ -101,10 +100,18 @@ def _clear_cold_remote_cluster_cache_roots(
             if rank > 0:
                 remote_targets.add(host.ssh)
 
+    # Resolve settings on the peer. Sending the coordinator's expanded
+    # /Users/<name>/... roots breaks as soon as the Macs use different login
+    # names, data roots, or SSD-cache locations.
     script = r"""
-import json, shutil, sys
+import shutil
 from pathlib import Path
-roots = [Path(value).expanduser() for value in json.loads(sys.argv[1])]
+from omlx.settings import GlobalSettings
+settings = GlobalSettings.load()
+roots = [
+    settings.cache.get_ssd_cache_dir(settings.base_path) / 'cluster-prompt-snapshots',
+    Path(settings.base_path) / 'cluster/runtime/prompt-cache-ssd',
+]
 allowed = {'cluster-prompt-snapshots', 'prompt-cache-ssd'}
 if any(root.name not in allowed for root in roots):
     raise SystemExit(3)
@@ -116,7 +123,7 @@ for root in roots:
     shutil.rmtree(root)
 print(deleted)
 """.strip()
-    command = shlex.join(["python3", "-c", script, json.dumps(normalized)])
+    command = shlex.join(["python3", "-c", script])
     deleted = 0
     for target in sorted(remote_targets):
         completed = _run_cluster_ssh(
@@ -5787,6 +5794,40 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                             pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
+
+        # When no distributed engine is resident, no rank-local maintenance
+        # endpoint exists. Clear the coordinator's cold cluster trees directly
+        # and ask every configured peer to resolve and clear its own paths.
+        if distributed_ranks == 0:
+            cluster_roots = (
+                cache_dir / "cluster-prompt-snapshots",
+                Path(global_settings.base_path)
+                / "cluster/runtime/prompt-cache-ssd",
+            )
+            for cluster_root in cluster_roots:
+                if not cluster_root.exists():
+                    continue
+                try:
+                    total_deleted += sum(
+                        1 for item in cluster_root.rglob("*") if item.is_file()
+                    )
+                    shutil.rmtree(cluster_root)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to clean distributed SSD cache directory %s: %s",
+                        cluster_root,
+                        exc,
+                    )
+            try:
+                remote_deleted, configured_ranks = await asyncio.to_thread(
+                    _clear_cold_remote_cluster_cache_roots,
+                    cluster_roots,
+                )
+                total_deleted += remote_deleted
+                distributed_ranks = configured_ranks
+            except Exception as exc:
+                logger.warning("Failed to clean cold peer SSD cache: %s", exc)
+                distributed_failures.append(f"cold cluster peers: {exc}")
 
     if distributed_failures:
         raise HTTPException(

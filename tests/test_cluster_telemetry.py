@@ -2,9 +2,12 @@
 """Tests for rank-local, end-to-end distributed inference telemetry."""
 
 import json
+import struct
 import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -211,6 +214,26 @@ def test_queue_observer_preserves_mlx_lm_queue_contract():
     assert snapshot["prompt_tokens_total"] == 4
     assert snapshot["cached_tokens_total"] == 1
     assert snapshot["completion_tokens_total"] == 1
+
+
+def test_shared_uid_removal_terminates_the_waiting_response_queue():
+    telemetry = RuntimeTelemetry(_Marker(), publish_interval=0)
+    target = _Queue()
+    queue = _TelemetryQueue(target, telemetry)
+    context = SimpleNamespace(
+        prompt=[1, 2, 3],
+        prompt_cache_count=0,
+        stop=lambda: None,
+    )
+    queue.put(context)
+    telemetry.bind_pending_uid((91,))
+
+    telemetry.cancel_uids([91])
+
+    assert [item[0] for item in target.items] == [context, None]
+    snapshot = telemetry.snapshot()
+    assert snapshot["active_requests"] == 0
+    assert snapshot["requests_cancelled"] == 1
 
 
 def test_telemetry_marker_failure_never_interrupts_inference():
@@ -579,7 +602,15 @@ class _BatchGenerator:
         self.removed.append(list(uids))
 
 
-def _cancel_telemetry(tmp_path, clock=None):
+class _GenerationContext:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def _cancel_telemetry(tmp_path, clock=None, *, plan_hash="", epoch_floor=0):
     marker = _Marker()
     telemetry = RuntimeTelemetry(
         marker,
@@ -587,25 +618,30 @@ def _cancel_telemetry(tmp_path, clock=None):
         publish_interval=0,
         cancel_path=tmp_path / "dep-1-cancel.json",
         cancel_deployment_id="dep-1",
+        cancel_plan_hash=plan_hash,
+        cancel_epoch_floor=epoch_floor,
     )
     return telemetry
 
 
-def test_force_cancel_all_removes_active_uids_through_the_batch_loop(tmp_path):
+def test_force_cancel_all_marks_context_for_the_shared_batch_loop(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
     generator = _BatchGenerator()
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((73,))
 
     cancelled = telemetry.force_cancel_all(reason="test")
 
     assert cancelled == 1
-    assert generator.removed == [[73]]
-    # remove() routes back through cancel_uids in production; here the
-    # fake does not, so the request is still tracked until it does.
+    assert context.stopped is True
+    assert generator.removed == [], "telemetry must never mutate one rank directly"
+    generator.remove([73])
     telemetry.cancel_uids([73])
+    assert generator.removed == [[73]]
     assert telemetry._requests == {}
     assert telemetry._requests_cancelled == 1
 
@@ -621,16 +657,16 @@ def test_force_cancel_all_without_generator_or_uids_is_a_noop(tmp_path):
     assert generator.removed == []
 
 
-def test_force_cancel_all_survives_a_failing_batch_loop(tmp_path):
+def test_force_cancel_all_survives_a_failing_generation_context(tmp_path):
     telemetry = _cancel_telemetry(tmp_path)
 
-    class BrokenGenerator:
-        def remove(self, uids):
+    class BrokenContext:
+        def stop(self):
             raise RuntimeError("wedged")
 
-    telemetry.register_batch_generator(BrokenGenerator())
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    telemetry.register_context(request_id, BrokenContext())
     telemetry.bind_pending_uid((5,))
 
     assert telemetry.force_cancel_all(reason="test") == 0
@@ -646,6 +682,8 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
     telemetry.register_batch_generator(generator)
     request_id = telemetry.begin_request()
     telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
     telemetry.bind_pending_uid((9,))
 
     cancel_path = tmp_path / "dep-1-cancel.json"
@@ -663,14 +701,15 @@ def test_cancel_file_is_consumed_once_and_acked(tmp_path):
     )
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
-    assert generator.removed == [[9]]
+    assert context.stopped is True
+    assert generator.removed == []
     ack = json.loads((tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8"))
     assert ack["epoch"] == 42
     assert ack["cancelled"] == 1
 
     # Same epoch is not consumed twice.
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
-    assert generator.removed == [[9]]
+    assert generator.removed == []
 
 
 def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
@@ -692,3 +731,224 @@ def test_cancel_file_from_a_foreign_deployment_is_ignored(tmp_path):
 
     assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
     assert generator.removed == []
+
+
+def test_cancel_file_is_scoped_to_plan_and_worker_lifetime(tmp_path):
+    telemetry = _cancel_telemetry(
+        tmp_path,
+        plan_hash="current-plan",
+        epoch_floor=1000,
+    )
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
+    telemetry.bind_pending_uid((11,))
+    cancel_path = tmp_path / "dep-1-cancel.json"
+
+    for plan_hash, epoch in (("old-plan", 2000), ("current-plan", 999)):
+        cancel_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "deployment_id": "dep-1",
+                    "plan_hash": plan_hash,
+                    "epoch": epoch,
+                    "scope": "all",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "current-plan",
+                "epoch": 1001,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert context.stopped is True
+    ack = json.loads((tmp_path / "dep-1-cancel-ack.json").read_text(encoding="utf-8"))
+    assert ack["plan_hash"] == "current-plan"
+
+
+def test_existing_matching_cancel_is_a_startup_watermark(tmp_path):
+    cancel_path = tmp_path / "dep-1-cancel.json"
+    cancel_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "deployment_id": "dep-1",
+                "plan_hash": "same-plan",
+                "epoch": 4242,
+                "scope": "all",
+            }
+        ),
+        encoding="utf-8",
+    )
+    telemetry = _cancel_telemetry(tmp_path, plan_hash="same-plan")
+    request_id = telemetry.begin_request()
+    telemetry.mark_pending_uid(request_id)
+    context = _GenerationContext()
+    telemetry.register_context(request_id, context)
+    telemetry.bind_pending_uid((12,))
+
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 0
+    payload = json.loads(cancel_path.read_text(encoding="utf-8"))
+    payload["epoch"] = 4243
+    cancel_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert telemetry.poll_cancel_requests(min_interval=0.0) == 1
+    assert context.stopped is True
+
+
+def test_distributed_cancel_vote_drains_and_rendezvous_before_removal(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    events = []
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class ControlPlane:
+        def broadcast_object(self, obj):
+            events.append(("broadcast", obj))
+            return obj
+
+        def barrier(self):
+            events.append(("barrier", None))
+
+    class FakeResponseGenerator:
+        def __init__(self):
+            self._is_distributed = True
+            self._rank = 0
+
+        def _share_object(self, _obj):
+            raise AssertionError("patched sharing must own cancellation")
+
+    class FakeBatchGenerator:
+        def remove(self, uids):
+            events.append(("remove", list(uids)))
+            return "removed"
+
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mx, "synchronize", lambda *args: events.append(("drain", None)))
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(mlx_server, "BatchGenerator", FakeBatchGenerator)
+
+    with install_server_telemetry(
+        _Marker(),
+        heartbeat_interval=0,
+        control_plane=ControlPlane(),
+    ):
+        generator = mlx_server.ResponseGenerator()
+        batch = mlx_server.BatchGenerator()
+        with pytest.raises(RuntimeError, match="not armed"):
+            batch.remove([73])
+        assert generator._share_object([73]) == [73]
+        assert batch.remove([73]) == "removed"
+
+    assert [event[0] for event in events] == [
+        "broadcast",
+        "drain",
+        "barrier",
+        "remove",
+    ]
+
+
+def test_pipeline_cache_plan_requires_rank_agreement(monkeypatch):
+    import mlx.core as mx
+    import mlx_lm.server as mlx_server
+
+    class Group:
+        rank = staticmethod(lambda: 0)
+        size = staticmethod(lambda: 2)
+
+    class FakePromptCache:
+        def fetch_nearest_cache(self, _model, tokens):
+            return "rank-zero-cache", tokens[2:]
+
+        def __len__(self):
+            return 1
+
+        nbytes = 64
+
+    class ControlPlane:
+        peer_plan = (2, 2, 0)
+
+        def broadcast_owned_bytes(self, payload, *, source_rank, expected_size):
+            assert expected_size == 24
+            return payload if source_rank == 0 else struct.pack("!QQQ", *self.peer_plan)
+
+    monkeypatch.setattr(mx.distributed, "init", lambda: Group())
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+    control = ControlPlane()
+
+    with install_server_telemetry(
+        _Marker(), heartbeat_interval=0, control_plane=control
+    ):
+        cache = mlx_server.LRUPromptCache()
+        tokens = [1, 2, 3, 4]
+        assert cache.fetch_nearest_cache("model", tokens) == (
+            "rank-zero-cache",
+            [3, 4],
+        )
+        control.peer_plan = (0, 4, 0)
+        assert cache.fetch_nearest_cache("model", tokens) == (None, tokens)
+
+
+def test_rank_hot_clear_reaches_live_prompt_cache_instances(monkeypatch):
+    from io import BytesIO
+
+    import mlx_lm.server as mlx_server
+
+    class Marker(_Marker):
+        payload = {"deployment_id": "dep", "plan_hash": "p" * 64}
+        path = None
+
+    class FakePromptCache:
+        def __init__(self):
+            self.entries = 3
+
+        def __len__(self):
+            return self.entries
+
+        @property
+        def nbytes(self):
+            return self.entries * 64
+
+        def trim_to(self, *, n_sequences, n_bytes):
+            assert (n_sequences, n_bytes) == (0, 0)
+            self.entries = 0
+
+    class Handler:
+        path = "/omlx/internal/cache/hot/clear"
+        headers = {"X-oMLX-Plan-Hash": "p" * 64}
+
+        def __init__(self):
+            self.wfile = BytesIO()
+            self.status = None
+
+        def _set_completion_headers(self, status):
+            self.status = status
+
+        def end_headers(self):
+            return None
+
+    monkeypatch.setattr(mlx_server, "LRUPromptCache", FakePromptCache)
+    with install_server_telemetry(Marker(), heartbeat_interval=0):
+        cache = mlx_server.LRUPromptCache()
+        handler = Handler()
+        mlx_server.APIHandler.do_POST(handler)
+
+    assert cache.entries == 0
+    assert handler.status == 200
+    assert json.loads(handler.wfile.getvalue())["hot_cleared"] == 3

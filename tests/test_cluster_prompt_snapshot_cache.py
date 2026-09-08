@@ -493,3 +493,15 @@ def test_a_failed_write_leaves_the_index_unchanged(tmp_path, monkeypatch):
     assert store.present_boundaries(MODEL, list(range(STEP))) == ()
     # No half-written temp file is left behind.
     assert list(tmp_path.glob("*")) == []
+
+
+def test_clear_removes_live_files_without_a_write_behind_flush(tmp_path):
+    store = SSDPromptSnapshotStore(tmp_path, step=STEP, persistent=True)
+    assert store.put(MODEL, list(range(STEP)), _kv()) is True
+    assert len(store) == 1
+
+    assert store.clear(timeout=0.01) == 1
+
+    assert len(store) == 0
+    assert store.nbytes == 0
+    assert list(tmp_path.glob("*.safetensors")) == []

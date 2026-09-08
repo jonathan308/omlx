@@ -128,6 +128,8 @@ class RuntimeTelemetry:
         heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
         cancel_path: Path | None = None,
         cancel_deployment_id: str = "",
+        cancel_plan_hash: str = "",
+        cancel_epoch_floor: int = 0,
     ) -> None:
         if publish_interval < 0:
             raise ValueError("publish_interval must be non-negative")
@@ -182,8 +184,20 @@ class RuntimeTelemetry:
         self._batch_generator: Any | None = None
         self._cancel_path = cancel_path
         self._cancel_deployment_id = cancel_deployment_id
-        self._last_cancel_epoch = 0
+        self._cancel_plan_hash = cancel_plan_hash
+        self._cancel_epoch_floor = max(0, int(cancel_epoch_floor))
+        self._last_cancel_epoch = max(0, self._cancel_epoch_floor - 1)
+        self._accepted_cancel_vote_epoch = 0
         self._last_cancel_poll_at = float("-inf")
+        # A cancel marker is an edge, not durable desired state. Treat a file
+        # left by an earlier worker lifetime as the startup watermark instead
+        # of replaying it against the first request this process receives.
+        existing_cancel = self._read_cancel_request()
+        if existing_cancel is not None:
+            self._last_cancel_epoch = max(
+                self._last_cancel_epoch,
+                int(existing_cancel["epoch"]),
+            )
 
     def heartbeat(self) -> None:
         """Refresh the marker with nothing new to say.
@@ -515,6 +529,7 @@ class RuntimeTelemetry:
             return
         now = float(self._clock())
         changed = False
+        queues_to_close: list[Any] = []
         with self._lock:
             for uid in uid_values:
                 request_id = self._uid_to_request.pop(uid, None)
@@ -522,16 +537,24 @@ class RuntimeTelemetry:
                     continue
                 self._cancel_requested_requests.discard(request_id)
                 self._request_to_uid.pop(request_id, None)
-                changed = (
-                    self._finish_locked(
-                        request_id,
-                        now=now,
-                        status="cancelled",
-                    )
-                    or changed
+                queue = self._request_queues.get(request_id)
+                finished = self._finish_locked(
+                    request_id,
+                    now=now,
+                    status="cancelled",
                 )
+                if finished and queue is not None:
+                    queues_to_close.append(queue)
+                changed = finished or changed
             if changed:
                 self._publish_locked(now, force=True)
+        # Wake the HTTP collector only after releasing the telemetry lock.
+        # Worker dummy queues receive the same terminal sentinel harmlessly.
+        for queue in queues_to_close:
+            try:
+                queue.put(None)
+            except Exception as exc:
+                logger.debug("Could not terminate cancelled response queue: %s", exc)
 
     def register_batch_generator(self, generator: Any) -> None:
         """Remember the live BatchGenerator so force-cancel can reach it."""
@@ -565,37 +588,42 @@ class RuntimeTelemetry:
         return merged
 
     def force_cancel_all(self, *, reason: str = "coordinator cancel") -> int:
-        """Remove every active uid through MLX-LM's own cancel path.
+        """Request cancellation through MLX-LM's shared server-loop path.
 
-        ``BatchGenerator.remove`` is the same call MLX-LM handlers make on
-        client disconnect: it is processed by the batch loop at a step
-        boundary and shared with peer ranks, so both sides of the pipeline
-        abandon the request together and no collective is severed
-        mid-request. Returns the number of uids handed to the batch loop.
+        The heartbeat must not call ``BatchGenerator.remove`` directly: that
+        mutates rank zero on the heartbeat thread while peers keep decoding.
+        Stop the real generation contexts and let the generation thread merge,
+        broadcast, drain, rendezvous, and remove the same UIDs on every rank.
         """
 
         with self._lock:
-            generator = self._batch_generator
-            uids = [
-                uid
-                for request_id, uid in self._request_to_uid.items()
+            self._cancel_requested_requests.update(self._requests)
+            contexts = [
+                context
+                for request_id, context in self._request_contexts.items()
                 if request_id in self._requests
             ]
-        if generator is None or not uids:
+        if not contexts:
             return 0
-        try:
-            generator.remove(list(uids))
-        except Exception as exc:
-            # A cancel that failed must be loud but must not kill the rank;
-            # the coordinator falls back to process teardown.
-            logger.warning("Rank-side force-cancel failed: %s", exc)
+        requested = 0
+        for context in contexts:
+            stop = getattr(context, "stop", None)
+            if not callable(stop):
+                continue
+            try:
+                stop()
+            except Exception as exc:
+                logger.warning("Rank-side context cancel failed: %s", exc)
+                continue
+            requested += 1
+        if not requested:
             return 0
         logger.warning(
-            "Force-cancelled %d active rank-side request(s): %s",
-            len(uids),
+            "Requested synchronized cancellation for %d active request(s): %s",
+            requested,
             reason,
         )
-        return len(uids)
+        return requested
 
     def force_cancel_request(
         self,
@@ -655,8 +683,15 @@ class RuntimeTelemetry:
             and payload.get("deployment_id") != self._cancel_deployment_id
         ):
             return None
+        if (
+            self._cancel_plan_hash
+            and payload.get("plan_hash") != self._cancel_plan_hash
+        ):
+            return None
         epoch = payload.get("epoch")
         if not isinstance(epoch, int) or isinstance(epoch, bool):
+            return None
+        if epoch < self._cancel_epoch_floor:
             return None
         return payload
 
@@ -668,6 +703,7 @@ class RuntimeTelemetry:
         payload = {
             "schema_version": 1,
             "deployment_id": self._cancel_deployment_id,
+            "plan_hash": self._cancel_plan_hash,
             "epoch": epoch,
             "cancelled": cancelled,
             "at": time.time(),
@@ -1103,6 +1139,7 @@ def install_server_telemetry(
         if isinstance(marker_payload, dict)
         else ""
     )
+    worker_cancel_epoch_floor = int(time.time() * 1000)
     telemetry = RuntimeTelemetry(
         marker,
         execution=execution,
@@ -1114,6 +1151,8 @@ def install_server_telemetry(
             else None
         ),
         cancel_deployment_id=marker_deployment_id,
+        cancel_plan_hash=marker_plan_hash,
+        cancel_epoch_floor=worker_cancel_epoch_floor,
     )
 
     snapshot_ctx = threading.local()
@@ -1272,7 +1311,25 @@ def install_server_telemetry(
             # Full token sequence per in-flight uid, so a boundary snapshot can
             # be keyed while the batched prefill is still running.
             self._omlx_tokens: dict[Any, list[int]] = {}
+            self._omlx_prepared_cancel_vote: tuple[int, tuple[int, ...]] | None = None
             telemetry.register_batch_generator(self)
+
+        def _omlx_drain_cancel_boundary(self, epoch: int, uids: Any) -> None:
+            """Finish scheduled Metal work before the cancel rendezvous."""
+
+            if self._omlx_prepared_cancel_vote is not None:
+                raise RuntimeError("a distributed cancel vote is already armed")
+            stream = getattr(self, "stream", None)
+            if stream is None:
+                mx.synchronize()
+            else:
+                mx.synchronize(stream)
+
+        def _omlx_arm_cancel_boundary(self, epoch: int, uids: Any) -> None:
+            normalized = tuple(int(uid) for uid in uids)
+            if self._omlx_prepared_cancel_vote is not None:
+                raise RuntimeError("a distributed cancel vote is already armed")
+            self._omlx_prepared_cancel_vote = (int(epoch), normalized)
 
         def insert_segments(self, *args: Any, **kwargs: Any) -> Any:
             uids = super().insert_segments(*args, **kwargs)
@@ -1375,6 +1432,10 @@ def install_server_telemetry(
             return prompt_responses, generation_responses
 
     class TelemetryPromptCache(original_prompt_cache):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            prompt_cache_instances.append(self)
+
         def _omlx_cache_inventory(self) -> tuple[int, int]:
             """Combined volatile LRU and durable rank-local snapshot tiers."""
 
@@ -1420,6 +1481,7 @@ def install_server_telemetry(
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
             entries, nbytes = self._omlx_cache_inventory()
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
@@ -1531,8 +1593,10 @@ def install_server_telemetry(
                 if obj:
                     obj = telemetry.make_cancel_vote(obj)
             if control_plane is not None:
-                return control_plane.broadcast_object(obj)
-            return super()._share_object(obj)
+                shared = control_plane.broadcast_object(obj)
+            else:
+                shared = super()._share_object(obj)
+            return self._finish_shared_cancel_vote(shared)
 
         def _share_request(self, request: Any) -> Any:
             shared = super()._share_request(request)

@@ -3720,6 +3720,8 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
+            if inference_request_id is not None:
+                gen_kwargs["_request_id"] = inference_request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -4819,6 +4821,8 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    if inference_request_id is not None:
+        gen_kwargs["_request_id"] = inference_request_id
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(

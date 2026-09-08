@@ -411,6 +411,22 @@ class SSDPromptSnapshotStore:
         with self._lock:
             return len(self._index)
 
+    def clear(self, timeout: float = 30.0) -> int:
+        """Atomically forget every live snapshot and reset its manifest.
+
+        This split writes snapshots synchronously, so there is no write-behind
+        queue to flush. ``timeout`` is accepted for parity with the rank cache
+        maintenance hook and with the later asynchronous store.
+        """
+
+        del timeout
+        with self._lock:
+            count = len(self._index)
+            self._clear_directory()
+            self._serialisable = True
+            self._persist_index_locked()
+            return count
+
     @property
     def nbytes(self) -> int:
         with self._lock:

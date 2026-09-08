@@ -9,6 +9,7 @@ import pickle
 import secrets
 import socket
 import struct
+import threading
 import time
 import zlib
 from contextlib import AbstractContextManager, suppress
@@ -24,16 +25,24 @@ _HANDSHAKE_MAGIC = b"OC2H"
 _HANDSHAKE_CHALLENGE_MAGIC = b"OC2C"
 _HANDSHAKE_ACK_MAGIC = b"OC2A"
 _MESSAGE_MAGIC = b"OC2M"
+_OWNED_BYTES_MAGIC = b"OC2B"
+_BARRIER_MAGIC = b"OC2R"
 _VERSION = 1
 _HANDSHAKE_CHALLENGE = struct.Struct("!4sI32s")
 _HANDSHAKE = struct.Struct("!4sII32s")
 _HANDSHAKE_ACK = struct.Struct("!4sI32s")
 _HEADER_PREFIX = struct.Struct("!4sIIII")
 _HEADER = struct.Struct("!4sIIII32s")
+_OWNED_BYTES_PREFIX = struct.Struct("!4sIIIII")
+_OWNED_BYTES_HEADER = struct.Struct("!4sIIIII32s")
+_BARRIER_PREFIX = struct.Struct("!4sIII")
+_BARRIER_PACKET = struct.Struct("!4sIII32s")
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
 _WORKER_AUTH_DOMAIN = b"omlx-rank-control-worker-v1"
 _COORDINATOR_AUTH_DOMAIN = b"omlx-rank-control-coordinator-v1"
 _MESSAGE_AUTH_DOMAIN = b"omlx-rank-control-message-v1"
+_OWNED_BYTES_AUTH_DOMAIN = b"omlx-rank-control-owned-bytes-v1"
+_BARRIER_AUTH_DOMAIN = b"omlx-rank-control-barrier-v1"
 
 
 def _recv_exact(stream: socket.socket, size: int) -> bytes:
@@ -86,6 +95,10 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         self._stream: socket.socket | None = None
         self._stream_proxy: SystemSocketProxy | None = None
         self._sequence = 0
+        # Model decisions and cancellation normally share one generation
+        # thread. Serialize defensively so a future second caller cannot
+        # interleave frames or consume the ordered sequence twice.
+        self._operation_lock = threading.RLock()
 
     def __enter__(self) -> RankControlPlane:
         try:
@@ -247,64 +260,258 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
     def broadcast_object(self, obj: Any) -> Any:
         """Broadcast one rank-zero-owned Python object in strict sequence."""
 
-        self._sequence += 1
-        if self.rank == 0:
-            payload = pickle.dumps(obj) if obj is not None else b""
-            if len(payload) > _MAX_OBJECT_BYTES:
-                raise RuntimeError("rank-control object exceeds 256 MiB")
-            checksum = zlib.crc32(payload)
-            prefix = _HEADER_PREFIX.pack(
-                _MESSAGE_MAGIC,
-                _VERSION,
-                self._sequence,
-                len(payload),
-                checksum,
+        with self._operation_lock:
+            self._sequence += 1
+            if self.rank == 0:
+                payload = pickle.dumps(obj) if obj is not None else b""
+                if len(payload) > _MAX_OBJECT_BYTES:
+                    raise RuntimeError("rank-control object exceeds 256 MiB")
+                checksum = zlib.crc32(payload)
+                prefix = _HEADER_PREFIX.pack(
+                    _MESSAGE_MAGIC,
+                    _VERSION,
+                    self._sequence,
+                    len(payload),
+                    checksum,
+                )
+                tag = hmac.new(
+                    self._token,
+                    _MESSAGE_AUTH_DOMAIN + prefix + payload,
+                    hashlib.sha256,
+                ).digest()
+                header = _HEADER.pack(
+                    _MESSAGE_MAGIC,
+                    _VERSION,
+                    self._sequence,
+                    len(payload),
+                    checksum,
+                    tag,
+                )
+                packet = header + payload
+                for rank in range(1, self.world_size):
+                    self._peers[rank].sendall(packet)
+                return obj
+
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            magic, version, sequence, size, checksum, observed_tag = _HEADER.unpack(
+                _recv_exact(stream, _HEADER.size)
             )
-            tag = hmac.new(
+            if magic != _MESSAGE_MAGIC or version != _VERSION:
+                raise RuntimeError("rank-control message header is invalid")
+            if sequence != self._sequence:
+                raise RuntimeError(
+                    f"rank-control sequence diverged: expected {self._sequence}, "
+                    f"received {sequence}"
+                )
+            if size > _MAX_OBJECT_BYTES:
+                raise RuntimeError("rank-control object has an invalid size")
+            payload = _recv_exact(stream, size) if size else b""
+            if zlib.crc32(payload) != checksum:
+                raise RuntimeError("rank-control object failed CRC32")
+            prefix = _HEADER_PREFIX.pack(magic, version, sequence, size, checksum)
+            expected_tag = hmac.new(
                 self._token,
                 _MESSAGE_AUTH_DOMAIN + prefix + payload,
                 hashlib.sha256,
             ).digest()
-            header = _HEADER.pack(
-                _MESSAGE_MAGIC,
-                _VERSION,
-                self._sequence,
-                len(payload),
-                checksum,
-                tag,
-            )
-            packet = header + payload
-            for rank in range(1, self.world_size):
-                self._peers[rank].sendall(packet)
-            return obj
+            if not hmac.compare_digest(observed_tag, expected_tag):
+                raise RuntimeError("rank-control object failed authentication")
+            return pickle.loads(payload) if payload else None
 
-        stream = self._stream
-        if stream is None:
-            raise RuntimeError("rank-control worker is not connected")
-        magic, version, sequence, size, checksum, observed_tag = _HEADER.unpack(
-            _recv_exact(stream, _HEADER.size)
+    def _owned_bytes_packet(
+        self,
+        stream: socket.socket,
+        *,
+        sequence: int,
+        source_rank: int,
+        expected_size: int,
+    ) -> tuple[bytes, bytes]:
+        header = _recv_exact(stream, _OWNED_BYTES_HEADER.size)
+        magic, version, received_sequence, source, size, checksum, observed_tag = (
+            _OWNED_BYTES_HEADER.unpack(header)
         )
-        if magic != _MESSAGE_MAGIC or version != _VERSION:
-            raise RuntimeError("rank-control message header is invalid")
-        if sequence != self._sequence:
+        if magic != _OWNED_BYTES_MAGIC or version != _VERSION:
+            raise RuntimeError("rank-control owned-bytes header is invalid")
+        if received_sequence != sequence:
             raise RuntimeError(
-                f"rank-control sequence diverged: expected {self._sequence}, "
-                f"received {sequence}"
+                f"rank-control sequence diverged: expected {sequence}, "
+                f"received {received_sequence}"
             )
-        if size > _MAX_OBJECT_BYTES:
-            raise RuntimeError("rank-control object has an invalid size")
+        if source != source_rank:
+            raise RuntimeError(
+                f"rank-control owned-bytes source diverged: expected {source_rank}, "
+                f"received {source}"
+            )
+        if size != expected_size or size > _MAX_OBJECT_BYTES:
+            raise RuntimeError(
+                f"rank-control owned-bytes size diverged: expected {expected_size}, "
+                f"received {size}"
+            )
         payload = _recv_exact(stream, size) if size else b""
         if zlib.crc32(payload) != checksum:
-            raise RuntimeError("rank-control object failed CRC32")
-        prefix = _HEADER_PREFIX.pack(magic, version, sequence, size, checksum)
+            raise RuntimeError("rank-control owned bytes failed CRC32")
+        prefix = _OWNED_BYTES_PREFIX.pack(
+            magic, version, received_sequence, source, size, checksum
+        )
         expected_tag = hmac.new(
             self._token,
-            _MESSAGE_AUTH_DOMAIN + prefix + payload,
+            _OWNED_BYTES_AUTH_DOMAIN + prefix + payload,
             hashlib.sha256,
         ).digest()
         if not hmac.compare_digest(observed_tag, expected_tag):
-            raise RuntimeError("rank-control object failed authentication")
-        return pickle.loads(payload) if payload else None
+            raise RuntimeError("rank-control owned bytes failed authentication")
+        return header + payload, payload
+
+    def broadcast_owned_bytes(
+        self,
+        payload: bytes | None,
+        *,
+        source_rank: int,
+        expected_size: int,
+    ) -> bytes:
+        """Broadcast fixed-size bytes owned by any rank in strict sequence."""
+
+        if not 0 <= int(source_rank) < self.world_size:
+            raise ValueError("rank-control owned-bytes source is invalid")
+        if not 0 <= int(expected_size) <= _MAX_OBJECT_BYTES:
+            raise ValueError("rank-control owned-bytes size is invalid")
+        if payload is not None and not isinstance(payload, bytes):
+            raise TypeError("rank-control owned payload must be bytes")
+        if self.rank == source_rank:
+            if payload is None or len(payload) != expected_size:
+                raise RuntimeError(
+                    "rank-control owned source produced an invalid payload"
+                )
+        elif payload is not None:
+            raise RuntimeError("rank-control non-source supplied owned bytes")
+
+        with self._operation_lock:
+            self._sequence += 1
+            sequence = self._sequence
+            if self.rank == source_rank:
+                checksum = zlib.crc32(payload)
+                prefix = _OWNED_BYTES_PREFIX.pack(
+                    _OWNED_BYTES_MAGIC,
+                    _VERSION,
+                    sequence,
+                    source_rank,
+                    expected_size,
+                    checksum,
+                )
+                tag = hmac.new(
+                    self._token,
+                    _OWNED_BYTES_AUTH_DOMAIN + prefix + payload,
+                    hashlib.sha256,
+                ).digest()
+                packet = (
+                    _OWNED_BYTES_HEADER.pack(
+                        _OWNED_BYTES_MAGIC,
+                        _VERSION,
+                        sequence,
+                        source_rank,
+                        expected_size,
+                        checksum,
+                        tag,
+                    )
+                    + payload
+                )
+            else:
+                packet = b""
+
+            if self.rank == 0:
+                if source_rank == 0:
+                    owned = payload
+                else:
+                    source = self._peers.get(source_rank)
+                    if source is None:
+                        raise RuntimeError("rank-control owned source is not connected")
+                    packet, owned = self._owned_bytes_packet(
+                        source,
+                        sequence=sequence,
+                        source_rank=source_rank,
+                        expected_size=expected_size,
+                    )
+                for rank in range(1, self.world_size):
+                    if rank != source_rank:
+                        self._peers[rank].sendall(packet)
+                return owned
+
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            if self.rank == source_rank:
+                stream.sendall(packet)
+                return payload
+            _packet, owned = self._owned_bytes_packet(
+                stream,
+                sequence=sequence,
+                source_rank=source_rank,
+                expected_size=expected_size,
+            )
+            return owned
+
+    def _barrier_packet(self, *, sequence: int, rank: int) -> bytes:
+        prefix = _BARRIER_PREFIX.pack(_BARRIER_MAGIC, _VERSION, sequence, rank)
+        tag = hmac.new(
+            self._token,
+            _BARRIER_AUTH_DOMAIN + prefix,
+            hashlib.sha256,
+        ).digest()
+        return _BARRIER_PACKET.pack(_BARRIER_MAGIC, _VERSION, sequence, rank, tag)
+
+    def _recv_barrier_packet(
+        self,
+        stream: socket.socket,
+        *,
+        sequence: int,
+        rank: int,
+    ) -> None:
+        magic, version, received_sequence, received_rank, observed_tag = (
+            _BARRIER_PACKET.unpack(_recv_exact(stream, _BARRIER_PACKET.size))
+        )
+        prefix = _BARRIER_PREFIX.pack(magic, version, received_sequence, received_rank)
+        expected_tag = hmac.new(
+            self._token,
+            _BARRIER_AUTH_DOMAIN + prefix,
+            hashlib.sha256,
+        ).digest()
+        if (
+            magic != _BARRIER_MAGIC
+            or version != _VERSION
+            or received_sequence != sequence
+            or received_rank != rank
+            or not hmac.compare_digest(observed_tag, expected_tag)
+        ):
+            raise RuntimeError("rank-control barrier packet is invalid")
+
+    def barrier(self) -> None:
+        """Wait until every rank reaches one ordered control boundary."""
+
+        with self._operation_lock:
+            self._sequence += 1
+            sequence = self._sequence
+            if self.rank == 0:
+                for rank in range(1, self.world_size):
+                    stream = self._peers.get(rank)
+                    if stream is None:
+                        raise RuntimeError("rank-control barrier peer is not connected")
+                    self._recv_barrier_packet(
+                        stream,
+                        sequence=sequence,
+                        rank=rank,
+                    )
+                release = self._barrier_packet(sequence=sequence, rank=0)
+                for rank in range(1, self.world_size):
+                    self._peers[rank].sendall(release)
+                return
+
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("rank-control worker is not connected")
+            stream.sendall(self._barrier_packet(sequence=sequence, rank=self.rank))
+            self._recv_barrier_packet(stream, sequence=sequence, rank=0)
 
     def close(self) -> None:
         for stream in self._peers.values():

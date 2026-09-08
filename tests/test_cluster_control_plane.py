@@ -63,6 +63,57 @@ def test_rank_control_plane_broadcasts_objects_in_sequence():
     assert received == expected
 
 
+def test_rank_control_plane_supports_barrier_and_nonzero_owned_bytes():
+    port = _free_port()
+    token = "c" * 64
+    worker_owned = b"worker-one-cache-plan"
+    coordinator_owned = b"rank-zero-follow-up"
+    received = {}
+    failures = []
+
+    def participant(rank):
+        try:
+            with RankControlPlane(
+                rank=rank,
+                world_size=3,
+                host="127.0.0.1",
+                port=port,
+                token=token,
+                connect_timeout=5,
+                io_timeout=5,
+            ) as control:
+                obj = control.broadcast_object(
+                    {"kind": "request"} if rank == 0 else None
+                )
+                control.barrier()
+                from_worker = control.broadcast_owned_bytes(
+                    worker_owned if rank == 1 else None,
+                    source_rank=1,
+                    expected_size=len(worker_owned),
+                )
+                from_coordinator = control.broadcast_owned_bytes(
+                    coordinator_owned if rank == 0 else None,
+                    source_rank=0,
+                    expected_size=len(coordinator_owned),
+                )
+                received[rank] = (obj, from_worker, from_coordinator)
+        except Exception as exc:  # pragma: no cover - relayed below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=participant, args=(rank,)) for rank in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=8)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert received == {
+        rank: ({"kind": "request"}, worker_owned, coordinator_owned)
+        for rank in range(3)
+    }
+
+
 def test_rank_control_plane_rejects_invalid_identity():
     try:
         RankControlPlane(
@@ -100,12 +151,13 @@ def test_invalid_handshake_is_dropped_without_blocking_a_valid_rank():
 
     thread = threading.Thread(target=coordinator)
     thread.start()
-    rogue = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     for _attempt in range(100):
+        rogue = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             rogue.connect(("127.0.0.1", port))
             break
         except ConnectionRefusedError:
+            rogue.close()
             threading.Event().wait(0.01)
     else:  # pragma: no cover - diagnostics for a wedged test host
         pytest.fail("coordinator listener did not start")
