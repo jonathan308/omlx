@@ -2870,6 +2870,12 @@ class Scheduler:
             # them for a measured ~+34% MoE prefill throughput on
             # M3 Ultra. 2048 is a multiple of the 128 window.
             lo = hi = self._POOLING_ROTATING_BLOCK_SIZE
+            # With the cache on every chunk is clamped to the next block
+            # boundary, so a wider prefill floor (MiMo on 128 GB+ hosts)
+            # only takes effect if the block grows with it.
+            floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
+            if floor > hi and floor % window_size == 0:
+                lo = hi = floor
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
