@@ -729,17 +729,16 @@ class Glm5NextSparseAttention(nn.Module):
                     mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
                 )
                 q_latent = q_latent.astype(native_dtype)
+                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
                 kv_latent_native = kv_latent.astype(native_dtype)
+                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
                 output = None
                 if Kv >= 4096:
-                    # GLM-5.3 has no rope dims: the helper zero-fills the
-                    # custom kernel's pe columns and the gathered path
-                    # skips them.
                     output = sparse_mla_attention(
                         q_latent,
-                        None,
+                        q_pe,
                         kv_latent_native,
-                        None,
+                        k_pe,
                         topk_indices,
                         self.scale,
                     )

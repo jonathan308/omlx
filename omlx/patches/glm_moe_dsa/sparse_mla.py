@@ -11,23 +11,29 @@ import mlx.core as mx
 from .kernels import fast as glm_fast
 
 # The gathered (MLX-ops) sparse MLA prefill path runs on the tensor units and
-# is ~1.5x faster than the classic-simd custom kernel on NAX GPUs (M5).
-# OMLX_GLM_SPARSE_MLA_GATHERED=0 keeps the custom kernel everywhere.
-_GATHERED_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_GATHERED", "1").strip().lower()
-_GATHERED_ENABLED = _GATHERED_ENV not in {"0", "false", "off"}
+# is ~1.7x faster than the classic-simd custom kernel on NAX GPUs (M5), but it
+# rounds the scores (bf16 matmul output) and the probabilities (bf16 PV
+# operand) to bf16, which the custom kernel keeps in fp32: measured against
+# an exact fp32 reference its mean error is ~2.5 bf16 ulp vs 0.25 for the
+# kernel. It is therefore opt-in: OMLX_GLM_SPARSE_MLA_GATHERED=1.
+_GATHERED_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_GATHERED", "0").strip().lower()
+_GATHERED_ENABLED = _GATHERED_ENV in {"1", "true", "on"}
 _GATHERED_Q_BLOCK = 128
 
 
 @lru_cache(maxsize=1)
 def _gathered_available() -> bool:
-    if not _GATHERED_ENABLED:
-        return False
+    """Whether the host has the tensor units the gathered path is built for."""
     try:
         from omlx.custom_kernels.nax import is_nax_available
 
         return bool(is_nax_available())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _gathered_enabled() -> bool:
+    return _GATHERED_ENABLED and _gathered_available()
 
 
 @lru_cache(maxsize=None)
@@ -510,7 +516,7 @@ def sparse_mla_attention(
     """
 
     if (
-        _gathered_available()
+        _gathered_enabled()
         and topk_length is None
         and causal_prefix_rows == 0
         and not topk_valid_prefix

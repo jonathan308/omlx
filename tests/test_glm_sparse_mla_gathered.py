@@ -97,14 +97,14 @@ def test_gathered_matches_custom_kernel():
     q_latent, q_pe, kv_latent, k_pe, idx = _inputs(L, K, topk, H=64, with_pe=True)
     scale = 576**-0.5
     # the production dispatcher with the gathered path switched off
-    real_available = sparse_mla._gathered_available
-    sparse_mla._gathered_available = lambda: False
+    real_enabled = sparse_mla._gathered_enabled
+    sparse_mla._gathered_enabled = lambda: False
     try:
         kern = sparse_mla.sparse_mla_attention(
             q_latent, q_pe, kv_latent, k_pe, idx, scale
         )
     finally:
-        sparse_mla._gathered_available = real_available
+        sparse_mla._gathered_enabled = real_enabled
     assert kern is not None
     out = sparse_mla.sparse_mla_attention_gathered(
         q_latent, q_pe, kv_latent, k_pe, idx, scale
@@ -123,7 +123,7 @@ def test_dispatcher_prefers_gathered_and_falls_back(monkeypatch):
         calls.append("gathered")
         return mx.zeros((1, 64, L, 512), dtype=mx.bfloat16)
 
-    monkeypatch.setattr(sparse_mla, "_gathered_available", lambda: True)
+    monkeypatch.setattr(sparse_mla, "_gathered_enabled", lambda: True)
     monkeypatch.setattr(sparse_mla, "sparse_mla_attention_gathered", fake_gathered)
     out = sparse_mla.sparse_mla_attention(
         q_latent, None, kv_latent, None, idx, 1.0
@@ -131,10 +131,32 @@ def test_dispatcher_prefers_gathered_and_falls_back(monkeypatch):
     assert calls == ["gathered"] and out.shape == (1, 64, L, 512)
     # gathered path disabled: the custom kernel runs (pe columns zero-filled)
     calls.clear()
-    monkeypatch.setattr(sparse_mla, "_gathered_available", lambda: False)
+    monkeypatch.setattr(sparse_mla, "_gathered_enabled", lambda: False)
     if not hasattr(sparse_mla.glm_fast, "glm_dsa_sparse_mla_attention"):
         return
     out = sparse_mla.sparse_mla_attention(
         q_latent, None, kv_latent, None, idx, 1.0
     )
     assert calls == [] and out is not None and out.shape == (1, 64, L, 512)
+
+
+def test_gathered_path_is_opt_in(monkeypatch):
+    """The gathered path rounds scores and probabilities to bf16, so the
+    dispatcher only takes it when OMLX_GLM_SPARSE_MLA_GATHERED=1."""
+    import os
+
+    if os.environ.get("OMLX_GLM_SPARSE_MLA_GATHERED"):
+        pytest.skip("OMLX_GLM_SPARSE_MLA_GATHERED set in the environment")
+    assert sparse_mla._GATHERED_ENABLED is False
+    L, K, topk = 32, 4096, 2048
+    q_latent, _, kv_latent, _, idx = _inputs(L, K, topk, H=64, with_pe=False)
+    calls = []
+
+    def fake_gathered(*args, **kwargs):
+        calls.append("gathered")
+        return mx.zeros((1, 64, L, 512), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(sparse_mla, "_gathered_available", lambda: True)
+    monkeypatch.setattr(sparse_mla, "sparse_mla_attention_gathered", fake_gathered)
+    sparse_mla.sparse_mla_attention(q_latent, None, kv_latent, None, idx, 1.0)
+    assert calls == []
