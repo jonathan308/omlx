@@ -237,13 +237,16 @@ class MoEGate(nn.Module):
 class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        switch_cls = _FusedSwitchGLU or SwitchGLU
+        # The fused combine kernel handles top-6/top-8 routing (MiMo: top-8).
+        self._fused_combine = _FusedSwitchGLU is not None and (
+            config.num_experts_per_tok in (6, 8)
+        )
+        switch_cls = _FusedSwitchGLU if self._fused_combine else SwitchGLU
         self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
         )
-        self._fused_combine = _FusedSwitchGLU is not None
         self.gate = MoEGate(config)
         self.sharding_group = None
 

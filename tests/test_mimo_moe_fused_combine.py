@@ -15,7 +15,7 @@ def _mimo_module():
     return importlib.import_module("mlx_lm.models.mimo_v2")
 
 
-def _small_moe(mimo, T, hidden=128, inter=64, experts=8, top_k=2):
+def _small_moe(mimo, T, hidden=128, inter=64, experts=16, top_k=8):
     cfg = mimo.ModelArgs.from_dict(
         {
             "model_type": "mimo_v2",
@@ -82,6 +82,16 @@ def test_mimo_moe_fused_combine_matches_reference(T):
     mx.eval(out, ref)
     assert out.shape == ref.shape == x.shape
     assert out.dtype == x.dtype
+    assert mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2).item()
+
+
+def test_mimo_moe_unsupported_top_k_uses_plain_switch_glu():
+    mimo = _mimo_module()
+    moe, x = _small_moe(mimo, 96, top_k=2)
+    assert not moe._fused_combine
+    out = moe(x)
+    ref = _reference(moe, x)
+    mx.eval(out, ref)
     assert mx.allclose(out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2).item()
 
 
