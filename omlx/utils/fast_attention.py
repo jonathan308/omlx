@@ -48,6 +48,26 @@ def _nax_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=None)
+def _native_mixed_dims_supported(qk_dim: int, v_dim: int) -> bool:
+    """True when MLX's fused prefill kernel accepts ``qk_dim``/``v_dim`` directly."""
+    try:
+        q = mx.zeros((1, 1, 16, qk_dim), mx.float16)
+        v = mx.zeros((1, 1, 16, v_dim), mx.float16)
+        out = mx.fast.scaled_dot_product_attention(
+            q, q, v, scale=1.0, mask="causal", force_fused=True
+        )
+        mx.eval(out)
+        return True
+    except Exception:  # noqa: BLE001 - older MLX raises ValueError
+        return False
+
+
+def _pad_last(x: mx.array, width: int) -> mx.array:
+    pad = [(0, 0)] * (x.ndim - 1) + [(0, width - x.shape[-1])]
+    return mx.pad(x, pad)
+
+
 def mixed_head_dim_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -57,7 +77,19 @@ def mixed_head_dim_sdpa(
     mask,
     sinks: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
-    """Fused SDPA for prefill with ``qk_dim > v_dim``; None when not applicable."""
+    """Fused SDPA for prefill with ``qk_dim > v_dim``; None when not applicable.
+
+    Three exact routes, best first:
+
+    * MLX builds whose fused kernel takes the mixed head dims natively
+      (NAX kernel with a separate value head dim) are called directly.
+    * Otherwise, on NAX (M5) GPUs, Q/K/V are zero-padded to 256 so the
+      tensor-unit head-dim-split kernel runs: padded query/key columns add
+      exactly zero to every score and padded value columns are sliced away.
+      This beats padding V to 192 (which lands on the classic kernel, ~3x
+      slower) despite the extra multiply-adds.
+    * Elsewhere V is zero-padded to the query head dim for the classic kernel.
+    """
     qk_dim, v_dim = queries.shape[-1], values.shape[-1]
     if (
         not _ENABLED
@@ -68,11 +100,33 @@ def mixed_head_dim_sdpa(
         or not (mask is None or isinstance(mask, str) or mask.dtype == mx.bool_)
     ):
         return None
-    pad = [(0, 0)] * (values.ndim - 1) + [(0, qk_dim - v_dim)]
+    if _native_mixed_dims_supported(qk_dim, v_dim):
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
+    if qk_dim in (96, 128, 192) and qk_dim not in (64, 96, 128):
+        # No NAX kernel for this width: pad to the 256-wide split kernel.
+        width = 256
+        out = mx.fast.scaled_dot_product_attention(
+            _pad_last(queries, width),
+            _pad_last(keys, width),
+            _pad_last(values, width),
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
+        return out[..., :v_dim]
     out = mx.fast.scaled_dot_product_attention(
         queries,
         keys,
-        mx.pad(values, pad),
+        _pad_last(values, qk_dim),
         scale=scale,
         mask=mask,
         sinks=sinks,
