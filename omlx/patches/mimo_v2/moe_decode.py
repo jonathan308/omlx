@@ -16,11 +16,11 @@ here compute exactly the same numbers with fewer passes:
 Bit-exactness: each output row is the reduction of MLX's
 ``fp_qmv_fast_impl`` (``fp_quantized.h``): lane ``l`` of a simdgroup owns the
 16 inputs ``[512 b + 16 l, 512 b + 16 l + 16)`` of every 512-wide block ``b``,
-accumulates ``scale * sum_i((x0 w0 + x1 w1) + x2 w2) + x3 w3)`` block by
+accumulates ``scale * sum_i(((x0 w0 + x1 w1) + x2 w2) + x3 w3)`` block by
 block, and the lanes are combined with ``simd_sum``; the result is rounded to
 the activation dtype once.  MXFP4 products are exact in float32 (bf16/fp16
-inputs times 2-bit-mantissa weights) and the e8m0 scale is a power of two,
-so the same additions in the same order give the same bits whatever the
+inputs times 2-bit-mantissa weights) and the e8m0 scale is a power of two
+(exact for normal results), so the same additions in the same order give the same bits whatever the
 compiler contracts.  The SwiGLU epilogue is MLX's compiled
 ``silu(gate) * up`` in the activation dtype, op for op.
 """

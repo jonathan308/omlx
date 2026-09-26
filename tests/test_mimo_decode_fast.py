@@ -424,3 +424,164 @@ def test_expert_kind_detects_layouts():
     sw2 = model2.model.layers[1].mlp.switch_mlp
     sw2.down_proj.mode = "affine"
     assert df._expert_kind(sw2) is None
+
+
+def _attention_f32(q, k, v, scale, mask, sinks):
+    """float32 reference attention (GQA, causal string / bool mask, sinks)."""
+    B, H, L, D = q.shape
+    Hk, S = k.shape[1], k.shape[2]
+    rep = H // Hk
+    q32 = q.astype(mx.float32).reshape(B, Hk, rep, L, D)
+    k32 = k.astype(mx.float32)[:, :, None]
+    v32 = v.astype(mx.float32)[:, :, None]
+    scores = (q32 * scale) @ k32.swapaxes(-1, -2)
+    if isinstance(mask, str):
+        allowed = mx.arange(S - L, S)[:, None] >= mx.arange(S)[None]
+        scores = mx.where(allowed, scores, -mx.inf)
+    elif mask is not None:
+        m = mask if mask.ndim < 3 else mask.reshape(mask.shape[0], 1, *mask.shape[1:])
+        scores = mx.where(m, scores, -mx.inf)
+    if sinks is not None:
+        s = sinks.astype(mx.float32).reshape(1, Hk, rep, 1, 1)
+        s = mx.broadcast_to(s, (*scores.shape[:-1], 1))
+        scores = mx.concatenate([s, scores], axis=-1)
+    p = mx.softmax(scores, axis=-1)
+    if sinks is not None:
+        p = p[..., 1:]
+    return (p @ v32).reshape(B, H, L, -1)
+
+
+@pytest.mark.parametrize("L", [3, 4, 7])
+@pytest.mark.parametrize("mask_kind", ["causal", "array", "window", "padded"])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_sdpa_row_chunks_match_attention(L, mask_kind, with_sinks):
+    """Row-chunked vector SDPA (verify rows x GQA > 32) computes the same
+    attention as the full-width call, to bf16 rounding."""
+    from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+
+    mx.random.seed(L)
+    B, H, Hk, D, Dv, S = (2 if mask_kind == "padded" else 1), 64, 4, 192, 128, 300
+    q = mx.random.normal((B, H, L, D)).astype(BF16)
+    k = mx.random.normal((B, Hk, S, D)).astype(BF16)
+    v = mx.random.normal((B, Hk, S, Dv)).astype(BF16)
+    sinks = mx.random.normal((H,)).astype(BF16) if with_sinks else None
+    if mask_kind == "causal":
+        mask = "causal"
+    elif mask_kind == "array":
+        mask = create_causal_mask(L, offset=S - L)
+    elif mask_kind == "window":
+        mask = create_causal_mask(L, offset=S - L, window_size=64)
+    else:
+        mask = create_causal_mask(L, offset=S - L, left_padding=mx.array([0, 17]))
+    scale = D ** -0.5
+    out = df._sdpa_row_chunks(
+        scaled_dot_product_attention, q, k, v, None, scale, mask, sinks, 32 // (H // Hk)
+    )
+    assert out.shape == (B, L, H * Dv)
+    ref = _attention_f32(q, k, v, scale, mask, sinks).swapaxes(1, 2).reshape(B, L, -1)
+    full = scaled_dot_product_attention(q, k, v, None, scale=scale, mask=mask, sinks=sinks)
+    full = full.swapaxes(1, 2).reshape(B, L, -1)
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    err_full = mx.abs(full.astype(mx.float32) - ref).max().item()
+    # Both bf16 results sit within bf16 rounding of the float32 attention.
+    assert err <= max(2 * err_full, 1e-2), (err, err_full)
+
+
+def _gqa16_model(seed=11):
+    m = _mimo()
+    cfg = dict(_TINY)
+    cfg.update(num_attention_heads=16, num_key_value_heads=1, swa_num_attention_heads=16,
+               swa_num_key_value_heads=2)
+    mx.random.seed(seed)
+    model = m.Model(m.ModelArgs.from_dict(cfg))
+    updates = []
+    for key, value in tree_flatten(model.parameters()):
+        if key.endswith("gate.weight"):
+            updates.append((key, mx.random.normal(value.shape) * 0.05))
+        elif key.endswith("e_score_correction_bias"):
+            updates.append((key, mx.random.normal(value.shape) * 0.02))
+        elif key.endswith("attention_sink_bias"):
+            updates.append((key, mx.random.normal(value.shape)))
+        elif "norm" in key:
+            updates.append((key, 1 + 0.1 * mx.random.normal(value.shape)))
+    model.load_weights(updates, strict=False)
+    nn.quantize(model, group_size=64, bits=8,
+                class_predicate=lambda p, mod: isinstance(mod, nn.Linear) and "switch_mlp" not in p)
+    nn.quantize(model, group_size=32, bits=4, mode="mxfp4",
+                class_predicate=lambda p, mod: "switch_mlp" in p and hasattr(mod, "to_quantized"))
+    model.load_weights([(k, v.astype(BF16)) for k, v in tree_flatten(model.parameters())
+                        if v.dtype == mx.float32 and "e_score_correction_bias" not in k], strict=False)
+    mx.eval(model.parameters())
+    return model
+
+
+def _chunked_reference(monkeypatch, m):
+    """Reference SDPA with the fast path's verify contract (row chunks)."""
+    orig_sdpa = m.scaled_dot_product_attention
+    chunked = {"n": 0}
+
+    def ref_sdpa(q, k, v, cache=None, scale=1.0, mask=None, sinks=None):
+        rep = q.shape[1] // k.shape[1]
+        L = q.shape[2]
+        if 1 < L <= 8 and L * rep > 32:
+            chunked["n"] += 1
+            out = df._sdpa_row_chunks(orig_sdpa, q, k, v, cache, scale, mask, sinks, 32 // rep)
+            return out.reshape(q.shape[0], L, q.shape[1], -1).swapaxes(1, 2)
+        return orig_sdpa(q, k, v, cache=cache, scale=scale, mask=mask, sinks=sinks)
+
+    monkeypatch.setattr(m, "scaled_dot_product_attention", ref_sdpa)
+    return chunked
+
+
+def test_fast_forward_gqa16_chunked_sdpa_matches_reference(monkeypatch):
+    """GQA 16 (MiMo's full-attention layers): verify forwards of 3+ rows run
+    the vector SDPA in row chunks; everything else stays bit-exact to the
+    reference computed with the same attention and a per-row router."""
+    m = _mimo()
+    model = _gqa16_model()
+    _per_row_router(monkeypatch, m)
+    chunked = _chunked_reference(monkeypatch, m)
+    tokens = mx.random.randint(0, 512, (1, 60))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :40], cache, False, monkeypatch)
+    pos = 40
+    for L in [1, 3, 4, 2, 7]:
+        step = tokens[:, pos : pos + L]
+        ref_cache, fast_cache = _clone(cache), _clone(cache)
+        before = chunked["n"]
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        if L >= 3:
+            assert chunked["n"] > before
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
+        for a, b in zip(ref_cache, fast_cache):
+            assert _mismatches(a.state[0], b.state[0]) == 0
+            assert _mismatches(a.state[1], b.state[1]) == 0
+        cache = fast_cache
+        pos += L
+
+
+def test_fast_forward_gqa16_chunked_sdpa_batch_caches(monkeypatch):
+    """Row chunks with merged batch caches (left padding, array masks)."""
+    m = _mimo()
+    model = _gqa16_model(seed=12)
+    _per_row_router(monkeypatch, m)
+    chunked = _chunked_reference(monkeypatch, m)
+    tokens = mx.random.randint(0, 512, (1, 50))
+    ca, cb = model.make_cache(), model.make_cache()
+    _forward(model, tokens[:, :45], ca, False, monkeypatch)
+    _forward(model, tokens[:, 5:36], cb, False, monkeypatch)
+    batch = [type(a).merge([a, b]) for a, b in zip(ca, cb)]
+    calls = _count_fast_runs(monkeypatch)
+    for L in [3, 1, 3, 2]:  # 2 x L rows stay within the fast path's 7
+        step = mx.random.randint(0, 512, (2, L))
+        ref_cache, fast_cache = _clone(batch), _clone(batch)
+        before = chunked["n"]
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        if L >= 3:
+            assert chunked["n"] > before
+        before_fast = calls["n"]
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        assert calls["n"] > before_fast, f"fast path did not run at L={L}"
+        assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
+        batch = fast_cache

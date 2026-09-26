@@ -1,31 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiMo V2 decode and short-verify forward (a few tokens per step).
+"""MiMo V2 decode and short-verify forward (a few token rows per step).
 
-A decode step of MiMo-V2.6-Flash dispatches ~2.8k kernels, most of them
-small element-wise ops between the weight-streaming mat-vecs.  This module
-runs the same math for forwards of at most ``MAX_ROWS`` token rows with
-fewer dispatches:
+A MiMo-V2.6-Flash decode step used to dispatch ~2.8k kernels, most of them
+small element-wise ops between the weight-streaming mat-vecs, and a 2-4 row
+verify forward (Lightning MTP) paid for float32 router GEMMs, one expert
+pass per (row, expert) pair and unfused attention on the full-attention
+layers.  For forwards of at most ``MAX_ROWS`` token rows this module runs the
+same math with fewer, cheaper dispatches:
 
-* q/k/v projections: one quantized mat-vec over the row-concatenated q, k
-  and v weights (the separate projections become views into that buffer,
-  so no weight memory is duplicated).  Each output row is the same
-  quantized dot product as before.
-* one kernel splits q/k/v, applies the partial RoPE to q and k and the
-  value scale to v (MLX's rope / multiply arithmetic, element for element).
-* one kernel for residual add + RMSNorm, one for the expert combine +
-  residual + the next layer's RMSNorm.  Both reproduce
-  ``mx.fast.rms_norm``'s reduction tree, and the combine sums the experts in
-  MLX's order, so they are bit-identical to the unfused ops.
-* router: one kernel for the float32 logits (MLX's M=1 ``gemv`` arithmetic
-  on the bf16 weights widened on load -- the reference casts the weights to
-  float32 every step) and one for sigmoid / bias / top-k / normalisation.
-  At one token per row this is bit-identical to the reference; for verify
-  rows (L > 1) every row gets exactly the logits a decode step computes,
-  where MLX's batched float32 matmul would sum in another order.
+* q/k/v: one quantized mat-vec over the row-concatenated q, k and v weights
+  (the separate projections become views into that buffer, so no weight
+  memory is duplicated); each output row is the same quantized dot product.
+* one kernel splits q/k/v, applies the partial RoPE to q and k and the value
+  scale to v (MLX's rope / multiply arithmetic, element for element).
+* residual add + RMSNorm, and expert combine + residual + the next layer's
+  RMSNorm, as one kernel each (``mx.fast.rms_norm``'s reduction tree, experts
+  summed in MLX's order).
+* router: float32 logits by a multi-row kernel with MLX's M=1 ``gemv``
+  arithmetic on the bf16 weights widened on load (the reference casts the
+  weights to float32 every step), and one kernel for sigmoid / bias / top-k /
+  normalisation.
+* routed experts: ``moe_decode`` (fused gate/up/SwiGLU and down mat-vecs,
+  one weight pass per distinct expert of the forward).
+* attention of verify forwards whose rows x GQA factor exceed MLX's vector
+  SDPA kernel (the full-attention layers at 3+ rows) runs as row chunks that
+  fit it, instead of MLX's unfused matmul / softmax fallback.
 
-Everything else (KV cache updates, attention, expert mat-vecs, lm_head) is
-the reference code.  Forwards the fast path does not cover fall back to the
-reference layer loop.
+Exactness: a one-row (decode) forward is bit-identical to the reference.
+For verify forwards (L > 1) two reductions run in another order than the
+reference: every row's router logits are the M=1 gemv a decode step computes
+(MLX's batched float32 matmul sums differently) and chunked attention rows
+use the vector SDPA kernel; everything else is bit-identical.  KV-cache
+updates, the SDPA calls themselves and lm_head are the reference code;
+forwards outside the fast path's contract run the reference layer loop.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ import logging
 import os
 import sys
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 
@@ -59,19 +66,14 @@ def enabled() -> bool:
     return _env_on("OMLX_MIMO_DECODE_FAST")
 
 
+def sdpa_chunks_enabled() -> bool:
+    """Verify rows beyond the vector SDPA limit run as row chunks; on by default."""
+    return _env_on("OMLX_MIMO_DECODE_SDPA_CHUNKS")
+
+
 def experts_enabled() -> bool:
     """Decode-time MXFP4 expert kernels (``moe_decode``); on by default."""
     return _env_on("OMLX_MIMO_DECODE_EXPERTS")
-
-
-def _type_name(dtype) -> str:
-    if dtype == mx.bfloat16:
-        return "bfloat16_t"
-    if dtype == mx.float16:
-        return "float16_t"
-    if dtype == mx.float32:
-        return "float"
-    raise ValueError(f"unsupported dtype {dtype}")
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +599,7 @@ def qkv_rope_split(
 class _FusedQKV:
     """Row-concatenated q/k/v quantized weights of one attention module."""
 
-    __slots__ = ("weight", "scales", "biases", "group_size", "bits", "mode", "width")
+    __slots__ = ("weight", "scales", "biases", "group_size", "bits", "mode")
 
     def __init__(self, weight, scales, biases, group_size, bits, mode):
         self.weight = weight
@@ -606,7 +608,6 @@ class _FusedQKV:
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
-        self.width = int(weight.shape[0])
 
 
 class _GateCache:
@@ -715,7 +716,8 @@ def _experts(switch_mlp, kind, x, inds):
 
 
 def _prepare(model) -> bool:
-    """One-time per model: fuse q/k/v weights and cache float32 router weights."""
+    """One-time per model: fuse q/k/v weights, check the RoPE / router /
+    expert layouts the fast path supports and cache the float32 router bias."""
     state = model.__dict__.get("_omlx_decode_fast_state")
     if state is not None:
         return state
@@ -762,7 +764,38 @@ def _prepare(model) -> bool:
     return ok
 
 
-def _attention(attn, x, mask, cache, sdpa, offsets_memo):
+# MLX's vector SDPA kernel serves query rows x GQA factor <= 32; beyond that
+# (MiMo's full-attention layers, GQA 16, at 3+ verify rows) it falls back to
+# unfused matmul + softmax + matmul, several kernels per layer.
+_SDPA_VECTOR_ROWS = 32
+
+
+def _sdpa_row_chunks(sdpa, q, k, v, cache, scale, mask, sinks, rows):
+    """Attention of ``q (B, H, L, D)`` in chunks of ``rows`` query rows, each
+    within the vector kernel's limit; returns ``(B, L, H * Dv)``.
+
+    Every chunk keeps the full forward's causal structure: a ``"causal"``
+    mask becomes a key prefix ending at the chunk's last row, an array mask
+    is sliced to the chunk's rows.
+    """
+    L = q.shape[2]
+    S = k.shape[2]
+    outs = []
+    for r0 in range(0, L, rows):
+        r1 = min(L, r0 + rows)
+        kc, vc, mc = k, v, mask
+        if isinstance(mask, str):
+            end = S - (L - r1)
+            kc, vc = k[:, :, :end], v[:, :, :end]
+        elif mask is not None and mask.ndim >= 2 and mask.shape[-2] == L:
+            mc = mask[..., r0:r1, :]
+        o = sdpa(q[:, :, r0:r1], kc, vc, cache=cache, scale=scale, mask=mc, sinks=sinks)
+        outs.append(o.swapaxes(1, 2))
+    out = mx.concatenate(outs, axis=1)
+    return out.reshape(out.shape[0], L, -1)
+
+
+def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks):
     B, L, _ = x.shape
     fused = attn.__dict__.get("_omlx_qkv")
     offset = cache.offset
@@ -809,6 +842,20 @@ def _attention(attn, x, mask, cache, sdpa, offsets_memo):
         queries = attn.rope(queries, offset=offset)
         keys = attn.rope(keys, offset=offset)
     keys, values = cache.update_and_fetch(keys, values)
+    n_rep = max(1, attn.n_heads // attn.n_kv_heads)
+    if row_chunks and L > 1 and L * n_rep > _SDPA_VECTOR_ROWS and n_rep <= _SDPA_VECTOR_ROWS:
+        output = _sdpa_row_chunks(
+            sdpa,
+            queries,
+            keys,
+            values,
+            cache,
+            attn.scale,
+            mask,
+            attn.attention_sink_bias,
+            _SDPA_VECTOR_ROWS // n_rep,
+        )
+        return attn.o_proj(output)
     output = sdpa(
         queries,
         keys,
@@ -872,10 +919,12 @@ def run_layers(model, h, cache, full_mask, swa_mask):
     x = mx.fast.rms_norm(h, first.weight, first.eps)
     n = len(layers)
     offsets_memo = {}
+    use_experts = experts_enabled()
+    row_chunks = sdpa_chunks_enabled()
     for i, layer in enumerate(layers):
         nxt = layers[i + 1].input_layernorm if i + 1 < n else model.norm
         mask = swa_mask if layer.is_sliding_window else full_mask
-        a = _attention(layer.self_attn, x, mask, cache[i], sdpa, offsets_memo)
+        a = _attention(layer.self_attn, x, mask, cache[i], sdpa, offsets_memo, row_chunks)
         post = layer.post_attention_layernorm
         mlp = layer.mlp
         gate = getattr(mlp, "gate", None)
@@ -894,7 +943,7 @@ def run_layers(model, h, cache, full_mask, swa_mask):
             logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
         )
         kind = mlp.__dict__.get("_omlx_experts")
-        if kind and experts_enabled():
+        if kind and use_experts:
             y = _experts(mlp.switch_mlp, kind, xm, inds)
         else:
             y = mlp.switch_mlp(xm, inds)
