@@ -14,9 +14,10 @@ side into one Metal dispatch:
 
 Both kernels mirror the stock rounding sites so the fused path is
 bit-compatible with the unfused stock path (fp32 L2 sums, a single cast
-back to the activation dtype, bf16-domain conv/SiLU). The forget gate and
-the recurrent delta kernel are untouched; the driver calls the stock
-``gated_delta_update`` on the fused outputs.
+back to the activation dtype, bf16-domain conv/SiLU). The recurrence runs
+on the blocked kernel in ``glm53_kda_recurrence`` (forget gate computed
+in-kernel; same math up to fp32 summation order), falling back to the stock
+``gated_delta_update`` when the gate is not the fp32 safe-gate form.
 
 Eligibility is fail-closed (see ``glm53_kda_prefill_eligible``); anything
 unexpected runs the stock path. Kill switch:
@@ -29,6 +30,8 @@ import logging
 import os
 
 import mlx.core as mx
+
+from .glm53_kda_recurrence import kda_recurrence
 
 logger = logging.getLogger(__name__)
 
@@ -291,17 +294,38 @@ def glm53_kda_prefill(module, inputs, cache):
     fg = module.forget_gate
     a = lang.linear_forward(fg.f_b_proj, fa_o).reshape(1, length, heads, dim)
     state = cache[1]
-    out, state = lang.gated_delta_update(
-        q,
-        k,
-        v,
-        a,
-        b_o,
-        fg.A_log.reshape(heads, 1),
-        fg.dt_bias.reshape(heads, dim),
-        state=state,
-        lower_bound=fg.safe_gate_lower_bound,
-    )
+    if (
+        fg.safe_gate_lower_bound is not None
+        and fg.A_log.dtype == mx.float32
+        and fg.dt_bias.dtype == mx.float32
+    ):
+        # Same recurrence as gated_delta_update's kernel with the gate
+        # computed in-kernel; only the fp32 dot summation order differs.
+        if state is None:
+            state = mx.zeros((1, heads, dim, dim), dtype=mx.float32)
+        out, state = kda_recurrence(
+            q,
+            k,
+            v,
+            a,
+            mx.sigmoid(b_o),
+            fg.A_log,
+            fg.dt_bias,
+            fg.safe_gate_lower_bound,
+            state,
+        )
+    else:
+        out, state = lang.gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b_o,
+            fg.A_log.reshape(heads, 1),
+            fg.dt_bias.reshape(heads, dim),
+            state=state,
+            lower_bound=fg.safe_gate_lower_bound,
+        )
     cache[1] = state
     cache.advance(length)
 
