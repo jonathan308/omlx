@@ -141,3 +141,105 @@ def test_mixed_head_dim_sdpa_native_probe_is_cached():
     first = fast_attention._native_mixed_dims_supported(192, 128)
     assert fast_attention._native_mixed_dims_supported(192, 128) is first
     assert fast_attention._native_mixed_dims_supported.cache_info().hits >= 1
+
+
+def _copied_blocks_reference(q, k, v, scale, window, sinks, block=128):
+    """Blocked window attention with every block materialised contiguously."""
+    from omlx.utils import fast_attention
+
+    H, L, D = q.shape[1], q.shape[2], q.shape[3]
+    S = k.shape[2]
+    prefix = S - L
+    pad_q = (-L) % block
+    nb = (L + pad_q) // block
+    used = min(prefix, window)
+    lead = window - used
+    span = block + window
+
+    def rows(x):
+        x = x[:, :, S - L - used :, :]
+        return mx.pad(x, [(0, 0), (0, 0), (lead, pad_q), (0, 0)])
+
+    kr, vr = rows(k), rows(v)
+    kb = mx.stack([kr[0, :, b * block : b * block + span] for b in range(nb)])
+    vb = mx.stack([vr[0, :, b * block : b * block + span] for b in range(nb)])
+    qp = mx.pad(q, [(0, 0), (0, 0), (0, pad_q), (0, 0)])
+    qb = mx.stack([qp[0, :, b * block : (b + 1) * block] for b in range(nb)])
+    fast_attention._BLOCK_MASK_CACHE[0] = None
+    block_mask = fast_attention._window_block_mask(
+        nb=nb,
+        block=block,
+        window=window,
+        lead=lead,
+        user_mask=None,
+        col_start=S - L - used,
+        pad_q=pad_q,
+    )
+    out = mx.fast.scaled_dot_product_attention(
+        mx.contiguous(qb),
+        mx.contiguous(kb),
+        mx.contiguous(vb),
+        scale=scale,
+        mask=block_mask,
+        sinks=sinks,
+    )
+    out = mx.concatenate([out[b] for b in range(nb)], axis=1)[None]
+    return out[:, :, :L]
+
+
+@pytest.mark.parametrize("prefix,L", [(0, 512), (127, 511), (300, 384)])
+def test_blocked_sliding_window_strided_views_match_copied_blocks(prefix, L):
+    """The overlapping strided key spans feed the kernel the same values."""
+    mx.random.seed(7 + prefix)
+    H, Hk, window = 8, 2, 128
+    S = prefix + L
+    q = mx.random.normal((1, H, L, 192)).astype(mx.bfloat16)
+    k = mx.random.normal((1, Hk, S, 192)).astype(mx.bfloat16)
+    v = mx.random.normal((1, Hk, S, 128)).astype(mx.bfloat16)
+    sinks = mx.random.normal((H,)).astype(mx.bfloat16)
+    scale = 192**-0.5
+    ref = _copied_blocks_reference(q, k, v, scale, window, sinks)
+    out = blocked_sliding_window_attention(
+        q, k, v, scale=scale, window=window, sinks=sinks
+    )
+    assert out is not None
+    assert out.shape == ref.shape
+    assert mx.array_equal(out, ref).item()
+
+
+def test_blocked_sliding_window_reuses_the_block_mask_per_mask_array():
+    from omlx.utils import fast_attention
+
+    mx.random.seed(3)
+    H, Hk, L, window, prefix = 4, 2, 384, 128, 100
+    S = prefix + L
+    q = mx.random.normal((1, H, L, 64))
+    k = mx.random.normal((1, Hk, S, 64))
+    v = mx.random.normal((1, Hk, S, 64))
+    qpos = mx.arange(prefix, S)[:, None]
+    kpos = mx.arange(S)[None, :]
+    window_mask = (kpos <= qpos) & (kpos > qpos - window)
+
+    fast_attention._BLOCK_MASK_CACHE[0] = None
+    mask_a = (window_mask & (kpos >= 5))[None, None]
+    out_a = blocked_sliding_window_attention(
+        q, k, v, scale=0.125, window=window, mask=mask_a
+    )
+    cached = fast_attention._BLOCK_MASK_CACHE[0]
+    assert cached is not None and cached[1] is mask_a
+    again = blocked_sliding_window_attention(
+        q, k, v, scale=0.125, window=window, mask=mask_a
+    )
+    assert fast_attention._BLOCK_MASK_CACHE[0] is cached
+    assert mx.array_equal(out_a, again).item()
+
+    # A different mask array (even after the first is dropped) is re-derived.
+    del mask_a, again
+    mask_b = (window_mask & (kpos >= 60))[None, None]
+    out_b = blocked_sliding_window_attention(
+        q, k, v, scale=0.125, window=window, mask=mask_b
+    )
+    ref_b = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=mask_b)
+    assert fast_attention._BLOCK_MASK_CACHE[0][1] is mask_b
+    assert mx.allclose(out_b, ref_b, atol=1e-4, rtol=1e-4).item()
+    assert not mx.allclose(out_a, out_b, atol=1e-4, rtol=1e-4).item()
