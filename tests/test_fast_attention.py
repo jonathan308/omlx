@@ -94,3 +94,50 @@ def test_mixed_head_dim_sdpa_matches_unfused():
     assert out is not None
     assert out.shape == ref.shape
     assert mx.allclose(out, ref, atol=2e-2, rtol=2e-2).item()
+
+
+def _mixed_dims_reference(q, k, v, scale, mask):
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+    mx.eval(out)
+    return out
+
+
+@pytest.mark.parametrize("mask_kind", ["causal", "array"])
+def test_mixed_head_dim_sdpa_long_context_all_routes(monkeypatch, mask_kind):
+    """Native, padded-to-256 and padded-to-qk routes all match the reference."""
+    from omlx.utils import fast_attention
+
+    if not fast_attention._nax_available():
+        pytest.skip("fast mixed head-dim paths are only enabled on NAX GPUs")
+    mx.random.seed(1)
+    L, S = 300, 1100
+    q = (0.5 * mx.random.normal((1, 8, L, 192))).astype(mx.bfloat16)
+    k = (0.5 * mx.random.normal((1, 2, S, 192))).astype(mx.bfloat16)
+    v = (0.5 * mx.random.normal((1, 2, S, 128))).astype(mx.bfloat16)
+    scale = 192**-0.5
+    if mask_kind == "causal":
+        mask = "causal"
+    else:
+        mask = (mx.arange(L)[:, None] + (S - L)) >= mx.arange(S)[None, :]
+        mask = mask[None, None]
+    ref = _mixed_dims_reference(q, k, v, scale, mask)
+
+    outs = {}
+    outs["auto"] = mixed_head_dim_sdpa(q, k, v, scale=scale, mask=mask)
+    monkeypatch.setattr(
+        fast_attention, "_native_mixed_dims_supported", lambda *a: False
+    )
+    outs["pad256"] = mixed_head_dim_sdpa(q, k, v, scale=scale, mask=mask)
+    for name, out in outs.items():
+        assert out is not None, name
+        assert out.shape == ref.shape, name
+        assert mx.allclose(out, ref, atol=2e-2, rtol=2e-2).item(), name
+
+
+def test_mixed_head_dim_sdpa_native_probe_is_cached():
+    from omlx.utils import fast_attention
+
+    fast_attention._native_mixed_dims_supported.cache_clear()
+    first = fast_attention._native_mixed_dims_supported(192, 128)
+    assert fast_attention._native_mixed_dims_supported(192, 128) is first
+    assert fast_attention._native_mixed_dims_supported.cache_info().hits >= 1
