@@ -105,7 +105,7 @@ def _mixed_dims_reference(q, k, v, scale, mask):
 
 @pytest.mark.parametrize("mask_kind", ["causal", "array"])
 def test_mixed_head_dim_sdpa_long_context_all_routes(monkeypatch, mask_kind):
-    """Native, padded-to-256 and padded-to-qk routes all match the reference."""
+    """Native, JIT NAX and padded-to-256 routes all match the reference."""
     from omlx.utils import fast_attention
 
     if not fast_attention._nax_available():
@@ -127,6 +127,10 @@ def test_mixed_head_dim_sdpa_long_context_all_routes(monkeypatch, mask_kind):
     outs["auto"] = mixed_head_dim_sdpa(q, k, v, scale=scale, mask=mask)
     monkeypatch.setattr(
         fast_attention, "_native_mixed_dims_supported", lambda *a: False
+    )
+    outs["jit"] = mixed_head_dim_sdpa(q, k, v, scale=scale, mask=mask)
+    monkeypatch.setattr(
+        fast_attention, "nax_mixed_head_dim_attention", lambda *a, **k: None
     )
     outs["pad256"] = mixed_head_dim_sdpa(q, k, v, scale=scale, mask=mask)
     for name, out in outs.items():
@@ -176,7 +180,9 @@ def _copied_blocks_reference(q, k, v, scale, window, sinks, block=128):
         col_start=S - L - used,
         pad_q=pad_q,
     )
-    out = mx.fast.scaled_dot_product_attention(
+    # Same kernel route as the blocked path (the JIT NAX kernel for 192/128
+    # on stock MLX), fed contiguous copies instead of strided views.
+    out = fast_attention._block_sdpa(
         mx.contiguous(qb),
         mx.contiguous(kb),
         mx.contiguous(vb),

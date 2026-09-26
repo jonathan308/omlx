@@ -11,8 +11,10 @@ prefill time on large GPUs:
   ``blocked_sliding_window_attention`` tiles the queries into blocks that only
   see their ``block + window`` key span.
 * Prefill with different query/key and value head dims (e.g. 192/128) has no
-  fused kernel, so MLX materialises the full score matrix. Zero-padding V to
-  the query head dim makes the fused kernel applicable; the extra output
+  fused kernel, so MLX materialises the full score matrix. On NAX (M5) GPUs
+  ``omlx.utils.nax_attention`` runs MLX's tensor-unit flash-attention kernel
+  with a separate value head dim as a JIT kernel. Otherwise zero-padding V
+  (or Q/K/V) makes one of MLX's fused kernels applicable; the extra output
   columns are exactly zero and sliced away. MLX also routes head dim 192/256
   prefill to the unfused path by default, which measures slower on NAX (M5)
   GPUs, so the fused kernel is requested explicitly there.
@@ -29,6 +31,8 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
+
+from omlx.utils.nax_attention import nax_mixed_head_dim_attention
 
 # Kill switch for A/B comparisons: OMLX_FAST_ATTENTION=0 keeps MLX's default
 # SDPA routing everywhere.
@@ -69,6 +73,25 @@ def _pad_last(x: mx.array, width: int) -> mx.array:
     return mx.pad(x, pad)
 
 
+def _block_sdpa(queries, keys, values, *, scale, mask, sinks):
+    """Fused SDPA over window blocks, mixed head dims included.
+
+    MLX has no fused kernel for mixed head dims (e.g. 192/128) unless it
+    carries the NAX value-head-dim kernel; without one the block attention
+    runs as the JIT NAX kernel on M5 GPUs instead of MLX's unfused fallback.
+    """
+    qk_dim, v_dim = queries.shape[-1], values.shape[-1]
+    if qk_dim != v_dim and not _native_mixed_dims_supported(qk_dim, v_dim):
+        out = nax_mixed_head_dim_attention(
+            queries, keys, values, scale=scale, mask=mask, sinks=sinks
+        )
+        if out is not None:
+            return out
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks
+    )
+
+
 def mixed_head_dim_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -80,11 +103,13 @@ def mixed_head_dim_sdpa(
 ) -> Optional[mx.array]:
     """Fused SDPA for prefill with ``qk_dim > v_dim``; None when not applicable.
 
-    Three exact routes, best first:
+    Four exact routes, best first:
 
     * MLX builds whose fused kernel takes the mixed head dims natively
       (NAX kernel with a separate value head dim) are called directly.
-    * Otherwise, on NAX (M5) GPUs, Q/K/V are zero-padded to 256 so the
+    * Otherwise, on NAX (M5) GPUs, the same NAX kernel runs as an oMLX JIT
+      kernel (``nax_mixed_head_dim_attention``, 192/128 head dims).
+    * Otherwise, on NAX GPUs, Q/K/V are zero-padded to 256 so the
       tensor-unit head-dim-split kernel runs: padded query/key columns add
       exactly zero to every score and padded value columns are sliced away.
       This beats padding V to 192 (which lands on the classic kernel, ~3x
@@ -111,6 +136,11 @@ def mixed_head_dim_sdpa(
             sinks=sinks,
             force_fused=True,
         )
+    out = nax_mixed_head_dim_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks
+    )
+    if out is not None:
+        return out
     if qk_dim in (96, 128, 192) and qk_dim not in (64, 96, 128):
         # No NAX kernel for this width: pad to the 256-wide split kernel.
         width = 256
@@ -304,9 +334,7 @@ def blocked_sliding_window_attention(
         col_start=S - L - used,
         pad_q=pad_q,
     )
-    out = mx.fast.scaled_dot_product_attention(
-        qb, kb, vb, scale=scale, mask=block_mask, sinks=sinks
-    )
+    out = _block_sdpa(qb, kb, vb, scale=scale, mask=block_mask, sinks=sinks)
     # The fused kernel writes [nb, block, H, v_dim] rows, so this regrouping
     # to [1, H, L, v_dim] (and the caller's transpose back) stays a view.
     out = out.transpose(1, 0, 2, 3).reshape(B, H, Lp, v_dim)
