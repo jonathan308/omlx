@@ -15,6 +15,7 @@ from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from mlx_lm.models.mla import MultiLinear
 from omlx.patches import glm53_kda_prework
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
     group_expert_select,
@@ -729,11 +730,15 @@ class Glm5NextSparseAttention(nn.Module):
                     mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
                 )
                 q_latent = q_latent.astype(native_dtype)
-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
                 kv_latent_native = kv_latent.astype(native_dtype)
-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
-                output = None
-                if Kv >= 4096:
+                # Tensor-unit kernel (M5): same fp32 math as the native
+                # kernel, at any context the indexer runs for.
+                output = sparse_mla_attention_nax(
+                    q_latent, kv_latent_native, topk_indices, self.scale
+                )
+                if output is None and Kv >= 4096:
+                    q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
+                    k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
                     output = sparse_mla_attention(
                         q_latent,
                         q_pe,
