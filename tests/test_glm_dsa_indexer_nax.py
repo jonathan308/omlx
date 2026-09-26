@@ -273,3 +273,32 @@ def test_topk_differences_are_threshold_near_ties():
     assert mx.max(ulp).item() <= 1
     same = mx.all(mx.sort(sel_n, axis=-1) == mx.sort(sel_x, axis=-1), axis=-1)
     assert mx.mean(same.astype(mx.float32)).item() > 0.9
+
+
+def test_indexer_without_cache(monkeypatch):
+    """Cache-less prefill (positions from 0) takes the NAX path and selects
+    the same pools as the native path (up to near ties)."""
+    from mlx_vlm.models.glm5_next import language
+
+    indexer = _make_indexer()
+    mx.random.seed(9)
+    x = mx.random.normal((1, 2600, 64)).astype(mx.bfloat16)
+    qr = mx.random.normal((1, 2600, 32)).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
+    expected = indexer(x, qr, None, cache=None, kv_cache=None)
+    calls = []
+    orig = indexer_nax.indexer_scores_nax
+
+    def spy(*args, **kwargs):
+        calls.append(args[3])  # before
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
+    monkeypatch.setattr(language, "indexer_scores_nax", spy)
+    got = indexer(x, qr, None, cache=None, kv_cache=None)
+    assert calls == [0]
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    e = mx.sort(expected[0, 0], axis=-1)
+    g = mx.sort(got[0, 0], axis=-1)
+    rows_equal = mx.all(e == g, axis=-1)
+    assert mx.mean(rows_equal.astype(mx.float32)).item() > 0.97

@@ -436,6 +436,7 @@ class Glm5NextIndexer(nn.Module):
                 valid_cur = mx.ones((B, S), dtype=mx.bool_)
                 total_max = after
         else:
+            before = 0
             before_a = mx.zeros((B,), dtype=mx.int32)
             valid_cur = mx.ones((B, S), dtype=mx.bool_)
             usable = (S // self.index_kpool) * self.index_kpool
