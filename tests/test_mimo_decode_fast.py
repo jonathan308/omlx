@@ -10,6 +10,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 from omlx.patches.mimo_v2 import decode_fast as df
+from omlx.patches.mimo_v2 import moe_decode as md
 
 BF16 = mx.bfloat16
 
@@ -158,7 +159,7 @@ _TINY = {
     "vocab_size": 512,
     "hidden_size": 1024,
     "intermediate_size": 512,
-    "moe_intermediate_size": 128,
+    "moe_intermediate_size": 512,
     "num_hidden_layers": 4,
     "num_attention_heads": 8,
     "num_key_value_heads": 2,
@@ -249,14 +250,20 @@ def _forward(model, tokens, cache, fast, monkeypatch):
 
 
 def _count_fast_runs(monkeypatch):
-    calls = {"n": 0}
+    calls = {"n": 0, "experts": 0}
     orig = df.combine_rms
+    orig_experts = df._experts
 
     def counted(*a, **k):
         calls["n"] += 1
         return orig(*a, **k)
 
+    def counted_experts(*a, **k):
+        calls["experts"] += 1
+        return orig_experts(*a, **k)
+
     monkeypatch.setattr(df, "combine_rms", counted)
+    monkeypatch.setattr(df, "_experts", counted_experts)
     return calls
 
 
@@ -272,9 +279,10 @@ def test_fast_forward_matches_reference(monkeypatch):
         step = tokens[:, pos : pos + L]
         ref_cache, fast_cache = _clone(cache), _clone(cache)
         ref = _forward(model, step, ref_cache, False, monkeypatch)
-        before = calls["n"]
+        before, before_experts = calls["n"], calls["experts"]
         fast = _forward(model, step, fast_cache, True, monkeypatch)
         assert calls["n"] > before, f"fast path did not run at L={L}"
+        assert calls["experts"] > before_experts, f"expert kernels did not run at L={L}"
         assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
         for a, b in zip(ref_cache, fast_cache):
             assert a.offset == b.offset
@@ -353,3 +361,66 @@ def test_fast_path_uses_the_model_modules_sdpa(monkeypatch):
     calls["n"] = 0
     _forward(model, mx.array([[6]]), cache, True, monkeypatch)
     assert calls["n"] == len(model.model.layers)
+
+
+def _mxfp4(e, n, k, seed):
+    mx.random.seed(seed)
+    w = (mx.random.normal((e, n, k)) * 0.05).astype(BF16)
+    wq, sc = mx.quantize(w, group_size=32, bits=4, mode="mxfp4")
+    return wq, sc
+
+
+def _gather(x, w, sc, inds):
+    return mx.gather_qmm(
+        x, w, sc, None, rhs_indices=inds, transpose=True, group_size=32, bits=4, mode="mxfp4"
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 5, 7])
+@pytest.mark.parametrize("layout", ["split", "fused"])
+def test_expert_kernels_match_gather_qmm(rows, layout):
+    """gate/up + SwiGLU and down per (row, expert) pair, bit-exact to MLX's
+    gather_qmv + mlx-lm swiglu; shared experts are computed once."""
+    from mlx_lm.models.activations import swiglu
+
+    E, D, F = 12, 1024, 512
+    g, u, d = _mxfp4(E, F, D, 1), _mxfp4(E, F, D, 2), _mxfp4(E, D, F, 3)
+    rng = np.random.default_rng(rows)
+    inds = mx.array(
+        np.stack([rng.choice(E, 8, replace=False) for _ in range(rows)])[None].astype(np.uint32)
+    )
+    mx.random.seed(rows)
+    x = (mx.random.normal((1, rows, D)) * 2).astype(BF16)
+    xe = mx.expand_dims(x, (-2, -3))
+    ref_act = swiglu(_gather(xe, *g, inds), _gather(xe, *u, inds))
+    ref_y = _gather(ref_act, *d, inds).squeeze(-2)
+    ref_act = ref_act.squeeze(-2)
+    if layout == "fused":
+        gu_w = mx.concatenate([g[0], u[0]], axis=1)
+        gu_s = mx.concatenate([g[1], u[1]], axis=1)
+        act = md.gate_up_swiglu(x, inds, gu_w, gu_s, gu_w, gu_s, n_out=F, up_offset=F)
+    else:
+        act = md.gate_up_swiglu(x, inds, g[0], g[1], u[0], u[1], n_out=F)
+    y = md.down_proj(act, inds, d[0], d[1])
+    assert act.shape == (1, rows, 8, F) and y.shape == (1, rows, 8, D)
+    assert _mismatches(act, ref_act) == 0
+    assert _mismatches(y, ref_y) == 0
+
+
+def test_expert_kind_detects_layouts():
+    model = _tiny_model(seed=8)
+    mlp = model.model.layers[1].mlp
+    assert df._expert_kind(mlp.switch_mlp) == "split"
+    sw = mlp.switch_mlp
+    gate, up = sw.gate_proj, sw.up_proj
+    gate.weight = mx.concatenate([gate.weight, up.weight], axis=1)
+    gate.scales = mx.concatenate([gate.scales, up.scales], axis=1)
+    sw.gate_up_proj = gate
+    del sw.gate_proj
+    del sw.up_proj
+    assert df._expert_kind(sw) == "fused"
+    # Affine-quantized experts: MLX's own gather path.
+    model2 = _tiny_model(seed=9)
+    sw2 = model2.model.layers[1].mlp.switch_mlp
+    sw2.down_proj.mode = "affine"
+    assert df._expert_kind(sw2) is None

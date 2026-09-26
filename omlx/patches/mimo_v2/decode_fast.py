@@ -51,13 +51,17 @@ _SELECT_MAX_EXPERTS = 1024
 _SELECT_MAX_TOPK = 32
 
 
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def enabled() -> bool:
-    return os.environ.get("OMLX_MIMO_DECODE_FAST", "1").strip().lower() not in (
-        "0",
-        "false",
-        "off",
-        "no",
-    )
+    return _env_on("OMLX_MIMO_DECODE_FAST")
+
+
+def experts_enabled() -> bool:
+    """Decode-time MXFP4 expert kernels (``moe_decode``); on by default."""
+    return _env_on("OMLX_MIMO_DECODE_EXPERTS")
 
 
 def _type_name(dtype) -> str:
@@ -658,6 +662,58 @@ def _fuse_qkv(attn) -> Optional[_FusedQKV]:
     return _FusedQKV(weight, scales, biases, q.group_size, q.bits, mode)
 
 
+_SWIGLU_MODULES = ("mlx_lm.models.switch_layers", "omlx.patches.glm_moe_dsa.switch_layers")
+
+
+def _expert_kind(switch_mlp) -> Optional[str]:
+    """``"split"`` / ``"fused"`` when the decode expert kernels reproduce this
+    ``SwitchGLU`` (MXFP4 gs32 experts, SwiGLU activation), else ``None``."""
+    from omlx.patches.mimo_v2 import moe_decode
+
+    act = getattr(switch_mlp, "activation", None)
+    if type(act).__name__ != "SwiGLU" or type(act).__module__ not in _SWIGLU_MODULES:
+        return None
+    down = getattr(switch_mlp, "down_proj", None)
+    if down is None:
+        return None
+    inter = int(down.weight.shape[-1]) * 8
+    hidden = int(down.weight.shape[1])
+    if not moe_decode.supported(down, inter, hidden):
+        return None
+    if "gate_up_proj" in switch_mlp:
+        gu = switch_mlp.gate_up_proj
+        if int(gu.weight.shape[1]) != 2 * inter or not moe_decode.supported(gu, hidden, inter):
+            return None
+        return "fused"
+    gate = getattr(switch_mlp, "gate_proj", None)
+    up = getattr(switch_mlp, "up_proj", None)
+    if gate is None or up is None:
+        return None
+    for p in (gate, up):
+        if int(p.weight.shape[1]) != inter or not moe_decode.supported(p, hidden, inter):
+            return None
+    return "split"
+
+
+def _experts(switch_mlp, kind, x, inds):
+    """Per-(row, expert) down-projected rows, ``(..., top_k, hidden)``."""
+    from omlx.patches.mimo_v2 import moe_decode
+
+    down = switch_mlp.down_proj
+    inter = int(down.weight.shape[-1]) * 8
+    if kind == "fused":
+        gu = switch_mlp.gate_up_proj
+        gw = uw = gu.weight
+        gs = us = gu.scales
+        up_offset = inter
+    else:
+        gw, gs = switch_mlp.gate_proj.weight, switch_mlp.gate_proj.scales
+        uw, us = switch_mlp.up_proj.weight, switch_mlp.up_proj.scales
+        up_offset = 0
+    act = moe_decode.gate_up_swiglu(x, inds, gw, gs, uw, us, n_out=inter, up_offset=up_offset)
+    return moe_decode.down_proj(act, inds, down.weight, down.scales)
+
+
 def _prepare(model) -> bool:
     """One-time per model: fuse q/k/v weights and cache float32 router weights."""
     state = model.__dict__.get("_omlx_decode_fast_state")
@@ -689,6 +745,8 @@ def _prepare(model) -> bool:
             ):
                 ok = False
                 break
+            if "_omlx_experts" not in mlp.__dict__:
+                mlp.__dict__["_omlx_experts"] = _expert_kind(mlp.switch_mlp)
             if gate.__dict__.get("_omlx_gate") is None:
                 bias32 = gate.e_score_correction_bias.astype(mx.float32)
                 mx.eval(bias32)
@@ -700,7 +758,7 @@ def _prepare(model) -> bool:
         ok = False
     model.__dict__["_omlx_decode_fast_state"] = ok
     if ok:
-        logger.info("MiMo decode fast path armed (fused qkv, fused norms, router)")
+        logger.info("MiMo decode fast path armed (fused qkv, fused norms, router, experts)")
     return ok
 
 
@@ -835,6 +893,10 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         inds, scores = router_select(
             logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
         )
-        y = mlp.switch_mlp(xm, inds)
+        kind = mlp.__dict__.get("_omlx_experts")
+        if kind and experts_enabled():
+            y = _experts(mlp.switch_mlp, kind, xm, inds)
+        else:
+            y = mlp.switch_mlp(xm, inds)
         h, x = combine_rms(h, y, scores, nxt.weight, nxt.eps)
     return h, x
