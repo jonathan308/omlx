@@ -285,65 +285,11 @@ _PRE_SOURCE = r"""
 """
 
 
-# One simdgroup per (row, 8-column tile); arithmetic of exact_hc_expand.
-_EXPAND_SOURCE = r"""
-    constexpr uint TILES = D / 8;
-    const uint lane = thread_index_in_simdgroup;
-    const uint flat_tile = threadgroup_position_in_grid.x * SIMDS
-        + simdgroup_index_in_threadgroup;
-    const uint row = flat_tile / TILES;
-    const uint tile = flat_tile - row * TILES;
-    const uint nrows = n_rows[0];
-    if (row >= nrows) {
-        return;
-    }
-
-    const short qid = short(lane / 4);
-    const short matrix_row = (qid & 4) + short((lane / 2) % 4);
-    const short matrix_col = (qid & 2) * 2 + short(lane % 2) * 2;
-
-    float2 a_values = 0.0f;
-    float2 b_values = 0.0f;
-    if (matrix_row < HC) {
-        for (short element = 0; element < 2; ++element) {
-            short source = matrix_col + element;
-            if (source < HC) {
-                a_values[element] = comb[
-                    (size_t)row * HC * HC + source * HC + matrix_row];
-            }
-            b_values[element] = float(residual[
-                (size_t)row * HC * D + matrix_row * D + tile * 8 + matrix_col + element]);
-        }
-    }
-
-    simdgroup_matrix<float, 8, 8> a_matrix;
-    simdgroup_matrix<float, 8, 8> b_matrix;
-    simdgroup_matrix<float, 8, 8> c_matrix;
-    simdgroup_matrix<float, 8, 8> d_matrix;
-    reinterpret_cast<thread float2&>(a_matrix.thread_elements()) = a_values;
-    reinterpret_cast<thread float2&>(b_matrix.thread_elements()) = b_values;
-    reinterpret_cast<thread float2&>(c_matrix.thread_elements()) = float2(0.0f);
-    simdgroup_multiply_accumulate(d_matrix, a_matrix, b_matrix, c_matrix);
-
-    float2 values =
-        reinterpret_cast<thread float2&>(d_matrix.thread_elements());
-    if (matrix_row < HC) {
-        for (short element = 0; element < 2; ++element) {
-            uint column = tile * 8 + matrix_col + element;
-            volatile float product =
-                post[row * HC + matrix_row] * float(branch[(size_t)row * D + column]);
-            values[element] = product + values[element];
-            out[(size_t)row * HC * D + matrix_row * D + column] = T(values[element]);
-        }
-    }
-"""
-
-
 # Row-per-threadgroup expand: A = blockdiag(comb^T, comb^T) so one 8x8 product
 # covers 16 columns (rows 0-3: columns c..c+7, rows 4-7: c+8..c+15).  Each
 # output element sees the same four products as exact_hc_expand plus four
 # exact zero terms, so values are identical (up to the sign of an exact zero).
-_EXPAND2_SOURCE = r"""
+_EXPAND_SOURCE = r"""
     constexpr int TPR = D / 16;
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -517,7 +463,6 @@ def hc_pre(connection, x):
 
 
 _EXPAND_SIMDS = 8
-_EXPAND_V1 = os.environ.get("OMLX_GLM_HC_EXPAND_V1", "0") == "1"
 
 
 def hc_expand(branch, residual, post, comb):
@@ -544,46 +489,24 @@ def hc_expand(branch, residual, post, comb):
         batch, length, width = branch.shape
         hc = residual.shape[2]
         rows = batch * length
-        if _EXPAND_V1:
-            tiles = rows * (width // 8)
-            n_rows = mx.array([rows], dtype=mx.uint32)
-            out = _kernel(
-                "omlx_glm_hc_prefill_expand_v1",
-                ["branch", "residual", "post", "comb", "n_rows"],
-                ["out"],
-                _EXPAND_SOURCE,
-            )(
-                inputs=[branch, residual, post, comb, n_rows],
-                template=[
-                    ("T", branch.dtype),
-                    ("HC", hc),
-                    ("D", width),
-                    ("SIMDS", _EXPAND_SIMDS),
-                ],
-                grid=(32 * ((tiles + _EXPAND_SIMDS - 1) // _EXPAND_SIMDS), _EXPAND_SIMDS, 1),
-                threadgroup=(32, _EXPAND_SIMDS, 1),
-                output_shapes=[residual.shape],
-                output_dtypes=[branch.dtype],
-            )[0]
-        else:
-            out = _kernel(
-                "omlx_glm_hc_prefill_expand",
-                ["branch", "residual", "post", "comb"],
-                ["out"],
-                _EXPAND2_SOURCE,
-            )(
-                inputs=[branch, residual, post, comb],
-                template=[
-                    ("T", branch.dtype),
-                    ("HC", hc),
-                    ("D", width),
-                    ("SIMDS", _EXPAND_SIMDS),
-                ],
-                grid=(32 * rows, _EXPAND_SIMDS, 1),
-                threadgroup=(32, _EXPAND_SIMDS, 1),
-                output_shapes=[residual.shape],
-                output_dtypes=[branch.dtype],
-            )[0]
+        out = _kernel(
+            "omlx_glm_hc_prefill_expand",
+            ["branch", "residual", "post", "comb"],
+            ["out"],
+            _EXPAND_SOURCE,
+        )(
+            inputs=[branch, residual, post, comb],
+            template=[
+                ("T", branch.dtype),
+                ("HC", hc),
+                ("D", width),
+                ("SIMDS", _EXPAND_SIMDS),
+            ],
+            grid=(32 * rows, _EXPAND_SIMDS, 1),
+            threadgroup=(32, _EXPAND_SIMDS, 1),
+            output_shapes=[residual.shape],
+            output_dtypes=[branch.dtype],
+        )[0]
         signature = ("expand", branch.dtype, hc, width)
         if signature not in _VALIDATED:
             mx.eval(out)
