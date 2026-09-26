@@ -24,6 +24,11 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.patches.glm_moe_dsa.indexer_nax import (
+    indexer_scores_nax,
+    max_rows_per_call,
+    nax_indexer_available,
+)
 from .config import ModelConfig, TextConfig
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
@@ -460,8 +465,30 @@ class Glm5NextIndexer(nn.Module):
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
         output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
 
+        # Tensor-unit scores with the causal pool mask folded in, for all
+        # scored rows of the chunk at once (single sequence).
+        before_s = before[0] if isinstance(before, list) and B == 1 else before
+        pool_len_s = (
+            pool_lengths[0]
+            if isinstance(pool_lengths, list) and B == 1
+            else pool_lengths
+        )
+        nax_scores = (
+            B == 1
+            and isinstance(before_s, int)
+            and isinstance(pool_len_s, int)
+            and select_k == 512
+            and self.n_heads == 32
+            and self.head_dim == 128
+            and q.dtype == mx.bfloat16
+            and pool_keys.dtype == mx.bfloat16
+            and nax_indexer_available()
+        )
         tail_rows = S - score_from
-        chunk = 512 if tail_rows > 512 else tail_rows
+        if nax_scores:
+            chunk = min(tail_rows, max_rows_per_call(P))
+        else:
+            chunk = 512 if tail_rows > 512 else tail_rows
         out = []
         for c0 in range(score_from, S, chunk):
             c1 = min(c0 + chunk, S)
@@ -469,25 +496,48 @@ class Glm5NextIndexer(nn.Module):
             q_chunk = q[:, c0:c1]
             weights = linear_forward(self.weights_proj, x[:, c0:c1])
             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
-            index_scores = self._native_scores(q_chunk, pool_keys, weights)
-            if index_scores is None:
-                head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
-                index_scores = mx.sum(
-                    weights[..., None]
-                    * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
-                    axis=2,
-                )
             query_pos = before_a[:, None] + mx.arange(c0, c1)[None]
-            valid_candidates = (
-                pool_idx[None, None] < pool_lengths_a[:, None, None]
-            ) & (pool_end[None, None] <= query_pos[..., None])
-            index_scores = mx.where(valid_candidates, index_scores, -1e30)
+            index_scores = None
+            if nax_scores:
+                index_scores = indexer_scores_nax(
+                    q_chunk[0],
+                    pool_keys[0],
+                    weights[0],
+                    before_s + c0,
+                    pool_len_s,
+                    self.index_kpool,
+                )
+            if index_scores is not None:
+                index_scores = index_scores[None]
+                valid_candidates = None
+            else:
+                index_scores = self._native_scores(q_chunk, pool_keys, weights)
+                if index_scores is None:
+                    head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
+                    index_scores = mx.sum(
+                        weights[..., None]
+                        * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
+                        axis=2,
+                    )
+                valid_candidates = (
+                    pool_idx[None, None] < pool_lengths_a[:, None, None]
+                ) & (pool_end[None, None] <= query_pos[..., None])
+                index_scores = mx.where(valid_candidates, index_scores, -1e30)
             selected = self._native_topk(index_scores, select_k)
             if selected is None:
                 selected = mx.argpartition(-index_scores, kth=select_k - 1, axis=-1)[
                     ..., :select_k
                 ]
-            selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
+            if valid_candidates is None:
+                # Same validity rule as valid_candidates, evaluated only at
+                # the selected pools.
+                selected_valid = (selected < pool_lengths_a[:, None, None]) & (
+                    (selected + 1) * self.index_kpool - 1 <= query_pos[..., None]
+                )
+            else:
+                selected_valid = mx.take_along_axis(
+                    valid_candidates, selected, axis=-1
+                )
             selected_indices = (
                 selected[..., None] * self.index_kpool
                 + mx.arange(self.index_kpool)[None, None, None]
