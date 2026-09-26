@@ -302,3 +302,31 @@ def test_indexer_without_cache(monkeypatch):
     g = mx.sort(got[0, 0], axis=-1)
     rows_equal = mx.all(e == g, axis=-1)
     assert mx.mean(rows_equal.astype(mx.float32)).item() > 0.97
+
+
+def test_nax_indexer_score_from_matches_suffix(monkeypatch):
+    """With the dense-prefix bypass the attention layer scores only the rows
+    from ``score_from`` on; the NAX path must return exactly the suffix of
+    the all-rows selection (rows are scored independently)."""
+    from mlx_vlm.models.glm5_next import language
+
+    indexer = _make_indexer()
+    mx.random.seed(21)
+    x = mx.random.normal((1, 2600, 64)).astype(mx.bfloat16)
+    qr = mx.random.normal((1, 2600, 32)).astype(mx.bfloat16)
+    calls = []
+    orig = indexer_nax.indexer_scores_nax
+
+    def spy(*args, **kwargs):
+        calls.append((args[0].shape[0], args[3]))  # (rows, first row position)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
+    monkeypatch.setattr(language, "indexer_scores_nax", spy)
+    full = indexer(x, qr, None)
+    tail = indexer(x, qr, None, score_from=2051)
+    mx.eval(full, tail)
+    assert calls == [(2600, 0), (549, 2051)]
+    assert tail.shape[:3] == (1, 1, 549)
+    assert mx.array_equal(tail, full[:, :, 2051:]).item()
+    assert indexer(x, qr, None, score_from=2600) is None
