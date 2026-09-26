@@ -599,23 +599,45 @@ def qkv_rope_split(
 class _FusedQKV:
     """Row-concatenated q/k/v quantized weights of one attention module."""
 
-    __slots__ = ("weight", "scales", "biases", "group_size", "bits", "mode")
+    __slots__ = ("weight", "scales", "biases", "group_size", "bits", "mode", "views")
 
-    def __init__(self, weight, scales, biases, group_size, bits, mode):
+    def __init__(self, weight, scales, biases, group_size, bits, mode, views):
         self.weight = weight
         self.scales = scales
         self.biases = biases
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        self.views = views  # the projections' weight arrays (views of `weight`)
+
+    def current(self, attn) -> bool:
+        """Whether the projections still hold the views of this buffer (a
+        later weight load would replace them).  Plain dict lookups: this runs
+        for every layer of every forward."""
+        v = self.views
+        return (
+            attn["q_proj"].get("weight") is v[0]
+            and attn["k_proj"].get("weight") is v[1]
+            and attn["v_proj"].get("weight") is v[2]
+        )
 
 
 class _GateCache:
-    __slots__ = ("bias32", "gemv")
+    __slots__ = ("bias32", "gemv", "source")
 
-    def __init__(self, bias32, gemv):
-        self.bias32 = bias32
-        self.gemv = gemv
+    def __init__(self, gate):
+        n_experts, hidden = gate.weight.shape
+        self.source = gate.e_score_correction_bias
+        self.bias32 = self.source.astype(mx.float32)
+        mx.eval(self.bias32)
+        self.gemv = router_gemv_supported(int(hidden), int(n_experts))
+
+
+def _gate_cache(gate) -> _GateCache:
+    gc = gate.__dict__.get("_omlx_gate")
+    if gc is None or gc.source is not gate.get("e_score_correction_bias"):
+        gc = gate.__dict__["_omlx_gate"] = _GateCache(gate)
+    return gc
 
 
 def _fuse_qkv(attn) -> Optional[_FusedQKV]:
@@ -660,7 +682,9 @@ def _fuse_qkv(attn) -> Optional[_FusedQKV]:
         views.extend(a for a in (p.weight, p.scales, p.get("biases")) if a is not None)
         start += n
     mx.eval(views)
-    return _FusedQKV(weight, scales, biases, q.group_size, q.bits, mode)
+    return _FusedQKV(
+        weight, scales, biases, q.group_size, q.bits, mode, tuple(p.weight for p in projs)
+    )
 
 
 _SWIGLU_MODULES = ("mlx_lm.models.switch_layers", "omlx.patches.glm_moe_dsa.switch_layers")
@@ -671,6 +695,11 @@ def _expert_kind(switch_mlp) -> Optional[str]:
     ``SwitchGLU`` (MXFP4 gs32 experts, SwiGLU activation), else ``None``."""
     from omlx.patches.mimo_v2 import moe_decode
 
+    if (
+        type(switch_mlp).__name__ != "SwitchGLU"
+        or type(switch_mlp).__module__ not in _SWIGLU_MODULES
+    ):
+        return None  # e.g. the expert-offload wrapper
     act = getattr(switch_mlp, "activation", None)
     if type(act).__name__ != "SwiGLU" or type(act).__module__ not in _SWIGLU_MODULES:
         return None
@@ -694,6 +723,22 @@ def _expert_kind(switch_mlp) -> Optional[str]:
         if int(p.weight.shape[1]) != inter or not moe_decode.supported(p, hidden, inter):
             return None
     return "split"
+
+
+def _expert_layout(mlp) -> Optional[str]:
+    """``_expert_kind`` of ``mlp.switch_mlp``, cached against the identity of
+    the modules it was derived from (a later regroup re-derives it)."""
+    sw = mlp["switch_mlp"]
+    get = getattr(sw, "get", None)
+    key = (
+        (id(sw), id(get("gate_up_proj")), id(get("gate_proj")), id(get("up_proj")), id(get("down_proj")))
+        if get is not None
+        else (id(sw),)
+    )
+    cached = mlp.__dict__.get("_omlx_experts")
+    if cached is None or cached[1] != key:
+        cached = mlp.__dict__["_omlx_experts"] = (_expert_kind(sw), key)
+    return cached[0]
 
 
 def _experts(switch_mlp, kind, x, inds):
@@ -747,14 +792,8 @@ def _prepare(model) -> bool:
             ):
                 ok = False
                 break
-            if "_omlx_experts" not in mlp.__dict__:
-                mlp.__dict__["_omlx_experts"] = _expert_kind(mlp.switch_mlp)
-            if gate.__dict__.get("_omlx_gate") is None:
-                bias32 = gate.e_score_correction_bias.astype(mx.float32)
-                mx.eval(bias32)
-                gate.__dict__["_omlx_gate"] = _GateCache(
-                    bias32, router_gemv_supported(int(hidden), int(n_experts))
-                )
+            _expert_layout(mlp)
+            _gate_cache(gate)
     except Exception:  # noqa: BLE001 - never break the reference forward
         logger.warning("MiMo decode fast path disabled", exc_info=True)
         ok = False
@@ -798,6 +837,8 @@ def _sdpa_row_chunks(sdpa, q, k, v, cache, scale, mask, sinks, rows):
 def _attention(attn, x, mask, cache, sdpa, offsets_memo, row_chunks):
     B, L, _ = x.shape
     fused = attn.__dict__.get("_omlx_qkv")
+    if fused and not fused.current(attn):
+        fused = attn.__dict__["_omlx_qkv"] = _fuse_qkv(attn) or False
     offset = cache.offset
     if fused:
         # Full-attention and sliding-window caches share offsets per step:
@@ -933,7 +974,7 @@ def run_layers(model, h, cache, full_mask, swa_mask):
             h, x = add_rms(h, mlp(xm), nxt.weight, nxt.eps)
             continue
         h, xm = add_rms(h, a, post.weight, post.eps)
-        gc = gate.__dict__["_omlx_gate"]
+        gc = _gate_cache(gate)
         if gc.gemv:
             # Each row's logits equal the reference router's M=1 (decode) gemv.
             logits = router_logits(xm, gate.weight)
@@ -942,8 +983,8 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         inds, scores = router_select(
             logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
         )
-        kind = mlp.__dict__.get("_omlx_experts")
-        if kind and use_experts:
+        kind = _expert_layout(mlp) if use_experts else None
+        if kind:
             y = _experts(mlp.switch_mlp, kind, xm, inds)
         else:
             y = mlp.switch_mlp(xm, inds)

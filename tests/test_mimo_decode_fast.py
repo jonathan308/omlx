@@ -585,3 +585,75 @@ def test_fast_forward_gqa16_chunked_sdpa_batch_caches(monkeypatch):
         assert calls["n"] > before_fast, f"fast path did not run at L={L}"
         assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
         batch = fast_cache
+
+
+def test_fast_path_follows_weight_and_module_changes(monkeypatch):
+    """Caches built on the first fast forward (fused q/k/v buffer, float32
+    router bias, expert layout) follow later weight loads and regroups."""
+    m = _mimo()
+    model = _tiny_model(seed=13)
+    _per_row_router(monkeypatch, m)
+    inner = model.model
+    tokens = mx.random.randint(0, 512, (1, 40))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :30], cache, False, monkeypatch)
+
+    def check(step):
+        ref_cache, fast_cache = _clone(cache), _clone(cache)
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        assert _mismatches(ref, fast) == 0
+
+    check(tokens[:, 30:31])  # arms the fast path
+    # 1) new attention weights (e.g. a reload): the stale fused buffer is rebuilt
+    attn = inner.layers[1].self_attn
+    old_fused = attn.__dict__["_omlx_qkv"]
+    attn.q_proj.weight = mx.array(np.array(attn.q_proj.weight)[::-1].copy())
+    check(tokens[:, 31:33])
+    assert attn.__dict__["_omlx_qkv"] is not old_fused
+    # 2) a new router bias
+    gate = inner.layers[1].mlp.gate
+    gate.e_score_correction_bias = gate.e_score_correction_bias + 0.05
+    check(tokens[:, 33:34])
+    assert gate.__dict__["_omlx_gate"].source is gate.e_score_correction_bias
+    # 3) gate/up regrouped into [gate; up] after the fast path armed
+    for layer in inner.layers:
+        sw = getattr(layer.mlp, "switch_mlp", None)
+        if sw is None:
+            continue
+        g, u = sw.gate_proj, sw.up_proj
+        g.weight = mx.concatenate([g.weight, u.weight], axis=1)
+        g.scales = mx.concatenate([g.scales, u.scales], axis=1)
+        sw.gate_up_proj = g
+        del sw.gate_proj
+        del sw.up_proj
+        # the reference forward of the fused layout (split after one gather)
+
+        def call(self, x, indices, scores=None, weighted_sum=False):
+            # per-expert rows (what MoE combines at decode sizes)
+            gu = self.gate_up_proj
+            xe = mx.expand_dims(x, (-2, -3))
+            y = mx.gather_qmm(xe, gu.weight, gu.scales, gu.get("biases"), rhs_indices=indices,
+                              transpose=True, group_size=gu.group_size, bits=gu.bits, mode=gu.mode)
+            xg, xu = mx.split(y, 2, axis=-1)
+            y = self.down_proj(self.activation(xu, xg), indices)
+            return y.squeeze(-2)
+
+        monkeypatch.setattr(type(sw), "__call__", call)
+    check(tokens[:, 34:36])
+    assert inner.layers[1].mlp.__dict__["_omlx_experts"][0] == "fused"
+
+
+def test_expert_kind_rejects_wrapped_switch_modules():
+    """An expert-offload style wrapper keeps a SwiGLU activation but is not a
+    stock SwitchGLU: MLX's own path."""
+    model = _tiny_model(seed=14)
+    sw = model.model.layers[1].mlp.switch_mlp
+
+    class OffloadSwitchGLU(nn.Module):
+        def __init__(self, glu):
+            super().__init__()
+            self.activation = glu.activation
+            self.down_proj = glu.down_proj
+
+    assert df._expert_kind(OffloadSwitchGLU(sw)) is None
