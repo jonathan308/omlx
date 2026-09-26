@@ -568,7 +568,10 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
+# Widen as soon as a full narrow chunk remains after the first one: the wide
+# step only feeds the expert GEMMs more rows per expert, it never waits for
+# the whole 8192 to be available.
+_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + 2048
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one

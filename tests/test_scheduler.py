@@ -4222,13 +4222,19 @@ class TestSchedulerArraysCacheBlockAlignment:
             step = scheduler._prefill_step_size_for_progress
             assert scheduler._qwen4_wide_prefill_step == 8192
             assert step(0, 16384) == 2048
-            # Prompts shorter than one narrow plus one wide chunk stay narrow.
-            assert step(2048, 8191) == 2048
+            # Prompts that fit in two narrow chunks stay narrow.
+            assert step(2048, 2047) == 2048
             if paged:
-                # The block clamp ends each wide request on the 8192 grid.
+                # Once the first narrow chunk is done the rest runs wide; the
+                # block clamp ends each wide request on the 8192 grid.
                 assert scheduler.config.paged_cache_block_size == 8192
+                assert step(2048, 2048) == 8192
+                assert step(2048, 8191) == 8192
                 assert step(2048, 14336) == 8192
             else:
+                # Without the clamp the wide step itself ends on the 8192 grid.
+                assert step(2048, 2048) == 6144
+                assert step(2048, 8191) == 6144
                 assert step(2048, 14336) == 6144
         finally:
             scheduler.shutdown()
