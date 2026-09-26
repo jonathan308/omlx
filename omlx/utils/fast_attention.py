@@ -193,6 +193,21 @@ def _window_block_mask(
     return block_mask
 
 
+def window_query_padding(num_queries: int, *, block: int = 128) -> int:
+    """Rows a caller can append to ``num_queries`` sliding-window queries.
+
+    ``blocked_sliding_window_attention`` runs whole ``block``-query blocks and
+    otherwise pads the queries itself, copying every query head. A caller can
+    instead pad a narrower tensor upstream (e.g. the query projection's input,
+    whose rows the projection and RoPE treat independently) and pass the
+    padded queries with ``query_len=num_queries``. 0 when no padding is needed
+    or the blocked path does not run for this many queries.
+    """
+    if not _ENABLED or num_queries < 2 * block:
+        return 0
+    return (-num_queries) % block
+
+
 def blocked_sliding_window_attention(
     queries: mx.array,
     keys: mx.array,
@@ -203,6 +218,7 @@ def blocked_sliding_window_attention(
     sinks: Optional[mx.array] = None,
     mask=None,
     block: int = 128,
+    query_len: Optional[int] = None,
 ) -> Optional[mx.array]:
     """Causal sliding-window attention computed per query block.
 
@@ -216,11 +232,16 @@ def blocked_sliding_window_attention(
     Returns None when the inputs do not fit this layout (batched inputs,
     short prompts, uneven blocks, additive masks).
 
+    With ``query_len`` set, ``queries`` holds ``L = query_len`` real rows
+    followed by the ``window_query_padding(L)`` padding rows the blocked
+    layout needs (their outputs are dropped), so no query copy is made here.
+
     The query blocks and their overlapping ``block + window`` key spans are
     strided views of one contiguous copy of the key/value rows, so the fused
     kernel reads them in place (no per-block gather or reshape copies).
     """
-    B, H, L, D = queries.shape
+    B, H, Lq, D = queries.shape
+    L = Lq if query_len is None else query_len
     S = keys.shape[2]
     prefix = S - L
     if (
@@ -229,6 +250,7 @@ def blocked_sliding_window_attention(
         or window <= 0
         or prefix < 0
         or L < 2 * block
+        or Lq not in (L, L + (-L) % block)
         or keys.shape[2] != values.shape[2]
     ):
         return None
@@ -241,9 +263,10 @@ def blocked_sliding_window_attention(
         return None
     # Prompt chunks are rarely a multiple of the block (the scheduler keeps the
     # last prompt token for generation, so 4095 is typical): pad the queries
-    # and the corresponding key/value positions and drop the padded rows at
-    # the end. Padded keys sit after every real query position, so the causal
-    # window never lets a real query see them.
+    # (unless the caller already did) and the corresponding key/value
+    # positions and drop the padded rows at the end. Padded keys sit after
+    # every real query position, so the causal window never lets a real query
+    # see them.
     pad_q = (-L) % block
     Lp = L + pad_q
     Hk = keys.shape[1]
@@ -268,7 +291,7 @@ def blocked_sliding_window_attention(
     vb = mx.as_strided(
         v, (nb, Hk, span, v_dim), (block * v_dim, rows * v_dim, v_dim, 1)
     )
-    if pad_q:
+    if Lq != Lp:
         queries = mx.pad(queries, [(0, 0), (0, 0), (0, pad_q), (0, 0)])
     qb = queries.reshape(H, nb, block, D).transpose(1, 0, 2, 3)
 

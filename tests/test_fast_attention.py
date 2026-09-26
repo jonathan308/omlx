@@ -7,6 +7,7 @@ import pytest
 from omlx.utils.fast_attention import (
     blocked_sliding_window_attention,
     mixed_head_dim_sdpa,
+    window_query_padding,
 )
 
 
@@ -243,3 +244,47 @@ def test_blocked_sliding_window_reuses_the_block_mask_per_mask_array():
     assert fast_attention._BLOCK_MASK_CACHE[0][1] is mask_b
     assert mx.allclose(out_b, ref_b, atol=1e-4, rtol=1e-4).item()
     assert not mx.allclose(out_a, out_b, atol=1e-4, rtol=1e-4).item()
+
+
+@pytest.mark.parametrize(
+    "num_queries,expected", [(4095, 1), (8191, 1), (300, 84), (4096, 0), (255, 0), (8, 0)]
+)
+def test_window_query_padding(num_queries, expected):
+    assert window_query_padding(num_queries) == expected
+
+
+def test_window_query_padding_is_zero_when_disabled(monkeypatch):
+    from omlx.utils import fast_attention
+
+    monkeypatch.setattr(fast_attention, "_ENABLED", False)
+    assert window_query_padding(4095) == 0
+
+
+@pytest.mark.parametrize("prefix,L", [(0, 4095), (127, 300), (500, 511), (0, 1024)])
+def test_blocked_sliding_window_uses_caller_padded_queries(prefix, L):
+    """Queries padded upstream give bit-identical rows (no query copy here)."""
+    mx.random.seed(11 + L)
+    H, Hk, window = 8, 2, 128
+    S = prefix + L
+    q = mx.random.normal((1, H, L, 192)).astype(mx.bfloat16)
+    k = mx.random.normal((1, Hk, S, 192)).astype(mx.bfloat16)
+    v = mx.random.normal((1, Hk, S, 128)).astype(mx.bfloat16)
+    sinks = mx.random.normal((H,)).astype(mx.bfloat16)
+    pad = window_query_padding(L)
+    junk = mx.random.normal((1, H, pad, 192)).astype(mx.bfloat16)  # any values
+    qp = mx.concatenate([q, junk], axis=2)
+    kwargs = dict(scale=192**-0.5, window=window, sinks=sinks)
+    ref = blocked_sliding_window_attention(q, k, v, **kwargs)
+    out = blocked_sliding_window_attention(qp, k, v, query_len=L, **kwargs)
+    assert ref is not None and out is not None
+    assert out.shape == (1, H, L, 128)
+    assert mx.array_equal(out, ref).item()
+
+
+def test_blocked_sliding_window_declines_wrong_caller_padding():
+    q = mx.zeros((1, 4, 4095 + 3, 64))
+    k = mx.zeros((1, 2, 4095, 64))
+    assert (
+        blocked_sliding_window_attention(q, k, k, scale=0.125, window=128, query_len=4095)
+        is None
+    )
