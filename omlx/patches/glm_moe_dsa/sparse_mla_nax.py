@@ -10,12 +10,13 @@ This kernel keeps the native kernel's arithmetic -- fp32 scores scaled by
 ``scale * log2(e)``, unused slots excluded, online ``exp2`` softmax in
 fp32, fp32 probabilities times bf16 values accumulated in fp32, one
 division at the end -- but runs both products on the tensor units with
-fp32 accumulation, so only the summation order differs. The PV product
-is a non-relaxed fp32 x bf16 tensor op: with ``relaxed_precision`` the
-tensor unit would round the fp32 probabilities to ~11 significant bits
-(measured), which the native kernel does not do. Its operands use the
-fp32 fragment layout (see ``cb`` below). The bf16 x bf16 QK product is
-exact in either mode.
+fp32 accumulation, so only the summation order differs. The fp32
+probabilities enter the PV product as three bf16 parts (hi + mid + lo ==
+p exactly, 8 + 8 + 8 significant bits), each through an exact bf16 x bf16
+-> fp32 tensor op: a single fp32 operand would need a non-relaxed tensor
+op (half rate, ~10% slower kernel), and with ``relaxed_precision`` the
+tensor unit rounds fp32 operands to ~11 significant bits (measured), which
+the native kernel does not do.
 
 Layout: one threadgroup per (query, 32-head half), 8 simdgroups. Per tile
 of 128 top-k slots, simdgroup ``(hg, kq)`` computes the scores of heads
@@ -69,10 +70,6 @@ _SOURCE = """
     const short qid = short(lane >> 2);
     const short fm = short((qid & 4) | ((lane >> 1) & 3));
     const short fn = short(((qid & 2) | (lane & 1)) * 4);
-    // fp32-operand layout of the PV product (relaxed_precision = false):
-    // left element i*4 + j -> row fm + 8i, col cb + {0, 1, 8, 9}[j];
-    // right/destination element i*8 + t*2 + u -> row fm + 8i, col cb + 8t + u.
-    const short cb = short(((qid & 2) | (lane & 1)) * 2);
 
     threadgroup float s_tile[2 * 16 * BK];
     threadgroup int sel[2][BK];
@@ -82,16 +79,18 @@ _SOURCE = """
         16, 32, 16, false, true, true,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, execution_simdgroup> qk_op;
-    // relaxed_precision must stay false here: with it the tensor unit rounds
-    // the fp32 probabilities to ~11 significant bits (the native kernel keeps
-    // them in fp32). bf16 x bf16 products are exact either way.
+    // PV: the fp32 probabilities enter as three bf16 parts (hi + mid + lo
+    // == p exactly: 8 + 8 + 8 significant bits), each multiplied with the
+    // bf16 values by an exact bf16 x bf16 -> fp32 tensor op.
     constexpr auto pv_desc = matmul2d_descriptor(
-        16, 32, 16, false, false, false,
+        16, 32, 16, false, false, true,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<pv_desc, execution_simdgroup> pv_op;
 
-    auto pa = pv_op.template get_left_input_cooperative_tensor<float, T, float>();
-    auto pb = pv_op.template get_right_input_cooperative_tensor<float, T, float>();
+    auto pa = pv_op.template get_left_input_cooperative_tensor<bfloat, T, float>();
+    auto pm = pv_op.template get_left_input_cooperative_tensor<bfloat, T, float>();
+    auto pl = pv_op.template get_left_input_cooperative_tensor<bfloat, T, float>();
+    auto pb = pv_op.template get_right_input_cooperative_tensor<bfloat, T, float>();
     auto o0 = pv_op.template get_destination_cooperative_tensor<
         metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
     auto o1 = pv_op.template get_destination_cooperative_tensor<
@@ -178,14 +177,14 @@ _SOURCE = """
 
         const threadgroup float* st = s_tile + hg * 16 * BK;
         const int n_ks = (tile_keys + 15) / 16;
-        const short c4[4] = {0, 1, 8, 9};
         float rmax[2] = {m_run[0], m_run[1]};
         for (short ks = 0; ks < n_ks; ++ks) {
-            for (short j = 0; j < 4; ++j) {
-                const int key = ks * 16 + cb + c4[j];
-                if (sel[buf][key] >= 0) {
-                    for (short i = 0; i < 2; ++i) {
-                        rmax[i] = max(rmax[i], st[(fm + i * 8) * BK + key] * scale_log2);
+            const int key0 = ks * 16 + fn;
+            for (short i = 0; i < 2; ++i) {
+                const int r = fm + i * 8;
+                for (short j = 0; j < 4; ++j) {
+                    if (sel[buf][key0 + j] >= 0) {
+                        rmax[i] = max(rmax[i], st[r * BK + key0 + j] * scale_log2);
                     }
                 }
             }
@@ -199,43 +198,56 @@ _SOURCE = """
             m_run[i] = rmax[i];
         }
         for (short e = 0; e < 16; ++e) {
-            const float f = factor[e >> 3];
+            const float f = factor[(e >> 2) & 1];
             o0[e] *= f;
             o1[e] *= f;
             o2[e] *= f;
             o3[e] *= f;
         }
         for (short ks = 0; ks < n_ks; ++ks) {
+            const int key0 = ks * 16 + fn;
             for (short i = 0; i < 2; ++i) {
                 const int r = fm + i * 8;
                 for (short j = 0; j < 4; ++j) {
-                    const int key = ks * 16 + cb + c4[j];
-                    const float e = sel[buf][key] < 0
+                    const float e = sel[buf][key0 + j] < 0
                         ? 0.0f
-                        : fast::exp2(st[r * BK + key] * scale_log2 - rmax[i]);
-                    pa[i * 4 + j] = e;
+                        : fast::exp2(st[r * BK + key0 + j] * scale_log2 - rmax[i]);
+                    const bfloat hi = bfloat(e);
+                    const float r1 = e - float(hi);
+                    const bfloat mid = bfloat(r1);
+                    pa[i * 4 + j] = hi;
+                    pm[i * 4 + j] = mid;
+                    pl[i * 4 + j] = bfloat(r1 - float(mid));
                     rsum[i] += e;
                 }
             }
             const int kp0 = sel[buf][ks * 16 + fm];
             const int kp1 = sel[buf][ks * 16 + fm + 8];
-            const device T* v0 = kv + ulong(max(kp0, 0)) * D + dq * 128 + cb;
-            const device T* v1 = kv + ulong(max(kp1, 0)) * D + dq * 128 + cb;
+            const device T* v0 = kv + ulong(max(kp0, 0)) * D + dq * 128 + fn;
+            const device T* v1 = kv + ulong(max(kp1, 0)) * D + dq * 128 + fn;
             for (short np = 0; np < 4; ++np) {
-                for (short t = 0; t < 4; ++t) {
-                    for (short u = 0; u < 2; ++u) {
-                        pb[t * 2 + u] = v0[np * 32 + t * 8 + u];
-                        pb[8 + t * 2 + u] = v1[np * 32 + t * 8 + u];
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short j = 0; j < 4; ++j) {
+                        pb[tn * 8 + j] = v0[np * 32 + tn * 16 + j];
+                        pb[tn * 8 + 4 + j] = v1[np * 32 + tn * 16 + j];
                     }
                 }
                 if (np == 0) {
                     pv_op.run(pa, pb, o0);
+                    pv_op.run(pm, pb, o0);
+                    pv_op.run(pl, pb, o0);
                 } else if (np == 1) {
                     pv_op.run(pa, pb, o1);
+                    pv_op.run(pm, pb, o1);
+                    pv_op.run(pl, pb, o1);
                 } else if (np == 2) {
                     pv_op.run(pa, pb, o2);
+                    pv_op.run(pm, pb, o2);
+                    pv_op.run(pl, pb, o2);
                 } else {
                     pv_op.run(pa, pb, o3);
+                    pv_op.run(pm, pb, o3);
+                    pv_op.run(pl, pb, o3);
                 }
             }
         }
@@ -247,15 +259,15 @@ _SOURCE = """
     }
 
     for (short i = 0; i < 2; ++i) {
-        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + dq * 128 + cb;
+        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + dq * 128 + fn;
         const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
-        for (short t = 0; t < 4; ++t) {
-            for (short u = 0; u < 2; ++u) {
-                const short e = i * 8 + t * 2 + u;
-                orow[t * 8 + u] = T(o0[e] / denom);
-                orow[32 + t * 8 + u] = T(o1[e] / denom);
-                orow[64 + t * 8 + u] = T(o2[e] / denom);
-                orow[96 + t * 8 + u] = T(o3[e] / denom);
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const short e = tn * 8 + i * 4 + j;
+                orow[tn * 16 + j] = T(o0[e] / denom);
+                orow[32 + tn * 16 + j] = T(o1[e] / denom);
+                orow[64 + tn * 16 + j] = T(o2[e] / denom);
+                orow[96 + tn * 16 + j] = T(o3[e] / denom);
             }
         }
     }
