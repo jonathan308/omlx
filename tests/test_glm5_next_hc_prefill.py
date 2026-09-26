@@ -135,6 +135,24 @@ def test_fused_pre_batch_rows_match_single_requests():
             assert mx.array_equal(a[i : i + 1], b)
 
 
+@pytest.mark.parametrize("rows, threads", [(8, 1024), (32, 1024), (16, 512), (8, 256)])
+def test_fused_pre_does_not_depend_on_tile_shape(monkeypatch, rows, threads):
+    """The reduction order is fixed, so any tile height / thread count gives
+    the same bits as the default configuration."""
+    _, hc_prefill, _ = _modules()
+    connection = _connection()
+    x = _stream(203)
+    default = hc_prefill.hc_pre(connection, x)
+    mx.eval(default)
+    monkeypatch.setattr(hc_prefill, "_ROWS", rows)
+    monkeypatch.setattr(hc_prefill, "_THREADS", threads)
+    other = hc_prefill.hc_pre(connection, x)
+    assert other is not None
+    mx.eval(other)
+    for a, b in zip(default, other):
+        assert mx.array_equal(a, b)
+
+
 @pytest.mark.parametrize("length", [64, 37])
 def test_fused_expand_matches_exact_short_block_kernel(length):
     from mlx_vlm.models.fast_ops import exact_hc_expand

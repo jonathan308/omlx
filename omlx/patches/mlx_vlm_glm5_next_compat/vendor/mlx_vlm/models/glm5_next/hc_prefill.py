@@ -10,14 +10,15 @@ kernel; ``hc_expand`` casts the residual to fp32, runs a batched
 MLX's NAX path on M5-class GPUs, which runs fp32 inputs at TF32 precision
 unless ``MLX_ENABLE_TF32=0``.
 
-``hc_pre`` does one pass per 8-row tile:
+``hc_pre`` runs one threadgroup per 16-row tile:
 
 - the fp32 sum of squares in MLX ``rms_looped``'s exact reduction order
-  (1024 threads, 4 reads each, ``simd_sum`` then a 32-way ``simd_sum``), so the
+  (1024 lanes, 4 reads each, ``simd_sum`` then a 32-way ``simd_sum``), so the
   inverse RMS and ``z = x * inv`` are bit-identical to ``mx.fast.rms_norm``;
 - the 24 mix dot products in full fp32 on 8x8 simdgroup matrices, with a fixed
-  K split (32 simdgroups x 512) and a fixed sequential sum of the partials, so
-  a row's result does not depend on the chunk length or its offset;
+  K split (32 slices x 512) and a fixed sequential sum of the partials, so a
+  row's result does not depend on the chunk length, its offset or the tile
+  shape;
 - sinkhorn and collapse transcribed from mlx-vlm's ``hc_sinkhorn_collapse``.
 
 ``hc_expand`` computes ``post * branch + comb^T @ residual`` with the
@@ -45,9 +46,12 @@ _DISABLED = os.environ.get("OMLX_GLM_HC_PREFILL", "1").strip().lower() in {
     "no",
     "off",
 }
-# Rows per threadgroup for the mix kernel (one 8-row simdgroup-matrix tile).
-_ROWS = 8
-# Threads per mix threadgroup.  1024 reproduces rms_looped's reduction order.
+# Rows per pre threadgroup (a multiple of 8, at most 32).  Every threadgroup
+# reads the whole [16384, 24] fp32 mix weight, so taller tiles cut that
+# traffic; 16 rows measured fastest on M5 Ultra at 2047-4096-row chunks.
+_ROWS = 16
+# Threads per pre threadgroup (256, 512 or 1024).  Fewer threads emulate the
+# 1024 reduction lanes, so results are identical for any _ROWS/_THREADS.
 _THREADS = 1024
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
@@ -59,12 +63,22 @@ _HEADER = r"""
 """
 
 # x: [rows, HC*D] bf16, fnT: [HC*D, MIX] fp32 (the transposed mix weight).
+# NT threads emulate rms_looped's 1024 lanes (VPER virtual simdgroups each);
+# RM rows per threadgroup in RT 8-row simdgroup-matrix tiles.
 _PRE_SOURCE = r"""
     constexpr int K = HC * D;
     constexpr int MIX = (2 + HC) * HC;
     constexpr int BASE_OFF = 2 * HC;
     constexpr int NSG = NT / 32;
-    constexpr int KS = K / NSG;
+    constexpr int VSG = 32;
+    constexpr int VPER = VSG / NSG;
+    constexpr int NSLICES = 32;
+    constexpr int SLICE = K / NSLICES;
+    constexpr int SPS = NSLICES / NSG;
+    constexpr int RT = RM / 8;
+    // Partial buffers per reduction round (<= 24 KB of threadgroup memory).
+    constexpr int PB = (RM * MIX * 4 * NSLICES <= 24576) ? NSLICES
+        : ((RM * MIX * 4 * 16 <= 24576) ? 16 : 8);
     constexpr float EPS = EPS_INT * 1e-9;
 
     const uint tid = thread_position_in_threadgroup.x;
@@ -73,84 +87,123 @@ _PRE_SOURCE = r"""
     const int row0 = int(threadgroup_position_in_grid.x) * RM;
     const int nrows = int(n_rows[0]);
 
-    threadgroup float lsum[RM][32];
+    threadgroup float lsum[RM][VSG];
     threadgroup float inv_sh[RM];
-    threadgroup float part[NSG][RM][MIX];
+    threadgroup float part[PB][RM][MIX];
     threadgroup float mix_sh[RM][MIX];
     threadgroup float pre_sh[RM][HC];
 
-    // Pass 1: sum of squares in rms_looped order (lsize = NT = 1024, 4 reads).
-    float acc[RM];
+    // Pass 1: sum of squares in rms_looped order (1024 lanes x 4 reads, a
+    // simd_sum per 32 lanes, then a simd_sum over the 32 partials).
     for (int m = 0; m < RM; ++m) {
-        acc[m] = 0.0f;
-        if (row0 + m < nrows) {
-            const device T* xr = x + (size_t)(row0 + m) * K + tid * 4;
-            for (int r = 0; r < K; r += NT * 4) {
-                for (int i = 0; i < 4; ++i) {
-                    float xi = float(xr[r + i]);
-                    acc[m] += xi * xi;
+        if (row0 + m >= nrows) break;
+        const device T* xr = x + (size_t)(row0 + m) * K;
+        for (int i = 0; i < VPER; ++i) {
+            const int vlid = (int(sg) + NSG * i) * 32 + int(lane);
+            float acc = 0.0f;
+            for (int r = 0; r < K; r += 4096) {
+                for (int e = 0; e < 4; ++e) {
+                    float xi = float(xr[r + vlid * 4 + e]);
+                    acc += xi * xi;
                 }
             }
+            float s = simd_sum(acc);
+            if (lane == 0) lsum[m][int(sg) + NSG * i] = s;
         }
     }
-    for (int m = 0; m < RM; ++m) {
-        float s = simd_sum(acc[m]);
-        if (lane == 0) lsum[m][sg] = s;
-    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg < (uint)RM) {
-        float s = simd_sum(lsum[sg][lane]);
-        if (lane == 0) inv_sh[sg] = metal::precise::rsqrt(s / float(K) + norm_eps[0]);
+    for (int m = int(sg); m < RM; m += NSG) {
+        if (row0 + m >= nrows) break;
+        float s = simd_sum(lsum[m][lane]);
+        if (lane == 0) inv_sh[m] = metal::precise::rsqrt(s / float(K) + norm_eps[0]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Pass 2: mixes = (x * inv) @ fnT on 8x8 fp32 simdgroup matrices.
+    // Pass 2: mixes = (x * inv) @ fnT on 8x8 fp32 simdgroup matrices over 32
+    // fixed 512-wide K slices (slice q on simdgroup q % NSG), then a
+    // sequential sum of the 32 slice partials, independent of NT and RM.
     const short qid = short(lane / 4);
     const short fm = (qid & 4) + short((lane / 2) % 4);
     const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
-    const bool row_ok = row0 + fm < nrows;
-    const float inv_r = inv_sh[fm];
-    const device T* xa = x + (size_t)(row_ok ? row0 + fm : row0) * K + fn;
+    bool row_ok[RT];
+    float inv_r[RT];
+    const device T* xa[RT];
+    for (int t = 0; t < RT; ++t) {
+        const int row = row0 + t * 8 + fm;
+        row_ok[t] = row < nrows;
+        inv_r[t] = row_ok[t] ? inv_sh[t * 8 + fm] : 0.0f;
+        xa[t] = x + (size_t)(row_ok[t] ? row : row0) * K + fn;
+    }
     const device float* fb = fnT + fm * MIX + fn;
 
+    using T2 = vec<T, 2>;
     simdgroup_matrix<float, 8, 8> A;
     simdgroup_matrix<float, 8, 8> B0, B1, B2;
-    simdgroup_matrix<float, 8, 8> C0 = simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> C1 = simdgroup_matrix<float, 8, 8>(0.0f);
-    simdgroup_matrix<float, 8, 8> C2 = simdgroup_matrix<float, 8, 8>(0.0f);
-    const int kbeg = int(sg) * KS;
-    for (int k0 = kbeg; k0 < kbeg + KS; k0 += 8) {
-        float2 a = float2(0.0f);
-        if (row_ok) {
-            a.x = float(xa[k0]) * inv_r;
-            a.y = float(xa[k0 + 1]) * inv_r;
+    simdgroup_matrix<float, 8, 8> C[SPS][RT][3];
+    for (int q = 0; q < SPS; ++q) {
+        for (int t = 0; t < RT; ++t) {
+            for (int j = 0; j < 3; ++j) C[q][t][j] = simdgroup_matrix<float, 8, 8>(0.0f);
         }
-        const device float* fk = fb + k0 * MIX;
-        reinterpret_cast<thread float2&>(A.thread_elements()) = a;
-        reinterpret_cast<thread float2&>(B0.thread_elements()) = float2(fk[0], fk[1]);
-        reinterpret_cast<thread float2&>(B1.thread_elements()) = float2(fk[8], fk[9]);
-        reinterpret_cast<thread float2&>(B2.thread_elements()) = float2(fk[16], fk[17]);
-        simdgroup_multiply_accumulate(C0, A, B0, C0);
-        simdgroup_multiply_accumulate(C1, A, B1, C1);
-        simdgroup_multiply_accumulate(C2, A, B2, C2);
+        const int kbeg = (int(sg) + NSG * q) * SLICE;
+        for (int k0 = kbeg; k0 < kbeg + SLICE; k0 += 8) {
+            const device float* fk = fb + k0 * MIX;
+            reinterpret_cast<thread float2&>(B0.thread_elements()) = *(const device float2*)(fk);
+            reinterpret_cast<thread float2&>(B1.thread_elements()) = *(const device float2*)(fk + 8);
+            reinterpret_cast<thread float2&>(B2.thread_elements()) = *(const device float2*)(fk + 16);
+            for (int t = 0; t < RT; ++t) {
+                float2 a = float2(*(const device T2*)(xa[t] + k0));
+                a.x = row_ok[t] ? a.x * inv_r[t] : 0.0f;
+                a.y = row_ok[t] ? a.y * inv_r[t] : 0.0f;
+                reinterpret_cast<thread float2&>(A.thread_elements()) = a;
+                simdgroup_multiply_accumulate(C[q][t][0], A, B0, C[q][t][0]);
+                simdgroup_multiply_accumulate(C[q][t][1], A, B1, C[q][t][1]);
+                simdgroup_multiply_accumulate(C[q][t][2], A, B2, C[q][t][2]);
+            }
+        }
     }
-    simdgroup_store(C0, &part[sg][0][0], MIX);
-    simdgroup_store(C1, &part[sg][0][8], MIX);
-    simdgroup_store(C2, &part[sg][0][16], MIX);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint o = tid; o < (uint)(RM * MIX); o += NT) {
-        const uint m = o / MIX;
-        const uint j = o - m * MIX;
-        float s = part[0][m][j];
-        for (int g = 1; g < NSG; ++g) s += part[g][m][j];
-        mix_sh[m][j] = s;
+    constexpr int OUT_PER = (RM * MIX + NT - 1) / NT;
+    float msum[OUT_PER];
+    for (int round = 0; round < NSLICES / PB; ++round) {
+        for (int q = 0; q < SPS; ++q) {
+            const int slice = int(sg) + NSG * q;
+            if (slice / PB != round) continue;
+            const int b = slice - round * PB;
+            for (int t = 0; t < RT; ++t) {
+                simdgroup_store(C[q][t][0], &part[b][t * 8][0], MIX);
+                simdgroup_store(C[q][t][1], &part[b][t * 8][8], MIX);
+                simdgroup_store(C[q][t][2], &part[b][t * 8][16], MIX);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = 0; i < OUT_PER; ++i) {
+            const uint o = tid + uint(i) * NT;
+            if (o < (uint)(RM * MIX)) {
+                const uint m = o / MIX;
+                const uint j = o - m * MIX;
+                int b = 0;
+                if (round == 0) {
+                    msum[i] = part[0][m][j];
+                    b = 1;
+                }
+                for (; b < PB; ++b) msum[i] += part[b][m][j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < OUT_PER; ++i) {
+        const uint o = tid + uint(i) * NT;
+        if (o < (uint)(RM * MIX)) {
+            const uint m = o / MIX;
+            mix_sh[m][o - m * MIX] = msum[i];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Sinkhorn: simdgroup m owns row m (mlx-vlm hc_sinkhorn_collapse phase 1).
-    if (sg < (uint)RM && row0 + int(sg) < nrows) {
-        const int row = row0 + int(sg);
-        const threadgroup float* mix = mix_sh[sg];
+    // Sinkhorn: one simdgroup per row (mlx-vlm hc_sinkhorn_collapse phase 1).
+    for (int m = int(sg); m < RM; m += NSG) {
+        const int row = row0 + m;
+        if (row >= nrows) break;
+        const threadgroup float* mix = mix_sh[m];
         device float* post_out = post + (size_t)row * HC;
         device float* comb_out = comb + (size_t)row * HC * HC;
         const float pre_scale  = scale[0];
@@ -166,8 +219,8 @@ _PRE_SOURCE = r"""
         float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
 
         if (lane < (uint)HC) {
-            pre_sh[sg][lane] = pre_v;
-            post_out[lane]   = post_v;
+            pre_sh[m][lane] = pre_v;
+            post_out[lane]  = post_v;
         }
 
         float4 v = (*(const threadgroup float4*)(mix + BASE_OFF + llane * HC)
@@ -386,7 +439,7 @@ def pre_compatible(connection, x) -> bool:
         and getattr(connection, "hc_mult", None) == 4
         and x.shape[2] == 4
         and x.shape[3] % 8 == 0
-        and (x.shape[2] * x.shape[3]) % (_THREADS * 4) == 0
+        and (x.shape[2] * x.shape[3]) % 4096 == 0
         and isinstance(getattr(connection, "fn", None), mx.array)
         and connection.fn.shape == (24, x.shape[2] * x.shape[3])
         and connection.fn.dtype == mx.float32
@@ -447,7 +500,9 @@ def hc_pre(connection, x):
             output_shapes=[(rows, width), (rows, hc), (rows, hc, hc)],
             output_dtypes=[x.dtype, mx.float32, mx.float32],
         )
-        signature = ("pre", x.dtype, hc, width, connection.sinkhorn_iters, eps_int)
+        signature = (
+            "pre", x.dtype, hc, width, connection.sinkhorn_iters, eps_int, _ROWS, _THREADS
+        )
         if signature not in _VALIDATED:
             mx.eval(collapsed, post, comb)
             _VALIDATED.add(signature)
