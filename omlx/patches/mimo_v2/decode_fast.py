@@ -1,0 +1,706 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MiMo V2 decode and short-verify forward (a few tokens per step).
+
+A decode step of MiMo-V2.6-Flash dispatches ~2.8k kernels, most of them
+small element-wise ops between the weight-streaming mat-vecs.  This module
+runs the same math for forwards of at most ``MAX_ROWS`` token rows with
+fewer dispatches:
+
+* q/k/v projections: one quantized mat-vec over the row-concatenated q, k
+  and v weights (the separate projections become views into that buffer,
+  so no weight memory is duplicated).  Each output row is the same
+  quantized dot product as before.
+* one kernel splits q/k/v, applies the partial RoPE to q and k and the
+  value scale to v (MLX's rope / multiply arithmetic, element for element).
+* one kernel for residual add + RMSNorm (+ the float32 router input), one
+  for the router's sigmoid / bias / top-k / normalisation, and one for the
+  expert combine + residual + the next layer's RMSNorm.  The RMSNorm
+  kernels reproduce ``mx.fast.rms_norm``'s reduction tree and the combine
+  sums the experts in MLX's order, so outputs are bit-identical to the
+  reference layer (verified by tests against the unfused ops).
+
+Everything else (KV cache updates, attention, expert mat-vecs, lm_head) is
+the reference code.  Forwards the fast path does not cover fall back to the
+reference layer loop.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import logging
+import os
+import sys
+from functools import lru_cache
+from typing import Any, Optional
+
+import mlx.core as mx
+
+logger = logging.getLogger(__name__)
+
+# Token rows (batch x length) the fast path handles.  Keeps the fused qkv
+# projection in MLX's mat-vec regime (qmv / qmv_wide), where every output row
+# is computed independently of the output width.
+MAX_ROWS = 8
+_RMS_MAX_AXIS = 4096  # mx.fast.rms_norm's single-row kernel limit
+_SELECT_MAX_EXPERTS = 1024
+_SELECT_MAX_TOPK = 32
+
+
+def enabled() -> bool:
+    return os.environ.get("OMLX_MIMO_DECODE_FAST", "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+def _type_name(dtype) -> str:
+    if dtype == mx.bfloat16:
+        return "bfloat16_t"
+    if dtype == mx.float16:
+        return "float16_t"
+    if dtype == mx.float32:
+        return "float"
+    raise ValueError(f"unsupported dtype {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm reduction (transcribed from MLX rms_norm.metal ``rms_single_row``:
+# RMS_N_READS = 4 values per thread, simd_sum, one threadgroup per row).
+# ---------------------------------------------------------------------------
+
+_RMS_TAIL = r"""
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+
+_ADD_RMS_SOURCE = r"""
+  constexpr int N_READS = 4;
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  uint gid = threadgroup_position_in_grid.x;
+  uint lid = thread_position_in_threadgroup.x;
+  uint simd_lane_id = thread_index_in_simdgroup;
+  uint simd_group_id = simdgroup_index_in_threadgroup;
+  const uint axis_size = AXIS;
+  const float eps = static_cast<float>(eps_in[0]);
+  size_t base = size_t(gid) * axis_size + lid * N_READS;
+
+  float acc = 0;
+  float thread_x[N_READS];
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      T hv = x[base + i] + y[base + i];
+      h_out[base + i] = hv;
+      thread_x[i] = hv;
+    } else {
+      thread_x[i] = 0;
+    }
+    acc += thread_x[i] * thread_x[i];
+  }
+""" + _RMS_TAIL + r"""
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      T nv = w[lid * N_READS + i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+      n_out[base + i] = nv;
+      F32_STORE
+    }
+  }
+"""
+
+# Expert combine + residual + RMSNorm.  The reference is
+#   y = (y * scores[..., None]).sum(axis=-2).astype(T); h = h + y
+# i.e. float32 products (each rounded) summed k = 0, 1, ... (MLX
+# col_reduce_small keeps one partial per expert row and folds them in row
+# order), rounded to T once, then a T add.
+_COMBINE_RMS_SOURCE = r"""
+  constexpr int N_READS = 4;
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  uint gid = threadgroup_position_in_grid.x;
+  uint lid = thread_position_in_threadgroup.x;
+  uint simd_lane_id = thread_index_in_simdgroup;
+  uint simd_group_id = simdgroup_index_in_threadgroup;
+  const uint axis_size = AXIS;
+  const float eps = static_cast<float>(eps_in[0]);
+  size_t base = size_t(gid) * axis_size + lid * N_READS;
+  size_t ybase = size_t(gid) * TOPK * axis_size + lid * N_READS;
+
+  float acc = 0;
+  float thread_x[N_READS];
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      float total = 0;
+      for (int k = 0; k < TOPK; k++) {
+        float p = static_cast<float>(y[ybase + size_t(k) * axis_size + i]) *
+            scores[gid * TOPK + k];
+        total = p + total;
+      }
+      T yv = static_cast<T>(total);
+      T hv = h[base + i] + yv;
+      h_out[base + i] = hv;
+      thread_x[i] = hv;
+    } else {
+      thread_x[i] = 0;
+    }
+    acc += thread_x[i] * thread_x[i];
+  }
+""" + _RMS_TAIL + r"""
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + i < axis_size) {
+      n_out[base + i] =
+          w[lid * N_READS + i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+    }
+  }
+"""
+
+# Router: sigmoid, + correction bias, top-k by biased score (descending,
+# lower expert id first on exact ties, like MLX's stable sort behind
+# argpartition), gather the unbiased scores, normalise, scale.
+_SELECT_SOURCE = r"""
+  threadgroup float biased[NE];
+  threadgroup float picked[TOPK];
+  uint row = threadgroup_position_in_grid.x;
+  uint e = thread_position_in_threadgroup.x;
+  float g = logits[size_t(row) * NE + e];
+  float y = 1 / (1 + metal::exp(metal::abs(g)));
+  float sig = (g < 0) ? y : 1 - y;
+  float b = sig + bias[e];
+  biased[e] = b;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint rank = 0;
+  for (uint j = 0; j < NE; j++) {
+    float o = biased[j];
+    rank += (o > b || (o == b && j < e)) ? 1 : 0;
+  }
+  if (rank < TOPK) {
+    inds[size_t(row) * TOPK + rank] = e;
+    picked[rank] = sig;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (e < TOPK) {
+    float s = picked[e];
+    if (NORM) {
+      float total = 0;
+      for (int k = 0; k < TOPK; k++) {
+        total = picked[k] + total;
+      }
+      s = s / (total + 1e-20f);
+    }
+    scores[size_t(row) * TOPK + e] = s * rsf[0];
+  }
+"""
+
+# q/k/v split + partial RoPE (MLX rope.metal, non-traditional, forward) +
+# value scale.  grid: x = lane (head_dim / 2), y = head (q heads, k heads,
+# v heads), z = token row (b * L + t).
+_ROPE_SPLIT_SOURCE = r"""
+  uint lane = thread_position_in_grid.x;
+  uint head = thread_position_in_grid.y;
+  uint row = thread_position_in_grid.z;
+  uint b = row / SEQ;
+  uint t = row % SEQ;
+  const device T* src = qkv + size_t(row) * NTOT;
+  if (head < NQ + NKV) {
+    bool is_q = head < NQ;
+    uint hh = is_q ? head : head - NQ;
+    const device T* in = src + (is_q ? 0 : NQ * HD) + hh * HD;
+    device T* out = is_q
+        ? q_out + ((size_t(b) * NQ + hh) * SEQ + t) * HD
+        : k_out + ((size_t(b) * NKV + hh) * SEQ + t) * HD;
+    if (lane < HALF) {
+      float d = static_cast<float>(lane) / static_cast<float>(HALF);
+      float inv_freq = metal::exp2(-d * base_log2[0]);
+      // uint + int like MLX's rope kernel (pos.y + batch_offset).
+      float L = rope_scale[0] * static_cast<float>(t + offsets[b * OFF_STRIDE]);
+      float theta = L * inv_freq;
+      float costheta = metal::fast::cos(theta);
+      float sintheta = metal::fast::sin(theta);
+      float x1 = static_cast<float>(in[lane]);
+      float x2 = static_cast<float>(in[lane + HALF]);
+      float rx1 = x1 * costheta - x2 * sintheta;
+      float rx2 = x1 * sintheta + x2 * costheta;
+      out[lane] = static_cast<T>(rx1);
+      out[lane + HALF] = static_cast<T>(rx2);
+    } else {
+      uint c = 2 * HALF + 2 * (lane - HALF);
+      if (c < HD) {
+        out[c] = in[c];
+        out[c + 1] = in[c + 1];
+      }
+    }
+  } else {
+    uint hh = head - NQ - NKV;
+    uint c = 2 * lane;
+    if (c < VD) {
+      const device T* in = src + (NQ + NKV) * HD + hh * VD;
+      device T* out = v_out + ((size_t(b) * NKV + hh) * SEQ + t) * VD;
+      if (HAS_VSCALE) {
+        T vs = vscale[0];
+        out[c] = in[c] * vs;
+        out[c + 1] = in[c + 1] * vs;
+      } else {
+        out[c] = in[c];
+        out[c + 1] = in[c + 1];
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _add_rms_kernel(want_f32: bool):
+    return mx.fast.metal_kernel(
+        name="omlx_mimo_add_rms" + ("_f32" if want_f32 else ""),
+        input_names=["x", "y", "w", "eps_in"],
+        output_names=["h_out", "n_out", "f_out"] if want_f32 else ["h_out", "n_out"],
+        source=_ADD_RMS_SOURCE.replace(
+            "F32_STORE",
+            "f_out[base + i] = static_cast<float>(nv);" if want_f32 else "",
+        ),
+    )
+
+
+@lru_cache(maxsize=None)
+def _combine_rms_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_mimo_combine_rms",
+        input_names=["h", "y", "scores", "w", "eps_in"],
+        output_names=["h_out", "n_out"],
+        source=_COMBINE_RMS_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _select_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_mimo_router_select",
+        input_names=["logits", "bias", "rsf"],
+        output_names=["inds", "scores"],
+        source=_SELECT_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _rope_split_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_mimo_qkv_rope_split",
+        input_names=["qkv", "offsets", "base_log2", "rope_scale", "vscale"],
+        output_names=["q_out", "k_out", "v_out"],
+        source=_ROPE_SPLIT_SOURCE,
+    )
+
+
+def _rms_threads(axis: int) -> int:
+    needed = (axis + 3) // 4
+    return 32 * ((needed + 31) // 32)
+
+
+@lru_cache(maxsize=None)
+def _eps_array(eps: float):
+    return mx.array([eps], dtype=mx.float32)
+
+
+def add_rms(x, y, w, eps: float, want_f32: bool = False):
+    """``h = x + y; (h, rms_norm(h, w, eps)[, float32 copy])`` in one kernel."""
+    D = int(x.shape[-1])
+    rows = x.size // D
+    threads = _rms_threads(D)
+    shapes = [x.shape, x.shape] + ([x.shape] if want_f32 else [])
+    dtypes = [x.dtype, x.dtype] + ([mx.float32] if want_f32 else [])
+    return _add_rms_kernel(want_f32)(
+        inputs=[x, y, w, _eps_array(float(eps))],
+        template=[("T", x.dtype), ("AXIS", D)],
+        grid=(threads * rows, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=shapes,
+        output_dtypes=dtypes,
+    )
+
+
+def combine_rms(h, y, scores, w, eps: float):
+    """Weighted expert sum + residual + RMSNorm.
+
+    ``h`` (..., D), ``y`` (..., K, D) expert rows, ``scores`` (..., K) float32.
+    Returns ``(h + sum_k y_k * s_k, rms_norm(that, w, eps))``.
+    """
+    D = int(h.shape[-1])
+    K = int(y.shape[-2])
+    rows = h.size // D
+    threads = _rms_threads(D)
+    return _combine_rms_kernel()(
+        inputs=[h, y, scores.astype(mx.float32), w, _eps_array(float(eps))],
+        template=[("T", h.dtype), ("AXIS", D), ("TOPK", K)],
+        grid=(threads * rows, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[h.shape, h.shape],
+        output_dtypes=[h.dtype, h.dtype],
+    )
+
+
+def router_select(logits, bias, top_k: int, norm_topk_prob: bool, scale: float):
+    """noaux_tc routing for ``n_group == 1`` from float32 router logits."""
+    NE = int(logits.shape[-1])
+    rows = logits.size // NE
+    inds, scores = _select_kernel()(
+        inputs=[logits, bias, _eps_array(float(scale))],
+        template=[("NE", NE), ("TOPK", int(top_k)), ("NORM", int(bool(norm_topk_prob and top_k > 1)))],
+        grid=(NE * rows, 1, 1),
+        threadgroup=(NE, 1, 1),
+        output_shapes=[(*logits.shape[:-1], top_k), (*logits.shape[:-1], top_k)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return inds, scores
+
+
+@lru_cache(maxsize=None)
+def _log2f(value: float) -> float:
+    """``std::log2(float)`` as MLX's rope dispatch computes the base."""
+    lib = ctypes.CDLL(ctypes.util.find_library("m") or None)
+    fn = lib.log2f
+    fn.restype = ctypes.c_float
+    fn.argtypes = [ctypes.c_float]
+    return float(fn(ctypes.c_float(value)))
+
+
+@lru_cache(maxsize=None)
+def _f32_scalar(value: float):
+    return mx.array([value], dtype=mx.float32)
+
+
+@lru_cache(maxsize=None)
+def _typed_scalar(value: float, dtype):
+    return mx.array([value], dtype=dtype)
+
+
+def offsets_array(offset):
+    """``(int32 offsets, stride)`` for the rope kernel from a cache offset."""
+    if isinstance(offset, int):
+        return mx.array([offset], dtype=mx.int32), 0
+    offsets = offset.astype(mx.int32) if offset.dtype != mx.int32 else offset
+    offsets = offsets.reshape(-1)
+    return offsets, (0 if offsets.size == 1 else 1)
+
+
+def qkv_rope_split(
+    qkv,
+    offset,
+    *,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    rope_dims: int,
+    rope_base: float,
+    rope_scale: float = 1.0,
+    v_scale: Optional[float],
+):
+    """Split a fused ``(B, L, H*D + Hkv*D + Hkv*Dv)`` projection into roped
+    ``q (B, H, L, D)``, roped ``k (B, Hkv, L, D)`` and scaled ``v``.
+
+    ``offset`` is the cache offset (int, or an int array with one entry per
+    batch row), or an ``(array, stride)`` pair from ``offsets_array``.
+    """
+    B, L, NT = qkv.shape
+    offsets, off_stride = (
+        offset if isinstance(offset, tuple) else offsets_array(offset)
+    )
+    half = rope_dims // 2
+    lanes = max(head_dim // 2, (v_head_dim + 1) // 2)
+    heads = n_heads + 2 * n_kv_heads
+    dtype = qkv.dtype
+    vs = _typed_scalar(float(v_scale), dtype) if v_scale is not None else _typed_scalar(1.0, dtype)
+    return _rope_split_kernel()(
+        inputs=[
+            qkv,
+            offsets,
+            _f32_scalar(_log2f(float(rope_base))),
+            _f32_scalar(float(rope_scale)),
+            vs,
+        ],
+        template=[
+            ("T", dtype),
+            ("SEQ", int(L)),
+            ("NTOT", int(NT)),
+            ("NQ", int(n_heads)),
+            ("NKV", int(n_kv_heads)),
+            ("HD", int(head_dim)),
+            ("VD", int(v_head_dim)),
+            ("HALF", int(half)),
+            ("OFF_STRIDE", int(off_stride)),
+            ("HAS_VSCALE", int(v_scale is not None)),
+        ],
+        grid=(lanes, heads, B * L),
+        threadgroup=(min(lanes, 128), 1, 1),
+        output_shapes=[
+            (B, n_heads, L, head_dim),
+            (B, n_kv_heads, L, head_dim),
+            (B, n_kv_heads, L, v_head_dim),
+        ],
+        output_dtypes=[dtype, dtype, dtype],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model-level fast path.
+# ---------------------------------------------------------------------------
+
+
+class _FusedQKV:
+    """Row-concatenated q/k/v quantized weights of one attention module."""
+
+    __slots__ = ("weight", "scales", "biases", "group_size", "bits", "mode", "width")
+
+    def __init__(self, weight, scales, biases, group_size, bits, mode):
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+        self.width = int(weight.shape[0])
+
+
+class _GateCache:
+    __slots__ = ("w32t", "bias32")
+
+    def __init__(self, w32t, bias32):
+        self.w32t = w32t
+        self.bias32 = bias32
+
+
+def _fuse_qkv(attn) -> Optional[_FusedQKV]:
+    """Concatenate q/k/v weights once and rebind the projections to views.
+
+    The fused buffer replaces the three separate ones (the projections keep
+    working unchanged on row slices of it), so memory is not duplicated.
+    """
+    import mlx.nn as nn
+
+    projs = (attn.q_proj, attn.k_proj, attn.v_proj)
+    if not all(isinstance(p, nn.QuantizedLinear) for p in projs):
+        return None
+    if any("bias" in p for p in projs):
+        return None
+    q = projs[0]
+    mode = getattr(q, "mode", "affine")
+    for p in projs[1:]:
+        if (
+            p.bits != q.bits
+            or p.group_size != q.group_size
+            or getattr(p, "mode", "affine") != mode
+        ):
+            return None
+    has_biases = [p.get("biases") is not None for p in projs]
+    if any(has_biases) and not all(has_biases):
+        return None
+    rows = [int(p.weight.shape[0]) for p in projs]
+    weight = mx.concatenate([p.weight for p in projs], axis=0)
+    scales = mx.concatenate([p.scales for p in projs], axis=0)
+    biases = (
+        mx.concatenate([p.biases for p in projs], axis=0) if all(has_biases) else None
+    )
+    mx.eval(weight, scales, biases) if biases is not None else mx.eval(weight, scales)
+    start = 0
+    views = []
+    for p, n in zip(projs, rows):
+        p.weight = weight[start : start + n]
+        p.scales = scales[start : start + n]
+        if biases is not None:
+            p.biases = biases[start : start + n]
+        views.extend(a for a in (p.weight, p.scales, p.get("biases")) if a is not None)
+        start += n
+    mx.eval(views)
+    return _FusedQKV(weight, scales, biases, q.group_size, q.bits, mode)
+
+
+def _prepare(model) -> bool:
+    """One-time per model: fuse q/k/v weights and cache float32 router weights."""
+    state = model.__dict__.get("_omlx_decode_fast_state")
+    if state is not None:
+        return state
+    import mlx.nn as nn
+
+    ok = True
+    try:
+        for layer in model.layers:
+            attn = layer.self_attn
+            rope = attn.rope
+            if type(rope) is not nn.RoPE or rope.traditional:
+                ok = False
+                break
+            if attn.__dict__.get("_omlx_qkv") is None:
+                attn.__dict__["_omlx_qkv"] = _fuse_qkv(attn) or False
+            mlp = layer.mlp
+            gate = getattr(mlp, "gate", None)
+            if gate is None:
+                continue
+            if (
+                getattr(mlp, "sharding_group", None) is not None
+                or gate.n_group != 1
+                or gate.top_k > _SELECT_MAX_TOPK
+                or gate.weight.shape[0] > _SELECT_MAX_EXPERTS
+                or gate.weight.shape[0] % 32 != 0
+            ):
+                ok = False
+                break
+            if gate.__dict__.get("_omlx_gate") is None:
+                w32t = gate.weight.astype(mx.float32)
+                bias32 = gate.e_score_correction_bias.astype(mx.float32)
+                mx.eval(w32t, bias32)
+                gate.__dict__["_omlx_gate"] = _GateCache(w32t, bias32)
+    except Exception:  # noqa: BLE001 - never break the reference forward
+        logger.warning("MiMo decode fast path disabled", exc_info=True)
+        ok = False
+    model.__dict__["_omlx_decode_fast_state"] = ok
+    if ok:
+        logger.info("MiMo decode fast path armed (fused qkv, fused norms, router)")
+    return ok
+
+
+def _attention(attn, x, mask, cache, sdpa, offsets_memo):
+    B, L, _ = x.shape
+    fused = attn.__dict__.get("_omlx_qkv")
+    offset = cache.offset
+    if fused:
+        # Full-attention and sliding-window caches share offsets per step:
+        # build each int offset's device array once per forward.
+        if isinstance(offset, int):
+            rope_offset = offsets_memo.get(offset)
+            if rope_offset is None:
+                rope_offset = offsets_memo[offset] = offsets_array(offset)
+        else:
+            rope_offset = offsets_array(offset)
+        qkv = mx.quantized_matmul(
+            x,
+            fused.weight,
+            fused.scales,
+            fused.biases,
+            transpose=True,
+            group_size=fused.group_size,
+            bits=fused.bits,
+            mode=fused.mode,
+        )
+        rope = attn.rope
+        queries, keys, values = qkv_rope_split(
+            qkv,
+            rope_offset,
+            n_heads=attn.n_heads,
+            n_kv_heads=attn.n_kv_heads,
+            head_dim=attn.head_dim,
+            v_head_dim=attn.v_head_dim,
+            rope_dims=rope.dims,
+            rope_base=rope.base,
+            rope_scale=rope.scale,
+            v_scale=attn.v_scale,
+        )
+    else:
+        queries = attn.q_proj(x).reshape(B, L, attn.n_heads, attn.head_dim).swapaxes(1, 2)
+        keys = attn.k_proj(x).reshape(B, L, attn.n_kv_heads, attn.head_dim).swapaxes(1, 2)
+        values = (
+            attn.v_proj(x).reshape(B, L, attn.n_kv_heads, attn.v_head_dim).swapaxes(1, 2)
+        )
+        if attn.v_scale is not None:
+            values = values * attn.v_scale
+        queries = attn.rope(queries, offset=offset)
+        keys = attn.rope(keys, offset=offset)
+    keys, values = cache.update_and_fetch(keys, values)
+    output = sdpa(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=attn.scale,
+        mask=mask,
+        sinks=attn.attention_sink_bias,
+    )
+    return attn.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
+
+
+def _max_rows(model) -> int:
+    rows = model.__dict__.get("_omlx_decode_fast_rows")
+    if rows is None:
+        top_k = max(
+            (
+                layer.mlp.gate.top_k
+                for layer in model.layers
+                if hasattr(layer.mlp, "gate")
+            ),
+            default=1,
+        )
+        # Keep SwitchGLU on its unsorted path (indices.size < 64), whose
+        # expert rows the combine kernel sums in the reference order.
+        rows = max(0, min(MAX_ROWS, (64 - 1) // max(1, top_k)))
+        model.__dict__["_omlx_decode_fast_rows"] = rows
+    return rows
+
+
+def run_layers(model, h, cache, full_mask, swa_mask):
+    """Decoder stack for a short forward; ``(h, norm(h))`` or ``None``.
+
+    ``model`` is the inner ``MiMoV2Model``; ``h`` the input embeddings.
+    Returns ``None`` (caller runs the reference loop) for anything outside
+    the fast path's contract.
+    """
+    if not enabled() or h.ndim != 3:
+        return None
+    B, L, D = h.shape
+    if B * L > _max_rows(model) or h.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    if D % 4 != 0 or D > _RMS_MAX_AXIS:
+        return None
+    if any(c is None or hasattr(c, "bits") for c in cache):
+        return None
+    if not _prepare(model):
+        return None
+    layers = model.layers
+    # The attention function the reference Attention.__call__ resolves (SDPA
+    # patches rebind the model module's global, not only mlx_lm's base).
+    sdpa = getattr(
+        sys.modules.get(type(layers[0].self_attn).__module__),
+        "scaled_dot_product_attention",
+        None,
+    )
+    if sdpa is None:
+        return None
+
+    first = layers[0].input_layernorm
+    x = mx.fast.rms_norm(h, first.weight, first.eps)
+    n = len(layers)
+    offsets_memo = {}
+    for i, layer in enumerate(layers):
+        nxt = layers[i + 1].input_layernorm if i + 1 < n else model.norm
+        mask = swa_mask if layer.is_sliding_window else full_mask
+        a = _attention(layer.self_attn, x, mask, cache[i], sdpa, offsets_memo)
+        post = layer.post_attention_layernorm
+        mlp = layer.mlp
+        gate = getattr(mlp, "gate", None)
+        if gate is None:
+            h, xm = add_rms(h, a, post.weight, post.eps)
+            h, x = add_rms(h, mlp(xm), nxt.weight, nxt.eps)
+            continue
+        h, xm, x32 = add_rms(h, a, post.weight, post.eps, want_f32=True)
+        gc = gate.__dict__["_omlx_gate"]
+        logits = x32 @ gc.w32t.T
+        inds, scores = router_select(
+            logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
+        )
+        y = mlp.switch_mlp(xm, inds)
+        h, x = combine_rms(h, y, scores, nxt.weight, nxt.eps)
+    return h, x

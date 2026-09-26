@@ -1,0 +1,306 @@
+# SPDX-License-Identifier: Apache-2.0
+"""MiMo V2 decode fast path: bit-exactness against the reference layer ops."""
+
+import importlib
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+import pytest
+from mlx.utils import tree_flatten
+
+from omlx.patches.mimo_v2 import decode_fast as df
+
+BF16 = mx.bfloat16
+
+
+def _mismatches(a, b):
+    a = np.array(a.astype(mx.float32))
+    b = np.array(b.astype(mx.float32))
+    assert a.shape == b.shape
+    return int((a != b).sum())
+
+
+def _mimo():
+    from omlx.patches.mimo_v2 import apply_mimo_v2_patch
+
+    apply_mimo_v2_patch()
+    return importlib.import_module("mlx_lm.models.mimo_v2")
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 4096), (1, 4, 4096), (2, 3, 1024), (1, 2, 4000)])
+def test_add_rms_is_bit_exact(shape):
+    mx.random.seed(0)
+    x = (mx.random.normal(shape) * 3).astype(BF16)
+    y = (mx.random.normal(shape) * 2).astype(BF16)
+    w = (1 + 0.1 * mx.random.normal(shape[-1:])).astype(BF16)
+    h, n, f = df.add_rms(x, y, w, 1e-6, want_f32=True)
+    h_ref = x + y
+    n_ref = mx.fast.rms_norm(h_ref, w, 1e-6)
+    assert _mismatches(h, h_ref) == 0
+    assert _mismatches(n, n_ref) == 0
+    assert f.dtype == mx.float32 and _mismatches(f, n_ref.astype(mx.float32)) == 0
+    h2, n2 = df.add_rms(x, y, w, 1e-6)
+    assert _mismatches(h2, h_ref) == 0 and _mismatches(n2, n_ref) == 0
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 4096), (1, 4, 4096), (2, 3, 1024)])
+def test_combine_rms_is_bit_exact(shape):
+    mx.random.seed(1)
+    h = (mx.random.normal(shape) * 3).astype(BF16)
+    y = mx.random.normal(shape[:-1] + (8, shape[-1])).astype(BF16)
+    s = mx.softmax(mx.random.normal(shape[:-1] + (8,)), axis=-1)
+    w = (1 + 0.1 * mx.random.normal(shape[-1:])).astype(BF16)
+    h_out, n_out = df.combine_rms(h, y, s, w, 1e-6)
+    h_ref = h + (y * s[..., None]).sum(axis=-2).astype(BF16)
+    assert _mismatches(h_out, h_ref) == 0
+    assert _mismatches(n_out, mx.fast.rms_norm(h_ref, w, 1e-6)) == 0
+
+
+@pytest.mark.parametrize("rows", [1, 4, 7])
+def test_router_select_matches_reference(rows):
+    m = _mimo()
+    mx.random.seed(2)
+    x = mx.random.normal((1, rows, 512)).astype(BF16)
+    weight = (mx.random.normal((256, 512)) * 0.05).astype(BF16)
+    bias = mx.random.normal((256,)) * 0.05
+    logits = x.astype(mx.float32) @ weight.astype(mx.float32).T
+    ref_inds, ref_scores = m.group_expert_select(logits, bias, 8, 1, 1, 1.0, True)
+    inds, scores = df.router_select(logits, bias, 8, True, 1.0)
+    assert inds.dtype == ref_inds.dtype
+    assert np.array_equal(np.array(inds), np.array(ref_inds))
+    assert _mismatches(scores, ref_scores) == 0
+
+
+@pytest.mark.parametrize(
+    "B,L,offset", [(1, 1, 1234), (1, 4, 77), (2, 3, "array"), (2, 4, "left_padded")]
+)
+@pytest.mark.parametrize("base", [10000.0, 1e7])
+def test_qkv_rope_split_is_bit_exact(B, L, offset, base):
+    mx.random.seed(3)
+    H, Hkv, D, Dv = 8, 2, 192, 128
+    qkv = mx.random.normal((B, L, H * D + Hkv * D + Hkv * Dv)).astype(BF16)
+    if offset == "array":
+        offset = mx.array([100, 5000])
+    elif offset == "left_padded":
+        # Batch caches start left-padded rows at negative offsets; MLX's rope
+        # adds them to the unsigned row index.
+        offset = mx.array([-3, 5000])
+    rope = nn.RoPE(64, traditional=False, base=base)
+    q = qkv[..., : H * D].reshape(B, L, H, D).swapaxes(1, 2)
+    k = qkv[..., H * D : (H + Hkv) * D].reshape(B, L, Hkv, D).swapaxes(1, 2)
+    v = qkv[..., (H + Hkv) * D :].reshape(B, L, Hkv, Dv).swapaxes(1, 2) * 0.707
+    fq, fk, fv = df.qkv_rope_split(
+        qkv,
+        offset,
+        n_heads=H,
+        n_kv_heads=Hkv,
+        head_dim=D,
+        v_head_dim=Dv,
+        rope_dims=64,
+        rope_base=base,
+        v_scale=0.707,
+    )
+    assert _mismatches(fq, rope(q, offset=offset)) == 0
+    assert _mismatches(fk, rope(k, offset=offset)) == 0
+    assert _mismatches(fv, v) == 0
+
+
+_TINY = {
+    "model_type": "mimo_v2",
+    "vocab_size": 512,
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "moe_intermediate_size": 128,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "head_dim": 48,
+    "v_head_dim": 32,
+    "rope_theta": 1e7,
+    "swa_num_attention_heads": 8,
+    "swa_num_key_value_heads": 4,
+    "swa_head_dim": 48,
+    "swa_v_head_dim": 32,
+    "swa_rope_theta": 10000.0,
+    "sliding_window_size": 32,
+    "add_full_attention_sink_bias": False,
+    "add_swa_attention_sink_bias": True,
+    "hybrid_layer_pattern": [0, 1, 1, 0],
+    "moe_layer_freq": [0, 1, 1, 1],
+    "n_routed_experts": 64,
+    "num_experts_per_tok": 8,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": True,
+    "topk_method": "noaux_tc",
+    "partial_rotary_factor": 0.334,
+    "attention_bias": False,
+    "layernorm_epsilon": 1e-6,
+    "max_position_embeddings": 4096,
+    "attention_value_scale": 0.707,
+}
+
+
+def _tiny_model(seed=3):
+    m = _mimo()
+    mx.random.seed(seed)
+    model = m.Model(m.ModelArgs.from_dict(dict(_TINY)))
+    updates = []
+    for key, value in tree_flatten(model.parameters()):
+        if key.endswith("gate.weight"):
+            updates.append((key, mx.random.normal(value.shape) * 0.05))
+        elif key.endswith("e_score_correction_bias"):
+            updates.append((key, mx.random.normal(value.shape) * 0.02))
+        elif key.endswith("attention_sink_bias"):
+            updates.append((key, mx.random.normal(value.shape)))
+        elif "norm" in key:
+            updates.append((key, 1 + 0.1 * mx.random.normal(value.shape)))
+    model.load_weights(updates, strict=False)
+    # MiMo-V2.6-Flash layout: 8-bit affine attention/dense, MXFP4 experts.
+    nn.quantize(
+        model,
+        group_size=64,
+        bits=8,
+        class_predicate=lambda p, mod: isinstance(mod, nn.Linear) and "switch_mlp" not in p,
+    )
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+        class_predicate=lambda p, mod: "switch_mlp" in p and hasattr(mod, "to_quantized"),
+    )
+    casts = [
+        (k, v.astype(BF16))
+        for k, v in tree_flatten(model.parameters())
+        if v.dtype == mx.float32 and "e_score_correction_bias" not in k
+    ]
+    model.load_weights(casts, strict=False)
+    mx.eval(model.parameters())
+    return model
+
+
+def _clone(caches):
+    # Fresh array objects: KV caches update their buffers with in-place slice
+    # assignment, which would otherwise write through to the other clone.
+    out = []
+    for c in caches:
+        n = type(c).__new__(type(c))
+        n.__dict__.update(
+            {k: mx.array(v) if isinstance(v, mx.array) else v for k, v in c.__dict__.items()}
+        )
+        out.append(n)
+    return out
+
+
+def _forward(model, tokens, cache, fast, monkeypatch):
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1" if fast else "0")
+    out = model(tokens, cache=cache)
+    mx.eval(out, [c.state for c in cache])
+    return out
+
+
+def _count_fast_runs(monkeypatch):
+    calls = {"n": 0}
+    orig = df.combine_rms
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(df, "combine_rms", counted)
+    return calls
+
+
+def test_fast_forward_matches_reference(monkeypatch):
+    model = _tiny_model()
+    calls = _count_fast_runs(monkeypatch)
+    tokens = mx.random.randint(0, 512, (1, 80))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :40], cache, False, monkeypatch)
+    pos = 40
+    for L in [1, 1, 2, 3, 4, 1, 5, 7, 1, 2]:
+        step = tokens[:, pos : pos + L]
+        ref_cache, fast_cache = _clone(cache), _clone(cache)
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        before = calls["n"]
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        assert calls["n"] > before, f"fast path did not run at L={L}"
+        assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
+        for a, b in zip(ref_cache, fast_cache):
+            assert a.offset == b.offset
+            assert _mismatches(a.state[0], b.state[0]) == 0
+            assert _mismatches(a.state[1], b.state[1]) == 0
+        cache = fast_cache
+        pos += L
+    # The fused q/k/v buffer is shared by the (view) projections.
+    attn = model.model.layers[1].self_attn
+    fused = attn.__dict__["_omlx_qkv"]
+    n_q = attn.q_proj.weight.shape[0]
+    assert np.array_equal(np.array(fused.weight[:n_q]), np.array(attn.q_proj.weight))
+
+
+def test_fast_forward_matches_reference_batch_caches(monkeypatch):
+    model = _tiny_model(seed=4)
+    calls = _count_fast_runs(monkeypatch)
+    tokens = mx.random.randint(0, 512, (1, 48))
+    ca, cb = model.make_cache(), model.make_cache()
+    _forward(model, tokens[:, :45], ca, False, monkeypatch)
+    _forward(model, tokens[:, 3:40], cb, False, monkeypatch)
+    batch = [type(a).merge([a, b]) for a, b in zip(ca, cb)]
+    for L in [1, 2, 3, 1]:
+        step = mx.random.randint(0, 512, (2, L))
+        ref_cache, fast_cache = _clone(batch), _clone(batch)
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        before = calls["n"]
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        assert calls["n"] > before
+        assert _mismatches(ref, fast) == 0
+        batch = fast_cache
+
+
+def test_fast_path_declines_unsupported_forwards(monkeypatch):
+    model = _tiny_model(seed=5)
+    inner = model.model
+    cache = model.make_cache()
+    h = inner.embed_tokens(mx.array([[1] * 8]))
+    # 8 rows x top-8 would take SwitchGLU's sorted path: reference loop.
+    assert df.run_layers(inner, h, cache, None, None) is None
+    h1 = inner.embed_tokens(mx.array([[1]]))
+    assert df.run_layers(inner, h1, [None] * len(cache), None, None) is None
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "0")
+    assert df.run_layers(inner, h1, cache, None, None) is None
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FAST", "1")
+    h32 = h1.astype(mx.float32)
+    assert df.run_layers(inner, h32, cache, None, None) is None
+
+
+def test_prepare_rejects_unsupported_rope(monkeypatch):
+    model = _tiny_model(seed=6)
+    inner = model.model
+    inner.layers[0].self_attn.rope = nn.RoPE(16, traditional=True, base=10000.0)
+    assert df._prepare(inner) is False
+    cache = model.make_cache()
+    h1 = inner.embed_tokens(mx.array([[1]]))
+    assert df.run_layers(inner, h1, cache, None, None) is None
+
+
+def test_fast_path_uses_the_model_modules_sdpa(monkeypatch):
+    """SDPA patches rebind the model module's global; the fast path must call
+    exactly what the reference Attention.__call__ would."""
+    m = _mimo()
+    model = _tiny_model(seed=7)
+    calls = {"n": 0}
+    orig = m.scaled_dot_product_attention
+
+    def wrapped(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(m, "scaled_dot_product_attention", wrapped)
+    cache = model.make_cache()
+    _forward(model, mx.array([[1, 2, 3, 4, 5]]), cache, False, monkeypatch)
+    calls["n"] = 0
+    _forward(model, mx.array([[6]]), cache, True, monkeypatch)
+    assert calls["n"] == len(model.model.layers)
