@@ -235,3 +235,37 @@ def test_mimo_moe_block_fused_matches_unfused(T):
     mx.eval(got)
     assert got.shape == ref.shape and got.dtype == ref.dtype
     assert bool(mx.array_equal(ref, got))
+
+
+def _glm5_language():
+    from omlx.patches import mlx_vlm_glm5_next_compat as compat
+
+    compat.apply_mlx_vlm_glm5_next_compat_patch()
+    import importlib
+
+    return importlib.import_module("mlx_vlm.models.glm5_next.language")
+
+
+def _eager_clamped_swiglu(x_up, x_gate, limit):
+    x_gate = mx.clip(x_gate, a_min=None, a_max=limit)
+    x_up = mx.clip(x_up, a_min=-limit, a_max=limit)
+    return nn.silu(x_gate) * x_up
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rows", [1, 8, 3000])
+def test_glm5_next_compiled_clamped_swiglu_is_bit_exact(dtype, rows):
+    lang = _glm5_language()
+    act = lang.Glm5NextClampedSwiGLU(10.0)
+    # The fused gate/up output is split into strided halves.
+    gate_up = (mx.random.normal((rows, 1, 2 * INTER)) * 8).astype(dtype)
+    x_gate, x_up = mx.split(gate_up, 2, axis=-1)
+    got = act(x_up, x_gate)
+    ref = _eager_clamped_swiglu(x_up, x_gate, 10.0)
+    mx.eval(got, ref)
+    assert got.dtype == ref.dtype and bool(mx.array_equal(got, ref))
+    # Another limit recompiles instead of reusing the first constant.
+    got7 = lang.Glm5NextClampedSwiGLU(7.0)(x_up, x_gate)
+    assert bool(mx.array_equal(got7, _eager_clamped_swiglu(x_up, x_gate, 7.0)))
+    unclamped = lang.Glm5NextClampedSwiGLU(None)(x_up, x_gate)
+    assert bool(mx.array_equal(unclamped, nn.silu(x_gate) * x_up))
