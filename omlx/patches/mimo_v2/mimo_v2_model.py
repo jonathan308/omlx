@@ -15,6 +15,11 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+try:  # fused expert combine (oMLX GLM kernels); falls back to mlx-lm's SwitchGLU
+    from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
+except Exception:  # noqa: BLE001
+    _FusedSwitchGLU = None
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -232,11 +237,13 @@ class MoEGate(nn.Module):
 class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.switch_mlp = SwitchGLU(
+        switch_cls = _FusedSwitchGLU or SwitchGLU
+        self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
         )
+        self._fused_combine = _FusedSwitchGLU is not None
         self.gate = MoEGate(config)
         self.sharding_group = None
 
@@ -244,8 +251,16 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        if self._fused_combine:
+            # One kernel unsorts the expert rows and applies the routing
+            # weights (prefill); decode-sized batches return per-expert rows.
+            y = self.switch_mlp(x, inds, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2)
+            y = y.astype(x.dtype)
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
