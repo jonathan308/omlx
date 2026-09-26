@@ -12,12 +12,16 @@ fewer dispatches:
   quantized dot product as before.
 * one kernel splits q/k/v, applies the partial RoPE to q and k and the
   value scale to v (MLX's rope / multiply arithmetic, element for element).
-* one kernel for residual add + RMSNorm (+ the float32 router input), one
-  for the router's sigmoid / bias / top-k / normalisation, and one for the
-  expert combine + residual + the next layer's RMSNorm.  The RMSNorm
-  kernels reproduce ``mx.fast.rms_norm``'s reduction tree and the combine
-  sums the experts in MLX's order, so outputs are bit-identical to the
-  reference layer (verified by tests against the unfused ops).
+* one kernel for residual add + RMSNorm, one for the expert combine +
+  residual + the next layer's RMSNorm.  Both reproduce
+  ``mx.fast.rms_norm``'s reduction tree, and the combine sums the experts in
+  MLX's order, so they are bit-identical to the unfused ops.
+* router: one kernel for the float32 logits (MLX's M=1 ``gemv`` arithmetic
+  on the bf16 weights widened on load -- the reference casts the weights to
+  float32 every step) and one for sigmoid / bias / top-k / normalisation.
+  At one token per row this is bit-identical to the reference; for verify
+  rows (L > 1) every row gets exactly the logits a decode step computes,
+  where MLX's batched float32 matmul would sum in another order.
 
 Everything else (KV cache updates, attention, expert mat-vecs, lm_head) is
 the reference code.  Forwards the fast path does not cover fall back to the
@@ -264,6 +268,130 @@ _ROPE_SPLIT_SOURCE = r"""
 """
 
 
+# Router logits: float32 ``x @ W.T`` for W (N, K) in bf16/fp16/fp32, every row
+# computed exactly like MLX's M=1 ``gemv`` (float32 matrix, K >= 16 * N:
+# bm1 bn8 sm1 sn32 tm4 tn4 -- per-thread K-strided products, simd shuffle-down
+# tree, then simdgroups 1..7 folded into simdgroup 0 in order).  Several rows
+# share one pass over the weights.  The weights and x are widened to float32
+# on load, which is exact, so this equals ``x.astype(f32) @ W.astype(f32).T``
+# of the reference router for each row, and reads half the bytes.
+_ROUTER_GEMV_SOURCE = r"""
+  constexpr int TM = 4;
+  constexpr int TN = 4;
+  constexpr int SN = 32;
+  constexpr int BN = 8;
+  constexpr int blockM = 4;
+  constexpr int blockN = BN * SN * TN;
+  threadgroup float tgp_memory[ROWS * BN * (blockM + TM)];
+  uint tid = threadgroup_position_in_grid.x;
+  uint simd_gid = simdgroup_index_in_threadgroup;
+  uint simd_lid = thread_index_in_simdgroup;
+  int thrN = simd_lid;
+  int sgN = simd_gid;
+  int bn = (SN * sgN + thrN) * TN;
+  int out_row = tid * blockM;
+  const device W* matp = mat + size_t(out_row) * KDIM;
+
+  float result[ROWS][TM];
+  for (int r = 0; r < ROWS; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      result[r][tm] = 0;
+    }
+  }
+  for (int i = 0; i < KDIM / blockN; ++i) {
+    float v_coeff[ROWS][TN];
+    for (int r = 0; r < ROWS; r++) {
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[r][tn] = static_cast<float>(vec[size_t(r) * KDIM + bn + tn]);
+      }
+    }
+    int mat_offset = 0;
+    for (int tm = 0; tm < TM; tm++) {
+      float inter[TN];
+      for (int tn = 0; tn < TN; tn++) {
+        inter[tn] = static_cast<float>(matp[mat_offset + bn + tn]);
+      }
+      for (int r = 0; r < ROWS; r++) {
+        for (int tn = 0; tn < TN; tn++) {
+          result[r][tm] += inter[tn] * v_coeff[r][tn];
+        }
+      }
+      mat_offset += KDIM;
+    }
+    bn += blockN;
+  }
+  for (int r = 0; r < ROWS; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+      }
+    }
+  }
+  threadgroup float* tgp_results = tgp_memory + sgN * (blockM + TM);
+  if (thrN == 0) {
+    for (int r = 0; r < ROWS; r++) {
+      for (int tm = 0; tm < TM; tm++) {
+        tgp_results[r * BN * (blockM + TM) + tm] = result[r][tm];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && thrN == 0) {
+    for (int r = 0; r < ROWS; r++) {
+      for (int sgn = 1; sgn < BN; sgn++) {
+        for (int tm = 0; tm < TM; tm++) {
+          result[r][tm] += tgp_memory[r * BN * (blockM + TM) + sgn * (blockM + TM) + tm];
+        }
+      }
+      for (int tm = 0; tm < TM; tm++) {
+        out[size_t(r) * NOUT + out_row + tm] = result[r][tm];
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _router_gemv_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_mimo_router_gemv",
+        input_names=["vec", "mat"],
+        output_names=["out"],
+        source=_ROUTER_GEMV_SOURCE,
+    )
+
+
+_GEMV_BLOCK_N = 8 * 32 * 4
+
+
+def router_gemv_supported(k: int, n: int) -> bool:
+    # MLX picks the bm1/bn8 gemv for K >= 16 * N; K must fill whole blocks.
+    return k % _GEMV_BLOCK_N == 0 and n % 4 == 0 and k >= 16 * n
+
+
+def router_logits(x, weight):
+    """float32 ``x @ weight.T`` per row, bit-identical to MLX's M=1 gemv on
+    the float32-cast operands (see ``_ROUTER_GEMV_SOURCE``)."""
+    K = int(x.shape[-1])
+    N = int(weight.shape[0])
+    rows = x.size // K
+    (out,) = _router_gemv_kernel()(
+        inputs=[x, weight],
+        template=[
+            ("T", x.dtype),
+            ("W", weight.dtype),
+            ("ROWS", int(rows)),
+            ("KDIM", K),
+            ("NOUT", N),
+        ],
+        grid=(32 * (N // 4), 8, 1),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(*x.shape[:-1], N)],
+        output_dtypes=[mx.float32],
+    )
+    return out
+
+
 @lru_cache(maxsize=None)
 def _add_rms_kernel(want_f32: bool):
     return mx.fast.metal_kernel(
@@ -478,11 +606,11 @@ class _FusedQKV:
 
 
 class _GateCache:
-    __slots__ = ("w32t", "bias32")
+    __slots__ = ("bias32", "gemv")
 
-    def __init__(self, w32t, bias32):
-        self.w32t = w32t
+    def __init__(self, bias32, gemv):
         self.bias32 = bias32
+        self.gemv = gemv
 
 
 def _fuse_qkv(attn) -> Optional[_FusedQKV]:
@@ -551,20 +679,22 @@ def _prepare(model) -> bool:
             gate = getattr(mlp, "gate", None)
             if gate is None:
                 continue
+            n_experts, hidden = gate.weight.shape
             if (
                 getattr(mlp, "sharding_group", None) is not None
                 or gate.n_group != 1
                 or gate.top_k > _SELECT_MAX_TOPK
-                or gate.weight.shape[0] > _SELECT_MAX_EXPERTS
-                or gate.weight.shape[0] % 32 != 0
+                or n_experts > _SELECT_MAX_EXPERTS
+                or n_experts % 32 != 0
             ):
                 ok = False
                 break
             if gate.__dict__.get("_omlx_gate") is None:
-                w32t = gate.weight.astype(mx.float32)
                 bias32 = gate.e_score_correction_bias.astype(mx.float32)
-                mx.eval(w32t, bias32)
-                gate.__dict__["_omlx_gate"] = _GateCache(w32t, bias32)
+                mx.eval(bias32)
+                gate.__dict__["_omlx_gate"] = _GateCache(
+                    bias32, router_gemv_supported(int(hidden), int(n_experts))
+                )
     except Exception:  # noqa: BLE001 - never break the reference forward
         logger.warning("MiMo decode fast path disabled", exc_info=True)
         ok = False
@@ -695,9 +825,13 @@ def run_layers(model, h, cache, full_mask, swa_mask):
             h, xm = add_rms(h, a, post.weight, post.eps)
             h, x = add_rms(h, mlp(xm), nxt.weight, nxt.eps)
             continue
-        h, xm, x32 = add_rms(h, a, post.weight, post.eps, want_f32=True)
+        h, xm = add_rms(h, a, post.weight, post.eps)
         gc = gate.__dict__["_omlx_gate"]
-        logits = x32 @ gc.w32t.T
+        if gc.gemv:
+            # Each row's logits equal the reference router's M=1 (decode) gemv.
+            logits = router_logits(xm, gate.weight)
+        else:
+            logits = xm.astype(mx.float32) @ gate.weight.astype(mx.float32).T
         inds, scores = router_select(
             logits, gc.bias32, gate.top_k, gate.norm_topk_prob, gate.routed_scaling_factor
         )

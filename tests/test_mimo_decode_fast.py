@@ -106,10 +106,57 @@ def test_qkv_rope_split_is_bit_exact(B, L, offset, base):
     assert _mismatches(fv, v) == 0
 
 
+@pytest.mark.parametrize("rows", [1, 2, 4, 7])
+def test_router_logits_match_decode_gemv(rows):
+    mx.random.seed(4)
+    x = mx.random.normal((1, rows, 4096)).astype(BF16)
+    weight = (mx.random.normal((256, 4096)) * 0.05).astype(BF16)
+    w32 = weight.astype(mx.float32)
+    # The reference router at decode: one row, float32 gemv.
+    ref = mx.concatenate(
+        [x[:, i : i + 1].astype(mx.float32) @ w32.T for i in range(rows)], axis=1
+    )
+    out = df.router_logits(x, weight)
+    assert out.dtype == mx.float32
+    assert _mismatches(out, ref) == 0
+
+
+def _per_row_router(monkeypatch, m):
+    """Reference router with every token row through MLX's M=1 gemv.
+
+    The fast path computes each row's router logits exactly like a decode
+    step does; MLX's batched float32 matmul (M > 1) sums in another order.
+    """
+    orig = m.MoEGate.__call__
+
+    def call(self, x):
+        if x.shape[-2] * x.shape[0] == 1:
+            return orig(self, x)
+        w32 = self.weight.astype(mx.float32)
+        rows = [
+            mx.concatenate(
+                [x[b : b + 1, i : i + 1].astype(mx.float32) @ w32.T for i in range(x.shape[1])],
+                axis=1,
+            )
+            for b in range(x.shape[0])
+        ]
+        return m.group_expert_select(
+            mx.concatenate(rows, axis=0),
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+
+    monkeypatch.setattr(m.MoEGate, "__call__", call)
+
+
 _TINY = {
     "model_type": "mimo_v2",
     "vocab_size": 512,
-    "hidden_size": 256,
+    "hidden_size": 1024,
     "intermediate_size": 512,
     "moe_intermediate_size": 128,
     "num_hidden_layers": 4,
@@ -215,6 +262,7 @@ def _count_fast_runs(monkeypatch):
 
 def test_fast_forward_matches_reference(monkeypatch):
     model = _tiny_model()
+    _per_row_router(monkeypatch, _mimo())
     calls = _count_fast_runs(monkeypatch)
     tokens = mx.random.randint(0, 512, (1, 80))
     cache = model.make_cache()
@@ -243,6 +291,7 @@ def test_fast_forward_matches_reference(monkeypatch):
 
 def test_fast_forward_matches_reference_batch_caches(monkeypatch):
     model = _tiny_model(seed=4)
+    _per_row_router(monkeypatch, _mimo())
     calls = _count_fast_runs(monkeypatch)
     tokens = mx.random.randint(0, 512, (1, 48))
     ca, cb = model.make_cache(), model.make_cache()
