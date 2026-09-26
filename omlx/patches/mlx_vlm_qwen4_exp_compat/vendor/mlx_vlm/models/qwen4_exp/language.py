@@ -1065,6 +1065,13 @@ _EAGER_DISPATCH = os.environ.get("OMLX_QWEN4_EAGER_DISPATCH", "1").strip().lower
     "off",
 }
 _EAGER_DISPATCH_MAX_ROWS = 64
+# Prefill: hand each decoder layer's MLP residual write to the next layer's fused
+# stream norm instead of a separate multiply + add over the 4-stream residual.
+# The fused kernel rounds exactly like the eager write, so outputs are
+# bit-identical. Disable with OMLX_QWEN4_HC_DEFERRED_WRITE=0.
+_DEFERRED_HC_WRITE = os.environ.get(
+    "OMLX_QWEN4_HC_DEFERRED_WRITE", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 # Lightning MTP verify rows through the gathered QSA arm (OMLX_QWEN4_QSA_GATHERED_VERIFY=0 disables).
 _GATHERED_VERIFY_DISABLED = os.environ.get(
     "OMLX_QWEN4_QSA_GATHERED_VERIFY", "1"
@@ -3059,7 +3066,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
         position_ids: Optional[mx.array],
         gdn_sink=None,
         target_verify: bool = False,
+        pending_write=None,
+        defer_write: bool = False,
     ):
+        # ``pending_write`` is the previous layer's unapplied (branch, gate) MLP
+        # residual write onto ``hidden_states``; with ``defer_write`` this layer
+        # returns ``(hyper_input, (branch, gate))`` instead of applying its own.
+        if pending_write is not None and "ple" in self:
+            hidden_states = _hc_write(hidden_states, *pending_write)
+            pending_write = None
         if "ple" in self:
             hidden_states = hidden_states + self.ple(
                 hidden_states,
@@ -3072,6 +3087,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mixed, hyper_input, injection_weights = self.attn_hyper_connection(
             hidden_states,
             target_verify=target_verify,
+            write=pending_write,
         )
         if self.is_linear:
             branch = (
@@ -3097,6 +3113,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             if target_verify
             else self.mlp(mixed)
         )
+        if defer_write:
+            return hyper_input, (branch, injection_weights)
         return _hc_write(hyper_input, branch, injection_weights)
 
 
@@ -3147,8 +3165,24 @@ class Qwen4ExpModel(nn.Module):
             ssm_mask = mask
 
         capture = set(capture_layer_ids or [])
+        # Prefill rows only (the fused decode path never takes a pending write);
+        # captured layers and the last layer materialize their stream.
+        defer_writes = (
+            _DEFERRED_HC_WRITE
+            and gdn_sink is None
+            and hc_fused.prefill_compatible(
+                self.layers[0].attn_hyper_connection, hidden_states
+            )
+        )
+        last_index = len(self.layers) - 1
+        pending_write = None
         for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
+            defer = (
+                defer_writes
+                and index < last_index
+                and not (hidden_sink is not None and index in capture)
+            )
             hidden_states = layer(
                 hidden_states,
                 inputs,
@@ -3157,7 +3191,13 @@ class Qwen4ExpModel(nn.Module):
                 position_ids=position_ids,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
+                pending_write=pending_write,
+                defer_write=defer,
             )
+            if defer:
+                hidden_states, pending_write = hidden_states
+            else:
+                pending_write = None
             if (
                 _EAGER_DISPATCH
                 and hidden_states.shape[0] * hidden_states.shape[1]
