@@ -41,9 +41,14 @@ vector SDPA kernel's arithmetic (``sdpa_rows`` is bit-identical to MLX's
 kernel on the same rows); everything else is bit-identical.  ``sdpa_flash``
 computes MLX's float32 attention in another summation order (within one bf16
 ULP of MLX's kernel, closer to float64) for one-row and verify forwards
-alike, so verify rows keep matching one-row decodes bit for bit.  KV-cache
-updates, the SDPA calls themselves and lm_head are the reference code;
-forwards outside the fast path's contract run the reference layer loop.
+alike, so a verify row's attention matches the one-row decode's at the same
+position bit for bit.  (Whole verify rows can still differ from decode steps
+by rounding, here as on the reference path: MLX runs quantized matmuls of 2+
+rows as ``qmv_wide`` and one-row ones as ``qmv``, and a window layer's
+rotating cache hands a verify its keys in time order but a decode step in
+ring order.)  KV-cache updates, the SDPA calls themselves and lm_head are the
+reference code; forwards outside the fast path's contract run the reference
+layer loop.
 """
 
 from __future__ import annotations
@@ -909,9 +914,9 @@ def _vector_attention(q, k, v, cache, scale, mask, sinks, kernels):
     kernels, or ``None`` (the caller keeps MLX's SDPA).
 
     ``kernels`` is ``(rows, flash, flash_min_keys)``.  From
-    ``flash_min_keys`` keys ``sdpa_flash`` serves every row count (so verify
-    rows keep matching one-row decodes); below it, forwards of 2+ rows use
-    ``sdpa_rows``, which is MLX's own arithmetic in one pass.
+    ``flash_min_keys`` keys ``sdpa_flash`` serves every row count (so a verify
+    row's attention matches the one-row decode's); below it, forwards of 2+
+    rows use ``sdpa_rows``, which is MLX's own arithmetic in one pass.
     """
     rows_on, flash_on, flash_min = kernels
     if not (rows_on or flash_on) or cache is None or hasattr(cache, "bits"):

@@ -679,13 +679,16 @@ def test_expert_kind_rejects_wrapped_switch_modules():
     assert df._expert_kind(OffloadSwitchGLU(sw)) is None
 
 
-def _mimo_dims_model(seed=21):
+def _mimo_dims_model(seed=21, window=None):
     """GQA 16 with MiMo's full-attention head dims (192 / 128), the shapes
-    MLX's vector SDPA (and the long-context kernels) serve."""
+    MLX's vector SDPA (and the long-context kernels) serve.  ``window``
+    overrides the window layers' sliding window."""
     m = _mimo()
     cfg = dict(_TINY)
     cfg.update(num_attention_heads=16, num_key_value_heads=1, head_dim=192, v_head_dim=128,
                swa_num_attention_heads=16, swa_num_key_value_heads=2)
+    if window is not None:
+        cfg["sliding_window_size"] = window
     mx.random.seed(seed)
     model = m.Model(m.ModelArgs.from_dict(cfg))
     updates = []
@@ -759,26 +762,62 @@ def test_fast_forward_one_pass_rows_kernel_is_bit_exact(monkeypatch):
     assert calls["flash"] == 0
 
 
+def _one_row_quantized_matmuls(monkeypatch):
+    """Evaluate every 2-8 row quantized matmul one row at a time.
+
+    MLX runs an affine quantized matmul of 2+ rows as ``qmv_wide`` on Apple
+    GPU generation 15+ (``dispatch_qmv``, mlx 0.32) and a one-row one as
+    ``qmv``; the two sum each output in another order, so a verify forward's
+    projections (the fast path's and the reference layers' alike) differ from
+    a decode step's in about 1e-4 of their bf16 outputs.  Pinned to one-row
+    calls, every verify row gets the decode step's projections.
+    """
+    orig = mx.quantized_matmul
+
+    def one_row(x, *args, **kwargs):
+        n = x.shape[-2] if x.ndim >= 2 else 1
+        if 1 < n <= df.MAX_ROWS:
+            rows = [orig(x[..., i : i + 1, :], *args, **kwargs) for i in range(n)]
+            return mx.concatenate(rows, axis=-2)
+        return orig(x, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "quantized_matmul", one_row)
+
+
 def test_fast_forward_flash_verify_rows_match_decode_steps(monkeypatch):
     """With the split-key kernel on, a 3-row verify forward produces, row for
-    row, the logits of three one-row decode steps (bit-identical).  (Its
-    closeness to MLX's attention is tested per kernel: in a random tiny MoE a
-    one-ULP attention difference can flip a near-tie expert choice, so final
-    logits are only sanity-checked against the reference here.)"""
+    row, the logits of three one-row decode steps (bit-identical): the kernel
+    computes each query row like a one-row call, and so do the fast path's
+    other kernels (q/k/v split + RoPE, norms, router, experts).
+
+    Two MLX ops that the fast path shares with the reference layers are not
+    row-invariant (without holding them to one computation, the logits of
+    most seeds differ by an ULP here and there, on the reference path too):
+    quantized matmuls run one row at a time here
+    (``_one_row_quantized_matmuls``), and the window layers' window covers the
+    whole context -- a rotating cache hands a verify its keys in time order
+    but a decode step in ring order, which MLX's SDPA sums in another order --
+    so every layer's attention, in both forwards, is the split-key kernel.
+    (Its closeness to MLX's attention is tested per kernel: in a random tiny
+    MoE a one-ULP attention difference can flip a near-tie expert choice, so
+    final logits are only sanity-checked against the reference here.)"""
     m = _mimo()
-    model = _mimo_dims_model(seed=22)
+    model = _mimo_dims_model(seed=22, window=2048)
     _per_row_router(monkeypatch, m)
+    _one_row_quantized_matmuls(monkeypatch)
     monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH", "1")
     monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH_MIN_KEYS", "512")
     calls = _count_kernel_calls(monkeypatch)
+    n_layers = len(model.model.layers)
     tokens = mx.random.randint(0, 512, (1, 1110))
     cache = model.make_cache()
     _forward(model, tokens[:, :1100], cache, False, monkeypatch)
     step = tokens[:, 1100:1103]
     verify_cache, decode_cache, ref_cache = _clone(cache), _clone(cache), _clone(cache)
     verify = _forward(model, step, verify_cache, True, monkeypatch)
-    assert calls["flash"] > 0
+    assert calls["flash"] == n_layers
     rows = [_forward(model, step[:, r : r + 1], decode_cache, True, monkeypatch) for r in range(3)]
+    assert calls["flash"] == 4 * n_layers
     decode = mx.concatenate(rows, axis=1)
     assert _mismatches(verify, decode) == 0
     ref = _forward(model, step, ref_cache, False, monkeypatch)
