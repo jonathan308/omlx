@@ -171,10 +171,34 @@ _ALIGNED = [
 ]
 
 
+@pytest.fixture(params=["64", "128"])
+def tile_rows(request, monkeypatch):
+    """Run a test with 64-row and with 128-row output tiles."""
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_BM", request.param)
+    return int(request.param)
+
+
+def test_tile_rows_selection(monkeypatch):
+    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX_BM", raising=False)
+    # GLM-5.3 at 4096-token chunks (114 rows per expert, K 4096 / 2048)
+    assert nax._tile_rows(32768, 288, 4096) == 128
+    assert nax._tile_rows(32768, 288, 2048) == 128
+    # MiMo at 4096 (128 rows) and 8192 (256 rows) tokens
+    assert nax._tile_rows(32768, 256, 4096) == 128
+    assert nax._tile_rows(65536, 256, 4096) == 64
+    # Qwen3.8 (40 / 160 rows per expert, short K) and small chunks
+    assert nax._tile_rows(20480, 512, 2560) == 64
+    assert nax._tile_rows(81920, 512, 2560) == 64
+    assert nax._tile_rows(16384, 288, 4096) == 64
+    assert nax._tile_rows(32768, 288, 640) == 64
+    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX_BM", "128")
+    assert nax._tile_rows(20480, 512, 2560) == 128
+
+
 @needs_nax
 @pytest.mark.parametrize("mode,bits,gs,dtype", _ALIGNED)
 @pytest.mark.parametrize("schedule", [0, 1])
-def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, schedule):
+def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, schedule, tile_rows):
     """Aligned K: same dequantization and tensor-op order as mlx's kernel."""
     E, N, K = len(_COUNTS), 128, 256
     wq, scales, biases, _ = _quantized(E, N, K, mode, bits, gs, dtype)
@@ -188,7 +212,7 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, schedule):
 @needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
 @pytest.mark.parametrize("skew", [0.0, 1.2])
-def test_routed_rows_match_stock(mode, gs, skew):
+def test_routed_rows_match_stock(mode, gs, skew, tile_rows):
     """SwitchGLU routing (uniform and skewed, empty experts) at MoE shapes."""
     E, N, K = 64, 192, 512
     wq, scales, biases, _ = _quantized(E, N, K, mode, 4, gs, mx.bfloat16, seed=5)
@@ -205,7 +229,7 @@ def test_routed_rows_match_stock(mode, gs, skew):
     [("affine", 4, mx.bfloat16), ("affine", 8, mx.float16), ("mxfp4", 4, mx.bfloat16)],
 )
 @pytest.mark.parametrize("K", [32, 96, 544])
-def test_ragged_k_matches_fp32_reference(mode, bits, dtype, K):
+def test_ragged_k_matches_fp32_reference(mode, bits, dtype, K, tile_rows):
     """K % 64 == 32 (group 32): the stock kernel's tail is wrong here."""
     E, N = len(_COUNTS), 128
     wq, scales, biases, wd = _quantized(E, N, K, mode, bits, 32, dtype)
@@ -251,7 +275,7 @@ def test_ragged_n_matches_stock(mode, gs):
 
 @needs_nax
 @pytest.mark.parametrize("mode,gs", [("affine", 64), ("mxfp4", 32)])
-def test_more_than_32768_rows(mode, gs):
+def test_more_than_32768_rows(mode, gs, tile_rows):
     """One call past the stock kernel's int16 row-offset limit.
 
     Every row is independent, so the stock kernel run on <= 32768-row
@@ -459,11 +483,12 @@ def test_failed_self_test_falls_back(_installed, monkeypatch):
 
 @needs_nax
 def test_self_test_passes_for_supported_instantiations():
-    for key in [
-        (mx.bfloat16, "affine", 4, 64, 1, True, True),
-        (mx.bfloat16, "affine", 4, 32, 0, True, False),
-        (mx.float16, "affine", 8, 64, 0, False, True),
-        (mx.bfloat16, "mxfp4", 4, 32, 1, True, True),
-        (mx.bfloat16, "mxfp4", 4, 32, 0, False, False),
-    ]:
-        assert nax._self_test(key) is True, key
+    for bm in (64, 128):
+        for key in [
+            (mx.bfloat16, "affine", 4, 64, 1, True, True),
+            (mx.bfloat16, "affine", 4, 32, 0, True, False),
+            (mx.float16, "affine", 8, 64, 0, False, True),
+            (mx.bfloat16, "mxfp4", 4, 32, 1, True, True),
+            (mx.bfloat16, "mxfp4", 4, 32, 0, False, False),
+        ]:
+            assert nax._self_test(key + (bm,)) is True, key + (bm,)

@@ -59,12 +59,15 @@ logger = logging.getLogger(__name__)
 
 _ENV_ENABLE = "OMLX_M5_GATHER_QMM_NAX"
 _ENV_SCHEDULE = "OMLX_M5_GATHER_QMM_NAX_SCHEDULE"
+_ENV_TILE = "OMLX_M5_GATHER_QMM_NAX_BM"
 
 # Tile geometry (fixed; the Metal source assumes it).
 _BM = 64
 _BN = 64
 _WM = 2
 _WN = 2
+# Taller variant (8 simdgroups): one weight-tile stream serves 128 rows.
+_BM_TALL = 128
 
 # Largest expert count the one-threadgroup pre-pass handles (its run
 # bounds live in threadgroup memory).
@@ -699,7 +702,7 @@ _lock = threading.RLock()
 _kernels: dict[str, object] = {}
 _header_failed = False
 # Self-test verdict per kernel instantiation:
-# (dtype, mode, bits, group_size, schedule, align_N, align_K) -> bool.
+# (dtype, mode, bits, group_size, schedule, align_N, align_K, tile_rows) -> bool.
 _verified: dict[tuple, bool] = {}
 
 
@@ -712,14 +715,24 @@ def enabled() -> bool:
     }
 
 
-def _get_kernel(kind: str):
+def _mm_header(bm: int) -> str:
+    """The matmul header for a tile height (``kSM`` stays 32 rows/simdgroup)."""
+    if bm == _BM:
+        return _MM_HEADER
+    return _MM_HEADER.replace(
+        "STEEL_CONST int kBM = 64;", f"STEEL_CONST int kBM = {bm};"
+    ).replace("STEEL_CONST int kWM = 2;", f"STEEL_CONST int kWM = {bm // 32};")
+
+
+def _get_kernel(kind: str, bm: int = _BM):
     """Build (once) the ``scan``, ``affine`` or ``fp`` kernel object."""
     global _header_failed
-    kernel = _kernels.get(kind)
+    cache_key = kind if kind == "scan" or bm == _BM else f"{kind}_bm{bm}"
+    kernel = _kernels.get(cache_key)
     if kernel is not None or _header_failed:
         return kernel
     with _lock:
-        kernel = _kernels.get(kind)
+        kernel = _kernels.get(cache_key)
         if kernel is not None:
             return kernel
         if kind == "scan":
@@ -742,7 +755,7 @@ def _get_kernel(kind: str):
                 return None
             if kind == "affine":
                 kernel = mx.fast.metal_kernel(
-                    name="omlx_gqmm_affine",
+                    name="omlx_gqmm_affine" + ("" if bm == _BM else f"_bm{bm}"),
                     input_names=[
                         "x",
                         "w",
@@ -753,18 +766,18 @@ def _get_kernel(kind: str):
                         "params",
                     ],
                     output_names=["y"],
-                    header=mlx_src + _MM_HEADER,
+                    header=mlx_src + _mm_header(bm),
                     source=_AFFINE_SOURCE,
                 )
             else:
                 kernel = mx.fast.metal_kernel(
-                    name="omlx_gqmm_mxfp4",
+                    name="omlx_gqmm_mxfp4" + ("" if bm == _BM else f"_bm{bm}"),
                     input_names=["x", "w", "scales", "tiles", "tile_count", "params"],
                     output_names=["y"],
-                    header=mlx_src + _MM_HEADER,
+                    header=mlx_src + _mm_header(bm),
                     source=_FP_SOURCE,
                 )
-        _kernels[kind] = kernel
+        _kernels[cache_key] = kernel
         return kernel
 
 
@@ -778,6 +791,23 @@ def _schedule(rows: int, experts: int, K: int, N: int) -> int:
     if rows <= _DB_MAX_ROWS_PER_EXPERT * experts:
         return _SCHED_DB
     return _SCHED_SEG
+
+
+def _tile_rows(rows: int, experts: int, K: int) -> int:
+    """Rows per output tile: 128 when experts average 65-128 rows.
+
+    A 128-row tile streams each expert's weight tile once where two 64-row
+    tiles stream it twice (M5 Ultra, GLM-5.3 at 4096-token chunks, 114 rows
+    per expert: +5-8% on the expert GEMMs, bit-identical). With fewer rows,
+    or a short K, the half-empty taller tile is slower.
+    """
+    forced = os.environ.get(_ENV_TILE, "").strip()
+    if forced in ("64", "128"):
+        return int(forced)
+    per_expert = rows / max(1, experts)
+    if 64 < per_expert <= 128 and K >= 2048:
+        return _BM_TALL
+    return _BM
 
 
 def supports(
@@ -825,18 +855,20 @@ def supports(
     return scales.shape == (E, N, K // group_size)
 
 
-def _launch(x, w, scales, biases, indices, group_size, bits, mode, sched, stream):
+def _launch(
+    x, w, scales, biases, indices, group_size, bits, mode, sched, stream, bm=_BM
+):
     scan = _get_kernel("scan")
-    mm = _get_kernel("affine" if mode == "affine" else "fp")
+    mm = _get_kernel("affine" if mode == "affine" else "fp", bm)
     if scan is None or mm is None:
         return None
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
-    max_tiles = (M + _BM - 1) // _BM + min(E, M)
+    max_tiles = (M + bm - 1) // bm + min(E, M)
     kw = {} if stream is None else {"stream": stream}
     tiles, tile_count = scan(
         inputs=[indices, mx.array([M, E, max_tiles], dtype=mx.int32)],
-        template=[("BM", _BM), ("MAXE", _MAX_EXPERTS)],
+        template=[("BM", bm), ("MAXE", _MAX_EXPERTS)],
         grid=(1024, 1, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(max_tiles * 4,), (1,)],
@@ -858,8 +890,8 @@ def _launch(x, w, scales, biases, indices, group_size, bits, mode, sched, stream
     return mm(
         inputs=inputs,
         template=template,
-        grid=(n_cols * 32, max_tiles * _WN, _WM),
-        threadgroup=(32, _WN, _WM),
+        grid=(n_cols * 32, max_tiles * _WN, bm // 32),
+        threadgroup=(32, _WN, bm // 32),
         output_shapes=[(M, 1, N)],
         output_dtypes=[x.dtype],
         **kw,
@@ -889,7 +921,7 @@ def _self_test(key: tuple) -> Optional[bool]:
     Returns None when the canary could not be evaluated here (e.g. while a
     function transformation is being traced); the caller then retries.
     """
-    dtype, mode, bits, group_size, sched, align_n, align_k = key
+    dtype, mode, bits, group_size, sched, align_n, align_k, bm = key
     E = len(_CANARY_COUNTS)
     N = 128 if align_n else 96
     K = 256 if align_k else 160
@@ -911,7 +943,9 @@ def _self_test(key: tuple) -> Optional[bool]:
         )
         M = int(idx.shape[0])
         x = (mx.random.normal((M, 1, K), key=k_x) * 0.5).astype(dtype)
-        out = _launch(x, wq, scales, biases, idx, group_size, bits, mode, sched, None)
+        out = _launch(
+            x, wq, scales, biases, idx, group_size, bits, mode, sched, None, bm
+        )
         if out is None:
             return False
         if align_k:
@@ -957,11 +991,11 @@ def _self_test(key: tuple) -> Optional[bool]:
 
 
 def _describe(key: tuple) -> str:
-    dtype, mode, bits, group_size, sched, align_n, align_k = key
+    dtype, mode, bits, group_size, sched, align_n, align_k, bm = key
     return (
         f"{str(dtype).rsplit('.', 1)[-1]} {mode} {bits}-bit gs{group_size} "
         f"({_SCHED_NAMES[sched]}{'' if align_n else ', ragged N'}"
-        f"{'' if align_k else ', ragged K'})"
+        f"{'' if align_k else ', ragged K'}{'' if bm == _BM else f', {bm}-row tiles'})"
     )
 
 
@@ -994,8 +1028,9 @@ def sorted_gather_qmm(
     sched = _schedule(M, E, K, N) if schedule is None else int(schedule)
     if sched == _SCHED_DB and (K % 64 or N % 64):
         sched = _SCHED_SEG
+    bm = _tile_rows(M, E, K)
     if verify:
-        key = (x.dtype, mode, bits, group_size, sched, N % _BN == 0, K % 64 == 0)
+        key = (x.dtype, mode, bits, group_size, sched, N % _BN == 0, K % 64 == 0, bm)
         ok = _verified.get(key)
         if ok is None:
             with _lock:
@@ -1006,4 +1041,6 @@ def sorted_gather_qmm(
                         _verified[key] = ok
         if not ok:
             return None
-    return _launch(x, w, scales, biases, indices, group_size, bits, mode, sched, stream)
+    return _launch(
+        x, w, scales, biases, indices, group_size, bits, mode, sched, stream, bm
+    )
