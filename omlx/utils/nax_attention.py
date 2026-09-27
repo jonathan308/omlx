@@ -23,6 +23,14 @@ calls); the MLX-side function constants (alignment, mask, causal, sinks) are
 compile-time constants of one generated kernel per variant. On MLX builds
 that carry the native kernel, the output is bit-identical to it.
 
+Long contexts run as several dispatches over consecutive key ranges
+(``OMLX_NAX_ATTN_PASS_KEYS`` keys each, default 8192) that hand the fp32
+online-softmax row state (O accumulator, running max and sum) from one to
+the next through device memory, so each row computes exactly what one
+dispatch computes (bit-identical output). One dispatch over a long key range
+lets its threadgroups drift apart until each streams its KV head from DRAM;
+per-slice dispatches keep the K/V they share in the on-chip caches.
+
 Inputs are read through their strides (no contiguity copies: KV-cache
 slices, transposed projections and the strided key windows of the blocked
 sliding-window path are consumed in place); only the head dim must be
@@ -64,6 +72,25 @@ _BK = 32
 _WM = 4
 _THREADS = 32 * _WM
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Key-range passes: keys per dispatch (0 = one dispatch). Every threadgroup
+# of a dispatch streams this many keys of its KV head, so the key slice the
+# threadgroups in flight share stays in the on-chip caches (one dispatch over
+# 1M keys runs at ~85 TFLOPS against ~103 at 64k). Grids of a wave or two
+# (query tails under ~512 rows at 64 heads) keep one dispatch: their
+# threadgroups stay in step anyway.
+_PASS_KEYS = _env_int("OMLX_NAX_ATTN_PASS_KEYS", 8192)
+_PASS_MIN_GROUPS = 512
+# Query tile resident in registers across key blocks (A/B switch).
+_QREG = _env_int("OMLX_NAX_ATTN_QREG", 1) != 0
+
 _METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "half"}
 
 _HEADER = NAX_TILE_HEADER + r"""
@@ -86,6 +113,9 @@ struct AttnParams {
   int qL_rem;
   int kL_rem;
   int qL_off;
+  // Key blocks [kb_begin, kb_end) of this dispatch (key-range passes).
+  int kb_begin;
+  int kb_end;
 };
 
 struct MaxOp {
@@ -116,10 +146,25 @@ struct ExpSubOp {
   }
 };
 
-// MLX's attention_nax with a value head dim BDV <= BD. Only the parameter
-// plumbing differs: strides come from the inputs, the output is written as
+// MLX's attention_nax with a value head dim BDV <= BD. The plumbing
+// differs: strides come from the inputs, the output is written as
 // [B, qL, H, BDV] rows (MLX's SDPA output layout), function constants are
-// template arguments, and the mask column stride is honoured.
+// template arguments, and the mask column stride is honoured. Two changes
+// keep the arithmetic but not the schedule:
+//
+// * Key-range passes. One dispatch covers key blocks [kb_begin, kb_end).
+//   Unless FIRST, the online-softmax state of every query row (fp32 O
+//   accumulator, running max, running sum) is loaded from Sin; unless LAST it
+//   is stored to Sout instead of normalising and writing the output. Every
+//   row thus runs exactly the operations of one full dispatch, in the same
+//   order (bit-identical output). Within a dispatch the threadgroups in
+//   flight only stream one key slice of their KV head, which stays on chip;
+//   over one long dispatch they drift apart and, once the KV head no longer
+//   fits in the caches, each re-streams it from DRAM.
+// * The query tile stays in registers (QREG) instead of being re-read from
+//   memory for every key block, and each row max is reduced over all of the
+//   row's score fragments before the cross-lane shuffles (max is exact, so
+//   the grouping does not matter).
 template <
     typename T,
     int BQ,
@@ -133,11 +178,15 @@ template <
     bool has_mask,
     bool do_causal,
     bool has_sinks,
+    bool FIRST,
+    bool LAST,
+    bool QREG,
     typename MaskType,
     typename AccumType,
     typename StridePtr,
     typename MaskPtr,
-    typename SinkPtr>
+    typename SinkPtr,
+    typename StatePtr>
 METAL_FUNC void attention_nax_bdv(
     const device T* Q,
     const device T* K,
@@ -150,6 +199,8 @@ METAL_FUNC void attention_nax_bdv(
     StridePtr m_str,
     MaskPtr mask,
     SinkPtr sinks,
+    StatePtr Sin,
+    device float* Sout,
     uint simd_group_id,
     uint3 tid) {
   ulong3 tidl{tid.x, tid.y, tid.z};
@@ -221,17 +272,35 @@ METAL_FUNC void attention_nax_bdv(
   metal::vec<AccumType, kRowsPT> max_score;
   metal::vec<AccumType, kRowsPT> sum_score{0};
 
-  // Init to -Inf
-  OMLX_NAX_UNROLL
-  for (short i = 0; i < kRowsPT; ++i) {
-    max_score[i] = Limits<AccumType>::finite_min;
-  }
+  // Online-softmax state rows of this simdgroup in the pass buffers:
+  // [B, H, NQ * BQ] rows of BDV + 2 floats (O accumulator, max, sum).
+  constexpr int kSW = BDV + 2;
+  const int64_t srow0 = (int64_t(tid.z) * params->H + tid.y) *
+          (int64_t(params->NQ) * BQ) +
+      int64_t(tid.x) * BQ + tm;
 
-  if (has_sinks) {
+  if constexpr (FIRST) {
+    // Init to -Inf
     OMLX_NAX_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
-      max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
-      sum_score[i] = 1;
+      max_score[i] = Limits<AccumType>::finite_min;
+    }
+
+    if (has_sinks) {
+      OMLX_NAX_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
+        sum_score[i] = 1;
+      }
+    }
+  } else {
+    // Resume the previous pass (rows past a query tail are never output).
+    Otile.load(Sin + srow0 * kSW, kSW);
+    OMLX_NAX_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const int64_t r = srow0 + sm + i * otile_t::kFragRowsJump;
+      max_score[i] = Sin[r * kSW + BDV];
+      sum_score[i] = Sin[r * kSW + BDV + 1];
     }
   }
 
@@ -254,8 +323,24 @@ METAL_FUNC void attention_nax_bdv(
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+  // This dispatch's key blocks.
+  const int kb_lo = params->kb_begin;
+  const int kb_hi = min(kb_lim, params->kb_end);
+  K += int64_t(kb_lo) * BK * K_strides[2];
+  V += int64_t(kb_lo) * BK * V_strides[2];
+
+  // Query fragments, loaded once when register resident.
+  NAXTile<T, TQ, (QREG ? TD : 1)> Qreg;
+  if (QREG) {
+    if (!align_Q && is_last_q) {
+      Qreg.load_rows(Q, int(Q_strides[2]), lim_rows_q);
+    } else {
+      Qreg.load(Q, int(Q_strides[2]));
+    }
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_lo; kb < kb_hi; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
 
     // Do S = Q @ K.T
@@ -276,7 +361,9 @@ METAL_FUNC void attention_nax_bdv(
           const int Q_load_off = iq * kU * int(Q_strides[2]) + id * kU;
           const int K_load_off = ik * kU * int(K_strides[2]) + id * kU;
 
-          if (!align_Q && is_last_q) {
+          if (QREG) {
+            Qtile.frag_at(0, 0) = Qreg.frag_at(iq, QREG ? id : 0);
+          } else if (!align_Q && is_last_q) {
             Qtile.load_rows(
                 Q + Q_load_off, int(Q_strides[2]), lim_rows_q - iq * kU);
           } else {
@@ -444,8 +531,27 @@ METAL_FUNC void attention_nax_bdv(
       new_max[i] = max_score[i];
     }
 
-    // Row max
-    Stile.template row_reduce<MaxOp>(new_max);
+    // Row max: all of a row's fragments first, then across lanes (the
+    // grouping is free, max is exact).
+    OMLX_NAX_UNROLL
+    for (short iq = 0; iq < TQ; ++iq) {
+      OMLX_NAX_UNROLL
+      for (short ii = 0; ii < stile_t::kFragThrRows; ++ii) {
+        const short loc0 = ii * stile_t::kFragThrCols;
+        AccumType m = Stile.frag_at(iq, 0)[loc0];
+        OMLX_NAX_UNROLL
+        for (short ik = 0; ik < TK; ++ik) {
+          OMLX_NAX_UNROLL
+          for (short jj = 0; jj < stile_t::kFragThrCols; ++jj) {
+            m = metal::max(m, Stile.frag_at(iq, ik)[loc0 + jj]);
+          }
+        }
+        m = metal::max(m, simd_shuffle_xor(m, ushort(1)));
+        m = metal::max(m, simd_shuffle_xor(m, ushort(8)));
+        const short r = iq * stile_t::kFragThrRows + ii;
+        new_max[r] = metal::max(new_max[r], m);
+      }
+    }
 
     // exp(Si - rowmax(Si))
     Stile.template row_bin_op<ExpSubOp>(new_max);
@@ -511,9 +617,23 @@ METAL_FUNC void attention_nax_bdv(
     V += BK * int(V_strides[2]);
   }
 
-  // Normalize output
-
   threadgroup_barrier(mem_flags::mem_none);
+
+  if constexpr (!LAST) {
+    // Hand the row state to the next pass.
+    Otile.store(Sout + srow0 * kSW, kSW);
+    if (sn == 0) {
+      OMLX_NAX_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        const int64_t r = srow0 + sm + i * otile_t::kFragRowsJump;
+        Sout[r * kSW + BDV] = max_score[i];
+        Sout[r * kSW + BDV + 1] = sum_score[i];
+      }
+    }
+    return;
+  }
+
+  // Normalize output
 
   metal::vec<AccumType, kRowsPT> rcp;
   OMLX_NAX_UNROLL
@@ -544,11 +664,12 @@ METAL_FUNC void attention_nax_bdv(
 _SOURCE = r"""
   omlx_nax::attention_nax_bdv<
       {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, 1,
-      {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS}, bool, float>(
+      {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS},
+      {FIRST}, {LAST}, {QREG}, bool, float>(
       q, k, v, out,
       reinterpret_cast<const device omlx_nax::AttnParams*>(params),
       q_strides, k_strides, v_strides, mask_strides,
-      mask, sinks,
+      mask, sinks, state, state_out,
       simdgroup_index_in_threadgroup,
       threadgroup_position_in_grid);
 """
@@ -568,6 +689,9 @@ def _kernel(
     has_mask: bool,
     do_causal: bool,
     has_sinks: bool,
+    first: bool = True,
+    last: bool = True,
+    qreg: bool = True,
 ):
     source = (
         _SOURCE.replace("{T}", _METAL_TYPES[dtype])
@@ -581,14 +705,27 @@ def _kernel(
         .replace("{HAS_MASK}", _flag(has_mask))
         .replace("{DO_CAUSAL}", _flag(do_causal))
         .replace("{HAS_SINKS}", _flag(has_sinks))
+        .replace("{FIRST}", _flag(first))
+        .replace("{LAST}", _flag(last))
+        .replace("{QREG}", _flag(qreg))
     )
     tag = "".join(
-        "1" if f else "0" for f in (align_q, align_k, has_mask, do_causal, has_sinks)
+        "1" if f else "0"
+        for f in (
+            align_q,
+            align_k,
+            has_mask,
+            do_causal,
+            has_sinks,
+            first,
+            last,
+            qreg,
+        )
     )
     return mx.fast.metal_kernel(
-        name=f"omlx_nax_attention_bd{bd}_bdv{bdv}_{tag}",
-        input_names=["q", "k", "v", "mask", "sinks", "params"],
-        output_names=["out"],
+        name=f"omlx_nax_attention_v2_bd{bd}_bdv{bdv}_{tag}",
+        input_names=["q", "k", "v", "mask", "sinks", "state", "params"],
+        output_names=["out", "state_out"],
         header=_HEADER,
         source=source,
         ensure_row_contiguous=False,
@@ -605,7 +742,19 @@ def _nax_available() -> bool:
         return False
 
 
-def _run(q, k, v, scale, mask, sinks) -> mx.array:
+def _pass_edges(
+    n_groups: int, nk: int, pass_keys: int, min_groups: Optional[int] = None
+) -> list[int]:
+    """Key-block boundaries of the dispatches for ``nk`` key blocks."""
+    if min_groups is None:
+        min_groups = _PASS_MIN_GROUPS
+    if pass_keys <= 0 or n_groups < min_groups:
+        return [0, nk]
+    n_pass = max(1, min(nk, round(nk * _BK / pass_keys)))
+    return [(i * nk) // n_pass for i in range(n_pass + 1)]
+
+
+def _run(q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None) -> mx.array:
     B, H, qL, D = q.shape
     kL = k.shape[2]
     DV = v.shape[3]
@@ -615,24 +764,6 @@ def _run(q, k, v, scale, mask, sinks) -> mx.array:
     NK = (kL + _BK - 1) // _BK
     NQ_aligned = qL // _BQ
     NK_aligned = kL // _BK
-    params = struct.pack(
-        "<6if7i",
-        B,
-        H,
-        D,
-        qL,
-        kL,
-        H // k.shape[1],
-        float(scale),
-        NQ,
-        NK,
-        NQ_aligned,
-        NK_aligned,
-        qL - NQ_aligned * _BQ,
-        kL - NK_aligned * _BK,
-        kL - qL,
-    )
-    params = mx.array(memoryview(params), dtype=mx.uint8)
     has_sinks = sinks is not None
     # Unused inputs get a one-element placeholder (never read).
     if has_mask:
@@ -643,23 +774,59 @@ def _run(q, k, v, scale, mask, sinks) -> mx.array:
         sinks = mx.contiguous(sinks.astype(q.dtype))
     else:
         sinks = mx.zeros((1,), dtype=q.dtype)
-    kernel = _kernel(
-        q.dtype,
-        D,
-        DV,
-        qL % _BQ == 0,
-        kL % _BK == 0,
-        has_mask,
-        do_causal,
-        has_sinks,
+    edges = _pass_edges(
+        B * H * NQ, NK, _PASS_KEYS if pass_keys is None else pass_keys, min_groups
     )
-    out = kernel(
-        inputs=[q, k, v, mask, sinks, params],
-        grid=(NQ * _THREADS, H, B),
-        threadgroup=(_THREADS, 1, 1),
-        output_shapes=[(B, qL, H, DV)],
-        output_dtypes=[q.dtype],
-    )[0]
+    n_pass = len(edges) - 1
+    # fp32 row state between passes: O accumulator, running max, running sum.
+    state_size = B * H * NQ * _BQ * (DV + 2)
+    state = mx.zeros((1,), dtype=mx.float32)
+    out = None
+    for i in range(n_pass):
+        first, last = i == 0, i == n_pass - 1
+        params = struct.pack(
+            "<6if9i",
+            B,
+            H,
+            D,
+            qL,
+            kL,
+            H // k.shape[1],
+            float(scale),
+            NQ,
+            NK,
+            NQ_aligned,
+            NK_aligned,
+            qL - NQ_aligned * _BQ,
+            kL - NK_aligned * _BK,
+            kL - qL,
+            edges[i],
+            edges[i + 1],
+        )
+        params = mx.array(memoryview(params), dtype=mx.uint8)
+        kernel = _kernel(
+            q.dtype,
+            D,
+            DV,
+            qL % _BQ == 0,
+            kL % _BK == 0,
+            has_mask,
+            do_causal,
+            has_sinks,
+            first,
+            last,
+            _QREG,
+        )
+        out, state = kernel(
+            inputs=[q, k, v, mask, sinks, state, params],
+            grid=(NQ * _THREADS, H, B),
+            threadgroup=(_THREADS, 1, 1),
+            output_shapes=[
+                (B, qL, H, DV) if last else (1,),
+                (1,) if last else (state_size,),
+            ],
+            output_dtypes=[q.dtype, mx.float32],
+        )
     # [B, qL, H, DV] rows viewed as [B, H, qL, DV], like MLX's SDPA output.
     return out.transpose(0, 2, 1, 3)
 
@@ -691,10 +858,12 @@ def _self_check_passed() -> bool:
         k = (0.5 * mx.random.normal((1, 2, 300, 192), key=kk)).astype(mx.bfloat16)
         v = (0.5 * mx.random.normal((1, 2, 300, 128), key=kv)).astype(mx.bfloat16)
         scale = 192**-0.5
-        out = _run(q, k, v, scale, "causal", None)
+        out = _run(q, k, v, scale, "causal", None, pass_keys=0)
         ref = _reference(q, k, v, scale, "causal")
         err = mx.abs(out.astype(mx.float32) - ref).max().item()
-        ok = err < 2e-2
+        # Key-range passes resume the exact row state: bit-identical output.
+        passes = _run(q, k, v, scale, "causal", None, pass_keys=96, min_groups=0)
+        ok = err < 2e-2 and bool(mx.array_equal(passes, out).item())
     except Exception as exc:  # noqa: BLE001 - any failure disables the route
         logger.warning("NAX JIT attention disabled: self-check failed (%s)", exc)
         return False
@@ -705,6 +874,21 @@ def _self_check_passed() -> bool:
         return False
     logger.info("NAX JIT attention (192/128 head dims) enabled")
     return True
+
+
+def uses_key_passes(queries: mx.array, keys: mx.array) -> bool:
+    """True when ``nax_mixed_head_dim_attention`` would split the key range.
+
+    Single-dispatch calls compute exactly what MLX's native 192/128 kernel
+    (on MLX builds that carry it) computes, at the same speed; split calls
+    are faster (long contexts), so callers may prefer this kernel then.
+    """
+    if not _ENABLED or queries.ndim != 4 or keys.ndim != 4:
+        return False
+    B, H, qL, _ = queries.shape
+    NQ = (qL + _BQ - 1) // _BQ
+    NK = (keys.shape[2] + _BK - 1) // _BK
+    return len(_pass_edges(B * H * NQ, NK, _PASS_KEYS)) > 2
 
 
 def nax_mixed_head_dim_attention(
