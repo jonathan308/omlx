@@ -70,7 +70,19 @@ def test_router_select_matches_reference(rows):
     inds, scores = df.router_select(logits, bias, 8, True, 1.0)
     assert inds.dtype == ref_inds.dtype
     assert np.array_equal(np.array(inds), np.array(ref_inds))
-    assert _mismatches(scores, ref_scores) == 0
+    if rows == 1:
+        # Decode: bitwise.
+        assert _mismatches(scores, ref_scores) == 0
+    else:
+        # Verify rows: the reference normalises with mlx's row reduction,
+        # whose summation order differs between the stock wheel's
+        # precompiled kernel and a source build; identical experts, scores
+        # within that summation-order difference.
+        np.testing.assert_array_max_ulp(
+            np.array(scores.astype(mx.float32)),
+            np.array(ref_scores.astype(mx.float32)),
+            maxulp=2,
+        )
 
 
 @pytest.mark.parametrize(
