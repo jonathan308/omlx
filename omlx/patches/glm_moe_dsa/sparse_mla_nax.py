@@ -273,18 +273,242 @@ _SOURCE = """
     }
 """
 
+# P @ V with the fp32 probabilities as two fp16 pieces (hi + lo, sum within
+# 2^-24 absolute of p: the precision of p's own fp32 rounding at 1.0) times
+# the bf16 values, as in the Qwen4 QSA tensor-unit kernel; 2 tensor ops per
+# value fragment instead of 3.
+_SOURCE_HALF2 = """
+    constexpr int D = 512;
+    constexpr int BK = 128;
+    const int L = params[0];
+    const int Kn = params[1];
+    const int TOPK = params[2];
+    const int q_off = params[3];
+    const float scale_log2 = scale[0] * 1.44269504088896341f;
+    const int qi = int(threadgroup_position_in_grid.x);
+    const int hh = int(threadgroup_position_in_grid.y);
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint tid = sg * 32 + lane;
+    const int hg = int(sg) / 4;
+    const int dq = int(sg) % 4;   // QK: key quarter; PV: dim quarter
+    const int q_abs = q_off + qi;
+    const int head0 = hh * 32 + hg * 16;
+
+    const short qid = short(lane >> 2);
+    const short fm = short((qid & 4) | ((lane >> 1) & 3));
+    const short fn = short(((qid & 2) | (lane & 1)) * 4);
+
+    threadgroup float s_tile[2 * 16 * BK];
+    threadgroup int sel[2][BK];
+    threadgroup int live[2][BK / 32];
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+    // PV: the fp32 probabilities enter as three bf16 parts (hi + mid + lo
+    // == p exactly: 8 + 8 + 8 significant bits), each multiplied with the
+    // bf16 values by an exact bf16 x bf16 -> fp32 tensor op.
+    constexpr auto pv_desc = matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+    auto pa = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
+    auto pm = pv_op.template get_left_input_cooperative_tensor<half, T, float>();
+    auto pb = pv_op.template get_right_input_cooperative_tensor<half, T, float>();
+    auto o0 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o1 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o2 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o3 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
+    for (short e = 0; e < 16; ++e) {
+        o0[e] = 0.0f;
+        o1[e] = 0.0f;
+        o2[e] = 0.0f;
+        o3[e] = 0.0f;
+    }
+    float m_run[2] = {-FLT_MAX, -FLT_MAX};
+    float l_run[2] = {0.0f, 0.0f};
+
+    const device T* qr0 = q + (ulong(head0 + fm) * L + qi) * D + fn;
+    const device T* qr1 = q + (ulong(head0 + fm + 8) * L + qi) * D + fn;
+    const device int32_t* idx_row = idx + ulong(qi) * TOPK;
+
+    const int n_tiles = (TOPK + BK - 1) / BK;
+    for (int t = 0; t < n_tiles; ++t) {
+        const int buf = t & 1;
+        const int tile_keys = min(BK, TOPK - t * BK);
+        if (tid < uint(BK)) {
+            const int slot = t * BK + int(tid);
+            int kp = slot < TOPK ? int(idx_row[slot]) : -1;
+            if (kp < 0 || kp >= Kn || kp > q_abs) {
+                kp = -1;
+            }
+            sel[buf][tid] = kp;
+            const bool any_live = simd_any(kp >= 0);
+            if (lane == 0) {
+                live[buf][sg] = any_live ? 1 : 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Unused slots sort last in the indexer's top-k rows: skip tiles
+        // with no live key (uniform across the threadgroup).
+        if ((live[buf][0] | live[buf][1] | live[buf][2] | live[buf][3]) == 0) {
+            continue;
+        }
+
+        if (dq * 32 < tile_keys) {
+            auto qa = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
+            auto kb = qk_op.template get_right_input_cooperative_tensor<T, T, float>();
+            auto sc = qk_op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(qa)>, metal::remove_addrspace_t<decltype(kb)>, float>();
+            for (short e = 0; e < 16; ++e) {
+                sc[e] = 0.0f;
+            }
+            const device T* kr[2][2];
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    const int kp = sel[buf][dq * 32 + tn * 16 + fm + i * 8];
+                    kr[tn][i] = kv + ulong(max(kp, 0)) * D + fn;
+                }
+            }
+            for (short kk = 0; kk < D; kk += 16) {
+                for (short j = 0; j < 4; ++j) {
+                    qa[j] = qr0[kk + j];
+                    qa[4 + j] = qr1[kk + j];
+                }
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short i = 0; i < 2; ++i) {
+                        for (short j = 0; j < 4; ++j) {
+                            kb[tn * 8 + i * 4 + j] = kr[tn][i][kk + j];
+                        }
+                    }
+                }
+                qk_op.run(qa, kb, sc);
+            }
+            threadgroup float* sp = s_tile + hg * 16 * BK + dq * 32;
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    for (short j = 0; j < 4; ++j) {
+                        sp[(fm + i * 8) * BK + tn * 16 + fn + j] = sc[tn * 8 + i * 4 + j];
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const threadgroup float* st = s_tile + hg * 16 * BK;
+        const int n_ks = (tile_keys + 15) / 16;
+        float rmax[2] = {m_run[0], m_run[1]};
+        for (short ks = 0; ks < n_ks; ++ks) {
+            const int key0 = ks * 16 + fn;
+            for (short i = 0; i < 2; ++i) {
+                const int r = fm + i * 8;
+                for (short j = 0; j < 4; ++j) {
+                    if (sel[buf][key0 + j] >= 0) {
+                        rmax[i] = max(rmax[i], st[r * BK + key0 + j] * scale_log2);
+                    }
+                }
+            }
+        }
+        float factor[2];
+        float rsum[2] = {0.0f, 0.0f};
+        for (short i = 0; i < 2; ++i) {
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(1)));
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(8)));
+            factor[i] = fast::exp2(m_run[i] - rmax[i]);
+            m_run[i] = rmax[i];
+        }
+        for (short e = 0; e < 16; ++e) {
+            const float f = factor[(e >> 2) & 1];
+            o0[e] *= f;
+            o1[e] *= f;
+            o2[e] *= f;
+            o3[e] *= f;
+        }
+        for (short ks = 0; ks < n_ks; ++ks) {
+            const int key0 = ks * 16 + fn;
+            for (short i = 0; i < 2; ++i) {
+                const int r = fm + i * 8;
+                for (short j = 0; j < 4; ++j) {
+                    const float e = sel[buf][key0 + j] < 0
+                        ? 0.0f
+                        : fast::exp2(st[r * BK + key0 + j] * scale_log2 - rmax[i]);
+                    const half hi = half(e);
+                    pa[i * 4 + j] = hi;
+                    pm[i * 4 + j] = half(e - float(hi));
+                    rsum[i] += e;
+                }
+            }
+            const int kp0 = sel[buf][ks * 16 + fm];
+            const int kp1 = sel[buf][ks * 16 + fm + 8];
+            const device T* v0 = kv + ulong(max(kp0, 0)) * D + dq * 128 + fn;
+            const device T* v1 = kv + ulong(max(kp1, 0)) * D + dq * 128 + fn;
+            for (short np = 0; np < 4; ++np) {
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short j = 0; j < 4; ++j) {
+                        pb[tn * 8 + j] = v0[np * 32 + tn * 16 + j];
+                        pb[tn * 8 + 4 + j] = v1[np * 32 + tn * 16 + j];
+                    }
+                }
+                if (np == 0) {
+                    pv_op.run(pa, pb, o0);
+                    pv_op.run(pm, pb, o0);
+                } else if (np == 1) {
+                    pv_op.run(pa, pb, o1);
+                    pv_op.run(pm, pb, o1);
+                } else if (np == 2) {
+                    pv_op.run(pa, pb, o2);
+                    pv_op.run(pm, pb, o2);
+                } else {
+                    pv_op.run(pa, pb, o3);
+                    pv_op.run(pm, pb, o3);
+                }
+            }
+        }
+        for (short i = 0; i < 2; ++i) {
+            rsum[i] += simd_shuffle_xor(rsum[i], ushort(1));
+            rsum[i] += simd_shuffle_xor(rsum[i], ushort(8));
+            l_run[i] = l_run[i] * factor[i] + rsum[i];
+        }
+    }
+
+    for (short i = 0; i < 2; ++i) {
+        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + dq * 128 + fn;
+        const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const short e = tn * 8 + i * 4 + j;
+                orow[tn * 16 + j] = T(o0[e] / denom);
+                orow[32 + tn * 16 + j] = T(o1[e] / denom);
+                orow[64 + tn * 16 + j] = T(o2[e] / denom);
+                orow[96 + tn * 16 + j] = T(o3[e] / denom);
+            }
+        }
+    }
+"""
+
 _KERNEL = None
+
+
+_PV_MODE = os.environ.get("OMLX_GLM_SPARSE_MLA_NAX_PV", "half2").strip().lower()
 
 
 def _kernel():
     global _KERNEL
     if _KERNEL is None:
+        half2 = _PV_MODE == "half2"
         _KERNEL = mx.fast.metal_kernel(
-            name="omlx_glm_sparse_mla_nax",
+            name="omlx_glm_sparse_mla_nax" + ("_h2" if half2 else ""),
             input_names=["q", "kv", "idx", "params", "scale"],
             output_names=["out"],
             header=_HEADER,
-            source=_SOURCE,
+            source=_SOURCE_HALF2 if half2 else _SOURCE,
         )
     return _KERNEL
 

@@ -250,3 +250,20 @@ def test_call_site_matches_fallback_paths(monkeypatch):
         e32, g32 = e.astype(mx.float32), g.astype(mx.float32)
         scale = mx.abs(e32).max().item()
         assert mx.abs(e32 - g32).max().item() <= tol * scale
+
+
+@pytest.mark.parametrize("mode", ["bf16x3", "half2"])
+def test_pv_modes_match_fp32_reference(mode, monkeypatch):
+    """Both P @ V operand splits stay at the native kernel's error level."""
+    if not sparse_mla_nax.nax_sparse_mla_available():
+        pytest.skip("needs NAX")
+    monkeypatch.setattr(sparse_mla_nax, "_PV_MODE", mode)
+    monkeypatch.setattr(sparse_mla_nax, "_KERNEL", None)
+    q, kv, idx = _inputs(96, 8192, 2051, seed=7)
+    scale = 576**-0.5
+    out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale).astype(mx.float32)
+    ref = _reference(q, kv, idx, scale)
+    native = _native(q, kv, idx, scale).astype(mx.float32)
+    err = mx.abs(out - ref).mean().item()
+    err_native = mx.abs(native - ref).mean().item()
+    assert err <= 1.05 * err_native
