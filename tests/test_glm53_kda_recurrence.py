@@ -283,3 +283,23 @@ def test_fused_prefill_then_fused_decode_is_bitwise_reference_decode():
     finally:
         language._DECODE_FUSION = saved
     assert dk.STATS["kda"] > before
+
+
+def test_prework_reads_qkv_in_place_from_the_fused_projection():
+    """A wider input (the whole fused projection) gives the concat's bits."""
+    from omlx.patches.glm53_kda_prework import kda_prework_fused
+
+    mx.random.seed(11)
+    heads, dim, length = 4, 128, 37
+    c_dim = 3 * heads * dim
+    fused = (mx.random.normal((1, length, c_dim + 320)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((1, 3, c_dim)) * 0.5).astype(mx.bfloat16)
+    conv_w = (mx.random.normal((c_dim, 1, 4)) * 0.3).astype(mx.bfloat16)
+    scale = mx.array(dim**-0.5, dtype=mx.float32)
+    wide = kda_prework_fused(fused, conv_state, conv_w, scale, length, heads, dim)
+    packed = kda_prework_fused(
+        mx.contiguous(fused[..., :c_dim]), conv_state, conv_w, scale, length, heads, dim
+    )
+    for a, b in zip(wide, packed):
+        assert a.shape == b.shape
+        assert mx.array_equal(a, b).item()
