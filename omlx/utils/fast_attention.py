@@ -107,9 +107,9 @@ def mixed_head_dim_sdpa(
 
     * MLX builds whose fused kernel takes the mixed head dims natively
       (NAX kernel with a separate value head dim) are called directly,
-      except for long key ranges: the oMLX JIT kernel below computes the
-      same (bit-identical) output there in several key-range dispatches
-      that keep the K/V stream on chip.
+      except for long key ranges: the oMLX JIT kernel below runs those in
+      several key-range dispatches that keep the K/V stream on chip (same
+      arithmetic; its head-dim split variant only reorders the fp32 sums).
     * Otherwise, on NAX (M5) GPUs, the same NAX kernel runs as an oMLX JIT
       kernel (``nax_mixed_head_dim_attention``, 192/128 head dims).
     * Otherwise, on NAX GPUs, Q/K/V are zero-padded to 256 so the

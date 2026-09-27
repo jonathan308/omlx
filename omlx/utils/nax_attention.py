@@ -29,7 +29,10 @@ online-softmax row state (O accumulator, running max and sum) from one to
 the next through device memory, so each row computes exactly what one
 dispatch computes (bit-identical output). One dispatch over a long key range
 lets its threadgroups drift apart until each streams its KV head from DRAM;
-per-slice dispatches keep the K/V they share in the on-chip caches.
+per-slice dispatches keep the K/V they share in the on-chip caches. Those
+dispatches also split the head dims over simdgroup pairs (MLX's dsplit
+scheme, ``OMLX_NAX_ATTN_DSPLIT``), which only reorders the fp32 sums of
+Q @ K.T (last-bit differences in ~0.5% of the outputs).
 
 Inputs are read through their strides (no contiguity copies: KV-cache
 slices, transposed projections and the strided key windows of the blocked
@@ -90,6 +93,15 @@ _PASS_KEYS = _env_int("OMLX_NAX_ATTN_PASS_KEYS", 8192)
 _PASS_MIN_GROUPS = 512
 # Query tile resident in registers across key blocks (A/B switch).
 _QREG = _env_int("OMLX_NAX_ATTN_QREG", 1) != 0
+# Fully unrolled Q @ K.T head-dim loop (A/B switch; the head-dim split
+# kernel always unrolls it).
+_QKFULL = _env_int("OMLX_NAX_ATTN_QKFULL", 0) != 0
+# Head-dim split over simdgroup pairs (MLX's attention_nax_dsplit scheme):
+# 0 = never, 1 = for calls that run in key-range passes (long contexts,
+# 3-4% faster there), 2 = always. It changes the summation order of
+# Q @ K.T (two 96-dim fp32 partial sums added), so its output differs from
+# the one-simdgroup kernel in the last bf16 bit of ~0.5% of the elements.
+_DSPLIT = _env_int("OMLX_NAX_ATTN_DSPLIT", 1)
 
 _METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "half"}
 
@@ -149,8 +161,7 @@ struct ExpSubOp {
 // MLX's attention_nax with a value head dim BDV <= BD. The plumbing
 // differs: strides come from the inputs, the output is written as
 // [B, qL, H, BDV] rows (MLX's SDPA output layout), function constants are
-// template arguments, and the mask column stride is honoured. Two changes
-// keep the arithmetic but not the schedule:
+// template arguments, and the mask column stride is honoured. Beyond that:
 //
 // * Key-range passes. One dispatch covers key blocks [kb_begin, kb_end).
 //   Unless FIRST, the online-softmax state of every query row (fp32 O
@@ -165,6 +176,13 @@ struct ExpSubOp {
 //   memory for every key block, and each row max is reduced over all of the
 //   row's score fragments before the cross-lane shuffles (max is exact, so
 //   the grouping does not matter).
+// * WN = 2 splits the head dims over simdgroup pairs, as MLX's
+//   attention_nax_dsplit does for 256-wide heads: each simdgroup of a pair
+//   computes Q @ K.T over half of the query/key dims and P @ V for half of
+//   the value dims, the pair adds its partial scores through threadgroup
+//   memory, and both run the softmax on the full score tile. Half the O
+//   accumulator and query registers per thread; the scores become the sum
+//   of two fp32 partial dot products (a summation-order change).
 template <
     typename T,
     int BQ,
@@ -181,6 +199,7 @@ template <
     bool FIRST,
     bool LAST,
     bool QREG,
+    bool QKFULL,
     typename MaskType,
     typename AccumType,
     typename StridePtr,
@@ -201,7 +220,9 @@ METAL_FUNC void attention_nax_bdv(
     SinkPtr sinks,
     StatePtr Sin,
     device float* Sout,
+    threadgroup AccumType* xchg,
     uint simd_group_id,
+    uint simd_lane_id,
     uint3 tid) {
   ulong3 tidl{tid.x, tid.y, tid.z};
 
@@ -237,30 +258,36 @@ METAL_FUNC void attention_nax_bdv(
   // Prepare MMA tiles
   constexpr short kU = 16;
 
-  constexpr int kNWarps = WM * WN;
-  static_assert(
-      BQ >= (kNWarps * kU) && BQ % (kNWarps * kU) == 0,
-      "Each simdgroup must host atleast 1 simdgroup matrix along Q sequence.");
+  // WM groups of 16 query rows; each group's WN simdgroups split the head
+  // dims (WN = 2: MLX's attention_nax_dsplit scheme; see the note above).
+  static_assert(BQ == WM * kU, "One 16-row fragment per row group");
+  static_assert(WN == 1 || WN == 2, "Head dims split over 1 or 2 simdgroups");
 
   // Q seq frags per warp
-  constexpr int TQ = BQ / (kNWarps * kU);
-  // HeadDim frags (all warps load the same frags)
-  constexpr int TD = BD / kU;
-  // Value head dim frags
-  constexpr int TDV = BDV / kU;
+  constexpr int TQ = 1;
+  // HeadDim frags of this simdgroup
+  constexpr int TD = BD / kU / WN;
+  // Value head dim frags of this simdgroup
+  constexpr int TDV = BDV / kU / WN;
   // KV seq frags per warp
   constexpr short TK = BK / kU;
 
-  static_assert(TQ == 1, "Check TQ");
-  static_assert(BDV % (2 * kU) == 0, "BDV must be a multiple of 32");
+  static_assert(TD * kU * WN == BD, "The head dim must split evenly");
+  static_assert(TDV % 2 == 0, "P@V accumulates output fragments in pairs");
   using otile_t = NAXTile<AccumType, TQ, TDV>;
   otile_t Otile;
 
   Otile.clear();
 
-  // Prepare mma tile offsets
-  const short tm = kU * TQ * simd_group_id;
-  Q += tm * int(Q_strides[2]);
+  // Prepare mma tile offsets: rows of this row group, columns of this
+  // simdgroup's share of the head dims.
+  const short row_group = simd_group_id / WN;
+  const short d_part = simd_group_id % WN;
+  const short tm = kU * TQ * row_group;
+  Q += tm * int(Q_strides[2]) + d_part * (BD / WN);
+  K += d_part * (BD / WN);
+  V += d_part * (BDV / WN);
+  O += d_part * (BDV / WN);
 
   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
   const short sm = simd_coord.y;
@@ -295,7 +322,7 @@ METAL_FUNC void attention_nax_bdv(
     }
   } else {
     // Resume the previous pass (rows past a query tail are never output).
-    Otile.load(Sin + srow0 * kSW, kSW);
+    Otile.load(Sin + srow0 * kSW + d_part * (BDV / WN), kSW);
     OMLX_NAX_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
       const int64_t r = srow0 + sm + i * otile_t::kFragRowsJump;
@@ -353,8 +380,7 @@ METAL_FUNC void attention_nax_bdv(
     for (short iq = 0; iq < TQ; iq++) {
       OMLX_NAX_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-#pragma clang loop unroll_count(4)
-        for (short id = 0; id < TD; id++) {
+        auto qk_step = [&](short id) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
 
@@ -385,6 +411,42 @@ METAL_FUNC void attention_nax_bdv(
               Ktile.frag_at(0, 0),
               Ktile.frag_at(1, 0),
               metal::true_type{});
+        };
+        if constexpr (QKFULL) {
+          // Register-resident query fragments need static indices.
+          OMLX_NAX_UNROLL
+          for (short id = 0; id < TD; id++) {
+            qk_step(id);
+          }
+        } else {
+#pragma clang loop unroll_count(4)
+          for (short id = 0; id < TD; id++) {
+            qk_step(id);
+          }
+        }
+
+        if constexpr (WN == 2) {
+          // Add the peer's partial scores (its half of the head dims).
+          constexpr short kEPF = stile_t::NAXFrag_t::kElemsPerFrag;
+          threadgroup AccumType* slot =
+              xchg + (row_group * WN + d_part) * (2 * kEPF * 32);
+          const threadgroup AccumType* peer =
+              xchg + (row_group * WN + 1 - d_part) * (2 * kEPF * 32);
+          thread auto& s0 = Stile.frag_at(iq, ik);
+          thread auto& s1 = Stile.frag_at(iq, ik + 1);
+          const short base = short(simd_lane_id) * (2 * kEPF);
+          OMLX_NAX_UNROLL
+          for (short i = 0; i < kEPF; i++) {
+            slot[base + i] = s0[i];
+            slot[base + kEPF + i] = s1[i];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          OMLX_NAX_UNROLL
+          for (short i = 0; i < kEPF; i++) {
+            s0[i] += peer[base + i];
+            s1[i] += peer[base + kEPF + i];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
       }
     }
@@ -581,7 +643,7 @@ METAL_FUNC void attention_nax_bdv(
     for (short iq = 0; iq < TQ; iq++) {
       OMLX_NAX_UNROLL
       for (short id = 0; id < TDV; id += 2) {
-        if constexpr (BDV == 128) {
+        if constexpr (BDV == 128 && WN == 1) {
           if (id == 4) {
             threadgroup_barrier(mem_flags::mem_none);
           }
@@ -621,8 +683,8 @@ METAL_FUNC void attention_nax_bdv(
 
   if constexpr (!LAST) {
     // Hand the row state to the next pass.
-    Otile.store(Sout + srow0 * kSW, kSW);
-    if (sn == 0) {
+    Otile.store(Sout + srow0 * kSW + d_part * (BDV / WN), kSW);
+    if (sn == 0 && d_part == 0) {
       OMLX_NAX_UNROLL
       for (short i = 0; i < kRowsPT; ++i) {
         const int64_t r = srow0 + sm + i * otile_t::kFragRowsJump;
@@ -662,15 +724,17 @@ METAL_FUNC void attention_nax_bdv(
 # One generated kernel per variant; the MLX kernel's function constants are
 # baked in as template arguments of the call.
 _SOURCE = r"""
+  threadgroup float xchg[{WN} == 2 ? {WM} * 2 * 16 * 32 : 1];
   omlx_nax::attention_nax_bdv<
-      {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, 1,
+      {T}, {BQ}, {BK}, {BD}, {BDV}, {WM}, {WN},
       {ALIGN_Q}, {ALIGN_K}, {HAS_MASK}, {DO_CAUSAL}, {HAS_SINKS},
-      {FIRST}, {LAST}, {QREG}, bool, float>(
+      {FIRST}, {LAST}, {QREG}, {QKFULL}, bool, float>(
       q, k, v, out,
       reinterpret_cast<const device omlx_nax::AttnParams*>(params),
       q_strides, k_strides, v_strides, mask_strides,
-      mask, sinks, state, state_out,
+      mask, sinks, state, state_out, xchg,
       simdgroup_index_in_threadgroup,
+      thread_index_in_simdgroup,
       threadgroup_position_in_grid);
 """
 
@@ -692,14 +756,18 @@ def _kernel(
     first: bool = True,
     last: bool = True,
     qreg: bool = True,
+    wn: int = 1,
+    qkfull: bool = False,
 ):
+    wm = _WM // wn
     source = (
         _SOURCE.replace("{T}", _METAL_TYPES[dtype])
-        .replace("{BQ}", str(_BQ))
+        .replace("{BQ}", str(16 * wm))
         .replace("{BK}", str(_BK))
         .replace("{BD}", str(bd))
         .replace("{BDV}", str(bdv))
-        .replace("{WM}", str(_WM))
+        .replace("{WM}", str(wm))
+        .replace("{WN}", str(wn))
         .replace("{ALIGN_Q}", _flag(align_q))
         .replace("{ALIGN_K}", _flag(align_k))
         .replace("{HAS_MASK}", _flag(has_mask))
@@ -708,6 +776,7 @@ def _kernel(
         .replace("{FIRST}", _flag(first))
         .replace("{LAST}", _flag(last))
         .replace("{QREG}", _flag(qreg))
+        .replace("{QKFULL}", _flag(qkfull))
     )
     tag = "".join(
         "1" if f else "0"
@@ -720,10 +789,11 @@ def _kernel(
             first,
             last,
             qreg,
+            qkfull,
         )
     )
     return mx.fast.metal_kernel(
-        name=f"omlx_nax_attention_v2_bd{bd}_bdv{bdv}_{tag}",
+        name=f"omlx_nax_attention_v2_bd{bd}_bdv{bdv}_wn{wn}_{tag}",
         input_names=["q", "k", "v", "mask", "sinks", "state", "params"],
         output_names=["out", "state_out"],
         header=_HEADER,
@@ -754,16 +824,37 @@ def _pass_edges(
     return [(i * nk) // n_pass for i in range(n_pass + 1)]
 
 
-def _run(q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None) -> mx.array:
+def _run(
+    q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None, dsplit=None
+) -> mx.array:
+    B, H, qL, _ = q.shape
+    NK = (k.shape[2] + _BK - 1) // _BK
+    edges = _pass_edges(
+        B * H * ((qL + _BQ - 1) // _BQ),
+        NK,
+        _PASS_KEYS if pass_keys is None else pass_keys,
+        min_groups,
+    )
+    mode = _DSPLIT if dsplit is None else dsplit
+    wn = 2 if (mode == 2 or (mode == 1 and len(edges) > 2)) else 1
+    if len(edges) > 2 and not _passes_check_passed(wn):
+        edges, wn = [0, NK], 1
+    return _run_edges(q, k, v, scale, mask, sinks, edges, wn)
+
+
+def _run_edges(q, k, v, scale, mask, sinks, edges, wn) -> mx.array:
+    """Dispatch the key blocks between consecutive ``edges`` in turn."""
     B, H, qL, D = q.shape
     kL = k.shape[2]
     DV = v.shape[3]
     do_causal = isinstance(mask, str)
     has_mask = isinstance(mask, mx.array)
-    NQ = (qL + _BQ - 1) // _BQ
     NK = (kL + _BK - 1) // _BK
-    NQ_aligned = qL // _BQ
     NK_aligned = kL // _BK
+    n_pass = len(edges) - 1
+    bq = 16 * (_WM // wn)
+    NQ = (qL + bq - 1) // bq
+    NQ_aligned = qL // bq
     has_sinks = sinks is not None
     # Unused inputs get a one-element placeholder (never read).
     if has_mask:
@@ -774,12 +865,8 @@ def _run(q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None) -> mx.arr
         sinks = mx.contiguous(sinks.astype(q.dtype))
     else:
         sinks = mx.zeros((1,), dtype=q.dtype)
-    edges = _pass_edges(
-        B * H * NQ, NK, _PASS_KEYS if pass_keys is None else pass_keys, min_groups
-    )
-    n_pass = len(edges) - 1
     # fp32 row state between passes: O accumulator, running max, running sum.
-    state_size = B * H * NQ * _BQ * (DV + 2)
+    state_size = B * H * NQ * bq * (DV + 2)
     state = mx.zeros((1,), dtype=mx.float32)
     out = None
     for i in range(n_pass):
@@ -797,7 +884,7 @@ def _run(q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None) -> mx.arr
             NK,
             NQ_aligned,
             NK_aligned,
-            qL - NQ_aligned * _BQ,
+            qL - NQ_aligned * bq,
             kL - NK_aligned * _BK,
             kL - qL,
             edges[i],
@@ -808,14 +895,16 @@ def _run(q, k, v, scale, mask, sinks, pass_keys=None, min_groups=None) -> mx.arr
             q.dtype,
             D,
             DV,
-            qL % _BQ == 0,
+            qL % bq == 0,
             kL % _BK == 0,
             has_mask,
             do_causal,
             has_sinks,
             first,
             last,
-            _QREG,
+            _QREG or wn == 2,
+            wn,
+            _QKFULL or wn == 2,
         )
         out, state = kernel(
             inputs=[q, k, v, mask, sinks, state, params],
@@ -858,12 +947,10 @@ def _self_check_passed() -> bool:
         k = (0.5 * mx.random.normal((1, 2, 300, 192), key=kk)).astype(mx.bfloat16)
         v = (0.5 * mx.random.normal((1, 2, 300, 128), key=kv)).astype(mx.bfloat16)
         scale = 192**-0.5
-        out = _run(q, k, v, scale, "causal", None, pass_keys=0)
+        out = _run_edges(q, k, v, scale, "causal", None, [0, 10], 1)
         ref = _reference(q, k, v, scale, "causal")
         err = mx.abs(out.astype(mx.float32) - ref).max().item()
-        # Key-range passes resume the exact row state: bit-identical output.
-        passes = _run(q, k, v, scale, "causal", None, pass_keys=96, min_groups=0)
-        ok = err < 2e-2 and bool(mx.array_equal(passes, out).item())
+        ok = err < 2e-2
     except Exception as exc:  # noqa: BLE001 - any failure disables the route
         logger.warning("NAX JIT attention disabled: self-check failed (%s)", exc)
         return False
@@ -876,12 +963,40 @@ def _self_check_passed() -> bool:
     return True
 
 
+@lru_cache(maxsize=None)
+def _passes_check_passed(wn: int) -> bool:
+    """First use of key-range passes (per head-dim split): one small case.
+
+    Several dispatches must reproduce one dispatch of the same kernel bit
+    for bit (the row state is resumed exactly), and match fp32. Any failure
+    keeps long contexts on one dispatch.
+    """
+    try:
+        key = mx.random.key(192129)
+        kq, kk, kv = mx.random.split(key, 3)
+        q = (0.5 * mx.random.normal((1, 4, 100, 192), key=kq)).astype(mx.bfloat16)
+        k = (0.5 * mx.random.normal((1, 2, 300, 192), key=kk)).astype(mx.bfloat16)
+        v = (0.5 * mx.random.normal((1, 2, 300, 128), key=kv)).astype(mx.bfloat16)
+        scale = 192**-0.5
+        one = _run_edges(q, k, v, scale, "causal", None, [0, 10], wn)
+        many = _run_edges(q, k, v, scale, "causal", None, [0, 3, 6, 10], wn)
+        ref = _reference(q, k, v, scale, "causal")
+        err = mx.abs(many.astype(mx.float32) - ref).max().item()
+        ok = err < 2e-2 and bool(mx.array_equal(many, one).item())
+    except Exception as exc:  # noqa: BLE001 - any failure keeps one dispatch
+        logger.warning("NAX JIT attention key-range passes disabled (%s)", exc)
+        return False
+    if not ok:
+        logger.warning("NAX JIT attention key-range passes disabled: check failed")
+    return ok
+
+
 def uses_key_passes(queries: mx.array, keys: mx.array) -> bool:
     """True when ``nax_mixed_head_dim_attention`` would split the key range.
 
     Single-dispatch calls compute exactly what MLX's native 192/128 kernel
     (on MLX builds that carry it) computes, at the same speed; split calls
-    are faster (long contexts), so callers may prefer this kernel then.
+    (long contexts) are faster, so callers may prefer this kernel then.
     """
     if not _ENABLED or queries.ndim != 4 or keys.ndim != 4:
         return False
