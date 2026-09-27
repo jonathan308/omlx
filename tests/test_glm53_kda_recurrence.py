@@ -248,6 +248,12 @@ def test_fused_prefill_leaves_stock_shaped_caches():
 
 def test_fused_prefill_then_fused_decode_is_bitwise_reference_decode():
     """Builds with fused GLM decode kernels: decode from a fused-prefill cache."""
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+
+    # The MTP runtime (applied process-wide by some earlier tests) replaces
+    # the layer calls, which do not route the fused decode kernels.
+    if getattr(glm5_next_vlm_runtime, "_APPLIED", False):
+        pytest.skip("glm5_next MTP runtime replaced the layer calls in this process")
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.glm5_next import language
 
