@@ -412,7 +412,12 @@ def _patch_model_call(g5_lang: Any) -> None:
         prefill = h.shape[1] >= 256
         # Each completed layer is waited for and the allocator cache is
         # released (layer-specific buffer sizes would otherwise accumulate).
-        pipeline = LayerPipeline(on_evaluated=mx.clear_cache) if prefill else None
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask

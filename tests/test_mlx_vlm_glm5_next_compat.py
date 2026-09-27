@@ -1051,16 +1051,18 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
 
     ids = mx.zeros((1, 256), dtype=mx.int32)
     out = model(ids)
-    real_eval(out)
-    assert len(calls) >= text.num_hidden_layers, (
+    # The last layer's output stays lazy (a prefill chunk only needs its
+    # cache update); every earlier layer is evaluated and released.
+    assert len(calls) >= text.num_hidden_layers - 1, (
         f"prefill width must eval the stream per layer, got {len(calls)} eval calls"
         f" for {text.num_hidden_layers} layers"
     )
     # Layer-specific buffer sizes can accumulate in the allocator pool.
-    assert len(clears) >= text.num_hidden_layers, (
+    assert len(clears) >= text.num_hidden_layers - 1, (
         f"prefill must clear the allocator pool per layer, got {len(clears)}"
         f" clears for {text.num_hidden_layers} layers"
     )
+    real_eval(out)
 
     calls.clear()
     clears.clear()
@@ -1071,6 +1073,54 @@ def test_prefill_evals_stream_per_layer_to_bound_transient(monkeypatch):
         "decode width must stay lazy (no per-layer eval)"
     )
     assert not clears, "decode width must not clear the pool per layer"
+
+
+def test_prefill_leaves_the_last_layer_output_lazy():
+    """A prefill chunk evaluates every layer but the last through the pipeline
+    (the chunk only needs the last layer's cache update); the caches and the
+    output are identical to a forward whose output is read right away."""
+    import mlx_vlm.models.glm5_next.language as lang
+
+    text = _tiny_config().text_config
+    lm = lang.LanguageModel(text)
+    mx.eval(lm.parameters())
+    ids = mx.array([[(7 * i + 3) % text.vocab_size for i in range(256)]], dtype=mx.int32)
+
+    def flat_state(cache):
+        arrays = []
+        for c in cache:
+            for part in getattr(c, "caches", None) or (c,):
+                state = part.state
+                for a in state if isinstance(state, (list, tuple)) else (state,):
+                    if isinstance(a, mx.array):
+                        arrays.append(a)
+        return arrays
+
+    queued = []
+    real_async_eval = mx.async_eval
+
+    def spy(*arrays):
+        queued.append(len(arrays))
+        return real_async_eval(*arrays)
+
+    lang.mx.async_eval = spy
+    try:
+        cache_a = lm.make_cache()
+        out_a = lm.model(ids, cache=cache_a)
+        mx.eval(flat_state(cache_a))
+    finally:
+        lang.mx.async_eval = real_async_eval
+    assert len(queued) == text.num_hidden_layers - 1
+    mx.eval(out_a)
+
+    cache_b = lm.make_cache()
+    out_b = lm.model(ids, cache=cache_b)
+    mx.eval(out_b, flat_state(cache_b))
+    assert mx.array_equal(out_a, out_b).item()
+    state_a, state_b = flat_state(cache_a), flat_state(cache_b)
+    assert len(state_a) == len(state_b) > 0
+    for a, b in zip(state_a, state_b):
+        assert a.shape == b.shape and mx.array_equal(a, b).item()
 
 
 def test_patch_overrides_site_packages_glm5_next_copy():
