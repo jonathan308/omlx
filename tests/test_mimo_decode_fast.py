@@ -677,3 +677,84 @@ def test_expert_kind_rejects_wrapped_switch_modules():
             self.down_proj = glu.down_proj
 
     assert df._expert_kind(OffloadSwitchGLU(sw)) is None
+
+
+def _mimo_dims_model(seed=21):
+    """GQA 16 with MiMo's full-attention head dims (192 / 128), the shapes
+    MLX's vector SDPA (and the long-context kernels) serve."""
+    m = _mimo()
+    cfg = dict(_TINY)
+    cfg.update(num_attention_heads=16, num_key_value_heads=1, head_dim=192, v_head_dim=128,
+               swa_num_attention_heads=16, swa_num_key_value_heads=2)
+    mx.random.seed(seed)
+    model = m.Model(m.ModelArgs.from_dict(cfg))
+    updates = []
+    for key, value in tree_flatten(model.parameters()):
+        if key.endswith("gate.weight"):
+            updates.append((key, mx.random.normal(value.shape) * 0.05))
+        elif key.endswith("e_score_correction_bias"):
+            updates.append((key, mx.random.normal(value.shape) * 0.02))
+        elif key.endswith("attention_sink_bias"):
+            updates.append((key, mx.random.normal(value.shape)))
+        elif "norm" in key:
+            updates.append((key, 1 + 0.1 * mx.random.normal(value.shape)))
+    model.load_weights(updates, strict=False)
+    nn.quantize(model, group_size=64, bits=8,
+                class_predicate=lambda p, mod: isinstance(mod, nn.Linear) and "switch_mlp" not in p)
+    nn.quantize(model, group_size=32, bits=4, mode="mxfp4",
+                class_predicate=lambda p, mod: "switch_mlp" in p and hasattr(mod, "to_quantized"))
+    model.load_weights([(k, v.astype(BF16)) for k, v in tree_flatten(model.parameters())
+                        if v.dtype == mx.float32 and "e_score_correction_bias" not in k], strict=False)
+    mx.eval(model.parameters())
+    return model
+
+
+def _count_kernel_calls(monkeypatch):
+    from omlx.patches.mimo_v2 import sdpa_rows
+
+    calls = {"rows": 0}
+    orig_rows = sdpa_rows.sdpa_rows
+
+    def rows(*a, **k):
+        out = orig_rows(*a, **k)
+        calls["rows"] += out is not None
+        return out
+
+    monkeypatch.setattr(sdpa_rows, "sdpa_rows", rows)
+    return calls
+
+
+def test_fast_forward_one_pass_rows_kernel_is_bit_exact(monkeypatch):
+    """Verify forwards over a 2-pass-sized KV cache run their attention rows
+    in one pass (sdpa_rows): bit-identical to the row-chunked reference."""
+    m = _mimo()
+    model = _mimo_dims_model()
+    _per_row_router(monkeypatch, m)
+    _chunked_reference(monkeypatch, m)
+    # The chunked reference stands in for MLX's SDPA in the model module.
+    monkeypatch.setattr(df, "_is_mlx_sdpa", lambda fn: True)
+    calls = _count_kernel_calls(monkeypatch)
+    tokens = mx.random.randint(0, 512, (1, 1130))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :1100], cache, False, monkeypatch)
+    pos = 1100
+    for L in [3, 1, 4, 2, 3]:
+        step = tokens[:, pos : pos + L]
+        ref_cache, fast_cache = _clone(cache), _clone(cache)
+        ref = _forward(model, step, ref_cache, False, monkeypatch)
+        before = calls["rows"]
+        fast = _forward(model, step, fast_cache, True, monkeypatch)
+        if L > 1:
+            assert calls["rows"] > before, f"sdpa_rows did not run at L={L}"
+        assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
+        cache = fast_cache
+        pos += L
+
+
+def test_fast_path_keeps_patched_attention_functions(monkeypatch):
+    """A model-module attention function the fast path does not know keeps
+    serving every call (the one-pass kernel only replaces MLX's SDPA)."""
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    assert df._is_mlx_sdpa(scaled_dot_product_attention)
+    assert not df._is_mlx_sdpa(lambda *a, **k: None)
