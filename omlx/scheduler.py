@@ -1654,6 +1654,26 @@ def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_
             next_n = min(next_n, delta)
     return max(1, next_n)
 
+
+def _mimo_fused_full_attention() -> bool:
+    """True when MiMo's 192/128 full-attention layers run a fused kernel.
+
+    Stock mlx has no fused SDPA for these head dims; the fused route comes
+    from ``omlx.utils.fast_attention`` (native kernel when the installed mlx
+    supports the dims, else the tensor-unit kernel with padded heads).
+    """
+    try:
+        from .utils import fast_attention
+    except ImportError:
+        return False
+    try:
+        if fast_attention._native_mixed_dims_supported(192, 128):
+            return True
+        return bool(fast_attention._nax_available())
+    except Exception:
+        return False
+
+
 @dataclass
 class SchedulerConfig:
     """Configuration for the scheduler."""
@@ -2941,12 +2961,16 @@ class Scheduler:
                 from .settings import get_system_memory
 
                 # MiMo's top-8-of-256 routing leaves ~64 rows per expert at a
-                # 2048-token chunk; 4096 fills the gather_qmm tiles better
-                # (M5 Ultra: +12% raw prefill throughput, no attention
-                # penalty thanks to the 128-token sliding window) and the
-                # doubled activation footprint is small next to the model on
-                # hosts with this much memory.
-                if get_system_memory() >= 128 * 1024**3:
+                # 2048-token chunk; 4096 fills the gather_qmm tiles better and
+                # the doubled activation footprint is small next to the model
+                # on hosts with this much memory. Only with fused full
+                # attention: otherwise its 9 full-attention layers (192/128
+                # head dims) materialise [heads, chunk, context] scores and
+                # the wider chunk is slower.
+                if (
+                    get_system_memory() >= 128 * 1024**3
+                    and _mimo_fused_full_attention()
+                ):
                     return 4096
         except Exception:
             logger.debug("qwen3_5 prefill floor probe failed", exc_info=True)

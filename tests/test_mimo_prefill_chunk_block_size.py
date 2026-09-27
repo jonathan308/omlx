@@ -44,3 +44,33 @@ def test_non_mimo_rotating_models_are_unchanged():
     s._align_block_size_with_rotating_window()
     # window 128 -> smallest multiple in [512, 1024]
     assert s.config.paged_cache_block_size == 512
+
+
+def test_wide_mimo_chunk_requires_fused_full_attention(monkeypatch):
+    """Without the fused 192/128 attention the wider chunk is not used."""
+    import sys
+    from types import SimpleNamespace as NS
+
+    import omlx.utils
+    from omlx import scheduler
+
+    def use(module):
+        # ``from .utils import fast_attention`` reads the package attribute
+        # first, then sys.modules; None in sys.modules makes it ImportError.
+        monkeypatch.setitem(sys.modules, "omlx.utils.fast_attention", module)
+        if module is None:
+            monkeypatch.delattr(omlx.utils, "fast_attention", raising=False)
+        else:
+            monkeypatch.setattr(omlx.utils, "fast_attention", module, raising=False)
+
+    use(None)
+    assert scheduler._mimo_fused_full_attention() is False
+
+    use(NS(_native_mixed_dims_supported=lambda qk, v: False, _nax_available=lambda: True))
+    assert scheduler._mimo_fused_full_attention() is True
+
+    use(NS(_native_mixed_dims_supported=lambda qk, v: True, _nax_available=lambda: False))
+    assert scheduler._mimo_fused_full_attention() is True
+
+    use(NS(_native_mixed_dims_supported=lambda qk, v: False, _nax_available=lambda: False))
+    assert scheduler._mimo_fused_full_attention() is False
