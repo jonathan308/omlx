@@ -3,7 +3,8 @@
 
 ``sdpa_rows``: every row of a short forward in one pass over the KV cache,
 bit-identical to MLX's vector kernel (the path it replaces: one call for
-rows x GQA <= 32, row chunks beyond).
+rows x GQA <= 32, row chunks beyond).  ``sdpa_flash``: split-key matrix
+kernel, MLX's float32 math in another summation order.
 """
 
 import zlib
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 
 from omlx.patches.mimo_v2 import decode_fast as df
+from omlx.patches.mimo_v2 import sdpa_flash as sf
 from omlx.patches.mimo_v2 import sdpa_rows as sr
 
 pytestmark = pytest.mark.skipif(
@@ -122,17 +124,115 @@ def test_mlx_blocks_heuristic_matches_mlx_0_32():
     assert sr.mlx_blocks(40000, 2, "g") == 32
 
 
-def test_sdpa_rows_reads_strided_views():
+def _ref64(q, k, v, scale, mask, sinks):
+    q = np.array(q.astype(mx.float32)).astype(np.float64)
+    k = np.array(k.astype(mx.float32)).astype(np.float64)
+    v = np.array(v.astype(mx.float32)).astype(np.float64)
+    B, H, L, _ = q.shape
+    S = k.shape[2]
+    rep = H // k.shape[1]
+    q = (np.float32(scale) * q.astype(np.float32)).astype(np.float64)
+    if isinstance(mask, str):
+        allowed = np.broadcast_to(np.arange(S - L, S)[:, None] >= np.arange(S)[None], (B, L, S))
+        bias = np.zeros((B, L, S))
+    elif mask is None:
+        allowed, bias = np.ones((B, L, S), bool), np.zeros((B, L, S))
+    else:
+        m = np.array(mask if mask.dtype == mx.bool_ else mask.astype(mx.float32))
+        m = np.broadcast_to(m.reshape((1,) * (4 - m.ndim) + m.shape), (B, 1, L, S))[:, 0]
+        if mask.dtype == mx.bool_:
+            allowed, bias = m, np.zeros((B, L, S))
+        else:
+            allowed, bias = np.isfinite(m), np.where(np.isfinite(m), m, 0)
+    sk = None if sinks is None else np.array(sinks.astype(mx.float32)).astype(np.float64)
+    out = np.zeros((B, L, H, v.shape[-1]))
+    for b in range(B):
+        for h in range(H):
+            s = np.where(allowed[b], q[b, h] @ k[b, h // rep].T + bias[b], -np.inf)
+            if sk is not None:
+                s = np.concatenate([np.full((L, 1), sk[h]), s], axis=1)
+            p = np.exp(s - s.max(axis=1, keepdims=True))
+            p /= p.sum(axis=1, keepdims=True)
+            if sk is not None:
+                p = p[:, 1:]
+            out[b, :, h] = p @ v[b, h // rep]
+    return out.reshape(B, L, -1)
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_sdpa_flash_matches_mlx_to_summation_order(case):
+    """Same float32 math as MLX's vector kernel: within two bf16 ULPs of it at
+    each head vector's scale (MLX's own bf16-rounded block partials put it up
+    to an ULP off float64), and at least as close to float64 as MLX."""
+    B, H, Hk, L, S, mask_kind, with_sinks = case
+    q, k, v, mask, sinks = _inputs(B, H, Hk, L, S, mask_kind, with_sinks, case)
+    scale = D ** -0.5
+    out = sf.sdpa_flash(q, k, v, scale, mask, sinks)
+    assert out is not None and out.shape == (B, L, H * DV)
+    ref = _today(q, k, v, scale, mask, sinks)
+    r64 = _ref64(q, k, v, scale, mask, sinks)
+    new = np.array(out.astype(mx.float32)).astype(np.float64)
+    old = np.array(ref.astype(mx.float32)).astype(np.float64)
+    assert np.isfinite(new).all()
+    vec = np.abs(r64).reshape(B, L, H, DV).max(axis=-1, keepdims=True)
+    ulp = np.broadcast_to(2.0 ** (np.floor(np.log2(np.maximum(vec, 1e-30))) - 7), (B, L, H, DV)).reshape(B, L, -1)
+    assert (np.abs(new - old) <= ulp * 2.0001).all()
+    assert np.abs(new - r64).max() <= np.abs(old - r64).max() + 1e-6
+
+
+@pytest.mark.parametrize("S", [1100, 17000])
+def test_sdpa_flash_verify_rows_equal_one_row_decodes(S):
+    """A causal L-row verify computes each row exactly like the one-row
+    decode at that row's position (same key splits and tiles)."""
+    for L in (2, 3, 4):
+        q, k, v, _, sinks = _inputs(1, 64, 4, L, S, "causal", True, ("verify", S, L))
+        scale = D ** -0.5
+        verify = sf.sdpa_flash(q, k, v, scale, "causal", sinks)
+        rows = []
+        for r in range(L):
+            n = S - L + r + 1
+            assert sf.chunk_size(n) == sf.chunk_size(S)
+            rows.append(sf.sdpa_flash(q[:, :, r : r + 1], k[:, :, :n], v[:, :, :n], scale, None, sinks))
+        decode = mx.concatenate(rows, axis=1)
+        assert (_bits(verify) != _bits(decode)).sum() == 0
+
+
+def test_sdpa_flash_declines_unsupported_shapes():
+    q = mx.zeros((1, 12, 1, 192), BF16)  # GQA 3: bands would mix heads
+    k = mx.zeros((1, 4, 5000, 192), BF16)
+    v = mx.zeros((1, 4, 5000, 128), BF16)
+    assert sf.sdpa_flash(q, k, v, 1.0, None, None) is None
+    q = mx.zeros((1, 64, 5, 192), BF16)  # more rows than MAX_ROWS
+    assert sf.sdpa_flash(q, k, v, 1.0, "causal", None) is None
+    q = mx.zeros((1, 64, 1, 192), mx.float32)
+    assert sf.sdpa_flash(q, k.astype(mx.float32), v.astype(mx.float32), 1.0, None, None) is None
+
+
+@pytest.mark.parametrize("kernel", ["rows", "flash"])
+def test_kernels_read_strided_views(kernel):
     """Queries / keys / values whose last axis is not contiguous (read with
     their strides, no copy) give the same result as contiguous copies."""
     B, H, Hk, L, S = 1, 64, 4, 3, 5000
-    q, k, v, _, sinks = _inputs(B, H, Hk, L, S, "causal", True, "strided")
+    q, k, v, _, sinks = _inputs(B, H, Hk, L, S, "causal", True, ("strided", kernel))
     kt = mx.contiguous(k.swapaxes(2, 3)).swapaxes(2, 3)  # (B, Hk, S, D) view, inner stride S
     vt = mx.contiguous(v.swapaxes(2, 3)).swapaxes(2, 3)
     qt = mx.contiguous(q.swapaxes(2, 3)).swapaxes(2, 3)
-    fn = sr.sdpa_rows
+    fn = sr.sdpa_rows if kernel == "rows" else sf.sdpa_flash
     scale = D ** -0.5
     a = fn(q, mx.contiguous(k), mx.contiguous(v), scale, "causal", sinks)
     b = fn(qt, kt, vt, scale, "causal", sinks)
     assert a is not None and b is not None
     assert (_bits(a) != _bits(b)).sum() == 0
+
+
+def test_sdpa_flash_band_split_is_bit_identical(monkeypatch):
+    """One-row forwards split each band over two simdgroups (HS 2), verify
+    forwards do not (HS 1); the scores are (first half) + (second half) of
+    the head dim either way, so the output bits do not depend on the layout."""
+    for L, mask_kind in ((1, "none"), (3, "causal")):
+        q, k, v, mask, sinks = _inputs(1, 64, 4, L, 5000, mask_kind, True, ("hs", L))
+        outs = []
+        for hs in ("1", "2"):
+            monkeypatch.setenv("OMLX_SDPA_FLASH_HS", hs)
+            outs.append(sf.sdpa_flash(q, k, v, D ** -0.5, mask, sinks))
+        assert (_bits(outs[0]) != _bits(outs[1])).sum() == 0

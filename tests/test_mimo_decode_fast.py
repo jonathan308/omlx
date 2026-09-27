@@ -710,17 +710,23 @@ def _mimo_dims_model(seed=21):
 
 
 def _count_kernel_calls(monkeypatch):
-    from omlx.patches.mimo_v2 import sdpa_rows
+    from omlx.patches.mimo_v2 import sdpa_flash, sdpa_rows
 
-    calls = {"rows": 0}
-    orig_rows = sdpa_rows.sdpa_rows
+    calls = {"rows": 0, "flash": 0}
+    orig_rows, orig_flash = sdpa_rows.sdpa_rows, sdpa_flash.sdpa_flash
 
     def rows(*a, **k):
         out = orig_rows(*a, **k)
         calls["rows"] += out is not None
         return out
 
+    def flash(*a, **k):
+        out = orig_flash(*a, **k)
+        calls["flash"] += out is not None
+        return out
+
     monkeypatch.setattr(sdpa_rows, "sdpa_rows", rows)
+    monkeypatch.setattr(sdpa_flash, "sdpa_flash", flash)
     return calls
 
 
@@ -733,6 +739,7 @@ def test_fast_forward_one_pass_rows_kernel_is_bit_exact(monkeypatch):
     _chunked_reference(monkeypatch, m)
     # The chunked reference stands in for MLX's SDPA in the model module.
     monkeypatch.setattr(df, "_is_mlx_sdpa", lambda fn: True)
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH", "0")
     calls = _count_kernel_calls(monkeypatch)
     tokens = mx.random.randint(0, 512, (1, 1130))
     cache = model.make_cache()
@@ -749,11 +756,41 @@ def test_fast_forward_one_pass_rows_kernel_is_bit_exact(monkeypatch):
         assert _mismatches(ref, fast) == 0, f"logits differ at L={L}"
         cache = fast_cache
         pos += L
+    assert calls["flash"] == 0
+
+
+def test_fast_forward_flash_verify_rows_match_decode_steps(monkeypatch):
+    """With the split-key kernel on, a 3-row verify forward produces, row for
+    row, the logits of three one-row decode steps (bit-identical).  (Its
+    closeness to MLX's attention is tested per kernel: in a random tiny MoE a
+    one-ULP attention difference can flip a near-tie expert choice, so final
+    logits are only sanity-checked against the reference here.)"""
+    m = _mimo()
+    model = _mimo_dims_model(seed=22)
+    _per_row_router(monkeypatch, m)
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH", "1")
+    monkeypatch.setenv("OMLX_MIMO_DECODE_FLASH_MIN_KEYS", "512")
+    calls = _count_kernel_calls(monkeypatch)
+    tokens = mx.random.randint(0, 512, (1, 1110))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :1100], cache, False, monkeypatch)
+    step = tokens[:, 1100:1103]
+    verify_cache, decode_cache, ref_cache = _clone(cache), _clone(cache), _clone(cache)
+    verify = _forward(model, step, verify_cache, True, monkeypatch)
+    assert calls["flash"] > 0
+    rows = [_forward(model, step[:, r : r + 1], decode_cache, True, monkeypatch) for r in range(3)]
+    decode = mx.concatenate(rows, axis=1)
+    assert _mismatches(verify, decode) == 0
+    ref = _forward(model, step, ref_cache, False, monkeypatch)
+    a = np.array(verify.astype(mx.float32))
+    b = np.array(ref.astype(mx.float32))
+    assert np.isfinite(a).all()
+    assert (a.argmax(-1) == b.argmax(-1)).mean() >= 2 / 3
 
 
 def test_fast_path_keeps_patched_attention_functions(monkeypatch):
     """A model-module attention function the fast path does not know keeps
-    serving every call (the one-pass kernel only replaces MLX's SDPA)."""
+    serving every call (the one-pass kernels only replace MLX's SDPA)."""
     from mlx_lm.models.base import scaled_dot_product_attention
 
     assert df._is_mlx_sdpa(scaled_dot_product_attention)
