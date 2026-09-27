@@ -972,3 +972,24 @@ def test_glm_target_loader_rejects_kv_quantization_and_foreign_configs(tmp_path)
     )
     with pytest.raises(ValueError, match="not a GLM-5.3 checkpoint"):
         load_glm5_target_bundle(tmp_path)
+
+
+def test_glm_adapter_prefill_chunk_follows_scheduler_nax_step(monkeypatch):
+    """DFlash GLM-5.3 prefill uses the batched scheduler's NAX floor when wider."""
+    import types
+
+    import omlx.scheduler as scheduler
+    from omlx.engine.dflash import _adapter_prefill_chunk
+
+    glm = types.SimpleNamespace(backend_name="glm5_next")
+    other = types.SimpleNamespace(backend_name="qwen3")
+    monkeypatch.setattr(
+        scheduler, "_glm5_next_nax_prefill_step", lambda: 4096, raising=False
+    )
+    assert _adapter_prefill_chunk(glm, 2048) == 4096
+    assert _adapter_prefill_chunk(glm, 8192) == 8192
+    assert _adapter_prefill_chunk(other, 2048) == 2048
+    monkeypatch.setattr(
+        scheduler, "_glm5_next_nax_prefill_step", lambda: 0, raising=False
+    )
+    assert _adapter_prefill_chunk(glm, 2048) == 2048

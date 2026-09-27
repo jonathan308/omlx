@@ -269,6 +269,24 @@ def check_draft_target_precision_pairing(
     )
 
 
+def _adapter_prefill_chunk(target_ops, runtime_step: int) -> int:
+    """Cold-prefill chunk for a target adapter that chunks prefill itself.
+
+    GLM-5.3 follows the batched scheduler's NAX prefill floor when that
+    exists (wider chunks once the tensor-unit sparse MLA makes the attention
+    cost chunk-independent), so DFlash prefill runs the same chunks as the
+    batched engine.
+    """
+    step = int(runtime_step or 0)
+    if getattr(target_ops, "backend_name", "") == "glm5_next":
+        try:
+            from ..scheduler import _glm5_next_nax_prefill_step
+        except ImportError:
+            return step
+        step = max(step, int(_glm5_next_nax_prefill_step() or 0))
+    return step
+
+
 class _DFlashPrefillGuard:
     """Prefill-memory guard target for DFlash's primary (speculative) path,
     which bypasses the Scheduler entirely.
@@ -877,8 +895,9 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             # Adapters that chunk cold prefill themselves follow the runtime's
             # prefill_step_size (GLM-5.3: the runtime only chunks
             # snapshot-capable targets).
-            step = int(
-                getattr(runtime_context.runtime, "prefill_step_size", 0) or 0
+            step = _adapter_prefill_chunk(
+                self._target_ops,
+                int(getattr(runtime_context.runtime, "prefill_step_size", 0) or 0),
             )
             if step > 0:
                 self._target_ops.prefill_chunk_size = step
