@@ -540,6 +540,45 @@ class _CacheFreshnessWait:
     deadline_s: float
 
 
+# GLM-5.3 prefill chunk on NAX (M5) hosts that run the DSA sparse attention
+# on the tensor units: its cost per query no longer depends on the chunk, so
+# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra,
+# stock mlx: 4096 is +3-6% over 2048, 8192 another +2-6% at 16k-64k prompts
+# for ~2 GB more peak memory). Hosts below 128 GB keep 4096-token chunks.
+_GLM5_NAX_PREFILL_STEP = 8192
+_GLM5_NAX_PREFILL_STEP_SMALL_HOST = 4096
+
+
+def _glm5_next_nax_prefill_step() -> int:
+    """Prefill floor for GLM-5.3 on NAX hosts (0 keeps the default step).
+
+    Needs the tensor-unit sparse MLA path; the paged-cache block follows the
+    floor, so larger blocks also make prefix-cache reuse coarser.
+    OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step, e.g.
+    4096 for finer prefix-cache blocks and a lower activation peak).
+    """
+    raw = os.environ.get("OMLX_GLM5_PREFILL_STEP", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid OMLX_GLM5_PREFILL_STEP=%r", raw)
+    try:
+        from .custom_kernels.nax import is_nax_available
+        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
+        from .settings import get_system_memory
+    except ImportError:
+        return 0
+    if not (is_nax_available() and nax_sparse_mla_available()):
+        return 0
+    memory = get_system_memory()
+    if memory >= 128 * 1024**3:
+        return _GLM5_NAX_PREFILL_STEP
+    if memory >= 64 * 1024**3:
+        return _GLM5_NAX_PREFILL_STEP_SMALL_HOST
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Monkey-patch GenerationBatch._step to feed grammar processors the token
 # that was sampled from their bitmask.  In the pipelined _step(), logits
@@ -568,7 +607,6 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
-_QWEN4_WIDE_PREFILL_MIN_TOKENS = 2048 + _QWEN4_WIDE_PREFILL_STEP
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -1924,6 +1962,9 @@ class Scheduler:
         # prefill step changes cache-ON from one forward into multiple forwards.
         self._qwen35_prefill_floor = self._detect_qwen35_prefill_floor()
         self._qwen4_wide_prefill_step = self._detect_qwen4_wide_prefill_step()
+        self._qwen4_wide_first_chunk = bool(
+            self._qwen4_wide_prefill_step
+        ) and not self._qwen4_ple_gathers_ahead()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -2924,6 +2965,9 @@ class Scheduler:
                     "glm_dsa_sparse_mla_attention"
                 ):
                     return 0
+                glm_step = _glm5_next_nax_prefill_step()
+                if glm_step:
+                    return glm_step
             if is_qwen35 or is_qwen4 or is_glm5_next:
                 from .custom_kernels.nax import is_nax_available
                 from .settings import get_system_memory
@@ -2936,7 +2980,7 @@ class Scheduler:
         return 0
 
     def _detect_qwen4_wide_prefill_step(self) -> int:
-        """Return the step used after the first chunk of long Qwen4-Exp prompts."""
+        """Return the wide Qwen4-Exp prefill step (0 when the host cannot use it)."""
         try:
             model_type = str(getattr(self.model, "model_type", "") or "")
             if not model_type:
@@ -2959,6 +3003,24 @@ class Scheduler:
         except Exception:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
+
+    def _qwen4_ple_gathers_ahead(self) -> bool:
+        """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
+
+        Only then does a narrow first chunk buy anything: it lets the gather
+        of the next chunk overlap GPU work. Models without a probe count as
+        gathering ahead.
+        """
+        if getattr(self.model, "prefetch_ple", None) is None:
+            return False
+        probe = getattr(self.model, "ple_gathers_ahead", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("qwen4 PLE gather-ahead probe failed", exc_info=True)
+            return True
 
     # Default block size for ArraysCache-only hybrid models. Raise the effective
     # target to the configured/model-specific prefill step so cache ON/OFF use
@@ -5778,15 +5840,13 @@ class Scheduler:
             if floor and size < floor:
                 size = floor
             wide = getattr(self, "_qwen4_wide_prefill_step", 0)
-            if (
-                wide
-                and processed_tokens > 0
-                and processed_tokens + remaining_tokens
-                >= _QWEN4_WIDE_PREFILL_MIN_TOKENS
+            if wide and (
+                processed_tokens > 0 or getattr(self, "_qwen4_wide_first_chunk", False)
             ):
-                # Wide steps feed the expert GEMMs more rows per expert. The
-                # first chunk stays narrow so the SSD n-gram gather for the
-                # next chunk overlaps GPU work.
+                # Wide steps feed the expert GEMMs more rows per expert. With
+                # SSD-backed PLE the first chunk stays narrow so the n-gram
+                # gather for the next chunk overlaps GPU work; resident PLE has
+                # nothing to overlap, so the first chunk is wide too.
                 size = max(size, wide)
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.

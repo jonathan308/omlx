@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "Typ modelu se změnil. Vysuňte model a znovu jej načtěte, aby se změna projevila.",
   "js.info.model_settings_auto_unloaded": "Nastavení uloženo. Model byl vysunut a při příštím použití se načte s novými nastaveními.",
   "js.info.model_settings_auto_reloaded": "Nastavení uloženo. Připnutý model byl opětovně načten s novými nastaveními.",
+  "js.info.model_settings_reload_deferred": "Nastavení uloženo. Model je zaneprázdněn, proto se vysune po dokončení aktuální práce a při příštím použití se načte s novými nastaveními.",
   "js.error.no_config_defaults": "Pro tento model nebyly nalezeny výchozí hodnoty konfigurace",
   "js.error.load_generation_config_failed": "Načtení konfiguracy generování se nezdařilo",
   "js.error.select_prompt_length": "Vyberte alespoň jednu délku promptu",
