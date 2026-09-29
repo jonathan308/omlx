@@ -1444,23 +1444,37 @@ def test_advertised_limit_counts_usable_unique_addresses():
 
 
 def test_advertised_ipv6_aliases_are_deduplicated():
-    result = decode_wassup(encode_wassup(7, "peer", 8000,
-        addrs=["2001:db8::1", "2001:0db8:0:0:0:0:0:1"]))
+    result = decode_wassup(
+        encode_wassup(7, "peer", 8000, addrs=["2001:db8::1", "2001:0db8:0:0:0:0:0:1"])
+    )
     assert result["addrs"] == ["2001:db8::1"]
 
 
 def test_advertised_mapped_loopback_is_not_dialable_peer_address():
-    result = decode_wassup(encode_wassup(7, "peer", 8000,
-        addrs=["::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:224.0.0.1", "192.0.2.2"]))
+    result = decode_wassup(
+        encode_wassup(
+            7,
+            "peer",
+            8000,
+            addrs=[
+                "::ffff:127.0.0.1",
+                "::ffff:0.0.0.0",
+                "::ffff:224.0.0.1",
+                "192.0.2.2",
+            ],
+        )
+    )
     assert result["addrs"] == ["192.0.2.2"]
 
 
 def test_advertised_address_cache_refreshes_after_hotplug():
     entries = [{"ip": "192.0.2.1"}]
     calls = []
+
     def addresses():
         calls.append(True)
         return entries
+
     service, clock = _service(addr_lister=addresses)
     first = service._advertised_addrs()
     first.clear()  # callers must not mutate the cached snapshot
@@ -1475,7 +1489,9 @@ def test_advertised_address_cache_refreshes_after_hotplug():
 
 def test_advertised_addresses_are_not_probed_without_our_nonce():
     service, _ = _service()
-    service._handle_wassup({"nonce": 123, "node_id": "peer", "http_port": 8000,
-                           "addrs": ["192.0.2.2"]}, ("fe80::99", 53413))
+    service._handle_wassup(
+        {"nonce": 123, "node_id": "peer", "http_port": 8000, "addrs": ["192.0.2.2"]},
+        ("fe80::99", 53413),
+    )
     assert not service._candidates
     assert not service.peers()
