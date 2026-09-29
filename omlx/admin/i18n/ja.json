@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "モデルタイプが変更されました。変更を適用するにはモデルをアンロードして再ロードしてください。",
   "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
   "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
+  "js.info.model_settings_reload_deferred": "Settings saved. The model is busy, so it will unload after its current work finishes and reload with the new settings on next use.",
   "js.error.no_config_defaults": "このモデルのデフォルト設定が見つかりません",
   "js.error.load_generation_config_failed": "生成設定の読み込みに失敗しました",
   "js.error.select_prompt_length": "プロンプト長を1つ以上選択してください",

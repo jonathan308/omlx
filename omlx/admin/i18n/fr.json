@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "Type de modèle modifié. Déchargez et rechargez le modèle pour que le changement prenne effet.",
   "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
   "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
+  "js.info.model_settings_reload_deferred": "Settings saved. The model is busy, so it will unload after its current work finishes and reload with the new settings on next use.",
   "js.error.no_config_defaults": "Aucun défaut de configuration trouvé pour ce modèle",
   "js.error.load_generation_config_failed": "Impossible de charger la configuration de génération",
   "js.error.select_prompt_length": "Sélectionnez au moins une longueur de prompt",

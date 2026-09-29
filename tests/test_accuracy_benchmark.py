@@ -210,6 +210,7 @@ class TestRunAccuracyBenchmark:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=mock_engine)
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
 
         # Mock evaluator
         mock_result = MagicMock()
@@ -251,6 +252,7 @@ class TestRunAccuracyBenchmark:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=MagicMock())
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
 
         mock_evaluator = MagicMock()
         mock_evaluator.load_dataset = AsyncMock(return_value=[])
@@ -272,6 +274,47 @@ class TestRunAccuracyBenchmark:
         assert len(run.results) == 0
 
 
+    @pytest.mark.asyncio
+    async def test_resident_target_is_reused_and_leased_for_the_run(self):
+        """Phase 1 keeps a resident target that the LM load reuses (#3959), and
+        the run holds a lease so a settings save cannot unload it (#3961)."""
+        run = create_run(
+            AccuracyBenchmarkRequest(model_id="target", benchmarks={"mmlu": 10})
+        )
+        order = []
+        mock_pool = MagicMock()
+        mock_pool._settings_manager = None
+        mock_pool.get_loaded_model_ids = MagicMock(return_value=["other", "target"])
+        mock_pool._force_lm_replaces_engine = MagicMock(return_value=False)
+        mock_pool.get_engine = AsyncMock(return_value=MagicMock())
+        mock_pool._unload_engine = AsyncMock(
+            side_effect=lambda mid: order.append(("unload", mid))
+        )
+        mock_pool.release_engine = AsyncMock(
+            side_effect=lambda mid: order.append(("release", mid))
+        )
+
+        mock_evaluator = MagicMock()
+        mock_evaluator.load_dataset = AsyncMock(return_value=[{"id": "1"}])
+        mock_evaluator.run = AsyncMock(return_value=_StubResult())
+        with patch.dict(
+            "omlx.eval.BENCHMARKS",
+            {"mmlu": MagicMock(return_value=mock_evaluator)},
+            clear=True,
+        ):
+            await run_accuracy_benchmark(run, mock_pool)
+
+        assert run.status == "completed"
+        mock_pool.get_engine.assert_awaited_once_with(
+            "target", force_lm=True, _lease=True
+        )
+        assert order == [
+            ("unload", "other"),
+            ("release", "target"),
+            ("unload", "target"),
+        ]
+
+
 class TestSamplingProfile:
     """sampling_profile gates whether per-model sampling reaches the evaluator.
 
@@ -287,6 +330,7 @@ class TestSamplingProfile:
         mock_pool.get_loaded_model_ids = MagicMock(return_value=[])
         mock_pool.get_engine = AsyncMock(return_value=mock_engine)
         mock_pool._unload_engine = AsyncMock()
+        mock_pool.release_engine = AsyncMock()
         mock_pool._settings_manager.get_settings = MagicMock(return_value=model_settings)
         return mock_pool
 
@@ -614,6 +658,7 @@ class TestLocalTruncation:
         pool.get_loaded_model_ids = MagicMock(return_value=[])
         pool.get_engine = AsyncMock(return_value=AsyncMock())
         pool._unload_engine = AsyncMock()
+        pool.release_engine = AsyncMock()
         pool._settings_manager = None
         run = create_run(
             AccuracyBenchmarkRequest(model_id="test-model", benchmarks={"mmlu": 4})
@@ -704,13 +749,20 @@ class _StubEnginePool:
     def get_loaded_model_ids(self):
         return list(self.loaded)
 
+    def _force_lm_replaces_engine(self, model_id):
+        return False
+
     async def _unload_engine(self, model_id):
         if model_id in self.loaded:
             self.loaded.remove(model_id)
 
-    async def get_engine(self, model_id, force_lm=False):
-        self.loaded.append(model_id)
+    async def get_engine(self, model_id, force_lm=False, _lease=False):
+        if model_id not in self.loaded:
+            self.loaded.append(model_id)
         return SimpleNamespace(model_id=model_id)
+
+    async def release_engine(self, model_id):
+        pass
 
 
 class TestQueueChainOwnership:
@@ -937,6 +989,7 @@ class TestCommunityUpload:
         pool.get_loaded_model_ids = MagicMock(return_value=[])
         pool.get_engine = AsyncMock(return_value=mock_engine)
         pool._unload_engine = AsyncMock()
+        pool.release_engine = AsyncMock()
         pool._settings_manager = None
         return pool
 

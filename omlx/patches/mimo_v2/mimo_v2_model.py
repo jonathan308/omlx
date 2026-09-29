@@ -21,6 +21,7 @@ from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+from omlx.patches.glm_moe_dsa.switch_layers import SwitchGLU as _FusedSwitchGLU
 from omlx.patches.mimo_v2.fused_qkv_layout import (
     FUSED_QKV_BLOCK_SIZE,
     detect_fused_qkv_tp,
@@ -279,7 +280,10 @@ class MoEGate(nn.Module):
 class MoE(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.switch_mlp = SwitchGLU(
+        # The fused combine kernel handles top-6/top-8 routing (MiMo: top-8).
+        self._fused_combine = config.num_experts_per_tok in (6, 8)
+        switch_cls = _FusedSwitchGLU if self._fused_combine else SwitchGLU
+        self.switch_mlp = switch_cls(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -291,8 +295,16 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        if self._fused_combine:
+            # One kernel unsorts the expert rows and applies the routing
+            # weights (prefill); decode-sized batches return per-expert rows.
+            y = self.switch_mlp(x, inds, scores=scores, weighted_sum=True)
+            if y.ndim == x.ndim + 1:
+                y = (y * scores[..., None]).sum(axis=-2)
+            y = y.astype(x.dtype)
+        else:
+            y = self.switch_mlp(x, inds)
+            y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         return y
@@ -438,6 +450,20 @@ class MiMoV2Model(PipelineMixin, nn.Module):
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
+
+        # Decode / short verify forwards: same math, fewer dispatches.
+        from omlx.patches.mimo_v2 import decode_fast as _decode_fast
+
+        fast = (
+            _decode_fast.run_layers(self, h, cache, full_mask, swa_mask)
+            if pipeline_size == 1
+            else None
+        )
+        if fast is not None:
+            h, normed = fast
+            if return_hidden:
+                return normed, h
+            return normed
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, pipeline_rank + 1)

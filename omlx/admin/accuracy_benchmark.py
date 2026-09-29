@@ -368,7 +368,7 @@ async def run_accuracy_benchmark(
     """Execute accuracy benchmark run.
 
     Phases:
-    1. Unload all models
+    1. Unload all models (a reusable resident target stays loaded)
     2. Load target model
     3. For each selected benchmark: load data, evaluate, report
     4. Unload model
@@ -383,6 +383,7 @@ async def run_accuracy_benchmark(
         engine_pool._suppress_ttl = True
     start_time = time.time()
     client: Optional[ExternalAPIClient] = None
+    leased_model_id: Optional[str] = None
 
     try:
         run.phase = "loading"
@@ -406,8 +407,14 @@ async def run_accuracy_benchmark(
             await engine.preflight()
             sampling_kwargs = {}
         else:
-            # Phase 1: Unload all models
-            loaded_ids = engine_pool.get_loaded_model_ids()
+            # Phase 1: Unload all models except a resident target that the
+            # LM load below would reuse as-is.
+            loaded_ids = [
+                model_id
+                for model_id in engine_pool.get_loaded_model_ids()
+                if model_id != request.model_id
+                or engine_pool._force_lm_replaces_engine(model_id)
+            ]
             if loaded_ids:
                 await _send_event(run, {
                     "type": "progress",
@@ -437,7 +444,12 @@ async def run_accuracy_benchmark(
 
             # Force LM engine for accuracy benchmarks — text-only tasks
             # don't need VLM and the VLM adapter can produce empty responses.
-            engine = await engine_pool.get_engine(request.model_id, force_lm=True)
+            # The lease keeps settings saves and eviction from unloading the
+            # engine between eval batches.
+            engine = await engine_pool.get_engine(
+                request.model_id, force_lm=True, _lease=True
+            )
+            leased_model_id = request.model_id
 
             # Load model sampling settings. Under the default "deterministic"
             # profile sampling params are not read — the benchmark runs greedy
@@ -707,6 +719,9 @@ async def run_accuracy_benchmark(
         # user "still running" while we clean up reads as a bug).
         run.phase = "unloading"
         if request.external is None:
+            if leased_model_id is not None:
+                await engine_pool.release_engine(leased_model_id)
+                leased_model_id = None
             try:
                 await engine_pool._unload_engine(request.model_id)
             except Exception:
@@ -743,6 +758,8 @@ async def run_accuracy_benchmark(
             "message": str(e),
         })
     finally:
+        if leased_model_id is not None:
+            await engine_pool.release_engine(leased_model_id)
         # Re-enable TTL auto-unload
         engine_pool._suppress_ttl = False
         if client is not None:

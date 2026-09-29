@@ -3099,6 +3099,8 @@
                                 alert(window.t('js.info.model_settings_auto_reloaded'));
                             } else if (data.auto_unloaded) {
                                 alert(window.t('js.info.model_settings_auto_unloaded'));
+                            } else if (data.reload_deferred) {
+                                alert(window.t('js.info.model_settings_reload_deferred'));
                             } else {
                                 alert(window.t('js.info.model_type_reload_required'));
                             }
@@ -3267,6 +3269,8 @@
                         alert(window.t('js.info.model_settings_auto_reloaded'));
                     } else if (data.auto_unloaded) {
                         alert(window.t('js.info.model_settings_auto_unloaded'));
+                    } else if (data.reload_deferred) {
+                        alert(window.t('js.info.model_settings_reload_deferred'));
                     } else {
                         alert(window.t('js.info.model_type_reload_required'));
                     }
