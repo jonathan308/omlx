@@ -208,9 +208,10 @@ class ServerSettings:
     # Maximum side length in pixels for VLM input images (0 to disable downscaling).
     max_image_side_length: int = 2048
     # Seconds between trivial GPU kernels submitted while a model is loaded
-    # but idle, so the GPU never enters its idle power state (the first
+    # but idle, so the GPU stays out of its idle power state (the first
     # command buffer after ~1s+ of GPU idle stalls for up to seconds on
-    # large resident models). 0 disables.
+    # large resident models). Ticks stop after 5 minutes without requests.
+    # 0 disables.
     gpu_keep_warm_interval: float = 0.5
 
     def max_audio_upload_bytes(self) -> int:

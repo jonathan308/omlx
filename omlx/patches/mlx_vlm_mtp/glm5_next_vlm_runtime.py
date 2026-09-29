@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from omlx.utils.layer_pipeline import LayerPipeline
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -427,6 +428,14 @@ def _patch_model_call(g5_lang: Any) -> None:
         # This replaces Glm5NextModel.__call__; preserve its prefill memory
         # policy and its one-token decode early evaluation.
         prefill = h.shape[1] >= 256
+        # Each completed layer is waited for and the allocator cache is
+        # released (layer-specific buffer sizes would otherwise accumulate).
+        # The last layer stays lazy: a prefill chunk only needs its cache update.
+        pipeline = (
+            LayerPipeline(on_evaluated=mx.clear_cache, lazy_last=True)
+            if prefill
+            else None
+        )
         eval_every = (
             getattr(g5_lang, "_DECODE_EVAL_EVERY", 0) if h.shape[1] == 1 else 0
         )
@@ -444,11 +453,12 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
                 h = layer(h, mask=mask, cache=c)
-            if prefill:
-                mx.eval(h)
-                mx.clear_cache()
+            if pipeline is not None:
+                pipeline.push(h)
             elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
                 mx.async_eval(h.arrays() if defer and isinstance(h, deferred_cls) else h)
+        if pipeline is not None:
+            pipeline.drain()
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary

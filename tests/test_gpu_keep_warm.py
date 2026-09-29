@@ -3,6 +3,7 @@
 
 import asyncio
 import concurrent.futures
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +12,9 @@ from omlx import engine_pool as ep
 from omlx.settings import GlobalSettings, ServerSettings
 
 
-def _entry(*, active: bool = False, loaded: bool = True):
+def _entry(*, active: bool = False, loaded: bool = True, idle_for: float = 0.0):
     engine = SimpleNamespace(has_active_requests=lambda: active) if loaded else None
-    return SimpleNamespace(engine=engine, in_use=0)
+    return SimpleNamespace(engine=engine, in_use=0, last_access=time.time() - idle_for)
 
 
 @pytest.fixture
@@ -55,6 +56,23 @@ async def test_ticks_only_while_a_loaded_model_is_idle(pool):
     assert pool._gpu_keep_warm_task is None
     n = len(pool.ticks)
     assert await _settle(pool) == n
+
+
+@pytest.mark.asyncio
+async def test_ticks_stop_after_the_idle_window(pool):
+    window = ep._GPU_KEEP_WARM_IDLE_WINDOW_S
+    pool.configure_gpu_keep_warm(0.005)
+    pool._entries["m"] = _entry(idle_for=window + 1)
+    pool._ensure_gpu_keep_warm_task()
+    assert await _settle(pool) == 0  # idle too long: let the GPU sleep
+
+    # A request that outlasts the window restarts it when it finishes.
+    pool._entries["m"] = _entry(active=True, idle_for=window + 1)
+    await _settle(pool, 0.02)
+    pool._entries["m"] = _entry(idle_for=window + 1)
+    assert await _settle(pool) > 0
+
+    await pool._stop_gpu_keep_warm()
 
 
 @pytest.mark.asyncio
