@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "Tipo de modelo alterado. Descarregue e recarregue o modelo para que a alteração tenha efeito.",
   "js.info.model_settings_auto_unloaded": "Configurações salvas. O modelo foi descarregado e recarregará com as novas configurações no próximo uso.",
   "js.info.model_settings_auto_reloaded": "Configurações salvas. O modelo fixado foi recarregado com as novas configurações.",
+  "js.info.model_settings_reload_deferred": "Configurações salvas. O modelo está ocupado, então será descarregado após concluir o trabalho atual e recarregará com as novas configurações no próximo uso.",
   "js.error.no_config_defaults": "Nenhum padrão de configuração encontrado para este modelo",
   "js.error.load_generation_config_failed": "Falha ao carregar a configuração de geração",
   "js.error.select_prompt_length": "Selecione pelo menos um comprimento de prompt",

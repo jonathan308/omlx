@@ -51,7 +51,12 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
-from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_discovery import (
+    VLM_NATIVE_TEXT_MODEL_TYPES,
+    discover_models,
+    format_size,
+    is_realtime_stt_model,
+)
 from .model_settings import (
     ane_prefill_backend,
     ane_prefill_fraction,
@@ -63,6 +68,25 @@ from .utils.model_loading import dflash_batched_requested, dflash_batched_suppor
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+
+def _touch_gpu() -> None:
+    """Run one trivial kernel so the GPU stays out of its idle power state.
+
+    Apple silicon parks the GPU after roughly a second without work, and the
+    first command buffer afterwards stalls for a time that grows with the
+    idle gap and the resident footprint (156 GB model on an M5 Ultra: +1.0 s
+    after 2 s idle, +1.7 s after 6 s — measured on both prefill and decode,
+    the kernels themselves run at full speed once it resumes). A request
+    arriving after a pause pays that on top of its TTFT. One tiny kernel
+    per keep-warm period is enough to prevent it; CPU activity alone is not.
+    """
+    mx.eval(mx.zeros((1,), dtype=mx.float32) + 1)
+
+
+# Stop keep-warm ticks after this long without requests, so an idle laptop
+# with a resident model still lets the GPU reach its idle power state.
+_GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
@@ -197,6 +221,18 @@ def _settled_phys_footprint() -> int:
     return max(0, get_phys_footprint() - unreleased_graphics_bytes(mlx_bytes))
 
 
+def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
+    while exc is not None:
+        text = str(exc)
+        if (
+            "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
+            or "Insufficient Memory" in text
+        ):
+            return True
+        exc = exc.__cause__
+    return False
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -325,7 +361,74 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
+        # from ServerSettings.gpu_keep_warm_interval; started on first load.
+        self._gpu_keep_warm_interval: float = 0.0
+        self._gpu_keep_warm_task: asyncio.Task[None] | None = None
+        self._gpu_keep_warm_last_active = 0.0
         self.configure_hot_cache_budget()
+
+    def configure_gpu_keep_warm(self, interval_seconds: float) -> None:
+        """Set the idle keep-warm period in seconds (0 or less disables it)."""
+        try:
+            interval = float(interval_seconds or 0.0)
+        except (TypeError, ValueError):
+            interval = 0.0
+        self._gpu_keep_warm_interval = max(0.0, interval)
+        if self._gpu_keep_warm_interval <= 0 and self._gpu_keep_warm_task is not None:
+            self._gpu_keep_warm_task.cancel()
+            self._gpu_keep_warm_task = None
+
+    def _ensure_gpu_keep_warm_task(self) -> None:
+        if self._gpu_keep_warm_interval <= 0 or self._shutting_down:
+            return
+        task = self._gpu_keep_warm_task
+        if task is not None and not task.done():
+            return
+        self._gpu_keep_warm_task = asyncio.get_running_loop().create_task(
+            self._gpu_keep_warm_loop(), name="gpu-keep-warm"
+        )
+
+    def _gpu_keep_warm_needed(self) -> bool:
+        """True when a model is resident, idle, and used within the idle window."""
+        now = time.time()
+        last_request = self._gpu_keep_warm_last_active
+        loaded = False
+        for entry in self._entries.values():
+            if entry.engine is None:
+                continue
+            loaded = True
+            if self._entry_has_active_requests(entry):
+                # Generation steps already keep the GPU busy.
+                self._gpu_keep_warm_last_active = now
+                return False
+            # last_access marks request start; long requests are caught above.
+            last_request = max(last_request, entry.last_access)
+        return loaded and now - last_request < _GPU_KEEP_WARM_IDLE_WINDOW_S
+
+    async def _gpu_keep_warm_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._shutting_down:
+            interval = self._gpu_keep_warm_interval
+            if interval <= 0:
+                return
+            await asyncio.sleep(interval)
+            if not self._gpu_keep_warm_needed():
+                continue
+            try:
+                await loop.run_in_executor(get_mlx_executor(), _touch_gpu)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("GPU keep-warm tick failed: %s", exc)
+
+    async def _stop_gpu_keep_warm(self) -> None:
+        task = self._gpu_keep_warm_task
+        self._gpu_keep_warm_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     def _distributed_deployment_for_entry(
         self, entry: EngineEntry
@@ -1566,6 +1669,21 @@ class EnginePool:
     def _entry_is_busy(self, entry: EngineEntry) -> bool:
         return entry.in_use > 0 or self._entry_has_active_requests(entry)
 
+    @staticmethod
+    def _has_mlx_lm_path(entry: EngineEntry) -> bool:
+        """False for text families that only mlx-vlm implements."""
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        return model_type not in VLM_NATIVE_TEXT_MODEL_TYPES
+
+    def _force_lm_replaces_engine(self, model_id: str) -> bool:
+        """True when ``get_engine(force_lm=True)`` would reload a resident VLM."""
+        entry = self._entries.get(model_id)
+        return (
+            entry is not None
+            and isinstance(entry.engine, VLMBatchedEngine)
+            and self._has_mlx_lm_path(entry)
+        )
+
     def _entry_has_scheduler_work(self, entry: EngineEntry) -> bool:
         """Return True until deferred aborts have actually left the scheduler."""
         scheduler = self._resolve_scheduler_from_engine(entry.engine)
@@ -1678,6 +1796,7 @@ class EnginePool:
             or entry.engine is None
             or not entry.pending_unload_reason
             or entry.is_loading
+            or model_id in self._unloading_models
             or (entry.is_pinned and not entry.pending_unload_allow_pinned)
             or not self._entry_is_quiescent(entry)
         ):
@@ -1744,12 +1863,14 @@ class EnginePool:
         model_id: str,
         *,
         reason: str = "manual unload",
+        abort_active: bool = True,
     ) -> bool:
         """Unload now when idle, otherwise abort and unload after quiescence.
 
         Returns True when the engine was unloaded before this call returned and
         False when teardown was queued. New acquisitions are rejected while the
         pending marker is installed, so the engine can drain deterministically.
+        With ``abort_active=False`` in-flight work and leases finish first.
         """
         async with self._lock:
             entry = self._entries.get(model_id)
@@ -1767,11 +1888,11 @@ class EnginePool:
             self._mark_pending_unload_locked(
                 model_id,
                 reason,
-                abort_requested=True,
+                abort_requested=abort_active,
                 allow_pinned=True,
             )
             abort_all = getattr(entry.engine, "abort_all_requests", None)
-            if callable(abort_all):
+            if abort_active and callable(abort_all):
                 try:
                     await abort_all(
                         reason=(
@@ -1887,6 +2008,10 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        entry = self._entries.get(model_id)
+        if force_lm and entry is not None and not self._has_mlx_lm_path(entry):
+            # The VLM engine is the only text engine for these families.
+            force_lm = False
         ready = self._acquire_loaded_engine(
             model_id, force_lm, _lease, runtime_settings
         )
@@ -3351,7 +3476,7 @@ class EnginePool:
                         f"Successfully loaded {model_id} as VLM "
                         f"(fallback from force_lm)"
                     )
-                elif entry.engine_type == "vlm":
+                elif entry.engine_type == "vlm" and self._has_mlx_lm_path(entry):
                     # VLM loading failed -- fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "
@@ -3415,6 +3540,7 @@ class EnginePool:
             self._current_model_memory += resident_size
             load_completed = True
             self._clear_load_failure(entry)
+            self._ensure_gpu_keep_warm_task()
 
             # Batched DFlash: load the block drafter and attach it to the
             # Lightning MTP verify path. Fail-soft like the VLM MTP drafter.
@@ -3599,6 +3725,25 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if (
+                not entry.abort_loading
+                and not entry_detached
+                and _is_metal_out_of_memory(exc)
+            ):
+                # Depends on what else is resident, so do not cache it: a retry
+                # after memory is freed can succeed with the same files.
+                logger.exception(
+                    "Model load for '%s' ran out of Metal memory", model_id
+                )
+                raise InsufficientMemoryError(
+                    required=resident_size,
+                    current=pre_load_memory,
+                    message=(
+                        f"Model '{model_id}' ran out of GPU memory while "
+                        f"loading: {exc}. Free memory (for example, unload "
+                        "another model) and retry."
+                    ),
+                ) from exc
             if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(
@@ -3658,6 +3803,7 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         self._shutting_down = True
+        await self._stop_gpu_keep_warm()
         reclaim_tasks = tuple(self._failed_load_reclaim_tasks)
         for task in reclaim_tasks:
             task.cancel()

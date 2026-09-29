@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "模型類型已變更。請卸載並重新載入模型以使變更生效。",
   "js.info.model_settings_auto_unloaded": "設定已儲存。模型已卸載，將在下次使用時以新設定重新載入。",
   "js.info.model_settings_auto_reloaded": "設定已儲存。已固定的模型已以新設定重新載入。",
+  "js.info.model_settings_reload_deferred": "設定已儲存。模型正在使用中，將在目前工作完成後卸載，下次使用時以新設定重新載入。",
   "js.error.no_config_defaults": "未找到該模型的設定預設值",
   "js.error.load_generation_config_failed": "載入生成設定失敗",
   "js.error.select_prompt_length": "請至少選擇一個 Prompt 長度",

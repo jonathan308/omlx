@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "Model type changed. Unload and reload the model for the change to take effect.",
   "js.info.model_settings_auto_unloaded": "Settings saved. The model was unloaded and will reload with the new settings on next use.",
   "js.info.model_settings_auto_reloaded": "Settings saved. The pinned model was reloaded with the new settings.",
+  "js.info.model_settings_reload_deferred": "Settings saved. The model is busy, so it will unload after its current work finishes and reload with the new settings on next use.",
   "js.error.no_config_defaults": "No config defaults found for this model",
   "js.error.load_generation_config_failed": "Failed to load generation config",
   "js.error.select_prompt_length": "Select at least one prompt length",
