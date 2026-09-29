@@ -603,7 +603,8 @@ def _sanitize_advertised_addrs(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     addrs: list[str] = []
-    for entry in value[:8]:
+    # Bound work on untrusted input as well as the usable output inventory.
+    for entry in value[:64]:
         if not isinstance(entry, str):
             continue
         ip = entry.split("%", 1)[0]
@@ -611,15 +612,21 @@ def _sanitize_advertised_addrs(value: Any) -> list[str]:
             parsed = ipaddress.ip_address(ip)
         except ValueError:
             continue
+        # IPv4-mapped IPv6 must obey the same routing exclusions as IPv4.
+        effective = getattr(parsed, "ipv4_mapped", None) or parsed
         if (
-            parsed.is_loopback
-            or parsed.is_multicast
-            or parsed.is_unspecified
+            effective.is_loopback
+            or effective.is_multicast
+            or effective.is_unspecified
             or (parsed.version == 6 and parsed.is_link_local)
         ):
             continue
+        ip = str(parsed)
         if ip not in addrs:
             addrs.append(ip)
+            # Count usable distinct destinations, not discarded input entries.
+            if len(addrs) == 8:
+                break
     return addrs
 
 
