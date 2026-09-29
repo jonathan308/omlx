@@ -1877,6 +1877,7 @@
   "js.info.model_type_reload_required": "模型类型已更改。请卸载并重新加载模型以使更改生效。",
   "js.info.model_settings_auto_unloaded": "设置已保存。模型已卸载，下次使用时将以新设置重新加载。",
   "js.info.model_settings_auto_reloaded": "设置已保存。已固定的模型已以新设置重新加载。",
+  "js.info.model_settings_reload_deferred": "设置已保存。模型正在使用中，将在当前任务完成后卸载，下次使用时以新设置重新加载。",
   "js.error.no_config_defaults": "未找到该模型的配置默认值",
   "js.error.load_generation_config_failed": "加载生成配置失败",
   "js.error.select_prompt_length": "请至少选择一个提示词长度",
