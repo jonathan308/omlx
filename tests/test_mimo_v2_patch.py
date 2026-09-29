@@ -7,6 +7,7 @@ import sys
 import types
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 
@@ -169,6 +170,41 @@ def test_mixed_cache_forward_and_continuous_batching():
     assert uids == [0, 1]
     assert {response.uid for response in finished} == {0, 1}
     assert all(response.finish_reason == "length" for response in finished)
+
+
+def test_window_layers_pad_the_projection_input_not_the_queries(monkeypatch):
+    """Padding the q_proj input for the blocked window path is bit-exact."""
+    mimo_v2 = _load_patch_module()
+    from omlx.utils import fast_attention
+
+    mx.random.seed(5)
+    config = _minimal_config(sliding_window_size=128, hybrid_layer_pattern=[1, 1, 0, 1])
+    model = mimo_v2.Model(mimo_v2.ModelArgs.from_dict(config))
+    model.set_dtype(mx.bfloat16)
+    first_chunk = mx.random.randint(0, 1000, (1, 300))  # 84 padding rows
+    second_chunk = mx.random.randint(0, 1000, (1, 257))  # 127, after a prefix
+    real_pad = mimo_v2.window_query_padding
+    asked = []
+
+    def run(pad_fn):
+        monkeypatch.setattr(mimo_v2, "window_query_padding", pad_fn)
+        cache = model.make_cache()
+        out = [model(first_chunk, cache=cache), model(second_chunk, cache=cache)]
+        mx.eval(out)
+        return out
+
+    padded = run(lambda n: asked.append(n) or real_pad(n))
+    assert set(asked) == {300, 257}
+    unpadded = run(lambda n: 0)  # the blocked path pads the queries itself
+    for a, b in zip(padded, unpadded):
+        assert mx.array_equal(a, b).item()
+
+    monkeypatch.setattr(fast_attention, "_ENABLED", False)  # masked full SDPA
+    reference = run(real_pad)
+    for a, b in zip(padded, reference):
+        assert mx.allclose(
+            a.astype(mx.float32), b.astype(mx.float32), atol=5e-2, rtol=5e-2
+        ).item()
 
 
 def test_sanitize_handles_fused_fp8_and_text_only_weights():
@@ -743,3 +779,51 @@ def test_oq_preserves_mtp_shards_and_calibrates_all_heads(tmp_path, layout):
         assert mx.allclose(mx.array(actual_energy), expected_energy, atol=1e-5).item()
     finally:
         collector.restore(loaded)
+
+
+def _quantized_moe(mimo, T, top_k=8):
+    cfg = mimo.ModelArgs.from_dict(
+        _minimal_config(n_routed_experts=16, num_experts_per_tok=top_k)
+    )
+    moe = mimo.MoE(cfg)
+    mx.random.seed(0)
+    moe.gate.weight = mx.random.normal(moe.gate.weight.shape) * 0.1
+    moe.gate.e_score_correction_bias = mx.zeros_like(moe.gate.e_score_correction_bias)
+    nn.quantize(moe.switch_mlp, group_size=64, bits=4)
+    x = mx.random.normal((1, T, 128)).astype(mx.bfloat16)
+    mx.eval(moe.parameters(), x)
+    return moe, x
+
+
+def _unfused_combine(moe, x):
+    inds, scores = moe.gate(x)
+    y = moe.switch_mlp(x, inds)
+    if y.ndim == x.ndim + 1:
+        y = (y * scores[..., None]).sum(axis=-2)
+    return y.astype(x.dtype)
+
+
+@pytest.mark.parametrize("T", [4, 96])
+def test_moe_fused_combine_matches_unfused_combine(T):
+    """Top-8 routing combines through glm_moe_weighted_sum (sorted prefill)."""
+    moe, x = _quantized_moe(_load_patch_module(), T)
+    assert moe._fused_combine
+    out = moe(x)
+    ref = _unfused_combine(moe, x)
+    mx.eval(out, ref)
+    assert out.shape == ref.shape == x.shape
+    assert out.dtype == x.dtype
+    assert mx.allclose(
+        out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2
+    ).item()
+
+
+def test_moe_unsupported_top_k_uses_plain_switch_glu():
+    moe, x = _quantized_moe(_load_patch_module(), 96, top_k=2)
+    assert not moe._fused_combine
+    out = moe(x)
+    ref = _unfused_combine(moe, x)
+    mx.eval(out, ref)
+    assert mx.allclose(
+        out.astype(mx.float32), ref.astype(mx.float32), atol=2e-2, rtol=2e-2
+    ).item()
