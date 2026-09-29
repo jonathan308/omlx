@@ -603,7 +603,8 @@ def _sanitize_advertised_addrs(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     addrs: list[str] = []
-    for entry in value:
+    # Bound work on untrusted input as well as the usable output inventory.
+    for entry in value[:64]:
         if not isinstance(entry, str):
             continue
         ip = entry.split("%", 1)[0]

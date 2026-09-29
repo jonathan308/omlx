@@ -1495,3 +1495,13 @@ def test_advertised_addresses_are_not_probed_without_our_nonce():
     )
     assert not service._candidates
     assert not service.peers()
+
+
+def test_advertised_addresses_bound_raw_input():
+    from omlx.cluster.discovery import _sanitize_advertised_addrs
+
+    for invalid_count, expected in [(63, ["192.0.2.1"]), (64, [])]:
+        assert (
+            _sanitize_advertised_addrs(["invalid"] * invalid_count + ["192.0.2.1"])
+            == expected
+        )
