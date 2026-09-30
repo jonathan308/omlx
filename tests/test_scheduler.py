@@ -17,6 +17,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 
 import concurrent.futures
 import json
+import sys
 import threading
 from collections import deque
 from types import SimpleNamespace
@@ -3854,6 +3855,66 @@ class TestSchedulerRotatingBlockAlignment:
         # chunks reach the regime where the native prefill kernels pay off.
         assert scheduler.config.paged_cache_block_size == 2048
 
+    @staticmethod
+    def _mimo_scheduler(mock_tokenizer):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class MiMoModel:
+            model_type = "mimo_v2"
+
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = 128
+                return [cache]
+
+        return Scheduler(
+            model=MiMoModel(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=256),
+        )
+
+    @pytest.mark.parametrize("floor,expected", [(0, 2048), (4096, 4096), (8192, 8192)])
+    def test_mimo_block_size_follows_prefill_floor(
+        self, mock_tokenizer, floor, expected
+    ):
+        """With the prefix cache on, a block below the floor would split the
+        wider MiMo chunks back to the block size."""
+        scheduler = self._mimo_scheduler(mock_tokenizer)
+        scheduler._qwen35_prefill_floor = floor
+        scheduler.config.paged_ssd_cache_dir = "/tmp/cache"
+        scheduler._align_block_size_with_rotating_window()
+        assert scheduler.config.paged_cache_block_size == expected
+
+    @pytest.mark.parametrize(
+        "memory_gb,nax,fused,gather,expected",
+        [
+            (128, True, True, True, 8192),
+            (256, True, True, False, 4096),  # >32768-row gathers would be split
+            (256, False, True, True, 4096),
+            (256, True, False, True, 0),  # unfused 192/128 attention
+            (96, True, True, True, 0),
+        ],
+    )
+    def test_mimo_prefill_floor(
+        self, mock_tokenizer, memory_gb, nax, fused, gather, expected
+    ):
+        scheduler = self._mimo_scheduler(mock_tokenizer)
+        with (
+            patch("omlx.settings.get_system_memory", return_value=memory_gb * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=nax),
+            patch.object(
+                scheduler_module, "_mimo_fused_full_attention", return_value=fused
+            ),
+            patch.object(
+                scheduler_module, "_oversized_sorted_gather_ok", return_value=gather
+            ),
+        ):
+            assert scheduler._detect_qwen35_prefill_floor() == expected
+
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
 
@@ -4148,6 +4209,51 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert scheduler._qwen35_prefill_floor == 4096
             assert scheduler._prefill_step_size_for_progress(0, 4096) == 4096
             assert scheduler.config.paged_cache_block_size == 4096
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize(
+        ("nax_sparse_mla", "memory_gb", "expected"),
+        [(True, 256, 4096), (True, 96, 4096), (True, 48, 0), (False, 256, 0)],
+    )
+    def test_glm5_next_nax_host_prefill_step(
+        self, mock_tokenizer, tmp_path, nax_sparse_mla, memory_gb, expected
+    ):
+        """On NAX hosts GLM-5.3 takes 4096-token chunks (and blocks) when the
+        tensor-unit sparse MLA path is available."""
+        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
+        with (
+            patch.dict(
+                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
+            ),
+            patch(
+                "omlx.settings.get_system_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                return_value=True,
+            ),
+            patch(
+                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                return_value=True,
+            ),
+        ):
+            scheduler = Scheduler(
+                model=self._hybrid_model(model_type="glm5_next"),
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            step = expected or 2048
+            assert scheduler._qwen35_prefill_floor == expected
+            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
+            assert scheduler.config.paged_cache_block_size == step
         finally:
             scheduler.shutdown()
 

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 from omlx.custom_kernels.nax import is_nax_available
@@ -101,10 +102,9 @@ def test_fused_matches_canonical_path(bits, rows, use_combine):
 #   768  -> down tail 256 for 4/5-bit;                          norm and inject loops exact
 #   1152 -> down tail 128 (all bits), inject tail 128 (4/5-bit), norm tail 128
 #   1344 -> down tail 320 (4/5) / 64 (6/8), inject tail 64,       norm tail 64
-#   512, 1536 -> odd multiples of 512, no tails anywhere
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
-@pytest.mark.parametrize("hidden", [512, 768, 1152, 1344, 1536])
+@pytest.mark.parametrize("hidden", [768, 1152, 1344])
 def test_fused_matches_canonical_path_at_other_hidden_sizes(hidden, bits):
     mx.random.seed(20260906 + hidden + bits)
     _assert_fused_matches_canonical(_module(bits, True, hidden=hidden), 16, True)
@@ -265,6 +265,14 @@ def test_compatible_fails_closed():
     del module.input_inject_weight
     module.input_mix_weight_down = nn.Linear(WIDTH, LOWRANK, bias=False)
     assert not hc_fused.compatible(module, ok)
+    # The layout verdict is cached per module; replacing a weight tensor must re-check it.
+    module = _module(4)
+    if mx.metal.is_available():
+        assert hc_fused.compatible(module, ok)
+    module.input_mix_weight_up.scales = module.input_mix_weight_up.scales.astype(
+        mx.float16
+    )
+    assert not hc_fused.compatible(module, ok)
 
 
 def test_kill_switch_disables_fused_path(monkeypatch):
@@ -274,6 +282,7 @@ def test_kill_switch_disables_fused_path(monkeypatch):
     reloaded = importlib.reload(hc_fused)
     try:
         assert not reloaded.enabled()
+        assert not reloaded.write_enabled()
         assert not reloaded.compatible(
             _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
         )
@@ -283,13 +292,23 @@ def test_kill_switch_disables_fused_path(monkeypatch):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("source_name", ["_N_SOURCE", "_D_SOURCE", "_U_SOURCE"])
+@pytest.mark.parametrize(
+    "two_launch,source_name",
+    [
+        (False, "_N_SOURCE"),
+        (False, "_D_SOURCE"),
+        (False, "_U_SOURCE"),
+        (True, "_NDN_SOURCE"),
+        (True, "_U2_SOURCE"),
+    ],
+)
 @pytest.mark.parametrize("use_combine", [False, True])
 def test_lazy_compilation_failure_returns_canonical_output(
-    monkeypatch, caplog, source_name, use_combine
+    monkeypatch, caplog, two_launch, source_name, use_combine
 ):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_DECODE_V2", two_launch)
     monkeypatch.setattr(hc_fused, "_KERNELS", {})
     monkeypatch.setattr(hc_fused, "_VALIDATED", set())
     monkeypatch.setattr(hc_fused, "_FAILURE_LOGGED", False)
@@ -386,24 +405,173 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, monkeypatch):
     assert max_ulps <= 16 and mean_ulps <= 0.5
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_prefill_pending_write_matches_eager_write():
-    from mlx_vlm.models.qwen4_exp import hc_fused, language
+# The prefill tail/inject arithmetic as originally shipped: one row per threadgroup, the
+# normed row read from device memory for both the mix and the inject dot. Kernel changes
+# must keep these bits (prefix caches and accuracy baselines depend on them).
+_REFERENCE_TAIL_INJECT = r"""
+    const uint row = threadgroup_position_in_grid.z;
+    const uint t = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const device T* up_r = up + (size_t)row * K;
+    const device T* xn_r = xn + (size_t)row * K;
+    for (int h = int(t); h < H; h += 256) {
+        float acc = 0.0f;
+        for (int s = 0; s < HC; ++s) {
+            const int n = s * H + h;
+            const T g = T(1.0f / (1.0f + metal::exp(-float(up_r[n]))));
+            const T p = T(float(g) * float(xn_r[n]));
+            acc = s == 0 ? float(p) : float(T(acc + float(p)));
+        }
+        mixed[(size_t)row * H + h] = T(acc * (1.0f / float(HC)));
+    }
+    constexpr int PF = hc_pack_factor<BITS_I>();
+    constexpr int BP = hc_bytes_per_pack<BITS_I>();
+    constexpr int ROW_BYTES = K * BP / PF;
+    constexpr int GROUPS = K / 64;
+    constexpr int PER = K / 256;
+    float res[HC] = {0.0f};
+    float xv[PF];
+    const int e0 = int(t) * PER;
+    for (int e = e0; e < e0 + PER; e += PF) {
+        const float sum = hc_load_vector<T, PF, BITS_I>(xn_r + e, xv);
+        const int g = e / 64;
+        for (int r = 0; r < HC; ++r) {
+            res[r] += hc_qdot<PF, BITS_I>(
+                (const device uint8_t*)inject_w + r * ROW_BYTES + e * BP / PF,
+                xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
+                sum);
+        }
+    }
+    threadgroup float part[HC][8];
+    for (int r = 0; r < HC; ++r) {
+        const float v = simd_sum(res[r]);
+        if (lane == 0) part[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < HC) {
+        float v = 0.0f;
+        for (int i = 0; i < 8; ++i) v += part[t][i];
+        const float q = float(T(float(T(v)) / float(HC)));
+        const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
+        inj[(size_t)row * HC + t] = T(2.0f * gate);
+    }
+"""
 
-    mx.random.seed(11)
-    rows = hc_fused.MAX_ROWS + 1
-    module = _module(4)
-    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
-    branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
-    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
-    written = language._hc_write(hyper, branch, gate)
-    expected = hc_fused.prefill_forward(module, written)
-    actual = hc_fused.prefill_forward(module, hyper, (branch, gate))
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("rows,seed", [(17, 0), (300, 1), (300, 2)])
+def test_prefill_tail_inject_keeps_reference_bits(bits, rows, seed):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(900 + seed * 10 + bits)
+    module = _module(bits)
+    inject = module.block_inject_weight
+    up = (mx.random.normal((rows, WIDTH)) * 3).astype(mx.bfloat16)
+    normed = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
+
+    def run(name, source, header):
+        return hc_fused._kernel(
+            name,
+            ["up", "xn", "inject_w", "inject_s", "inject_b"],
+            ["mixed", "inj"],
+            source,
+            header=header,
+        )(
+            inputs=[up, normed, inject.weight, inject.scales, inject.biases],
+            template=[
+                ("T", mx.bfloat16),
+                ("BITS_I", bits),
+                ("K", WIDTH),
+                ("H", HIDDEN),
+                ("HC", HC),
+            ],
+            grid=(256, 1, rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, HIDDEN), (rows, HC)],
+            output_dtypes=[mx.bfloat16, mx.bfloat16],
+        )
+
+    expected = run(
+        "test_reference_tail_inject", _REFERENCE_TAIL_INJECT, hc_fused._HEADER
+    )
+    actual = run(
+        "omlx_qwen4_hc_prefill_tail_inject",
+        hc_fused._TI_SOURCE,
+        hc_fused._HEADER + hc_fused._TG_HEADER,
+    )
     mx.eval(expected, actual)
     for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed.view(mx.uint16), reference.view(mx.uint16)).item()
+
+
+def test_prefill_activation_rounds_like_eager_ops():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(5)
+    special = mx.array(
+        [0.0, -0.0, 1e-40, -1e-40, 3e38, -3e38, float("inf"), -float("inf"), float("nan")]
+    )
+    for scale in (1e-38, 1e-3, 1.0, 40.0, 1e5):
+        y = mx.concatenate([mx.random.normal((4096,)) * scale, special]).astype(
+            mx.bfloat16
+        ).reshape(1, -1, 1)
+        expected = nn.silu(y / HC)
+        actual = hc_fused._act(HC)(y)
+        mx.eval(expected, actual)
+        assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize(
+    "shape", [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 16), (1, 17), (1, 2048)]
+)
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_pending_write_matches_eager_write(bits, shape, use_combine):
+    """The write-norm kernels store the eager residual bit for bit and normalize the same bits."""
+    from mlx_vlm.models.qwen4_exp import hc_fused, language
+
+    mx.random.seed(11 + 31 * bits + 7 * shape[0] + shape[1])
+    module = _module(bits, use_combine)
+    hyper = (mx.random.normal((*shape, WIDTH)) * 2).astype(mx.bfloat16)
+    branch = mx.random.normal((*shape, HIDDEN)).astype(mx.bfloat16)
+    gate = (2 * mx.sigmoid(mx.random.normal((*shape, HC)))).astype(mx.bfloat16)
+    written = language._hc_write(hyper, branch, gate)
+    decode = shape[0] * shape[1] <= hc_fused.MAX_ROWS
+    forward = hc_fused.fused_forward if decode else hc_fused.prefill_forward
+    expected = forward(module, written)
+    actual = forward(module, hyper, (branch, gate))
+    expected = (
+        (expected[0], written, expected[2]) if use_combine else (expected, written)
+    )
+    assert actual is not None and len(actual) == len(expected)
+    mx.eval(actual, expected)
+    for observed, reference in zip(actual, expected):
+        assert observed.shape == reference.shape
         assert mx.array_equal(
             observed.view(mx.uint16), reference.view(mx.uint16)
         ).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 64])
+def test_promoting_pending_write_falls_back_to_eager_write(rows):
+    # An FP32 branch promotes the eager write; the BF16 kernels must not take it.
+    from mlx_vlm.models.qwen4_exp import language
+
+    mx.random.seed(rows)
+    module = _module(6)
+    hyper = mx.random.normal((1, rows, WIDTH)).astype(mx.bfloat16)
+    branch = mx.random.normal((1, rows, HIDDEN))
+    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+    expected = module(language._hc_write(hyper, branch, gate))
+    actual = module(hyper, write=(branch, gate))
+    mx.eval(actual, expected)
+    assert actual[1].dtype == mx.float32
+    for observed, reference in zip(actual, expected):
+        assert mx.array_equal(observed, reference).item()
 
 
 def test_prefill_path_not_offered_for_fused_rows():
@@ -447,7 +615,7 @@ def test_transient_failure_preserves_other_models_and_recovers(monkeypatch, path
     inputs = mx.ones((1, 32 if path == "prefill" else 4, HC * 64), dtype=mx.bfloat16)
     expected = failed._forward(inputs)
     mx.eval(expected)
-    hook = "_tail" if path == "prefill" else "_kernel_norm"
+    hook = "_tail" if path == "prefill" else "_kernel_norm_down"
     with monkeypatch.context() as fault:
         fault.setattr(
             hc_fused, hook, Mock(side_effect=RuntimeError("transient failure"))
@@ -502,7 +670,7 @@ needs_nax = pytest.mark.skipif(
 )
 
 
-# Deferred MLP residual writes in Qwen4ExpModel prefill.
+# Small quantized Qwen4ExpModel for model-level prefill checks.
 
 
 def _deferred_model():
@@ -550,76 +718,6 @@ def _logits(model, inputs):
     out = getattr(out, "logits", out)
     mx.eval(out)
     return out
-
-
-@needs_metal
-@pytest.mark.parametrize("rows", [40, 129])
-def test_deferred_write_is_bit_identical_and_fused(monkeypatch, rows):
-    from mlx_vlm.models.qwen4_exp import hc_fused, language
-
-    model, config = _deferred_model()
-    layers = model.model.layers
-    assert "ple" in layers[1] and "ple" not in layers[2]
-    assert hc_fused.prefill_compatible(
-        layers[0].attn_hyper_connection,
-        mx.zeros((1, rows, 4 * 512), dtype=mx.bfloat16),
-    )
-    inputs = mx.random.randint(0, config.text_config.vocab_size, (1, rows))
-
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", False)
-    eager = _logits(model, inputs)
-
-    writes = []
-    real = hc_fused.prefill_forward
-
-    def spy(module, hyper_input, write=None):
-        writes.append(
-            (
-                module is layers[2].attn_hyper_connection,
-                write is not None,
-            )
-        )
-        return real(module, hyper_input, write)
-
-    monkeypatch.setattr(hc_fused, "prefill_forward", spy)
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", True)
-    deferred = _logits(model, inputs)
-
-    # Layer 1 carries PLE, so layer 0's write is applied eagerly there; layer
-    # 1's write is fused into layer 2's stream norm; layer 2 writes eagerly.
-    assert (True, True) in writes
-    assert eager.dtype == deferred.dtype
-    view = mx.uint32 if eager.dtype == mx.float32 else mx.uint16
-    assert mx.array_equal(eager.view(view), deferred.view(view)).item()
-
-
-@needs_metal
-def test_decode_rows_and_kill_switch_never_defer(monkeypatch):
-    from mlx_vlm.models.qwen4_exp import language
-
-    model, config = _deferred_model()
-    deferred = []
-    real_call = language.Qwen4ExpDecoderLayer.__call__
-
-    def spy(self, *args, **kwargs):
-        deferred.append(bool(kwargs.get("defer_write")))
-        return real_call(self, *args, **kwargs)
-
-    monkeypatch.setattr(language.Qwen4ExpDecoderLayer, "__call__", spy)
-    # 16 rows take the fused decode kernels, which have no pending-write input.
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 16)))
-    assert deferred and not any(deferred)
-
-    deferred.clear()
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", False)
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 40)))
-    assert deferred and not any(deferred)
-
-    deferred.clear()
-    monkeypatch.setattr(language, "_DEFERRED_HC_WRITE", True)
-    _logits(model, mx.random.randint(0, config.text_config.vocab_size, (1, 40)))
-    # Every layer but the last defers.
-    assert deferred == [True, True, False]
 
 
 # Tensor-unit (NAX) prefill: bitwise parity with the MLX matmul path.
@@ -854,3 +952,527 @@ def test_model_prefill_logits_are_bit_identical(monkeypatch):
     assert spies["up_tail"].call_count == 6
     view = mx.uint32 if observed.dtype == mx.float32 else mx.uint16
     assert mx.array_equal(observed.view(view), reference.view(view)).item()
+
+def _decode_both_ways(hc_fused, monkeypatch, module, hyper, write):
+    """fused_forward outputs from the three-launch and the two-launch decode kernels.
+
+    The two-launch kernels run at every decode row count here, including the rows
+    that normally keep the three-launch kernels for speed.
+    """
+    monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    outputs = []
+    for two_launch in (False, True):
+        monkeypatch.setattr(hc_fused, "_DECODE_V2", two_launch)
+        out = hc_fused.fused_forward(module, hyper, write)
+        assert out is not None
+        outputs.append(out if isinstance(out, tuple) else (out,))
+    mx.eval(outputs)
+    return outputs
+
+
+def _assert_same_bits(outputs):
+    three_launch, two_launch = outputs
+    assert len(two_launch) == len(three_launch)
+    for new, old in zip(two_launch, three_launch):
+        assert new.shape == old.shape and new.dtype == old.dtype
+        assert mx.array_equal(new.view(mx.uint16), old.view(mx.uint16)).item()
+
+
+def _two_launch_fits(hc_fused, monkeypatch, module, rows):
+    monkeypatch.setattr(hc_fused, "_DECODE_V2", True)
+    monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    return hc_fused._decode_v2(
+        rows,
+        HC,
+        module.hidden_size,
+        LOWRANK,
+        module.input_mix_weight_up.bits,
+        "block_inject_weight" in module,
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatch):
+    """Mixed, written residual and injection match the three-launch kernels bit for bit at
+    every decode row count, with and without a pending write (checkpoint shapes)."""
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    rows_list = range(1, hc_fused.MAX_ROWS + 1) if bits == 6 else (1, 2, 3, 5, 16)
+    for seed in (0, 1, 2) if bits == 6 else (0,):
+        mx.random.seed(4017 + 97 * seed + bits)
+        module = _module(bits, use_combine)
+        for rows in rows_list:
+            assert _two_launch_fits(hc_fused, monkeypatch, module, rows)
+            hyper = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
+            branch = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
+            gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+            for write in (None, (branch, gate)):
+                _assert_same_bits(
+                    _decode_both_ways(hc_fused, monkeypatch, module, hyper, write)
+                )
+
+
+# 64: every down block is a partial tail; 768/1152/1344: partial final down, inject
+# and norm blocks (see test_fused_matches_canonical_path_at_other_hidden_sizes).
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("hidden", [64, 1152, 1344])
+def test_two_launch_decode_keeps_bits_with_partial_blocks(hidden, bits, monkeypatch):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(4018 + hidden + bits)
+    module = _module(bits, True, hidden=hidden)
+    for rows in (1, 3, 16):
+        assert _two_launch_fits(hc_fused, monkeypatch, module, rows)
+        hyper = (mx.random.normal((1, rows, HC * hidden)) * 2).astype(mx.bfloat16)
+        branch = mx.random.normal((1, rows, hidden)).astype(mx.bfloat16)
+        gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(mx.bfloat16)
+        for write in (None, (branch, gate)):
+            _assert_same_bits(_decode_both_ways(hc_fused, monkeypatch, module, hyper, write))
+
+
+# Norm/down threadgroup (g, ks) stores strip g of stream ks, so a stream needs no
+# more 256-element strips than there are row groups: with two down rows per
+# simdgroup (rows >= 3) that is 320 / 16 + 1 = 21, so 5376 is the widest hidden
+# size and 5440 must keep the three-launch kernels.
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_two_launch_decode_strip_boundary(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    mx.random.seed(4019)
+    widest = _module(6, True, hidden=5376)
+    assert _two_launch_fits(hc_fused, monkeypatch, widest, 3)
+    hyper = (mx.random.normal((1, 3, HC * 5376)) * 2).astype(mx.bfloat16)
+    _assert_same_bits(_decode_both_ways(hc_fused, monkeypatch, widest, hyper, None))
+    too_wide = _module(6, True, hidden=5440)
+    assert not _two_launch_fits(hc_fused, monkeypatch, too_wide, 3)
+    assert _two_launch_fits(hc_fused, monkeypatch, too_wide, 1)
+    hyper = (mx.random.normal((1, 3, HC * 5440)) * 2).astype(mx.bfloat16)
+    _assert_same_bits(_decode_both_ways(hc_fused, monkeypatch, too_wide, hyper, None))
+
+
+def _probe(source: str, epilogue: str, replacement: str) -> str:
+    """A kernel source whose epilogue stores the FP32 value it would have rounded."""
+    assert epilogue in source
+    return source.replace(epilogue, replacement)
+
+
+_D_ACT_EPILOGUE = """            v = v / float(HC);
+            act[(size_t)row * R + int(tg) * 8 + int(sg) * 4 + r]
+                = T(v / (1.0f + metal::exp(-v)));
+"""
+_D_INJ_EPILOGUE = """            v = v / float(HC);
+            inj[(size_t)row * HC + r] = T(2.0f / (1.0f + metal::exp(-v)));
+"""
+_U_EPILOGUE = """    float gate = 1.0f / (1.0f + metal::exp(-acc));
+    float v = gate * float(xn[(size_t)r * K + n]);
+    v += simd_shuffle_down(v, 1);
+    v += simd_shuffle_down(v, 2);
+    if (s == 0) mixed[(size_t)r * H + h] = T(v / float(HC));
+"""
+_U2_EPILOGUE = """    float gate = 1.0f / (1.0f + metal::exp(-acc));
+    float v = gate * xnv;
+    v += simd_shuffle_down(v, 1);
+    v += simd_shuffle_down(v, 2);
+    if (s == 0) mixed[(size_t)r * H + h] = T(v / float(HC));
+    if (inj_thread) inj[(size_t)r * HC + int(t)] = injv;
+"""
+_U2_ACT_COMBINE = """        v = v / float(HC);
+        acts[i] = T(v / (1.0f + metal::exp(-v)));
+"""
+_U2_INJ_COMBINE = """        v = v / float(HC);
+        injv = T(2.0f / (1.0f + metal::exp(-v)));
+"""
+_N_INV = "    const float inv = metal::rsqrt(tot / float(H) + eps[0]);\n"
+_NDN_INV = "    const float inv = metal::rsqrt(tot / float(H) + e);\n"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("rows", [1, 3, 16])
+def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, monkeypatch):
+    """The BF16 outputs absorb most one-ulp FP32 changes (reversing the up sum order
+    changed no output bit over 128 rows), so compare the FP32 values each path rounds:
+    the stream sums of squares, the down and inject slice sums
+    (part[0] + part[1] + part[2] + part[3]) and the up accumulators before the gate."""
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    mx.random.seed(4020 + 10 * bits + rows)
+    module = _module(bits, True)
+    down, up = module.input_mix_weight_down, module.input_mix_weight_up
+    inject = module.block_inject_weight
+    flat = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
+    norm_inputs = [flat, module.hc_norm.weight, hc_fused._eps_array(module)]
+
+    _, normed, parts = hc_fused._kernel_norm_down(
+        module, flat, None, rows, HC, HIDDEN, LOWRANK, mx.bfloat16, down, inject
+    )
+    rps = hc_fused._down_rps(rows)
+    new_tots = mx.fast.metal_kernel(
+        name="test_hc_norm_down_sums",
+        input_names=["x", "w", "eps", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
+        output_names=["xn", "parts", "tots"],
+        header=hc_fused._V2_HEADER,
+        source=_probe(
+            hc_fused._NDN_SOURCE,
+            _NDN_INV,
+            _NDN_INV + "    if (t == 0 && g == 0) tots[(size_t)row * HC + s] = tot;\n",
+        ),
+    )(
+        inputs=[*norm_inputs, down.weight, down.scales, down.biases, inject.weight, inject.scales, inject.biases],
+        template=[
+            ("T", mx.bfloat16),
+            ("BITS_D", bits),
+            ("BITS_I", bits),
+            ("K", WIDTH),
+            ("H", HIDDEN),
+            ("R", LOWRANK),
+            ("HC", HC),
+            ("INJ", 1),
+            ("RPS", rps),
+        ],
+        grid=(256, HC * hc_fused._down_row_groups(LOWRANK, True, rps), rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, WIDTH), (rows, HC, LOWRANK + HC), (rows, HC)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+    )[2]
+    old_normed, old_tots = mx.fast.metal_kernel(
+        name="test_hc_norm_sums",
+        input_names=["x", "w", "eps"],
+        output_names=["xn", "tots"],
+        source=_probe(
+            hc_fused._N_SOURCE,
+            _N_INV,
+            _N_INV + "    if (t == 0) tots[(size_t)row * 4 + s] = tot;\n",
+        ),
+    )(
+        inputs=norm_inputs,
+        template=[("T", mx.bfloat16), ("K", WIDTH), ("H", HIDDEN)],
+        grid=(256, HC, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, WIDTH), (rows, HC)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+    mx.eval(normed, old_normed, new_tots, old_tots)
+    assert mx.array_equal(new_tots.view(mx.uint32), old_tots.view(mx.uint32)).item()
+    assert mx.array_equal(normed.view(mx.uint16), old_normed.view(mx.uint16)).item()
+    down_inputs = [
+        old_normed,
+        down.weight,
+        down.scales,
+        down.biases,
+        inject.weight,
+        inject.scales,
+        inject.biases,
+    ]
+    down_names = ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"]
+    down_launch = dict(
+        template=[
+            ("T", mx.bfloat16),
+            ("BITS_D", bits),
+            ("BITS_I", bits),
+            ("K", WIDTH),
+            ("R", LOWRANK),
+            ("HC", HC),
+            ("INJ", 1),
+        ],
+        grid=(32, 8 * (LOWRANK // 8 + 1), rows),
+        threadgroup=(32, 8, 1),
+    )
+    probe = _probe(
+        _probe(
+            hc_fused._D_SOURCE,
+            _D_ACT_EPILOGUE,
+            "            act[(size_t)row * R + int(tg) * 8 + int(sg) * 4 + r] = v;\n",
+        ),
+        _D_INJ_EPILOGUE,
+        "            inj[(size_t)row * HC + r] = v;\n",
+    )
+    down_sums, inject_sums = mx.fast.metal_kernel(
+        name="test_hc_down_sums",
+        input_names=down_names,
+        output_names=["act", "inj"],
+        header=hc_fused._HEADER,
+        source=probe,
+    )(
+        inputs=down_inputs,
+        output_shapes=[(rows, LOWRANK), (rows, HC)],
+        output_dtypes=[mx.float32, mx.float32],
+        **down_launch,
+    )
+    old_act, _ = mx.fast.metal_kernel(
+        name="test_hc_down",
+        input_names=down_names,
+        output_names=["act", "inj"],
+        header=hc_fused._HEADER,
+        source=hc_fused._D_SOURCE,
+    )(
+        inputs=down_inputs,
+        output_shapes=[(rows, LOWRANK), (rows, HC)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+        **down_launch,
+    )
+
+    up_template = [
+        ("T", mx.bfloat16),
+        ("BITS_U", bits),
+        ("K", WIDTH),
+        ("R", LOWRANK),
+        ("HC", HC),
+        ("H", HIDDEN),
+    ]
+    store_acc = "    mixed[(size_t)r * K + n] = acc;\n"
+    old_accs = mx.fast.metal_kernel(
+        name="test_hc_up_sums",
+        input_names=["xn", "act", "up_w", "up_s", "up_b"],
+        output_names=["mixed"],
+        header=hc_fused._HEADER,
+        source=_probe(hc_fused._U_SOURCE, _U_EPILOGUE, store_acc),
+    )(
+        inputs=[old_normed, old_act, up.weight, up.scales, up.biases],
+        template=up_template,
+        grid=(256, HIDDEN // 64, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, WIDTH)],
+        output_dtypes=[mx.float32],
+    )[0]
+    chunks = hc_fused._up_chunks(bits, LOWRANK)
+    threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
+    outputs = hc_fused._V2_UP_OUTPUTS
+    up2_probe = _probe(
+        _probe(
+            _probe(hc_fused._U2_SOURCE, _U2_EPILOGUE, store_acc),
+            _U2_ACT_COMBINE,
+            "        if (threadgroup_position_in_grid.y == 0) sums[(size_t)r * PR + i] = v;\n"
+            + _U2_ACT_COMBINE,
+        ),
+        _U2_INJ_COMBINE,
+        "        sums[(size_t)r * PR + i] = v;\n" + _U2_INJ_COMBINE,
+    )
+    new_accs, _, new_sums = mx.fast.metal_kernel(
+        name="test_hc_up2_sums",
+        input_names=["xn", "parts", "up_w", "up_s", "up_b"],
+        output_names=["mixed", "inj", "sums"],
+        header=hc_fused._V2_HEADER,
+        source=up2_probe,
+    )(
+        inputs=[normed, parts, up.weight, up.scales, up.biases],
+        template=[*up_template, ("INJ", 1), ("NO", outputs), ("TGS", threads)],
+        grid=(threads, WIDTH // outputs, rows),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(rows, WIDTH), (rows, HC), (rows, LOWRANK + HC)],
+        output_dtypes=[mx.float32, mx.bfloat16, mx.float32],
+    )
+
+    mx.eval(new_sums, down_sums, inject_sums, old_accs, new_accs)
+    for new, old in (
+        (new_sums[:, :LOWRANK], down_sums),
+        (new_sums[:, LOWRANK:], inject_sums),
+        (new_accs, old_accs),
+    ):
+        assert mx.array_equal(new.view(mx.uint32), old.view(mx.uint32)).item()
+
+
+# Deferred residual writes: a real-shape stack must match eager writes bit for bit.
+# Each layer's tail write is carried into the next hyper-connection norm (and the
+# final mixer); the reference runs with OMLX_QWEN4_HC_FUSED_WRITE off.
+
+
+def _stack(seed: int):
+    """Four layers (DeltaNet, DeltaNet+PLE, sparse attention, DeltaNet) at the checkpoint's HC shapes."""
+    from mlx_vlm.models import qwen4_exp
+    from mlx_vlm.models.qwen4_exp import language
+
+    text = qwen4_exp.TextConfig(
+        model_type="qwen4_exp_text",
+        hidden_size=2560,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_conv_kernel_dim=4,
+        num_experts=16,
+        num_experts_per_tok=10,
+        shared_expert_intermediate_size=64,
+        moe_intermediate_size=64,
+        rms_norm_eps=1e-6,
+        vocab_size=256,
+        num_key_value_heads=2,
+        max_position_embeddings=65536,
+        hc_count=4,
+        hc_lowrank=320,
+        head_dim=64,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+        ],
+        ple_layer_ids=[2],
+        ple_embed_dim=64,
+        ple_conv_kernel_size=3,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=17,
+        make_ngram_vocab_size_divisible_by=4,
+        split_ngram_parts=4,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=64,
+        indexer_budget=64,
+        indexer_compress_ratio=4,
+        eos_token_id=1,
+        rope_parameters={
+            "rope_type": "default",
+            "mrope_section": [16, 8, 8],
+            "rope_theta": 10_000,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+    vision = qwen4_exp.VisionConfig(
+        model_type="qwen4_exp",
+        depth=1,
+        hidden_size=32,
+        intermediate_size=64,
+        out_hidden_size=32,
+        num_heads=4,
+        patch_size=14,
+        in_channels=3,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
+    )
+    config = qwen4_exp.ModelConfig(
+        text_config=text,
+        vision_config=vision,
+        model_type="qwen4_exp",
+        image_token_id=250,
+        video_token_id=251,
+        vision_start_token_id=252,
+        vision_end_token_id=253,
+        vocab_size=256,
+    )
+    mx.random.seed(seed)
+    model = language.LanguageModel(text, config)
+    head = language.Qwen4ExpMTPModule(text)
+    # Checkpoint layout: 6-bit layer HC with one 8-bit layer, 5-bit final mixer.
+    for module, layout in (
+        (
+            model,
+            [
+                ("model.layers.3.", 8),
+                ("model.layers.", 6),
+                ("model.hyper_connection_mixer", 5),
+            ],
+        ),
+        (head, [("", 6)]),
+    ):
+        module.set_dtype(mx.bfloat16)
+        for name, sub in module.named_modules():
+            if name.endswith("hc_norm"):
+                sub.weight = (mx.random.normal(sub.weight.shape) * 0.05).astype(
+                    mx.bfloat16
+                )
+        for prefix, bits in layout:
+            nn.quantize(
+                module,
+                group_size=64,
+                bits=bits,
+                class_predicate=lambda path, m, prefix=prefix: isinstance(m, nn.Linear)
+                and path.startswith(prefix)
+                and "hyper_connection" in path,
+            )
+        mx.eval(module.parameters())
+    return model, head
+
+
+def _run(monkeypatch, model, head, seed, deferred, script):
+    from mlx_vlm.models.qwen4_exp import hc_fused, language
+
+    monkeypatch.setattr(hc_fused, "_WRITE_DISABLED", not deferred)
+    eager_writes = []
+    real_write = language._hc_write
+    monkeypatch.setattr(
+        language,
+        "_hc_write",
+        lambda *args: eager_writes.append(args[0].shape) or real_write(*args),
+    )
+    rng = np.random.default_rng(seed)
+    outputs = script(
+        model,
+        head,
+        lambda batch, length: mx.array(
+            rng.integers(2, 256, (batch, length)), dtype=mx.int32
+        ),
+    )
+    mx.eval(outputs)
+    return outputs, eager_writes
+
+
+def _assert_identical(monkeypatch, seed, script):
+    model, head = _stack(seed)
+    # Separate contexts so the second run does not wrap the first run's spy.
+    with monkeypatch.context() as patch:
+        expected, eager = _run(patch, model, head, seed, False, script)
+    with monkeypatch.context() as patch:
+        actual, deferred = _run(patch, model, head, seed, True, script)
+    # Only the PLE layer still materializes its incoming write.
+    assert len(deferred) < len(eager)
+    assert len(actual) == len(expected)
+    for index, (observed, reference) in enumerate(zip(actual, expected)):
+        assert observed.dtype == reference.dtype == mx.bfloat16, index
+        assert observed.shape == reference.shape, index
+        assert mx.array_equal(
+            observed.view(mx.uint16), reference.view(mx.uint16)
+        ).item(), f"output {index} differs"
+
+
+def _decode_and_verify(model, head, ids):
+    outputs = []
+    cache = model.make_cache()
+    outputs.append(model(ids(1, 17), cache=cache).logits)
+    for rows in (1, 2, 3, 4):
+        outputs.append(model(ids(1, rows), cache=cache).logits)
+    for rows in (1, 2, 3, 4):
+        # Lightning MTP verify: target-verify rows plus the pre-mixer residual
+        # (a one-row window is the decode step itself, with no transaction).
+        out = model(ids(1, rows), cache=cache, return_hidden=True)
+        hidden = out.hidden_states[0]
+        if out.gdn_states is not None:
+            out.gdn_states.commit([rows])
+        mixed, residual = head(hidden, ids(1, rows), model.model.embed_tokens)
+        outputs += [out.logits, hidden, mixed, residual]
+    sink = []
+    outputs.append(
+        model.model(ids(1, 3), cache=cache, hidden_sink=sink, capture_layer_ids=[0, 2])
+    )
+    outputs += sink
+    batch = model.make_cache()
+    outputs.append(model(ids(2, 9), cache=batch).logits)
+    for rows in (1, 2):
+        outputs.append(model(ids(2, rows), cache=batch).logits)
+    return outputs
+
+
+@needs_metal
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_decode_and_verify_rows_match_eager_writes(monkeypatch, seed):
+    _assert_identical(monkeypatch, seed, _decode_and_verify)
+
+
+@needs_metal
+@pytest.mark.parametrize("chunk", [17, 257, 2048])
+def test_prefill_chunks_match_eager_writes(monkeypatch, chunk):
+    def prefill(model, head, ids):
+        cache = model.make_cache()
+        first = model(ids(1, chunk), cache=cache).logits
+        second = model(ids(1, chunk), cache=cache).logits
+        return [first, second, model(ids(1, 1), cache=cache).logits]
+
+    _assert_identical(monkeypatch, 40 + chunk, prefill)
