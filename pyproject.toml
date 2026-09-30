@@ -116,7 +116,7 @@ dependencies = [
     # mlx-vlm now requires mlx-audio in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@49596ac8b69b9ed377db311a73df838795f38a3d",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
+    # dflash-mlx v0.1.10+omlx.8 (c1dc154) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
     # fired upstream), the single-host-sync decode cycle (one D2H transfer
     # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
@@ -124,9 +124,11 @@ dependencies = [
     # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
     # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
     # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix, and
-    # repetition penalty support across speculative and fallback sampling.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c55324c86540c369f6818a0f47eae544d405475b",
+    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix,
+    # repetition penalty support across speculative and fallback sampling,
+    # Muse Glimmer target registration and live KV snapshots on mlx-lm 0.32
+    # (PR 11), and Muse Glimmer prefix snapshots (PR 5).
+    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@c1dc1548a446417602ac16c5e719a18efbbfadd0",
     "markitdown[pdf,docx,pptx]==0.1.7",
 ]
 

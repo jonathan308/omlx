@@ -94,7 +94,7 @@ def _get_dflash_stop_token_ids(
 def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
     """Decide whether ``model_path`` can run on the current dflash backend.
 
-    DFlash 0.1.10+omlx.7 registers QwenGdnTargetOps, Gemma4TargetOps, and
+    DFlash 0.1.10+omlx.8 registers QwenGdnTargetOps, Gemma4TargetOps, and
     MuseGlimmerTargetOps; oMLX adds Laguna, MiMo V2, and GLM-5.3 target/draft
     adapters. The top-level ``model_type`` is the canonical
     discriminator: Gemma4 multimodal
@@ -816,11 +816,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 is not False
             ):
                 try:
-                    from ..patches.qwen35_moe_gate_up import (
-                        apply_qwen35_moe_gate_up_fusion,
+                    from ..patches.moe_gate_up_fusion import (
+                        apply_moe_gate_up_fusion,
                     )
 
-                    apply_qwen35_moe_gate_up_fusion(target_bundle.model)
+                    apply_moe_gate_up_fusion(target_bundle.model)
                 except Exception:
                     logger.debug(
                         "DFlash target MoE gate+up fusion not applied",
