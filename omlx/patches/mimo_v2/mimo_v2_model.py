@@ -74,10 +74,6 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 0
     omlx_mtp_sidecar: Optional[str] = None
-    # Tensor-parallel degree the sidecar's fused qkv was sharded for; None
-    # follows the main layers, or 4 (Xiaomi's release layout) when those are
-    # already split and the sliding-window geometry cannot tell.
-    omlx_mtp_sidecar_tp: Optional[int] = None
     n_shared_experts: Optional[int] = None
     scoring_func: str = "sigmoid"
 
@@ -621,24 +617,22 @@ class Model(nn.Module):
 
         TP = detect_fused_qkv_tp(self.args, shape_of)
         n_mtp = int(self.args.num_nextn_predict_layers or 0)
-        mtp_tp = self.args.omlx_mtp_sidecar_tp
-        if mtp_tp is None:
-            mtp_tp = TP
-            main_fused = any(
-                fused_qkv_keys(i)[1] in weights
-                for i in range(self.args.num_hidden_layers)
+        mtp_tp = TP
+        main_fused = any(
+            fused_qkv_keys(i)[1] in weights for i in range(self.args.num_hidden_layers)
+        )
+        sidecar_fused = any(
+            f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
+            for i in range(n_mtp)
+        )
+        if sidecar_fused and not main_fused:
+            # Sliding-window qkv shapes fit every TP degree, so the split main
+            # layers leave nothing to detect; Xiaomi's releases use TP=4.
+            mtp_tp = 4
+            logger.info(
+                "MiMo MTP sidecar: the main layers are already split; assuming "
+                "the official TP=4 fused qkv layout"
             )
-            sidecar_fused = any(
-                f"model.mtp.layers.{i}.self_attn.qkv_proj.weight_scale_inv" in weights
-                for i in range(n_mtp)
-            )
-            if sidecar_fused and not main_fused:
-                mtp_tp = 4
-                logger.info(
-                    "MiMo MTP sidecar: the main layers are already split, so "
-                    "the fused qkv layout cannot be detected; assuming the "
-                    "official TP=4 layout (set omlx_mtp_sidecar_tp to override)"
-                )
 
         def dequant_block(weight, scale_inv):
             weight = mx.from_fp8(weight, dtype=bf16)
